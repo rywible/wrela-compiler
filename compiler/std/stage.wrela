@@ -1,42 +1,134 @@
 // Fields built while the program runs, as a tape of operations that `interpret` evaluates
-// (language.md §7). A field the program assembles while it runs, from an edit log or a
-// sculpting tool, has no code of its own to compile; its tape is data. A `Tape` is a `Surface`
-// like any compiled field, on the CPU and the GPU, and its gradient and interval are derived
-// from `interpret`'s own code, as any function's are (§14).
+// (language.md §14.4). A field the program assembles while it runs, from an edit log or a
+// sculpting tool, has no code of its own to compile; its tape is data. And a compiled field
+// becomes one (`std::derive::tape`), so one kernel that interprets tapes serves every field. A
+// tape is a `Surface` like any compiled field, on the CPU and the GPU, and its gradient and
+// interval are derived from `interpret`'s own code, as any function's are (§14).
 //
-// Each operation writes its own register, the one at its index, from earlier registers or a
-// constant; the last register is the field's value. A tape is fixed-size, so it's `GpuData`
-// and passes to a kernel as a uniform.
+// Each operation writes its own register, the one at its index, from earlier registers, a
+// constant, or the tape's table of constants (`consts`); the last register is the field's
+// value. A tape is fixed-size, so it's `GpuData` and passes to a kernel as a uniform, or as a
+// read-only storage binding past 64 KiB: a `Tape` holds `TAPE_LEN` operations, a `ShortTape`
+// `TAPE_SHORT`, both a `Taped` of their sizes.
 
 use std::derive::{Box2, Box3, Interval, interval}
 use std::math::is_finite
-use std::field::{Surface, smin}
+use std::field::{Surface, lattice, lattice_coord, smin, value_noise}
 
-/// The most operations a tape holds.
-pub const TAPE_LEN: u32 = 128
+/// The most operations a `Tape` holds, and the most constants in its table.
+pub const TAPE_LEN: u32 = 4096
+/// The most constants in a `Tape`'s table.
+pub const TAPE_CONSTS: u32 = 2048
+/// A `ShortTape`'s: a pruned tape's, which a block's work reads from a uniform.
+pub const TAPE_SHORT: u32 = 256
+/// The most constants in a `ShortTape`'s table.
+pub const TAPE_SHORT_CONSTS: u32 = 256
 
-// The operations.
-const X: u32 = 0
-const Y: u32 = 1
-const Z: u32 = 2
-const CONST: u32 = 3
-const ADD: u32 = 4
-const SUB: u32 = 5
-const MUL: u32 = 6
-const DIV: u32 = 7
-const MIN: u32 = 8
-const MAX: u32 = 9
-const SMIN: u32 = 10
-const NEG: u32 = 11
-const ABS: u32 = 12
-const SQRT: u32 = 13
-const SIN: u32 = 14
-const COS: u32 = 15
-const EXP: u32 = 16
-const COPY: u32 = 17
+// The operations. Each reads registers `a` and `b` and, for the ternary ones, a third register
+// held in the code's high 16 bits; or a constant `c`; or the table.
+/// The point's x, less `c`.
+pub const X: u32 = 0
+/// The point's y, less `c`.
+pub const Y: u32 = 1
+/// The point's z, less `c`.
+pub const Z: u32 = 2
+/// The constant `c`.
+pub const CONST: u32 = 3
+/// `a + b`.
+pub const ADD: u32 = 4
+/// `a - b`.
+pub const SUB: u32 = 5
+/// `a * b`.
+pub const MUL: u32 = 6
+/// `a / b`.
+pub const DIV: u32 = 7
+/// `min(a, b)`.
+pub const MIN: u32 = 8
+/// `max(a, b)`.
+pub const MAX: u32 = 9
+/// `smin(a, b, c)`: a smooth minimum `c` wide.
+pub const SMIN: u32 = 10
+/// `-a`.
+pub const NEG: u32 = 11
+/// `abs(a)`.
+pub const ABS: u32 = 12
+/// `sqrt(a)`.
+pub const SQRT: u32 = 13
+/// `sin(a)`.
+pub const SIN: u32 = 14
+/// `cos(a)`.
+pub const COS: u32 = 15
+/// `exp(a)`.
+pub const EXP: u32 = 16
+/// `a`, copied.
+pub const COPY: u32 = 17
+/// `floor(a)`.
+pub const FLOOR: u32 = 18
+/// `fract(a)`.
+pub const FRACT: u32 = 19
+/// `a < b ? 1 : 0`.
+pub const STEP: u32 = 20
+/// `a > 0 ? b : t`, `t` the third register.
+pub const SELECT: u32 = 21
+/// `a + (b - a) * t`.
+pub const MIX: u32 = 22
+/// `saturate(a)`.
+pub const CLAMP01: u32 = 23
+/// `pow(a, c)`.
+pub const POW: u32 = 24
+/// `log(a)`.
+pub const LOG: u32 = 25
+/// `a - b * floor(a / b)`.
+pub const MOD: u32 = 26
+/// `consts[c + clamp(floor(a), 0, n - 1)]`, `n` the table's entries from `c` (held where a
+/// ternary operation's third register is): a constant table read at a computed index.
+pub const LOAD: u32 = 27
+/// Between `consts[c + i]` and `consts[c + i + 1]`, linearly, at `a` clamped to `[0, n - 1]`
+/// (`i` its floor), `n` as `LOAD`'s.
+pub const LERP_LOAD: u32 = 28
+/// `value_noise(vec3(a, b, t) * c)`: std::field's own noise, so a tape and a compiled field
+/// agree bit for bit.
+pub const NOISE3: u32 = 29
+/// `fbm(consts[c], octaves: consts[c + 1]).value(vec3(a, b, t))`, each octave's amplitude
+/// `consts[c + 2]` of the last's (std::field's `Fbm` takes 0.5).
+pub const FBM3: u32 = 30
+/// `lattice(lattice_coord(floor(a)), lattice_coord(floor(b)), lattice_coord(floor(t)))`: the
+/// lattice's hash of a cell, in [-1, 1].
+pub const HASH: u32 = 31
+/// `dot(r[a..a+3], r[b..b+3])`: two vectors, each three registers in a row.
+pub const DOT3: u32 = 32
+/// `length(r[a..a+3])`.
+pub const LEN3: u32 = 33
+/// Component `c` (0, 1 or 2) of `normalize(r[a..a+3])`.
+pub const NORM3: u32 = 34
 
-/// One operation: its register gets `code` of registers `a` and `b`, or of the constant `c`
-/// (a coordinate's offset, a constant's value, a smooth minimum's width).
+/// How many registers an operation reads (`a`, `b`, then the third), the vector operations
+/// aside (`reads`).
+fn arity(code: u32) -> u32 {
+    if code < ADD {
+        0
+    } else if code <= SMIN || code == STEP || code == MOD {
+        2
+    } else if code == SELECT || code == MIX || code == NOISE3 || code == FBM3 || code == HASH {
+        3
+    } else if code == LOAD || code == LERP_LOAD || code == NORM3 || code == LEN3 {
+        1
+    } else if code == DOT3 {
+        2
+    } else {
+        1
+    }
+}
+
+/// Whether an operation reads its registers three in a row: `a..a+3` (and `b..b+3`).
+fn vector_op(code: u32) -> bool {
+    code == DOT3 || code == LEN3 || code == NORM3
+}
+
+/// One operation: its register gets `code` (the opcode in the low 16 bits; a ternary
+/// operation's third register, or a table read's entry count, in the high 16) of registers `a`
+/// and `b`, or of the constant `c` (a coordinate's offset, a constant's value, a smooth
+/// minimum's width, a table's first entry).
 pub struct Op: Copy + GpuData {
     code: u32,
     a: u32,
@@ -44,33 +136,107 @@ pub struct Op: Copy + GpuData {
     c: f32,
 }
 
+impl Op {
+    /// Its opcode.
+    pub fn opcode(self) -> u32 {
+        self.code & 65535
+    }
+
+    /// Its third register, or a table read's entry count.
+    pub fn third(self) -> u32 {
+        self.code >> 16
+    }
+}
+
 /// A value on a tape: the register an operation writes.
 pub struct Reg: Copy {
     index: u32,
 }
 
-/// A field built at runtime: up to `TAPE_LEN` operations over the point. Build one with its
-/// methods, each of which adds an operation and returns its register; the last one added is
-/// the field's value.
-pub struct Tape: Copy + GpuData {
-    ops: [Op; 128],
+/// A field built at runtime: up to `N` operations over the point, and a table of up to `K`
+/// constants. Build one with its methods, each of which adds an operation and returns its
+/// register; the last one added is the field's value. `Tape` and `ShortTape` are its sizes.
+pub struct Taped<const N: u32, const K: u32>: Copy + GpuData {
+    ops: [Op; N],
     len: u32,
+    consts: [f32; K],
+    nconsts: u32,
 }
 
+/// A tape of up to `TAPE_LEN` operations and `TAPE_CONSTS` constants: 72 KiB, which a kernel
+/// binds as read-only storage.
+pub type Tape = Taped<4096, 2048>
+
+/// A tape of up to `TAPE_SHORT` operations and constants (5 KiB): a pruned tape, which a kernel
+/// reads from a uniform-sized block.
+pub type ShortTape = Taped<256, 256>
+
 /// The value of `tape`'s field at `p`: its last register.
-pub fn interpret(tape: Tape, p: vec3) -> f32 {
-    var r = [0.0; 128]
+pub fn interpret<const N: u32, const K: u32>(tape: Taped<N, K>, p: vec3) -> f32 {
+    var r = [0.0; N]
     for i in 0..tape.len {
         let op = tape.ops[i]
-        r[i] = apply(op, p, r[op.a], r[op.b])
+        let code = op.opcode()
+        r[i] = if vector_op(code) {
+            let u = vec3(r[op.a], r[op.a + 1], r[op.a + 2])
+            if code == DOT3 {
+                dot(u, vec3(r[op.b], r[op.b + 1], r[op.b + 2]))
+            } else if code == LEN3 {
+                length(u)
+            } else {
+                vector_component(normalize(u), op.c)
+            }
+        } else if code == LOAD || code == LERP_LOAD {
+            table(tape, op, r[op.a])
+        } else if code == FBM3 {
+            fbm3(tape, op, vec3(r[op.a], r[op.b], r[op.third()]))
+        } else {
+            apply(op, p, r[op.a], r[op.b], r[op.third()])
+        }
     }
     if tape.len == 0 { 0.0 } else { r[tape.len - 1] }
 }
 
-/// What operation `op` writes at `p`, given the values `a` and `b` of its registers `op.a` and
-/// `op.b`: one step of `interpret`, and `Tape::prune`'s step of the registers' intervals.
-fn apply(op: Op, p: vec3, a: f32, b: f32) -> f32 {
-    match op.code {
+/// Component `c` (0, 1 or 2) of `v`.
+fn vector_component(v: vec3, c: f32) -> f32 {
+    if c < 0.5 { v.x } else if c < 1.5 { v.y } else { v.z }
+}
+
+/// A table read (`LOAD`, `LERP_LOAD`) at `at`.
+fn table<const N: u32, const K: u32>(tape: Taped<N, K>, op: Op, at: f32) -> f32 {
+    let base = u32(op.c)
+    let last = f32(max(op.third(), 1) - 1)
+    let t = clamp(at, 0.0, last)
+    let i = floor(t)
+    let lo = tape.consts[base + u32(i)]
+    if op.opcode() == LOAD {
+        return lo
+    }
+    let next = min(i + 1.0, last)
+    let hi = tape.consts[base + u32(next)]
+    lo + (hi - lo) * (t - i)
+}
+
+/// `FBM3` at `q`: std::field's `Fbm::value`, octave by octave, as it sums them.
+fn fbm3<const N: u32, const K: u32>(tape: Taped<N, K>, op: Op, q: vec3) -> f32 {
+    let base = u32(op.c)
+    var s = 0.0
+    var a = 1.0
+    var fr = tape.consts[base]
+    let octaves = u32(tape.consts[base + 1])
+    let gain = tape.consts[base + 2]
+    for o in 0..octaves {
+        s += a * value_noise(q * fr + f32(o) * 17.0)
+        a *= gain
+        fr *= 2.0
+    }
+    s
+}
+
+/// What a scalar operation `op` writes at `p`, given the values `a`, `b` and `t` of its
+/// registers: one step of `interpret`, and `Taped::prune`'s step of the registers' intervals.
+fn apply(op: Op, p: vec3, a: f32, b: f32, t: f32) -> f32 {
+    match op.opcode() {
         X => p.x - op.c,
         Y => p.y - op.c,
         Z => p.z - op.c,
@@ -88,20 +254,36 @@ fn apply(op: Op, p: vec3, a: f32, b: f32) -> f32 {
         SIN => sin(a),
         COS => cos(a),
         EXP => exp(a),
+        FLOOR => floor(a),
+        FRACT => fract(a),
+        STEP => if a < b { 1.0 } else { 0.0 },
+        SELECT => if a > 0.0 { b } else { t },
+        MIX => a + (b - a) * t,
+        CLAMP01 => saturate(a),
+        POW => pow(a, op.c),
+        LOG => log(a),
+        MOD => a - b * floor(a / b),
+        NOISE3 => value_noise(vec3(a, b, t) * op.c),
+        HASH => lattice(lattice_coord(floor(a)), lattice_coord(floor(b)), lattice_coord(floor(t))),
         _ => a,
     }
 }
 
-impl Surface for Tape {
+impl<const N: u32, const K: u32> Surface for Taped<N, K> {
     fn distance(self, p: vec3) -> f32 {
         interpret(self, p)
     }
 }
 
-impl Tape {
+impl<const N: u32, const K: u32> Taped<N, K> {
     /// An empty tape, whose value is 0 until an operation is added.
-    pub fn new() -> Tape {
-        Tape { ops: [Op { code: CONST, a: 0, b: 0, c: 0.0 }; 128], len: 0 }
+    pub fn new() -> Taped<N, K> {
+        Taped {
+            ops: [Op { code: CONST, a: 0, b: 0, c: 0.0 }; N],
+            len: 0,
+            consts: [0.0; K],
+            nconsts: 0,
+        }
     }
 
     /// How many operations it holds.
@@ -109,17 +291,63 @@ impl Tape {
         self.len
     }
 
+    /// How many constants its table holds.
+    pub fn consts_len(self) -> u32 {
+        self.nconsts
+    }
+
+    /// Its `i`th operation.
+    pub fn op_at(self, i: u32) -> Op {
+        self.ops[i]
+    }
+
+    /// The same operations and table in a tape of another size, if they fit (a pruned tape into
+    /// a `ShortTape`).
+    pub fn resized<const M: u32, const L: u32>(self) -> Option<Taped<M, L>> {
+        if self.len > M || self.nconsts > L {
+            return None
+        }
+        var out = Taped::new()
+        for i in 0..self.len {
+            out.ops[i] = self.ops[i]
+        }
+        for i in 0..self.nconsts {
+            out.consts[i] = self.consts[i]
+        }
+        out.len = self.len
+        out.nconsts = self.nconsts
+        Some(out)
+    }
+
+    /// Adds `values` to the table: where they start.
+    pub fn table(mut self, values: [f32]) -> u32 {
+        if self.nconsts + values.len() > K {
+            panic("a tape's table is full")
+        }
+        let at = self.nconsts
+        for v in values {
+            self.consts[self.nconsts] = v
+            self.nconsts += 1
+        }
+        at
+    }
+
     fn op(mut self, code: u32, a: Reg, b: Reg, c: f32) -> Reg {
-        if self.len == TAPE_LEN {
-            panic("a tape holds at most 128 operations")
+        self.op3(code, a, b, Reg { index: 0 }, c)
+    }
+
+    fn op3(mut self, code: u32, a: Reg, b: Reg, t: Reg, c: f32) -> Reg {
+        if self.len == N {
+            panic("a tape is full")
         }
-        if a.index >= self.len && code != X && code != Y && code != Z && code != CONST {
+        let n = arity(code)
+        let wide = if vector_op(code) { 2 } else { 0 }
+        let from_another = |r: Reg| r.index + wide >= self.len
+        let bad_t = n == 3 && t.index >= self.len
+        if (n >= 1 && from_another(a)) || (n >= 2 && from_another(b)) || bad_t {
             panic("a register from another tape, or from after this operation")
         }
-        if b.index >= self.len && code >= ADD && code <= SMIN {
-            panic("a register from another tape, or from after this operation")
-        }
-        self.ops[self.len] = Op { code, a: a.index, b: b.index, c }
+        self.ops[self.len] = Op { code: code | (t.index << 16), a: a.index, b: b.index, c }
         self.len += 1
         Reg { index: self.len - 1 }
     }
@@ -209,6 +437,100 @@ impl Tape {
         self.op(EXP, a, a, 0.0)
     }
 
+    /// `floor(a)`.
+    pub fn floor(mut self, a: Reg) -> Reg {
+        self.op(FLOOR, a, a, 0.0)
+    }
+
+    /// `fract(a)`.
+    pub fn fract(mut self, a: Reg) -> Reg {
+        self.op(FRACT, a, a, 0.0)
+    }
+
+    /// `1` where `a < b`, else `0`.
+    pub fn step(mut self, a: Reg, b: Reg) -> Reg {
+        self.op(STEP, a, b, 0.0)
+    }
+
+    /// `b` where `a > 0`, else `t`.
+    pub fn select(mut self, a: Reg, b: Reg, t: Reg) -> Reg {
+        self.op3(SELECT, a, b, t, 0.0)
+    }
+
+    /// `a + (b - a) * t`.
+    pub fn mix(mut self, a: Reg, b: Reg, t: Reg) -> Reg {
+        self.op3(MIX, a, b, t, 0.0)
+    }
+
+    /// `saturate(a)`.
+    pub fn clamp01(mut self, a: Reg) -> Reg {
+        self.op(CLAMP01, a, a, 0.0)
+    }
+
+    /// `pow(a, e)`.
+    pub fn pow(mut self, a: Reg, e: f32) -> Reg {
+        self.op(POW, a, a, e)
+    }
+
+    /// `log(a)`.
+    pub fn log(mut self, a: Reg) -> Reg {
+        self.op(LOG, a, a, 0.0)
+    }
+
+    /// `a - b * floor(a / b)`.
+    pub fn modulo(mut self, a: Reg, b: Reg) -> Reg {
+        self.op(MOD, a, b, 0.0)
+    }
+
+    /// The table's `n` entries from `at` (`table`), read at `i` (`LOAD`) or between at `t`
+    /// (`LERP_LOAD`).
+    pub fn load(mut self, at: u32, n: u32, i: Reg) -> Reg {
+        self.op3(LOAD, i, i, Reg { index: n }, f32(at))
+    }
+
+    /// Between the table's entries `at + floor(t)` and the one after, linearly (`t` clamped to
+    /// the `n` entries from `at`).
+    pub fn lerp_load(mut self, at: u32, n: u32, t: Reg) -> Reg {
+        self.op3(LERP_LOAD, t, t, Reg { index: n }, f32(at))
+    }
+
+    /// `value_noise(vec3(x, y, z) * scale)`.
+    pub fn noise(mut self, x: Reg, y: Reg, z: Reg, scale: f32) -> Reg {
+        self.op3(NOISE3, x, y, z, scale)
+    }
+
+    /// `fbm(freq, octaves).value(vec3(x, y, z))`, each octave `gain` of the last (std's `Fbm`
+    /// is 0.5).
+    pub fn fbm(mut self, x: Reg, y: Reg, z: Reg, freq: f32, octaves: u32, gain: f32 = 0.5) -> Reg {
+        let at = self.table([freq, f32(octaves), gain])
+        self.op3(FBM3, x, y, z, f32(at))
+    }
+
+    /// The lattice's hash of the cell `(floor(x), floor(y), floor(z))`, in [-1, 1].
+    pub fn hash(mut self, x: Reg, y: Reg, z: Reg) -> Reg {
+        self.op3(HASH, x, y, z, 0.0)
+    }
+
+    /// `dot(u, v)` of two vectors, each three registers in a row from `u` and `v`.
+    pub fn dot3(mut self, u: Reg, v: Reg) -> Reg {
+        self.op(DOT3, u, v, 0.0)
+    }
+
+    /// `length` of the vector three registers in a row from `u`.
+    pub fn length3(mut self, u: Reg) -> Reg {
+        self.op(LEN3, u, u, 0.0)
+    }
+
+    /// Component `k` of `normalize` of the vector three registers in a row from `u`.
+    pub fn normalize3(mut self, u: Reg, k: u32) -> Reg {
+        self.op(NORM3, u, u, f32(k))
+    }
+
+    /// A register's copy: the next operation's, in a row with others (a vector's components).
+    pub fn copy(mut self, a: Reg) -> Reg {
+        self.op(COPY, a, a, 0.0)
+    }
+
     /// The length of `(a, b, c)`, as `length` computes it: the squares summed in order, then
     /// the root.
     pub fn length(mut self, a: Reg, b: Reg, c: Reg) -> Reg {
@@ -238,26 +560,64 @@ impl Tape {
     }
 
     /// Each register's `register_interval` over `over`, from one pass: each operation's interval
-    /// is `interval` of `apply`, the step `interpret` takes, over its operands' intervals. That
+    /// is `interval` of its step, the step `interpret` takes, over its operands' intervals. That
     /// is `interpret`'s own derived arithmetic, an operation at a time, because an interval
-    /// follows no value's identity through a register. One difference remains: `interval` makes
+    /// follows no value's identity through a register. Two differences remain: `interval` makes
     /// a NaN bound infinite, at the end of the function it derives, so a bound that isn't finite
-    /// may stand for a NaN that the whole tape's derivation would carry on. An operation that
-    /// reads such a register takes its `register_interval` instead.
-    fn register_intervals(self, over: Box3) -> [Interval; 128] {
-        var r = [Interval { lo: 0.0, hi: 0.0 }; 128]
-        var finite = [false; 128]
+    /// may stand for a NaN that the whole tape's derivation would carry on; and a dot product
+    /// reads six registers, more than a step's box holds. An operation that reads such a
+    /// register, or a dot product, takes its `register_interval` instead.
+    fn register_intervals(self, over: Box3) -> [Interval; N] {
+        var r = [Interval { lo: 0.0, hi: 0.0 }; N]
+        var finite = [false; N]
         for i in 0..self.len {
             let op = self.ops[i]
-            r[i] = if op.code < ADD {
-                interval(|q: vec3| apply(op, q, a: 0.0, b: 0.0), over)
-            } else if finite[op.a] && finite[op.b] {
-                let a = r[op.a]
-                let b = r[op.b]
-                let ab = Box2 { lo: vec2(a.lo, b.lo), hi: vec2(a.hi, b.hi) }
-                interval(|v: vec2| apply(op, vec3(0.0), v.x, v.y), ab)
-            } else {
+            let code = op.opcode()
+            let n = arity(code)
+            let wide = if vector_op(code) { 2 } else { 0 }
+            var known = true
+            if n >= 1 {
+                for k in 0..wide + 1 {
+                    known = known && finite[op.a + k]
+                }
+            }
+            if n >= 2 && code != DOT3 {
+                known = known && finite[op.b]
+            }
+            if n == 3 {
+                known = known && finite[op.third()]
+            }
+            let me = self
+            r[i] = if n == 0 {
+                interval(|q: vec3| apply(op, q, a: 0.0, b: 0.0, t: 0.0), over)
+            } else if !known || code == DOT3 {
                 self.register_interval(i, over)
+            } else if vector_op(code) {
+                let u = Box3 {
+                    lo: vec3(r[op.a].lo, r[op.a + 1].lo, r[op.a + 2].lo),
+                    hi: vec3(r[op.a].hi, r[op.a + 1].hi, r[op.a + 2].hi),
+                }
+                if code == LEN3 {
+                    interval(|v: vec3| length(v), u)
+                } else {
+                    interval(|v: vec3| vector_component(normalize(v), op.c), u)
+                }
+            } else if code == LOAD || code == LERP_LOAD {
+                let a = r[op.a]
+                interval(
+                    |v: vec2| table(me, op, v.x),
+                    Box2 { lo: vec2(a.lo, 0.0), hi: vec2(a.hi, 0.0) },
+                )
+            } else {
+                let a = r[op.a]
+                let b = if n >= 2 { r[op.b] } else { Interval { lo: 0.0, hi: 0.0 } }
+                let t = if n == 3 { r[op.third()] } else { Interval { lo: 0.0, hi: 0.0 } }
+                let abt = Box3 { lo: vec3(a.lo, b.lo, t.lo), hi: vec3(a.hi, b.hi, t.hi) }
+                if code == FBM3 {
+                    interval(|v: vec3| fbm3(me, op, v), abt)
+                } else {
+                    interval(|v: vec3| apply(op, vec3(0.0), v.x, v.y, v.z), abt)
+                }
             }
             finite[i] = is_finite(r[i].lo) && is_finite(r[i].hi)
         }
@@ -265,34 +625,52 @@ impl Tape {
     }
 
     /// The same field within `over`, with less work: each minimum or maximum whose operands'
-    /// intervals over `over` don't overlap (by the smooth minimum's width, for one) becomes the
-    /// operand it always picks, then the operations the value no longer uses are dropped. Inside
-    /// `over`, the result has the same value and the same derived gradient as the original at
-    /// every point; outside, it may not.
+    /// intervals over `over` don't overlap (by the smooth minimum's width, for one), and each
+    /// selection or step whose condition has one sign there, becomes the operand it always
+    /// picks (or the constant a step gives), then the operations the value no longer uses are
+    /// dropped. Inside `over`, the result has the same value and the same derived gradient as
+    /// the original at every point; outside, it may not.
     ///
     /// Intervals that only touch overlap: the operands can tie there, and at a tie a minimum's
     /// or maximum's gradient is the average of both operands' (§14.2), not either one's. A
     /// smooth minimum exactly its width apart is the lower operand, value and gradient (`smin`'s
     /// `m` is 0 there, so `m * (m * s)` and its tangent are 0), but `a.hi + k` rounds: a sum
     /// equal to `b.lo` doesn't show that `b - a >= k` at every point, while one below it does.
-    pub fn prune(self, over: Box3) -> Tape {
+    pub fn prune(self, over: Box3) -> Taped<N, K> {
         let iv = self.register_intervals(over)
         var ops = self.ops
         for i in 0..self.len {
             let op = ops[i]
-            if op.code == MIN || op.code == MAX || op.code == SMIN {
+            let code = op.opcode()
+            let copy = |r: u32| Op { code: COPY, a: r, b: r, c: 0.0 }
+            if code == MIN || code == MAX || code == SMIN {
                 let a = iv[op.a]
                 let b = iv[op.b]
                 // The width a smooth minimum blends over; 0 for the others.
-                let k = if op.code == SMIN { max(op.c, 0.0) } else { 0.0 }
+                let k = if code == SMIN { max(op.c, 0.0) } else { 0.0 }
                 let a_low = a.hi + k < b.lo
                 let b_low = b.hi + k < a.lo
-                let keep_a = if op.code == MAX { b_low } else { a_low }
-                let keep_b = if op.code == MAX { a_low } else { b_low }
+                let keep_a = if code == MAX { b_low } else { a_low }
+                let keep_b = if code == MAX { a_low } else { b_low }
                 if keep_a {
-                    ops[i] = Op { code: COPY, a: op.a, b: op.a, c: 0.0 }
+                    ops[i] = copy(op.a)
                 } else if keep_b {
-                    ops[i] = Op { code: COPY, a: op.b, b: op.b, c: 0.0 }
+                    ops[i] = copy(op.b)
+                }
+            } else if code == SELECT {
+                let a = iv[op.a]
+                if a.lo > 0.0 {
+                    ops[i] = copy(op.b)
+                } else if a.hi <= 0.0 {
+                    ops[i] = copy(op.third())
+                }
+            } else if code == STEP {
+                let a = iv[op.a]
+                let b = iv[op.b]
+                if a.hi < b.lo {
+                    ops[i] = Op { code: CONST, a: 0, b: 0, c: 1.0 }
+                } else if a.lo >= b.hi {
+                    ops[i] = Op { code: CONST, a: 0, b: 0, c: 0.0 }
                 }
             }
         }
@@ -300,39 +678,58 @@ impl Tape {
     }
 
     /// The tape with operations `ops`: the ones its value uses, in order, renumbered.
-    fn drop_unused(self, ops: [Op; 128]) -> Tape {
+    fn drop_unused(self, ops: [Op; N]) -> Taped<N, K> {
         if self.len == 0 {
             return self
         }
-        // The registers the value uses, from the last back.
-        var used = [false; 128]
+        // The registers the value uses, from the last back; and those a vector operation reads
+        // three in a row, which keep their place (a copy among them isn't read through).
+        var used = [false; N]
+        var in_row = [false; N]
         used[self.len - 1] = true
         var i = self.len
         while i > 0 {
             i -= 1
             if used[i] {
                 let op = ops[i]
-                if op.code >= ADD {
-                    used[op.a] = true
-                    if op.code <= SMIN {
-                        used[op.b] = true
+                let code = op.opcode()
+                let n = arity(code)
+                let wide = if vector_op(code) { 3 } else { 1 }
+                if n >= 1 {
+                    for k in 0..wide {
+                        used[op.a + k] = true
+                        in_row[op.a + k] = in_row[op.a + k] || wide == 3
                     }
+                }
+                if n >= 2 {
+                    let wb = if code == DOT3 { 3 } else { 1 }
+                    for k in 0..wb {
+                        used[op.b + k] = true
+                        in_row[op.b + k] = in_row[op.b + k] || wb == 3
+                    }
+                }
+                if n == 3 {
+                    used[op.third()] = true
                 }
             }
         }
         // Those operations, in order, renumbered; a copy reads through to what it copies.
-        var out = Tape::new()
-        var at = [0; 128]
+        var out = self
+        out.len = 0
+        var at = [0; N]
         for j in 0..self.len {
             if used[j] {
                 let op = ops[j]
-                if op.code == COPY && j + 1 < self.len {
+                let code = op.opcode()
+                if code == COPY && j + 1 < self.len && !in_row[j] {
                     at[j] = at[op.a]
                 } else {
                     at[j] = out.len
-                    let a = if op.code >= ADD { at[op.a] } else { op.a }
-                    let b = if op.code >= ADD && op.code <= SMIN { at[op.b] } else { op.b }
-                    out.ops[out.len] = Op { code: op.code, a, b, c: op.c }
+                    let n = arity(code)
+                    let a = if n >= 1 { at[op.a] } else { op.a }
+                    let b = if n >= 2 { at[op.b] } else { op.b }
+                    let t = if n == 3 { at[op.third()] } else { op.third() }
+                    out.ops[out.len] = Op { code: code | (t << 16), a, b, c: op.c }
                     out.len += 1
                 }
             }
@@ -480,4 +877,31 @@ fn an_unbounded_operand_takes_the_tapes_interval() {
     assert(iv[2].lo == -1.0 / 0.0 && iv[3].lo == 0.0 && iv[3].hi == 1.0 / 0.0)
     let p = t.prune(over)
     assert(p.len == 5 && p.ops[4].code == COPY && p.ops[4].a == 3, "the maximum is |1 / x|")
+}
+
+@test
+fn pruning_settles_a_selection_whose_condition_has_one_sign() {
+    // `x + 2 > 0` on x in [-1, 1]: the selection is always its second operand, so its third
+    // and what only it reads go; on [-3, 1] the condition takes both signs, and both stay.
+    var t = Tape::new()
+    let x = t.x()
+    let two = t.constant(2.0)
+    let cond = t.add(x, two)
+    let picked = t.sin(x)
+    let other = t.cos(x)
+    let _ = t.select(cond, picked, other)
+    let one_sign = t.prune(Box3 { lo: vec3(-1.0), hi: vec3(1.0) })
+    assert(one_sign.len < t.len, "the selection folds")
+    let last = one_sign.ops[one_sign.len - 1]
+    assert(last.opcode() == COPY && one_sign.ops[last.a].opcode() == SIN, "to its second operand")
+    let both = t.prune(Box3 { lo: vec3(-3.0), hi: vec3(1.0) })
+    assert(both.len == t.len, "both signs: kept whole")
+    // A step whose operands' intervals are apart is a constant.
+    var u = Tape::new()
+    let ux = u.x()
+    let three = u.constant(3.0)
+    let _ = u.step(ux, three)
+    let stepped = u.prune(Box3 { lo: vec3(-1.0), hi: vec3(1.0) })
+    let s = stepped.ops[stepped.len - 1]
+    assert(stepped.len == 1 && s.opcode() == CONST && s.c == 1.0, "x < 3 throughout: 1")
 }

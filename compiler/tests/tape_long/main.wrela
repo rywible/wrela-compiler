@@ -1,0 +1,109 @@
+// Long tapes on the GPU (language.md §14.4): a full `Tape` of 4,096 operations binds as
+// read-only storage (it's over the 64 KiB a uniform holds) and runs on both hosts, giving the
+// value the CPU gives; and the interpreter's cost: a 1,024-operation tape over 10⁶ points,
+// timed (`std::gpu::timed`), printed as nanoseconds per operation per point.
+use std::gpu::{GlobalId, GpuBuffer, Slots, buffer, dispatch, label, read, timed}
+use std::io::{Pending, print}
+use std::stage::{Tape, interpret}
+
+const POINTS: u32 = 1000000
+
+/// A tape of `n` operations: the point's coordinates, then sums and products that keep the
+/// value bounded (each step a mix of the last two), the last register its value.
+fn chain(n: u32) -> Tape {
+    var t = Tape::new()
+    let x = t.x()
+    let y = t.y()
+    let half = t.constant(0.5)
+    var a = x
+    var b = y
+    while t.len() + 3 <= n {
+        let s = t.add(a, b)
+        let m = t.mul(s, half)
+        let c = t.sin(m)
+        a = b
+        b = c
+    }
+    while t.len() < n {
+        b = t.abs(b)
+    }
+    t
+}
+
+@compute(64)
+fn run(tape: Tape, out: mut Slots<f32>, id: GlobalId) {
+    let i = id.x
+    let p = vec3(f32(i % 1000) * 0.01, f32(i / 1000) * 0.01, 0.0)
+    out[id] = interpret(tape, p)
+}
+
+pub struct State {
+    frame: u32,
+    full: Tape,
+    timed_tape: Tape,
+    out: GpuBuffer<f32>,
+    asked: Option<Pending<f32>>,
+    read_back: Option<Pending<f32>>,
+    ns: f32,
+    values: Vec<f32>,
+}
+
+pub fn init() -> State {
+    State {
+        frame: 0,
+        full: chain(4096),
+        timed_tape: chain(1024),
+        out: buffer(POINTS),
+        asked: None,
+        read_back: None,
+        ns: 0.0,
+        values: Vec::new(),
+    }
+}
+
+pub fn frame(s: mut State, time: f32, width: u32, height: u32) {
+    if s.frame == 0 {
+        dispatch(run.bind(tape: s.full, out: mut s.out), groups: (POINTS + 63) / 64)
+        s.read_back = Some(read(s.out.span(start: 0, count: 2000)))
+    }
+    if s.frame == 2 {
+        s.asked = Some(timed("tape"))
+        label("tape")
+        dispatch(run.bind(tape: s.timed_tape, out: mut s.out), groups: (POINTS + 63) / 64)
+    }
+    match mut s.read_back {
+        Some(p) => {
+            if s.values.len() == 0 {
+                if let Some(Ok(v)) = p.poll() {
+                    s.values = take v
+                }
+            }
+        },
+        None => {},
+    }
+    match mut s.asked {
+        Some(p) => {
+            if s.ns == 0.0 {
+                if let Some(Ok(us)) = p.poll() {
+                    s.ns = us[0] * 1000.0 / (1024.0 * f32(POINTS))
+                    print(
+                        f"a 1,024-operation tape over 10^6 points: {us[0]} us, {s.ns} ns an operation a point",
+                    )
+                }
+            }
+        },
+        None => {},
+    }
+    s.frame += 1
+}
+
+@test(frames: 12, gpu: true, hosts: both)
+fn a_full_tape_runs_and_its_cost_is_measured(s: State) {
+    assert(s.full.len() == 4096 && s.values.len() == 2000)
+    // The GPU's values are the CPU's, within the GPU's `sin`.
+    for i in [0, 1, 999, 1000, 1999] {
+        let p = vec3(f32(i % 1000) * 0.01, f32(i / 1000) * 0.01, 0.0)
+        assert(abs(s.values[i] - interpret(s.full, p)) < 1.0e-3, "the GPU's value is the CPU's")
+    }
+    assert(s.ns > 0.0, "the tape was timed")
+}

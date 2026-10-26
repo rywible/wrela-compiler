@@ -561,14 +561,28 @@ fn sample_point(seed: u32, i: u32) -> vec3 {
 /// On the CPU: the largest difference between twin `k`'s tape and its compiled field over
 /// `n` sampled points.
 pub fn tape_error_cpu(k: u32, seed: u32, n: u32) -> f32 {
+    // Each field made once, its values over the points: a tape is 72 KiB to build.
+    let a: Vec<f32> = twin(k, tape: true, v: Values { seed, n })
+    let b: Vec<f32> = twin(k, tape: false, v: Values { seed, n })
     var worst = 0.0
     for i in 0..n {
-        let p = sample_point(seed, i)
-        let a: f32 = twin(k, tape: true, v: Distance { p })
-        let b: f32 = twin(k, tape: false, v: Distance { p })
-        worst = max(worst, abs(a - b))
+        worst = max(worst, abs(a[i] - b[i]))
     }
     worst
+}
+
+/// A field's values at `n` sampled points.
+struct Values: Copy {
+    seed: u32,
+    n: u32,
+}
+
+impl Visit for Values {
+    type Out = Vec<f32>
+
+    fn visit<F: Surface>(self, f: F) -> Vec<f32> {
+        Vec::from_fn(self.n, |i| f.distance(sample_point(self.seed, i)))
+    }
 }
 
 @compute(64)

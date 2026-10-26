@@ -1,0 +1,268 @@
+// Each of std::stage's operations against its std twin (language.md §14.4), at 10⁶ points
+// each, on the CPU (`each_operation_matches_its_twin_on_the_cpu`) and the GPU (a kernel over the
+// points, `each_operation_matches_its_twin_on_the_gpu`): the tape's value against the function
+// it stands for, in ulps. The noises and the hash call std's own code, so they agree bit for
+// bit; the rest within an ulp. Each operation reads the point's coordinates (registers 0 to 2,
+// and their copies 3 to 5, for a dot product's second vector); its inputs are drawn from a
+// range its function is defined on.
+use std::field::{fbm, lattice, lattice_coord, value_noise, Noise}
+use std::gpu::{Atomics, GlobalId, GpuBuffer, buffer, dispatch, read}
+use std::io::{Pending, print}
+use std::stage::{
+    ABS, CLAMP01, CONST, COPY, DOT3, FBM3, FLOOR, FRACT, HASH, LEN3, LERP_LOAD, LOAD, LOG, MIX, MOD,
+    NOISE3, NORM3, POW, SELECT, STEP, Taped, X, Y, Z, interpret,
+}
+
+/// The operations checked, in their tapes' order.
+const OPS: [u32; 19] = [
+    FLOOR,
+    FRACT,
+    STEP,
+    SELECT,
+    MIX,
+    CLAMP01,
+    POW,
+    LOG,
+    MOD,
+    LOAD,
+    LERP_LOAD,
+    NOISE3,
+    FBM3,
+    HASH,
+    DOT3,
+    LEN3,
+    NORM3,
+    NORM3,
+    NORM3,
+]
+const COUNT: u32 = 19
+const POINTS: u32 = 1000000
+/// A table's entries, for `LOAD` and `LERP_LOAD`.
+const TABLE: [f32; 16] = [
+    0.5, -1.25, 3.0, 0.125, 7.5, -2.0, 1.0, 0.0, 4.25, -0.75, 2.5, 6.0, -3.5, 0.375, 1.75, 5.0,
+]
+
+type Small = Taped<8, 32>
+
+/// Operation `k`'s tape: the point's x, y and z, their copies (y, z, x), and the operation.
+fn tape_for(k: u32) -> Small {
+    var t: Small = Taped::new()
+    let x = t.x()
+    let y = t.y()
+    let z = t.z()
+    let yz = t.copy(y)
+    let _ = t.copy(z)
+    let _ = t.copy(x)
+    let code = OPS[k]
+    let _ = if code == FLOOR {
+        t.floor(x)
+    } else if code == FRACT {
+        t.fract(x)
+    } else if code == STEP {
+        t.step(x, y)
+    } else if code == SELECT {
+        t.select(x, y, z)
+    } else if code == MIX {
+        t.mix(x, y, z)
+    } else if code == CLAMP01 {
+        t.clamp01(x)
+    } else if code == POW {
+        t.pow(x, 2.375)
+    } else if code == LOG {
+        t.log(x)
+    } else if code == MOD {
+        t.modulo(x, y)
+    } else if code == LOAD {
+        let at = t.table(TABLE)
+        t.load(at, 16, x)
+    } else if code == LERP_LOAD {
+        let at = t.table(TABLE)
+        t.lerp_load(at, 16, x)
+    } else if code == NOISE3 {
+        t.noise(x, y, z, 1.7)
+    } else if code == FBM3 {
+        t.fbm(x, y, z, freq: 0.8, octaves: 4)
+    } else if code == HASH {
+        t.hash(x, y, z)
+    } else if code == DOT3 {
+        t.dot3(x, yz)
+    } else if code == LEN3 {
+        t.length3(x)
+    } else {
+        t.normalize3(x, k - 16)
+    }
+    t
+}
+
+/// What operation `k` stands for at `p`.
+fn twin(k: u32, p: vec3) -> f32 {
+    let code = OPS[k]
+    let (x, y, z) = (p.x, p.y, p.z)
+    if code == FLOOR {
+        floor(x)
+    } else if code == FRACT {
+        fract(x)
+    } else if code == STEP {
+        if x < y { 1.0 } else { 0.0 }
+    } else if code == SELECT {
+        if x > 0.0 { y } else { z }
+    } else if code == MIX {
+        x + (y - x) * z
+    } else if code == CLAMP01 {
+        saturate(x)
+    } else if code == POW {
+        pow(x, 2.375)
+    } else if code == LOG {
+        log(x)
+    } else if code == MOD {
+        x - y * floor(x / y)
+    } else if code == LOAD {
+        TABLE[u32(clamp(floor(x), 0.0, 15.0))]
+    } else if code == LERP_LOAD {
+        let t = clamp(x, 0.0, 15.0)
+        let i = floor(t)
+        let lo = TABLE[u32(i)]
+        let hi = TABLE[u32(min(i + 1.0, 15.0))]
+        lo + (hi - lo) * (t - i)
+    } else if code == NOISE3 {
+        value_noise(p * 1.7)
+    } else if code == FBM3 {
+        fbm(0.8, 4).value(p)
+    } else if code == HASH {
+        lattice(lattice_coord(floor(x)), lattice_coord(floor(y)), lattice_coord(floor(z)))
+    } else if code == DOT3 {
+        dot(p, vec3(y, z, x))
+    } else if code == LEN3 {
+        length(p)
+    } else {
+        let n = normalize(p)
+        if k == 16 { n.x } else if k == 17 { n.y } else { n.z }
+    }
+}
+
+/// A 32-bit integer hash (`lowbias32`).
+fn mix32(x: u32) -> u32 {
+    var h = x ^ (x >> 16)
+    h = h.wrapping_mul(2146121005)
+    h = h ^ (h >> 15)
+    h = h.wrapping_mul(2221713035)
+    h ^ (h >> 16)
+}
+
+/// Point `i` for operation `k`: in [-8, 8]³, or where the function is defined (a positive
+/// base or argument for `pow` and `log`, a divisor away from 0 for `mod`, an index round the
+/// table for the table reads).
+fn point(k: u32, i: u32) -> vec3 {
+    let h = mix32(i * 31 + k * 1000003)
+    let u = |s: u32| f32(mix32(h + s) % 1048576) / 1048576.0
+    let p = vec3(u(1), u(2), u(3)) * 16.0 - vec3(8.0)
+    let code = OPS[k]
+    if code == POW || code == LOG {
+        vec3(u(1) * 64.0 + 1.0e-3, p.y, p.z)
+    } else if code == MOD {
+        vec3(p.x, u(2) * 4.0 + 0.25, p.z)
+    } else if code == LOAD || code == LERP_LOAD {
+        vec3(u(1) * 20.0 - 2.0, p.y, p.z)
+    } else {
+        p
+    }
+}
+
+/// How many ulps apart `a` and `b` are (0 for two NaNs, the most for one): their bits as an
+/// ordered key, negatives below positives.
+fn ulps(a: f32, b: f32) -> u32 {
+    if a != a || b != b {
+        return if a != a && b != b { 0 } else { 4294967295 }
+    }
+    let key = |x: f32| {
+        let u = bitcast_u32(x)
+        if u >= 2147483648 { 4294967295 - u } else { u + 2147483648 }
+    }
+    let (ka, kb) = (key(a), key(b))
+    if ka > kb { ka - kb } else { kb - ka }
+}
+
+@compute(64)
+fn compare(tapes: [Small], worst: mut Atomics<u32>, id: GlobalId) {
+    let i = id.x
+    if i >= POINTS {
+        return
+    }
+    for k in 0..COUNT {
+        let p = point(k, i)
+        let got = interpret(tapes[k], p)
+        let _ = worst.max(k, ulps(got, twin(k, p)))
+    }
+}
+
+pub struct State {
+    frame: u32,
+    tapes: GpuBuffer<Small>,
+    worst: GpuBuffer<u32>,
+    pending: Option<Pending<u32>>,
+    seen: Vec<u32>,
+}
+
+pub fn init() -> State {
+    var tapes = Vec::new()
+    for k in 0..COUNT {
+        tapes.push(tape_for(k))
+    }
+    State {
+        frame: 0,
+        tapes: std::gpu::buffer_of(tapes),
+        worst: buffer(COUNT),
+        pending: None,
+        seen: Vec::new(),
+    }
+}
+
+pub fn frame(s: mut State, time: f32, width: u32, height: u32) {
+    if s.frame == 0 {
+        std::gpu::write(mut s.worst, 0, [0; 19])
+        dispatch(
+            compare.bind(tapes: s.tapes.items(), worst: mut s.worst),
+            groups: (POINTS + 63) / 64,
+        )
+        s.pending = Some(read(s.worst.items()))
+    }
+    match mut s.pending {
+        Some(p) => {
+            if s.seen.len() == 0 {
+                if let Some(Ok(v)) = p.poll() {
+                    s.seen = take v
+                    for k in 0..COUNT {
+                        print(f"gpu op {OPS[k]} (#{k}): worst {s.seen[k]} ulps")
+                    }
+                }
+            }
+        },
+        None => {},
+    }
+    s.frame += 1
+}
+
+@test
+@fuel(2 ** 40)
+fn each_operation_matches_its_twin_on_the_cpu() {
+    for k in 0..COUNT {
+        let t = tape_for(k)
+        var worst = 0
+        for i in 0..POINTS {
+            let p = point(k, i)
+            worst = max(worst, ulps(interpret(t, p), twin(k, p)))
+        }
+        print(f"cpu op {OPS[k]} (#{k}): worst {worst} ulps")
+        let exact = OPS[k] == NOISE3 || OPS[k] == FBM3 || OPS[k] == HASH
+        assert(worst == 0 || (!exact && worst <= 1), "an operation differs from its twin")
+    }
+}
+
+@test(frames: 4, gpu: true, hosts: both)
+fn each_operation_matches_its_twin_on_the_gpu(s: State) {
+    assert(s.seen.len() == COUNT, "the GPU's worst came back")
+    for k in 0..COUNT {
+        let exact = OPS[k] == NOISE3 || OPS[k] == FBM3 || OPS[k] == HASH
+        assert(s.seen[k] == 0 || (!exact && s.seen[k] <= 1), "an operation differs from its twin")
+    }
+}

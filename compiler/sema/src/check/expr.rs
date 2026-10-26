@@ -559,6 +559,20 @@ impl<'p> Checker<'p> {
                             let ty = b.ty(&self.p.types);
                             return Some(ValueRes::TypeRelative(ty, last));
                         }
+                        // `Alias::f`: the aliased type's (`type Tape = Taped<4096, 2048>`), its
+                        // generics the alias's own, given or inferred.
+                        Res::Alias(al) if self.p.aliases[al.index()].defined_by.is_none() => {
+                            let def = &self.p.aliases[al.index()];
+                            let (generics, name, aliased) =
+                                (def.generics.clone(), def.name.clone(), def.ty);
+                            let given = segs[segs.len() - 2].generics.as_deref();
+                            let args = self
+                                .given_args(&generics, given, &name, path.span)
+                                .unwrap_or_else(|| vec![self.p.types.error; generics.len()]);
+                            let ty =
+                                self.p.types.subst(aliased, &Subst::from_pairs(&generics, &args));
+                            return Some(ValueRes::TypeRelative(ty, last));
+                        }
                         Res::Trait(t) => return Some(ValueRes::TraitRelative(t, last)),
                         _ => {}
                     }

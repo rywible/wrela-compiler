@@ -802,6 +802,18 @@ fn const_parameters_and_tiers_run_on_both_hosts() {
     }
 }
 
+/// Tapes that can hold a creature (language.md §14.4): each new operation against its std
+/// twin at 10⁶ points on the CPU and the GPU (compiler/tests/tape_ops), and a full 4,096-op
+/// tape bound as storage, run on both hosts and timed (compiler/tests/tape_long).
+#[test]
+#[ignore = "needs a GPU"]
+fn tape_operations_match_their_twins_and_a_full_tape_runs() {
+    for (pkg, n) in [("tape_ops", 2), ("tape_long", 1)] {
+        let dir = wrela_tests::repo_root().join("compiler/tests").join(pkg);
+        assert_eq!(crate::tests_pass(&dir), n, "{pkg}");
+    }
+}
+
 /// Constants that hold `Text`, read by GPU code (M6, AC15): compiler/tests/gpu-constants has a
 /// kernel read a table of sites, each a place, a height and a name, written as a literal and
 /// computed by the build; it reads back what the CPU computes from the same tables. Spike 17

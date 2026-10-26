@@ -1691,7 +1691,7 @@ pub fn hash_u32(x: u32) -> u32 {
 
 /// `i32(x)` for a whole number `x`, wrapped to 32 bits as the lattice's hash wraps its
 /// coordinates: `x`'s low 32 bits beyond the i32 range, and 0 for inf or NaN.
-fn lattice_coord(x: f32) -> i32 {
+pub fn lattice_coord(x: f32) -> i32 {
     if abs(x) < 2147483648.0 {
         return i32(x)
     }
