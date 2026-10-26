@@ -619,9 +619,9 @@ function runNext(program: Program, tickFrom: number | null, schedule: number, fp
   return r;
 }
 
-/** The adapter a test ran on and the optional features its program saw: what a profile's report
- * names its hardware by (`results/device.json`). */
-function deviceInfo(device: GPUDevice): { vendor: string; architecture: string; device: string; description: string; features: readonly string[] } {
+/** The adapter a test ran on, the optional features its program saw, and the browser's user agent:
+ * what a profile's report names its hardware by (`results/device.json`), a device on the LAN too. */
+function deviceInfo(device: GPUDevice): { vendor: string; architecture: string; device: string; description: string; features: readonly string[]; agent: string } {
   const info = (device as GPUDevice & { adapterInfo?: GPUAdapterInfo }).adapterInfo;
   return {
     vendor: info?.vendor ?? "",
@@ -629,6 +629,7 @@ function deviceInfo(device: GPUDevice): { vendor: string; architecture: string; 
     device: info?.device ?? "",
     description: info?.description ?? "",
     features: deviceFeatures(device),
+    agent: navigator.userAgent,
   };
 }
 
