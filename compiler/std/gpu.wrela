@@ -248,6 +248,15 @@ pub struct WithDepth<C>: Copy {
     pub depth: f32,
 }
 
+/// A `WithDepth` whose depth is never less than its triangle's (a shader that only pushes its
+/// fragments away), which would let the GPU keep its early depth test. WGSL can't say it yet
+/// (Chrome 155 has no conservative-depth attribute, and naga 30.0.1's WGSL writer emits none),
+/// so it is a `WithDepth`: code names its intent now, and gets the early test when WGSL can.
+pub type WithDepthGreater<C> = WithDepth<C>
+
+/// As `WithDepthGreater`, for a depth never greater than its triangle's.
+pub type WithDepthLess<C> = WithDepth<C>
+
 /// A vertex output that isn't interpolated.
 pub struct Flat<T>: Copy {
     pub value: T,

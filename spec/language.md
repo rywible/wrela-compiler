@@ -2107,7 +2107,7 @@ An entry point is a kernel or shader, marked `@compute(x, y, z)`, `@vertex` or `
   - a `vec4`, which replaces what is in its target;
   - a `u32`, the texel of an `R32Uint` target. A draw of a `u32` into another target, or of a colour into an `R32Uint` target, is E0603 at the draw.
   - a `std::gpu::Over`, whose colour is drawn over the target: alpha blending with straight alpha, for text and UI;
-  - a `std::gpu::WithDepth<C>`: a colour `C` (a `vec4`, or a `u32` for an `R32Uint` target) and the fragment's own depth, in place of its triangle's depth. It draws a flat stand-in for something with depth, such as an impostor's leaves and the id of the tree that won the pixel. It is drawn only in a pass with a depth target (E0603 otherwise).
+  - a `std::gpu::WithDepth<C>`: a colour `C` (a `vec4`, or a `u32` for an `R32Uint` target) and the fragment's own depth, in place of its triangle's depth. It draws a flat stand-in for something with depth, such as an impostor's leaves and the id of the tree that won the pixel. It is drawn only in a pass with a depth target (E0603 otherwise). `WithDepthGreater<C>` and `WithDepthLess<C>` name a depth that's never less (or never greater) than the triangle's, which would keep the GPU's early depth test on; WGSL can't say it yet, so each is a `WithDepth<C>`.
 
 **What passes from the vertex shader to the fragment shader:** numbers and vectors of `f32`s, `i32`s and `u32`s, matrices, and structs and tuples of those. Each value is interpolated, or held in a `Flat<T>`; integers are never interpolated. WGSL gives each number or vector a location of its own, each matrix column one, and each struct field one. At most 16 locations pass.
 
