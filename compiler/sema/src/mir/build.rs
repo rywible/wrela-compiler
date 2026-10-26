@@ -2277,7 +2277,11 @@ impl<'a> Builder<'a> {
         span: Span,
         continuing: impl FnOnce(&mut Self),
     ) {
-        self.fs.scopes.pop();
+        // The body's value's temporaries (a call it ends with, whose `()` is its value) are the
+        // loop's: dropped at the end of each pass, as a statement's are.
+        if let Some(scope) = self.fs.scopes.pop() {
+            self.drop_locals(scope.owned.into_iter().rev());
+        }
         self.goto(cont, span);
         self.fs.cur = cont;
         continuing(self);
