@@ -136,6 +136,27 @@ fn a_box_noises_interval_holds_its_negative_values() {
     assert(worst(t.prune(over), floored, 1.0) < 1.0e-6, "pruned, the tape lost the noise")
 }
 
+/// A box noise beside a dot product that doesn't read it: the lesser is always the dot product
+/// within a unit box.
+fn beside(p: vec3) -> f32 {
+    min(value_noise_box(p, vec3(0.2)) + 5.0, dot(p, p))
+}
+
+/// Only what reads a box noise has every number's interval: a dot product after one that doesn't
+/// read it keeps its own, so the tape's interval is the dot product's and pruning keeps it alone.
+@test
+fn a_box_noise_widens_only_what_reads_it() {
+    let t = tape(beside)
+    let over = Box3 { lo: vec3(-1.0), hi: vec3(1.0) }
+    let iv = t.interval(over)
+    assert(iv.hi < 4.0, f"[{iv.lo}, {iv.hi}]: the dot product's interval went with the noise")
+    let pruned = t.prune(over)
+    for i in 0..27 {
+        let p = over.lo + (over.hi - over.lo) * vec3(f32(i % 3), f32((i / 3) % 3), f32(i / 9)) * 0.5
+        assert(interpret(pruned, p) == beside(p), f"pruned, the tape changed at {p}")
+    }
+}
+
 /// What a generic surface's interval is, through `Surface`.
 fn bounds<S: Surface>(s: S, over: Box3) -> std::derive::Interval {
     s.interval(over)

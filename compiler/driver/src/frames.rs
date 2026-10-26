@@ -68,9 +68,9 @@ pub fn run(
     if has_errors(&diags) {
         return (Vec::new(), diags);
     }
-    // The files its shipped constants ship too, so what the program fetches is there (and their
-    // errors: two constants shipping into one directory).
-    let shipped = if full_build && fetches(&lowered.cpu) {
+    // The files its shipped constants ship too, so what the program fetches or names to the host
+    // is there (and their errors: two constants shipping into one directory).
+    let shipped = if full_build {
         let (files, errors) = crate::shipped::files(checked, data);
         diags.extend(errors);
         if has_errors(&diags) {

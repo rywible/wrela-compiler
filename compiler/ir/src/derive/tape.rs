@@ -1143,13 +1143,13 @@ impl Tp<'_> {
                     let one = self.fconst(out, 1.0);
                     self.op(out, NOISE3, &[x, y, z], Some(one))?
                 }
-                // `F2I` is `lattice_coord`: toward zero, wrapped to the low 32 bits past `i32`'s
-                // range, 0 for an infinity or NaN.
                 // Its point and its half widths, three registers in a row each.
                 Known::ValueNoiseBox => {
                     let (p, half) = (self.in_a_row(out, regs[0])?, self.in_a_row(out, regs[1])?);
                     self.op(out, BOXNOISE3, &[p, half], None)?
                 }
+                // `F2I` is `lattice_coord`: toward zero, wrapped to the low 32 bits past `i32`'s
+                // range, 0 for an infinity or NaN.
                 Known::LatticeCoord => self.int_op(out, F2I, &[regs[0], regs[0]])?,
                 Known::Pcg => self.int_op(out, PCG, &[regs[0], regs[0]])?,
             };

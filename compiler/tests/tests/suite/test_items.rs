@@ -818,11 +818,11 @@ fn tape_operations_match_their_twins_and_a_full_tape_runs() {
 /// What a tape must take as compiled code does (compiler/tests/tape_cases): a branch's writes
 /// through a call, a value only part of which depends on the point, an integer table past 2²⁴,
 /// `lattice` and `lattice_coord` past `i32`'s range, one function taped at two sizes, a pruned
-/// tape of `tape_with`, and box-filtered value noise.
+/// tape of `tape_with`, and box-filtered value noise (its interval, alone and through `Surface`).
 #[test]
 fn tapes_take_what_compiled_code_does() {
     let dir = wrela_tests::repo_root().join("compiler/tests/tape_cases");
-    assert_eq!(crate::tests_pass(&dir), 7);
+    assert_eq!(crate::tests_pass(&dir), 10);
 }
 
 /// `gather` (language.md §18.8): a 2 × 2 colour texture's texels, one component of each, and a
