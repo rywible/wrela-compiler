@@ -2277,17 +2277,22 @@ impl<'a> Builder<'a> {
         span: Span,
         continuing: impl FnOnce(&mut Self),
     ) {
-        // The body's value's temporaries (a call it ends with, whose `()` is its value) are the
-        // loop's: dropped at the end of each pass, as a statement's are.
-        if let Some(scope) = self.fs.scopes.pop() {
-            self.drop_locals(scope.owned.into_iter().rev());
-        }
+        self.fs.scopes.pop();
         self.goto(cont, span);
         self.fs.cur = cont;
         continuing(self);
         self.terminate(TerminatorKind::LoopBack(lp), span);
         self.fs.loops.pop();
         self.fs.cur = exit;
+    }
+
+    /// A loop's body, its temporaries ended with each pass: a body that ends with a call
+    /// returning nothing has that call for its value, whose temporaries are the body's to drop,
+    /// as a statement's are (before the pass's loop variable ends).
+    fn loop_body(&mut self, body: &thir::Block) {
+        self.open_scope(ScopeKind::Temps);
+        let _ = self.block(body, Want::Read);
+        self.close_scope();
     }
 
     /// `if cond { break }`: a loop's own test.
@@ -2316,7 +2321,7 @@ impl<'a> Builder<'a> {
                 self.break_if(nc, lp, c.span);
             }
         }
-        let _ = self.block(body, Want::Read);
+        self.loop_body(body);
         self.end_loop(lp, cont, exit, span, |_| {});
     }
 
@@ -2358,7 +2363,7 @@ impl<'a> Builder<'a> {
         self.push(StatementKind::Live(var), span);
         let c = copy(self);
         self.set(var, c, span);
-        let _ = self.block(body, Want::Read);
+        self.loop_body(body);
         self.push(StatementKind::Dead(var), span);
         self.end_loop(lp, cont, exit, span, |b| {
             let c = copy(b);
@@ -2439,7 +2444,7 @@ impl<'a> Builder<'a> {
             let v = self.materialize(OperandKind::Copy(elem), et, span);
             self.set(var, v, span);
         }
-        let _ = self.block(body, Want::Read);
+        self.loop_body(body);
         self.push(StatementKind::Dead(var), span);
         self.end_loop(lp, cont, exit, span, |b| {
             let i = b.materialize(OperandKind::Copy(Place::local(index)), u32_ty, span);

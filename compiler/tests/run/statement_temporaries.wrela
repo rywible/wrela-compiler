@@ -3,10 +3,11 @@
 // `assert`'s comparison, which binds the values its operands project into first (§6.1). A
 // value made after a temporary was freed would take its block, so a projection read after it
 // would read that value's bytes. A loop's body that ends with a call returning nothing has
-// that call's temporaries freed on each pass, as a statement's are. Each temporary is freed once (`apart()` is 21 when no block
-// is handed out twice) and freed at all (a 1 MiB one made 2,048 times would need 2 GiB; the
-// memory stops at 1 GiB). An `assert` evaluates its operands' parts once each, in the order
-// written: an index is read before a later argument changes it.
+// that call's temporaries freed on each pass, as a statement's are. Each temporary is freed
+// once (`apart()` is 21 when no block is handed out twice) and freed at all (a 1 MiB one made
+// 2,048 times would need 2 GiB; the memory stops at 1 GiB). An `assert` evaluates its
+// operands' parts once each, in the order written: an index is read before a later argument
+// changes it.
 // expect: receiver() = 97
 // expect: call_argument() = 97
 // expect: fstring_hole() = 3

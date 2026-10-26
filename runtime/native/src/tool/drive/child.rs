@@ -370,11 +370,12 @@ impl Recorded {
             b.iter().map(|b| [b.handle, b.offset, b.size]).collect()
         };
         let mut r = Recorded { kind: c.opcode().name(), ..Recorded::default() };
+        if let Some((pipeline, bindings)) = c.pipeline() {
+            (r.pipeline, r.bindings) = (named(pipeline), bound(bindings));
+        }
         match c {
             C::Label { name } => r.label = bounded(name),
-            C::Dispatch { pipeline, groups, bindings, .. } => {
-                (r.pipeline, r.groups, r.bindings) = (named(*pipeline), *groups, bound(bindings));
-            }
+            C::Dispatch { groups, .. } => r.groups = *groups,
             C::StorageRead { path, .. }
             | C::Fetch { url: path, .. }
             | C::Prepare { path, .. }
@@ -384,14 +385,6 @@ impl Recorded {
             | C::Post { url: path, body: bytes, .. }
             | C::HostRequest { service: path, body: bytes, .. } => {
                 (r.target, r.bytes) = (bounded(path), bytes.to_vec());
-            }
-            C::Draw { pipeline, bindings, .. }
-            | C::DrawIndexed { pipeline, bindings, .. }
-            | C::DispatchIndirect { pipeline, bindings, .. }
-            | C::DrawIndirect { pipeline, bindings, .. }
-            | C::DrawIndexedIndirect { pipeline, bindings, .. }
-            | C::MultiDrawIndirect { pipeline, bindings, .. } => {
-                (r.pipeline, r.bindings) = (named(*pipeline), bound(bindings));
             }
             _ => {}
         }
@@ -1009,7 +1002,7 @@ mod tests {
     /// Every draw names its pipeline, indexed and multi-draws too: the pass viewer lists them.
     #[test]
     fn every_draw_names_its_pipeline() {
-        let names = vec![String::from("a"), String::from("b")];
+        let names = [String::from("a"), String::from("b")];
         let bound = vec![Binding { handle: 7, offset: 0, size: 0 }];
         let indexed = Command::DrawIndexed {
             pipeline: 1,
