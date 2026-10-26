@@ -386,9 +386,11 @@ impl Recorded {
                 (r.target, r.bytes) = (bounded(path), bytes.to_vec());
             }
             C::Draw { pipeline, bindings, .. }
+            | C::DrawIndexed { pipeline, bindings, .. }
             | C::DispatchIndirect { pipeline, bindings, .. }
             | C::DrawIndirect { pipeline, bindings, .. }
-            | C::DrawIndexedIndirect { pipeline, bindings, .. } => {
+            | C::DrawIndexedIndirect { pipeline, bindings, .. }
+            | C::MultiDrawIndirect { pipeline, bindings, .. } => {
                 (r.pipeline, r.bindings) = (named(*pipeline), bound(bindings));
             }
             _ => {}
@@ -997,4 +999,45 @@ impl Actor {
 /// cut.
 fn bounded(line: &str) -> String {
     bounded_to(line, MOST_BYTES / 2)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::Recorded;
+    use wrela_abi::stream::{Binding, Command};
+
+    /// Every draw names its pipeline, indexed and multi-draws too: the pass viewer lists them.
+    #[test]
+    fn every_draw_names_its_pipeline() {
+        let names = vec![String::from("a"), String::from("b")];
+        let bound = vec![Binding { handle: 7, offset: 0, size: 0 }];
+        let indexed = Command::DrawIndexed {
+            pipeline: 1,
+            indices: 3,
+            index_offset: 0,
+            index_size: 0,
+            index_count: 6,
+            instances: 1,
+            first_index: 0,
+            base_vertex: 0,
+            first_instance: 0,
+            bindings: bound.clone(),
+            uniforms: &[],
+        };
+        let multi = Command::MultiDrawIndirect {
+            pipeline: 1,
+            indices: Some([3, 0, 0]),
+            arguments: 4,
+            offset: 0,
+            count: 8,
+            count_buffer: 5,
+            count_offset: 0,
+            bindings: bound,
+            uniforms: &[],
+        };
+        for c in [indexed, multi] {
+            let r = Recorded::of(&c, &names);
+            assert_eq!((r.pipeline.as_str(), r.bindings.as_slice()), ("b", &[[7, 0, 0]][..]));
+        }
+    }
 }
