@@ -164,6 +164,10 @@ export interface Manifest {
   pipelines: Pipeline[];
   /** The WASM's interface, as the build made it (null where the manifest doesn't state it). */
   wasm_abi: WasmAbi | null;
+  /** A relaxed-SIMD build's second module, and its interface (`wrela build --relaxed-simd`):
+   * what a browser that runs relaxed SIMD loads instead (`loadBuild`). */
+  wasm_relaxed: string | null;
+  wasm_relaxed_abi: WasmAbi | null;
 }
 
 /** A memory's limits, in 64 KiB pages. */
@@ -435,6 +439,8 @@ export function parseManifest(json: string): Manifest {
     wasm: str(o, "wasm", "the manifest"),
     pipelines: pipelines.map(pipeline),
     wasm_abi: o["wasm_abi"] === undefined ? null : wasmAbi(o["wasm_abi"]),
+    wasm_relaxed: o["wasm_relaxed"] === undefined ? null : str(o, "wasm_relaxed", "the manifest"),
+    wasm_relaxed_abi: o["wasm_relaxed_abi"] === undefined ? null : wasmAbi(o["wasm_relaxed_abi"]),
   };
   validateManifest(m);
   return m;

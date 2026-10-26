@@ -195,11 +195,15 @@ pub struct Options {
     /// The most pages the memory grows to: [`memory::MAX_PAGES`] (1 GiB), or a tool build's
     /// [`memory::TOOL_MAX_PAGES`].
     pub max_pages: u32,
+    /// Relaxed SIMD in relaxable functions (`ir::Function::relaxable`): a vector multiply that
+    /// only an add takes is one `f32x4.relaxed_madd`, and `min` and `max` are relaxed. Every
+    /// other function stays standard, which the check after emitting proves of each.
+    pub relaxed: bool,
 }
 
 impl Default for Options {
     fn default() -> Options {
-        Options { shared_memory: true, simd: true, max_pages: memory::MAX_PAGES }
+        Options { shared_memory: true, simd: true, max_pages: memory::MAX_PAGES, relaxed: false }
     }
 }
 
@@ -211,7 +215,7 @@ pub fn emit(m: &ir::Module) -> Result<Emitted, String> {
 
 /// [`emit`], with these options.
 pub fn emit_with(m: &ir::Module, options: Options) -> Result<Emitted, String> {
-    let Options { shared_memory, simd, max_pages } = options;
+    let Options { shared_memory, simd, max_pages, relaxed } = options;
     if !m.entry_points.is_empty() || !m.resources.is_empty() {
         return Err("internal: a GPU module reached the WASM back end".into());
     }
@@ -332,7 +336,14 @@ pub fn emit_with(m: &ir::Module, options: Options) -> Result<Emitted, String> {
     }
     // The program's functions, and each one's locations.
     let mut body_lines = Vec::with_capacity(m.functions.len());
-    let at = func::At { first_fn, helpers: &helpers, data: &data_at, heap_base, simd };
+    let at = func::At {
+        first_fn,
+        helpers: &helpers,
+        data: &data_at,
+        heap_base,
+        simd,
+        relaxed: relaxed && simd,
+    };
     for (i, f) in m.functions.iter().enumerate() {
         let (params, results) = signature(m, f, simd);
         let ty = types.get(params, results);
@@ -454,7 +465,14 @@ pub fn emit_with(m: &ir::Module, options: Options) -> Result<Emitted, String> {
     let mut k = 0usize;
     for payload in wasmparser::Parser::new(0).parse_all(&wasm) {
         if let wasmparser::Payload::CodeSectionEntry(body) = payload.map_err(|e| e.to_string())? {
-            no_relaxed_simd(&body)?;
+            // A relaxable function's body may use relaxed SIMD; every other must not.
+            let relaxable = k
+                .checked_sub(nhelpers)
+                .and_then(|i| m.functions.get(i))
+                .is_some_and(|f| relaxed && f.relaxable);
+            if !relaxable {
+                no_relaxed_simd(&body)?;
+            }
             let start = body.range().start as u32;
             lines.push((start, None));
             if let Some(ls) = k.checked_sub(nhelpers).and_then(|i| body_lines.get(i)) {

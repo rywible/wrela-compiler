@@ -62,6 +62,8 @@ export function shapes(): Manifest {
     stream_version: STREAM_VERSION,
     wasm: "game.wasm",
     wasm_abi: null,
+    wasm_relaxed: null,
+    wasm_relaxed_abi: null,
     pipelines: [
       {
         kind: "render",

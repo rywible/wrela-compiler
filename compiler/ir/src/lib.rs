@@ -753,6 +753,10 @@ pub struct Function {
     pub interval: bool,
     /// One of std's functions that a derivation knows by what it computes (`derive::tape`).
     pub known: Option<Known>,
+    /// CPU code outside what deterministic code reaches (lowering's `mark_relaxable`): with
+    /// `--relaxed-simd`, its vector arithmetic may use relaxed SIMD (a fused multiply-add),
+    /// which can differ from engine to engine in its last bit.
+    pub relaxable: bool,
 }
 
 /// A function of std's that a tape holds as one of its operations rather than as its body.
@@ -809,6 +813,7 @@ impl Function {
             counted: self.counted,
             interval: false,
             known: None,
+            relaxable: false,
         }
     }
 

@@ -169,6 +169,12 @@ struct Fe<'m> {
     m: &'m ir::Module,
     f: &'m ir::Function,
     at: &'m At<'m>,
+    /// Its vector arithmetic may use relaxed SIMD (`At::relaxed` and the function relaxable).
+    relaxed: bool,
+    /// With `relaxed`: each add a product fuses into (`fusions`), and each product's statement,
+    /// which emits nothing.
+    fused: HashMap<*const ir::Stmt, Fused>,
+    fused_away: HashSet<*const ir::Stmt>,
     ins: Vec<I<'static>>,
     locals: Vec<ValType>,
     nparams: u32,
@@ -251,6 +257,8 @@ pub(crate) struct At<'m> {
     pub heap_base: u32,
     /// Vectors are `v128`s (`crate::Options::simd`).
     pub simd: bool,
+    /// Relaxable functions use relaxed SIMD (`crate::Options::relaxed`).
+    pub relaxed: bool,
 }
 
 /// A function's code, and where each source location starts in it (byte offsets from the
@@ -267,6 +275,9 @@ pub(crate) fn emit_function(
         m,
         f,
         at,
+        relaxed: at.relaxed && f.relaxable,
+        fused: HashMap::new(),
+        fused_away: HashSet::new(),
         ins: Vec::new(),
         locals: Vec::new(),
         nparams: u32::from(sret) + f.params.len() as u32,
@@ -335,6 +346,9 @@ pub(crate) fn emit_function(
         fe.value_slots[v.index()] = Some(fe.slot(f.value_ty(v)));
     }
     releases(f, &mut fe.release);
+    if fe.relaxed {
+        (fe.fused, fe.fused_away) = fusions(m, f, &mut fe.release);
+    }
     fe.block(&f.body)?;
     // Falling off the end: only a function with no result can.
     fe.epilogue();
@@ -502,6 +516,88 @@ fn drop_restores(fe: &mut Fe) {
 /// block that defines it (`ir::verify` checks), so that's where it dies; a use in a nested loop
 /// counts as a use by the loop's whole statement, so a value read on every iteration lives
 /// until the loop ends.
+/// A vector `a * b + c` (or `c - a * b`, `negate`) to emit as one relaxed fused multiply-add.
+pub(super) struct Fused {
+    pub a: ir::ValueId,
+    pub b: ir::ValueId,
+    pub c: ir::ValueId,
+    pub negate: bool,
+}
+
+/// Relaxed SIMD's fusions in `f`: each vector add (or subtract) of a product that only it takes,
+/// after it in one block, keyed by the add's statement; and the products' statements, which
+/// emit nothing. A product's factors then live until the add: their releases (`release`) move
+/// there, and a fusion whose factor another statement between them frees isn't made.
+fn fusions(
+    m: &ir::Module,
+    f: &ir::Function,
+    release: &mut HashMap<*const ir::Stmt, Vec<ir::ValueId>>,
+) -> (HashMap<*const ir::Stmt, Fused>, HashSet<*const ir::Stmt>) {
+    let mut uses = vec![0u32; f.values.len()];
+    ir::visit::walk(&f.body, &mut |s| s.for_each_value(&mut |v| uses[v.index()] += 1));
+    let lanes = |v: ir::ValueId| {
+        matches!(m.types.get(f.value_ty(v)), ir::TypeDef::Vector(ir::Scalar::F32, _))
+    };
+    let lane_or_float = |v: ir::ValueId| {
+        lanes(v) || matches!(m.types.get(f.value_ty(v)), ir::TypeDef::Scalar(ir::Scalar::F32))
+    };
+    let mut fused = HashMap::new();
+    let mut away = HashSet::new();
+    let mut stack = vec![&f.body];
+    while let Some(b) = stack.pop() {
+        // The block's products: each one's index and factors.
+        let mut products: HashMap<ir::ValueId, (usize, ir::ValueId, ir::ValueId)> = HashMap::new();
+        for (i, s) in b.iter().enumerate() {
+            stack.extend(s.blocks());
+            let ir::Stmt::Let(v, ir::Expr::Binary(op, x, y)) = s else { continue };
+            if !lanes(*v) || !lane_or_float(*x) || !lane_or_float(*y) {
+                continue;
+            }
+            if *op == ir::BinOp::Mul {
+                products.insert(*v, (i, *x, *y));
+                continue;
+            }
+            let product = |p: ir::ValueId| products.get(&p).filter(|_| uses[p.index()] == 1);
+            let found = match op {
+                ir::BinOp::Add => product(*x)
+                    .map(|&t| (*x, t, *y, false))
+                    .or_else(|| product(*y).map(|&t| (*y, t, *x, false))),
+                ir::BinOp::Sub => product(*y).map(|&t| (*y, t, *x, true)),
+                _ => None,
+            };
+            let Some((p, (at, a, f2), c, negate)) = found else { continue };
+            let freed_between = b[at + 1..i].iter().any(|t| {
+                release
+                    .get(&std::ptr::from_ref(t))
+                    .is_some_and(|r| r.contains(&a) || r.contains(&f2))
+            });
+            if freed_between {
+                continue;
+            }
+            let mul = std::ptr::from_ref(&b[at]);
+            let add = std::ptr::from_ref(s);
+            // The factors live until the add; the product has no local to free.
+            let mut moved = Vec::new();
+            if let Some(r) = release.get_mut(&mul) {
+                r.retain(|w| {
+                    let keep = *w != a && *w != f2;
+                    if !keep {
+                        moved.push(*w);
+                    }
+                    keep
+                });
+            }
+            let at_add = release.entry(add).or_default();
+            at_add.retain(|w| *w != p);
+            at_add.extend(moved);
+            fused.insert(add, Fused { a, b: f2, c, negate });
+            away.insert(mul);
+            products.remove(&p);
+        }
+    }
+    (fused, away)
+}
+
 fn releases(f: &ir::Function, out: &mut HashMap<*const ir::Stmt, Vec<ir::ValueId>>) {
     // Each value records its defining scope and the last statement there that uses it.
     // A nested use belongs to that scope's current ancestor statement: a value used by a loop
@@ -1106,9 +1202,19 @@ impl<'m> Fe<'m> {
             }
             self.ir_locals[l.index()] = LocalRepr::Scalar(w);
         }
-        if let ir::Stmt::Let(v, _) = s {
+        let away = self.fused_away.contains(&std::ptr::from_ref(s));
+        if let ir::Stmt::Let(v, _) = s
+            && !away
+        {
             let t = repr(&self.m.types, self.vty(*v), self.at.simd);
             self.values[v.index()] = self.reuse_local(t);
+        }
+        if away {
+            // A product an add takes as its fused multiply-add: nothing to emit.
+            for v in self.release.remove(&std::ptr::from_ref(s)).unwrap_or_default() {
+                self.free_local(self.values[v.index()]);
+            }
+            return Ok(());
         }
         self.scratch.push(Vec::new());
         let r = self.stmt_code(s);
@@ -1128,6 +1234,12 @@ impl<'m> Fe<'m> {
 
     fn stmt_code(&mut self, s: &ir::Stmt) -> R<()> {
         match s {
+            ir::Stmt::Let(v, _) if self.fused.contains_key(&std::ptr::from_ref(s)) => {
+                let fused = &self.fused[&std::ptr::from_ref(s)];
+                let (a, b, c, negate) = (fused.a, fused.b, fused.c, fused.negate);
+                ops::fused_madd(self, *v, a, b, c, negate);
+                Ok(())
+            }
             ir::Stmt::Let(v, e) => self.expr(*v, e),
             ir::Stmt::Eval(e) => self.eval(e),
             ir::Stmt::Store(p, v) => self.store_place(p, *v),

@@ -117,7 +117,7 @@ mod trace;
 pub(crate) fn usage() -> ExitCode {
     let lines = [
         "wrela check <package-dir> [--json]",
-        "wrela build <package-dir> [-o <out-dir>] [--debug] [--testing] [--optimize [size|speed]] [--lift <package>]... [--report data] [--json]",
+        "wrela build <package-dir> [-o <out-dir>] [--debug] [--testing] [--optimize [size|speed]] [--relaxed-simd] [--lift <package>]... [--report data] [--json]",
         "wrela fmt <file-or-dir>... [--check]",
         "wrela fix <package-dir> [--dry-run] [--json]",
         "wrela migrate <package-dir> [--dry-run] [--json]",
@@ -126,7 +126,7 @@ pub(crate) fn usage() -> ExitCode {
         "wrela doc <item> [<package-dir>]",
         "wrela doc --export <dir> [--commit <sha>] [<package-dir>...]",
         "wrela pipelines <package-dir> [--json]",
-        "wrela profile <package-dir> [--frames n] [--warmup n] [--workers n] [--size WxH] [--input <script.json>] [--scenario name] [--serial] [--worst n] [--chrome [--features none|<list>] [--checked]] [--optimize size|speed] [--json] [--baseline <report.json> | --compare <build-dir> [--pairs n]]",
+        "wrela profile <package-dir> [--frames n] [--warmup n] [--workers n] [--size WxH] [--input <script.json>] [--scenario name] [--serial] [--worst n] [--chrome [--features none|<list>] [--checked]] [--optimize size|speed] [--relaxed-simd] [--json] [--baseline <report.json> | --compare <build-dir> [--pairs n]]",
         "wrela test <package-dir> [<filter>] [--exact] [--std] [--bless] [--json]",
         "wrela script <package-dir> <module>::<NAME> [-o <file>]",
         "wrela primer [area]",
@@ -254,6 +254,9 @@ pub(crate) struct PackageArgs {
     pub optimize: Option<wrela_driver::optimize::Level>,
     /// `--report data`, which only `build` takes: what the build's constant data holds.
     pub report_data: bool,
+    /// `--relaxed-simd`, which only `build` takes: a second module beside `game.wasm` whose
+    /// presentation code uses relaxed SIMD (`wrela_driver::build_relaxed`).
+    pub relaxed_simd: bool,
 }
 
 /// Reads the arguments of `check`, or of `build` (`takes_out`), and checks that the package is
@@ -263,6 +266,7 @@ pub(crate) fn package_args(args: &[String], takes_out: bool) -> Result<PackageAr
     let (mut dir, mut out, mut json, mut debug, mut testing) = (None, None, false, false, false);
     let mut optimize = None;
     let mut report_data = false;
+    let mut relaxed_simd = false;
     let mut lift = Vec::new();
     let mut it = args.iter().peekable();
     while let Some(a) = it.next() {
@@ -274,6 +278,7 @@ pub(crate) fn package_args(args: &[String], takes_out: bool) -> Result<PackageAr
             "--json" => json = true,
             "--debug" if takes_out => debug = true,
             "--testing" if takes_out => testing = true,
+            "--relaxed-simd" if takes_out => relaxed_simd = true,
             "--optimize" if takes_out => {
                 use wrela_driver::optimize::Level;
                 optimize = Some(match it.peek().and_then(|l| Level::parse(l)) {
@@ -313,7 +318,13 @@ pub(crate) fn package_args(args: &[String], takes_out: bool) -> Result<PackageAr
         );
         return Err(ExitCode::from(2));
     }
-    Ok(PackageArgs { dir, json, out, debug, testing, lift, optimize, report_data })
+    if relaxed_simd && (debug || testing || !lift.is_empty()) {
+        eprintln!(
+            "error: `--relaxed-simd` makes a release build: not with --debug, --testing or --lift"
+        );
+        return Err(ExitCode::from(2));
+    }
+    Ok(PackageArgs { dir, json, out, debug, testing, lift, optimize, report_data, relaxed_simd })
 }
 
 /// Checks that the package `dir` is a directory. If it isn't, the message is printed and the
@@ -366,10 +377,11 @@ pub(crate) fn build_into(
     dir: &Path,
     name: &str,
     optimize: Option<wrela_driver::optimize::Level>,
+    relaxed: bool,
 ) -> Result<PathBuf, String> {
     let built = dir.join("build").join(name);
     generated_path(dir, &built)?;
-    let mut out = wrela_driver::build(dir);
+    let mut out = if relaxed { wrela_driver::build_relaxed(dir) } else { wrela_driver::build(dir) };
     if let Some(level) = optimize
         && !out.has_errors()
     {

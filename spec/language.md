@@ -1143,11 +1143,11 @@ CPU code uses strict IEEE floats, std's own transcendentals and integer arithmet
 
 ### 11.1 Strict floats on the CPU
 
-CPU code always uses strict IEEE floats. There's no fast-math mode, no reassociation, no implicit FMA contraction and no relaxed SIMD.
+CPU code always uses strict IEEE floats. There's no fast-math mode, no reassociation, no implicit FMA contraction and no relaxed SIMD. The one exception is a relaxed-SIMD build's second module, and only in presentation code (§11.2).
 
 - WASM's float arithmetic is already IEEE-strict, apart from NaN bits. NaN bits are canonical wherever they're observed (§11.3).
 - Transcendentals come from std (`std::math`), compiled to WASM, never from the host. They compute in f64 and round once. Tests sample 20,000 points for each function, in the ranges they choose, and each result is within an ulp. This is evidence, not proof.
-- The compiler checks that each WASM module it emits has no relaxed SIMD.
+- The compiler checks that each WASM module it emits has no relaxed SIMD, outside a relaxed module's presentation code.
 - A program's command-stream hash is the same in Chrome and in the native host. That hash covers every byte that the program submits to its host: its GPU work and its requests, not its state. A state's checksum is `StateHash` (§6.11).
 
 ### 11.2 SIMD
@@ -1161,10 +1161,16 @@ Vector math uses WASM's 128-bit SIMD wherever the result is the same.
   - The body reads and writes elements only at the counter's index, of arrays and runs that it doesn't replace.
   - The body keeps nothing from one iteration to the next.
 - The last iterations, and an iteration that would index out of range, run one at a time. So a trap happens at the same iteration, with the same elements written.
-- Standard SIMD rounds each lane exactly as the scalar operation does, and has no fused multiply-add, so the bits are identical. Relaxed SIMD stays forbidden.
+- Standard SIMD rounds each lane exactly as the scalar operation does, and has no fused multiply-add, so the bits are identical. Relaxed SIMD is forbidden, except in a relaxed-SIMD build's presentation code (below).
 - An operation whose SIMD form behaves differently stays scalar. For example, float-to-int conversion saturates in SIMD but traps in scalar code (§11.3).
 - A reduction keeps its fixed order (§12). A dot product or a length adds its lanes one at a time, in order. A loop that sums stays one iteration at a time.
 - A debug build runs every loop one iteration at a time, since its NaN checks panic at a specific iteration.
+
+A relaxed-SIMD build (`wrela build --relaxed-simd`, release only) has a second module beside `game.wasm`, `game.relaxed.wasm`, named in the manifest as `wasm_relaxed`. A host that runs relaxed SIMD loads it; any other host loads `game.wasm`. The browser runtime asks `WebAssembly.validate` about a module of one `f32x4.relaxed_madd`; the native host loads it with `wrela-host --relaxed`.
+
+- **Only presentation code relaxes.** A function relaxes when only the client's `frame` reaches it. What `init`, any other export, a test, a job or a task reaches stays strict, and so does everything an `@deterministic` function or an `@audio` entry point reaches. `init` makes the world that the simulation starts from, so it's strict too.
+- **What relaxes:** a vector multiply whose only use is a later add in the same block fuses into one `f32x4.relaxed_madd`, and vector `min` and `max` become `f32x4.relaxed_min` and `f32x4.relaxed_max`. Their results may differ in the last bit, or in which NaN or which zero comes back, from engine to engine.
+- **The simulation's bits don't change.** `game.wasm` is the build without the option, byte for byte. Both modules run the same ticks, so their tick logs compare `equal` (`wrela-host --compare-ticks`). Presentation results reach the simulation only as input, which a tick log records.
 
 ### 11.3 What each target does
 
@@ -1572,7 +1578,7 @@ Exports other than `frame` serve tests and tools, and take scalar and vector par
 - A returned value crosses as its numbers in order (fields, then elements, then components), at most 64. `wrela trace` names them `.x` to `.w`, or `.0` and on for more than four.
 - Other types cannot cross, and the host cannot choose a generic function's types (E0703).
 
-**What a build states about its module.** A client build's `manifest.json` carries `wasm_abi`: the module's imported memory's limits, each import as `[module, name, type]` and each exported function as `[name, type]`, in the module's order (a function's type is written `(i32, i32) -> ()`, another import's is its kind, `memory`). The browser host checks the module against it rather than reading the module's bytes, so it compiles the WASM as it streams in (`WebAssembly.compileStreaming`, which needs the server to send it as `application/wasm`; any other type is read whole, then compiled), and a second open of the same build finds the compiled code in the browser's code cache. A build that `wasm-opt` rewrote (`--optimize`) states the rewritten module's interface.
+**What a build states about its module.** A client build's `manifest.json` carries `wasm_abi`: the module's imported memory's limits, each import as `[module, name, type]` and each exported function as `[name, type]`, in the module's order (a function's type is written `(i32, i32) -> ()`, another import's is its kind, `memory`). The browser host checks the module against it rather than reading the module's bytes, so it compiles the WASM as it streams in (`WebAssembly.compileStreaming`, which needs the server to send it as `application/wasm`; any other type is read whole, then compiled), and a second open of the same build finds the compiled code in the browser's code cache. A build that `wasm-opt` rewrote (`--optimize`) states the rewritten module's interface. A relaxed-SIMD build states its second module and that module's interface too, as `wasm_relaxed` and `wasm_relaxed_abi` (§11.2).
 
 ### 15.3 Client, server and tool roles
 

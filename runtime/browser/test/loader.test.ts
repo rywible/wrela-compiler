@@ -3,7 +3,7 @@ import { existsSync, readFileSync } from "node:fs";
 import { join } from "node:path";
 import { MANIFEST_VERSION } from "../src/abi.gen.ts";
 import { pathProblem } from "../src/path.ts";
-import { browserIo, type Fetch, loadBuild, loadLines, loadScript } from "../src/loader.ts";
+import { browserIo, chooseWasm, type Fetch, loadBuild, loadLines, loadScript, RELAXED_PROBE, runsRelaxedSimd } from "../src/loader.ts";
 import { ManifestError, parseManifest } from "../src/manifest.ts";
 import { FIRST_LIGHT, readFixture, readFixtureText } from "./fixtures.ts";
 
@@ -36,6 +36,25 @@ test("loads a build's manifest, WASM and shaders", async () => {
   expect(requested.sort()).toEqual(
     ["/game/fill.wgsl", "/game/first-light.wgsl", "/game/game.wasm", "/game/manifest.json"].sort(),
   );
+});
+
+test("a relaxed-SIMD build's relaxed module loads only where relaxed SIMD runs", async () => {
+  const manifest = parseManifest(readFixtureText("manifest.json"));
+  const relaxed = { ...manifest, wasm_relaxed: "game.relaxed.wasm", wasm_relaxed_abi: null };
+  expect(chooseWasm(relaxed, true).wasm).toBe("game.relaxed.wasm");
+  expect(chooseWasm(relaxed, true).wasm_abi).toBeNull();
+  // Where `WebAssembly.validate` says no (Safari), the standard module, its interface with it.
+  expect(chooseWasm(relaxed, false)).toBe(relaxed);
+  expect(chooseWasm(manifest, true)).toBe(manifest);
+  // The probe is a relaxed op: the same module with an unassigned SIMD opcode doesn't validate.
+  expect(runsRelaxedSimd()).toBe(true);
+  const unknown = RELAXED_PROBE.slice();
+  unknown[unknown.length - 3] = 0xff;
+  expect(WebAssembly.validate(unknown)).toBe(false);
+  const { fetch, requested } = server({ "manifest.json": JSON.stringify({ ...JSON.parse(readFixtureText("manifest.json")), wasm_relaxed: "game.relaxed.wasm" }) });
+  await loadBuild(BASE, fetch).catch(() => {});
+  expect(requested).toContain("/game/game.relaxed.wasm");
+  expect(requested).not.toContain("/game/game.wasm");
 });
 
 test("rejects a manifest of another version, loudly", async () => {

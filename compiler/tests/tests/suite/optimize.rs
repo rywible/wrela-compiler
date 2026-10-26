@@ -14,7 +14,7 @@ use wrela_tests::{ChromeRun, chrome_failure, page};
 fn optimize_in_place(dir: &Path) {
     let wasm = std::fs::read(dir.join("game.wasm")).expect("game.wasm");
     let (code, lines) =
-        wrela_driver::optimize::optimize(&wasm, wrela_driver::optimize::Level::Size)
+        wrela_driver::optimize::optimize(&wasm, wrela_driver::optimize::Level::Size, false)
             .expect("optimizes");
     assert!(code.len() < wasm.len(), "optimized {} bytes into {}", wasm.len(), code.len());
     // As `wrela build --optimize` does: the manifest states the rewritten module's interface.
@@ -154,9 +154,12 @@ fn each_frozen_programs_manifest_states_its_wasm_interface() {
             .iter()
             .map(|f| (f.to_string(), std::fs::read(small.join(f)).expect("file")))
             .collect();
-        let (code, _) =
-            wrela_driver::optimize::optimize(&files[0].1, wrela_driver::optimize::Level::Size)
-                .expect("optimizes");
+        let (code, _) = wrela_driver::optimize::optimize(
+            &files[0].1,
+            wrela_driver::optimize::Level::Size,
+            false,
+        )
+        .expect("optimizes");
         files[0].1 = code;
         wrela_driver::build::restate_abi(&mut files).expect("restated");
         for (f, bytes) in &files {

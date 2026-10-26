@@ -135,6 +135,13 @@ pub struct Manifest {
     /// without reading its bytes (a browser compiles it as it streams in).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub wasm_abi: Option<WasmAbi>,
+    /// A build with relaxed SIMD (`wrela build --relaxed-simd`): the module whose presentation
+    /// code uses it, beside `wasm`, and its interface. A host that runs relaxed SIMD loads it;
+    /// any other, `wasm`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub wasm_relaxed: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub wasm_relaxed_abi: Option<WasmAbi>,
 }
 
 /// A module's interface (language.md §15): its imported memory's limits, and the type of each
@@ -703,6 +710,8 @@ impl Manifest {
             wasm: wasm.into(),
             pipelines: Vec::new(),
             wasm_abi: None,
+            wasm_relaxed: None,
+            wasm_relaxed_abi: None,
         }
     }
 
@@ -1333,6 +1342,14 @@ mod read {
                 .map(|(i, p)| pipeline(p, i))
                 .collect::<Result<_>>()?,
             wasm_abi: match o.get("wasm_abi") {
+                None => None,
+                Some(v) => Some(wasm_abi(v)?),
+            },
+            wasm_relaxed: match o.get("wasm_relaxed") {
+                None => None,
+                Some(_) => Some(string(o, "wasm_relaxed", "the manifest")?),
+            },
+            wasm_relaxed_abi: match o.get("wasm_relaxed_abi") {
                 None => None,
                 Some(v) => Some(wasm_abi(v)?),
             },

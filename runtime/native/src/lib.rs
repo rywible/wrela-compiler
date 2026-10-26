@@ -341,7 +341,7 @@ fn driven_build(build: &BuildDir, shaders: bool, code: &CodeFor) -> Result<Build
     let text = |bytes: Vec<u8>, name: &str| {
         String::from_utf8(bytes).map_err(|_| Error::Program(format!("{name} isn't UTF-8")))
     };
-    let manifest = Manifest::parse(&text(file("manifest.json")?, "manifest.json")?)?;
+    let manifest = chosen(Manifest::parse(&text(file("manifest.json")?, "manifest.json")?)?);
     let wasm = file(&manifest.wasm)?;
     let shaders = if shaders {
         manifest
@@ -360,10 +360,29 @@ fn driven_build(build: &BuildDir, shaders: bool, code: &CodeFor) -> Result<Build
     Ok(Build { manifest, shaders, wasm_hash, compiled, driven: None })
 }
 
+/// Whether builds load their relaxed-SIMD module where they have one (`wrela-host --relaxed`).
+static RELAXED_SIMD: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// From now on, a relaxed-SIMD build (`wrela build --relaxed-simd`) loads its relaxed module, as a
+/// browser that runs relaxed SIMD does (runtime/browser `chooseWasm`); wasmtime runs relaxed SIMD.
+pub fn load_relaxed_simd() {
+    RELAXED_SIMD.store(true, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// `manifest` as this process loads it: its relaxed module, after [`load_relaxed_simd`].
+fn chosen(manifest: Manifest) -> Manifest {
+    match &manifest.wasm_relaxed {
+        Some(wasm) if RELAXED_SIMD.load(std::sync::atomic::Ordering::Relaxed) => {
+            Manifest { wasm: wasm.clone(), wasm_abi: manifest.wasm_relaxed_abi.clone(), ..manifest }
+        }
+        _ => manifest,
+    }
+}
+
 /// Reads a build's manifest, WASM and WGSL from `dir`.
 fn read_build(dir: &Path, shaders: bool) -> Result<(Manifest, Vec<u8>, Vec<String>)> {
     let text = |name: &str| read_file(dir, name, |path| std::fs::read_to_string(path));
-    let manifest = Manifest::parse(&text("manifest.json")?)?;
+    let manifest = chosen(Manifest::parse(&text("manifest.json")?)?);
     let wasm = read_file(dir, &manifest.wasm, |path| std::fs::read(path))?;
     let shaders = if shaders {
         manifest.pipelines.iter().map(|p| text(&p.shader)).collect::<Result<Vec<_>>>()?

@@ -11,6 +11,10 @@
 //! - loops four iterations at a time, at every length to 64, and one that traps;
 //! - the run-pass suite's expectations (`run_pass.rs` checks both builds).
 //!
+//! A relaxed-SIMD build (`wrela build --relaxed-simd`, §11.2) keeps that for deterministic code:
+//! its relaxed module fuses a multiply-add only outside it, and its standard module is the build's
+//! without the option, byte for byte.
+//!
 //! The speed-up on a loop of `vec4` math is measured, not gated: `cargo test --release -p
 //! wrela-tests --test suite simd_speed -- --ignored --nocapture` prints it.
 
@@ -198,4 +202,69 @@ fn a_voice_renders_the_same_samples_with_simd() {
     let (x, y) = (a.render_audio(200).expect("render"), b.render_audio(200).expect("render"));
     let bits = |s: &[f32]| s.iter().map(|x| x.to_bits()).collect::<Vec<_>>();
     assert!(bits(&x) == bits(&y), "the samples differ with SIMD");
+}
+
+/// `compiler/tests/relaxed`: `strict` (an export) and `loose` (which only `frame` reaches) do the
+/// same `a * b + c`, on values a fused multiply-add rounds differently. In the relaxed module
+/// `loose` fuses it and `strict` doesn't; the standard module is the build without
+/// `--relaxed-simd`'s.
+#[test]
+fn relaxed_simd_fuses_only_in_presentation_code() {
+    let pkg = "compiler/tests/relaxed";
+    let (dir, _) = wrela_tests::relaxed_page(pkg, "relaxed-simd");
+    let read = |name: &str| std::fs::read(dir.join(name)).expect(name);
+    let relaxed = read("game.relaxed.wasm");
+    assert!(wrela_wasm::check_no_relaxed_simd(&read("game.wasm")).is_ok(), "the standard module");
+    assert!(wrela_wasm::check_no_relaxed_simd(&relaxed).is_err(), "the relaxed module has none");
+    let plain = wrela_driver::build(&wrela_tests::repo_root().join(pkg));
+    let wasm = plain.files.iter().find(|(f, _)| f == "game.wasm").expect("game.wasm");
+    assert!(wasm.1 == read("game.wasm"), "the standard module is the plain build's");
+    let mut a = CpuHost::load(&dir).expect("load");
+    let mut b = CpuHost::load(as_relaxed(&dir)).expect("load the relaxed module");
+    let mut fused = 0;
+    for seed in 0..3 {
+        let args = [Value::I32(seed)];
+        let (x, y) = (a.call_export("strict", &args), b.call_export("strict", &args));
+        assert!(same(&x, &y), "strict({seed}): {x:?} standard, {y:?} relaxed");
+        let seen = |h: &mut CpuHost| {
+            h.frame(seed as f32, 64, 64).expect("frame");
+            h.call_export("seen", &[])
+        };
+        let (p, q) = (seen(&mut a), seen(&mut b));
+        assert!(same(&p, &x), "loose({seed}) unfused is strict's");
+        fused += usize::from(!same(&p, &q));
+    }
+    assert_eq!(fused, 3, "the relaxed module's `loose` fuses its multiply-add");
+}
+
+/// The build in `dir` with its relaxed module as `game.wasm` is: what a host that runs relaxed SIMD
+/// loads (runtime/browser `chooseWasm`), in a directory of its own.
+fn as_relaxed(dir: &Path) -> std::path::PathBuf {
+    let text = std::fs::read_to_string(dir.join("manifest.json")).expect("the manifest");
+    let mut manifest = wrela_abi::Manifest::parse(&text).expect("the manifest");
+    let to = dir.join("as-relaxed");
+    std::fs::create_dir_all(&to).expect("dir");
+    manifest.wasm = manifest.wasm_relaxed.take().expect("a relaxed module");
+    manifest.wasm_abi = manifest.wasm_relaxed_abi.take();
+    std::fs::write(to.join("manifest.json"), manifest.to_json()).expect("manifest");
+    let files =
+        manifest.pipelines.iter().map(|p| p.shader.as_str()).chain([manifest.wasm.as_str()]);
+    for name in files {
+        std::fs::copy(dir.join(name), to.join(name)).expect(name);
+    }
+    to
+}
+
+/// The herd's ticks with its relaxed module: the same world, tick by tick. What `init` reaches,
+/// and the math `rewrite_cpu_math` calls in, stay strict (language.md §11.2).
+#[test]
+fn a_relaxed_build_ticks_the_same_world() {
+    let (dir, _) = wrela_tests::relaxed_page("compiler/tests/frozen/herd", "relaxed-herd");
+    let ticks = |d: &Path| {
+        let built = wrela_host::CpuBuild::load(d).expect("load");
+        built.record_ticks(120, &[], 2).expect("ticks")
+    };
+    let (a, b) = (ticks(&dir), ticks(&as_relaxed(&dir)));
+    let c = wrela_abi::ticks::TickComparison::of(&a, &b);
+    assert!(matches!(c, wrela_abi::ticks::TickComparison::Equal { .. }), "{c}");
 }

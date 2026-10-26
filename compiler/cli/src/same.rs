@@ -180,7 +180,7 @@ fn same(a: &Args) -> Result<Report, String> {
     let before = manifest(&against)?;
     let script = crate::read_script(a.input.as_deref())?;
     // The candidate, as `wrela build` builds it.
-    let built = crate::build_into(&a.dir, "same", None)?;
+    let built = crate::build_into(&a.dir, "same", None, false)?;
     let after = manifest(&built)?;
     let names = |m: &wrela_abi::Manifest| -> Vec<String> {
         let mut v: Vec<String> = m.pipelines.iter().map(|p| p.name.clone()).collect();

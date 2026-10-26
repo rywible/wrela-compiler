@@ -94,14 +94,15 @@ fn run_here(program: &std::path::Path, args: &[std::ffi::OsString]) -> Result<Ra
 
 /// `wasm`, optimized for `level`, without its lines table; and the table for its optimized
 /// code, encoded.
-pub fn optimize(wasm: &[u8], level: Level) -> Result<(Vec<u8>, Vec<u8>), String> {
-    optimize_with(wasm, level, &mut run_here)
+pub fn optimize(wasm: &[u8], level: Level, relaxed: bool) -> Result<(Vec<u8>, Vec<u8>), String> {
+    optimize_with(wasm, level, relaxed, &mut run_here)
 }
 
 /// [`optimize`], `wasm-opt` run by `run`.
 pub fn optimize_with(
     wasm: &[u8],
     level: Level,
+    relaxed: bool,
     run: &mut Runner,
 ) -> Result<(Vec<u8>, Vec<u8>), String> {
     let program = wasm_opt(run)?;
@@ -121,6 +122,10 @@ pub fn optimize_with(
     write("in.map", table.source_map()?.as_bytes())?;
     let mut args: Vec<std::ffi::OsString> = vec![path("in.wasm").into(), level.flag().into()];
     args.extend(FEATURES.iter().map(Into::into));
+    // Only a relaxed module may hold relaxed SIMD: `wasm-opt` adds none to any other.
+    if relaxed {
+        args.push("--enable-relaxed-simd".into());
+    }
     for (flag, name) in
         [("--input-source-map", "in.map"), ("--output-source-map", "out.map"), ("-o", "out.wasm")]
     {
@@ -138,7 +143,12 @@ pub fn optimize_with(
     let read =
         |name: &str| std::fs::read(path(name)).map_err(|e| format!("can't read {name}: {e}"));
     let optimized = read("out.wasm")?;
-    wrela_wasm::check_no_relaxed_simd(&optimized)?;
+    // A relaxed module's relaxed SIMD is the back end's, outside deterministic code; `wasm-opt`
+    // only moves code that deterministic code calls into code that it doesn't (inlining), never
+    // back.
+    if !relaxed {
+        wrela_wasm::check_no_relaxed_simd(&optimized)?;
+    }
     // Binaryen keeps a module's custom sections; the pair id must survive (`read_pair`).
     if wrela_abi::read_pair(&optimized) != wrela_abi::read_pair(wasm) {
         return Err("`wasm-opt` lost the module's pair id".into());

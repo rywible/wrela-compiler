@@ -25,6 +25,9 @@
 //! Run benchmarks with other builds and GPU workloads idle.
 //!
 //! `--optimize size|speed` profiles the build `wasm-opt` made, as a shipped one is.
+//! `--relaxed-simd` profiles a relaxed-SIMD build (`wrela build --relaxed-simd`) running its
+//! relaxed module, as a host that runs relaxed SIMD does; `--compare` a build without it for the
+//! difference.
 //!
 //! Beside the times, each report has the executor's counters, each a frame's median: passes,
 //! dispatches, draws and draw calls, buffer and texture writes, bind groups and pipelines set
@@ -74,6 +77,8 @@ struct Args {
     optimize: Option<wrela_driver::optimize::Level>,
     /// How many of the slowest frames to name (`--worst n`).
     worst: usize,
+    /// A relaxed-SIMD build (`--relaxed-simd`), its relaxed module run where the host runs it.
+    relaxed_simd: bool,
 }
 
 fn parse(args: &[String]) -> Option<Args> {
@@ -95,6 +100,7 @@ fn parse(args: &[String]) -> Option<Args> {
         checked: false,
         optimize: None,
         worst: 5,
+        relaxed_simd: false,
     };
     let mut dir = None;
     let mut it = args.iter();
@@ -118,6 +124,7 @@ fn parse(args: &[String]) -> Option<Args> {
             "--worst" => a.worst = it.next()?.parse().ok()?,
             "--chrome" => a.chrome = true,
             "--checked" => a.checked = true,
+            "--relaxed-simd" => a.relaxed_simd = true,
             "--optimize" => a.optimize = Some(wrela_driver::optimize::Level::parse(it.next()?)?),
             "--features" => {
                 let keep = it.next()?;
@@ -332,7 +339,11 @@ fn run_report(a: &Args) -> Result<String, String> {
         workers: a.workers,
         ..Options::default()
     };
-    let (mut host, script, built) = load(&a.dir, a.input.as_deref(), &options, a.optimize)?;
+    if a.relaxed_simd {
+        wrela_host::load_relaxed_simd();
+    }
+    let (mut host, script, built) =
+        load(&a.dir, a.input.as_deref(), &options, a.optimize, a.relaxed_simd)?;
     let environment = comparison::environment(&mut host)?;
     let workload = comparison::workload(a, &script);
     let frozen = comparison::build_hash(&built)?;
@@ -366,8 +377,9 @@ fn load(
     input: Option<&Path>,
     options: &Options,
     optimize: Option<wrela_driver::optimize::Level>,
+    relaxed: bool,
 ) -> Result<(Host, Vec<Scripted>, PathBuf), String> {
-    let built = crate::build_into(dir, "profile", optimize)?;
+    let built = crate::build_into(dir, "profile", optimize, relaxed)?;
     let script = crate::read_script(input)?;
     let host = Host::load_with(&built, options).map_err(|e| e.to_string())?;
     Ok((host, script, built))
@@ -392,7 +404,7 @@ fn place_input(from: Option<&Path>, dir: &Path) -> Result<(), String> {
 
 /// `--chrome`'s report: the build measured in headless Chrome (`profile/chrome.rs`).
 fn chrome_report(a: &Args, baseline: Option<&Baseline>) -> Result<String, String> {
-    let built = crate::build_into(&a.dir, "profile", a.optimize)?;
+    let built = crate::build_into(&a.dir, "profile", a.optimize, a.relaxed_simd)?;
     let script = crate::read_script(a.input.as_deref())?;
     let workload = comparison::workload(a, &script);
     let frozen = comparison::build_hash(&built)?;
@@ -926,7 +938,7 @@ mod tests {
         std::fs::create_dir_all(&dir).expect("package");
         std::fs::create_dir_all(&outside).expect("outside");
         std::os::unix::fs::symlink(&outside, dir.join("build")).expect("linked build");
-        assert!(load(&dir, None, &Options::default(), None).is_err());
+        assert!(load(&dir, None, &Options::default(), None, false).is_err());
         assert!(std::fs::read_dir(&outside).expect("outside directory").next().is_none());
         let _ = std::fs::remove_dir_all(dir);
         let _ = std::fs::remove_dir_all(outside);

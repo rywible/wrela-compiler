@@ -31,6 +31,8 @@ pub fn run(args: &[String]) -> ExitCode {
         wrela_driver::build_for_tests(dir, args.debug)
     } else if args.debug {
         wrela_driver::build_debug(dir)
+    } else if args.relaxed_simd {
+        wrela_driver::build_relaxed(dir)
     } else {
         wrela_driver::build(dir)
     };
@@ -154,21 +156,31 @@ pub(crate) fn optimized(
     files: &mut Vec<(String, Vec<u8>)>,
     level: wrela_driver::optimize::Level,
 ) -> Result<(), String> {
-    optimized_with(files, |wasm| wrela_driver::optimize::optimize(wasm, level))
+    optimized_with(files, |wasm, relaxed| wrela_driver::optimize::optimize(wasm, level, relaxed))
 }
 
 /// [`optimized`], with `optimize` making the optimized code and its table.
 pub(crate) fn optimized_with(
     files: &mut Vec<(String, Vec<u8>)>,
-    optimize: impl FnOnce(&[u8]) -> Result<(Vec<u8>, Vec<u8>), String>,
+    mut optimize: impl FnMut(&[u8], bool) -> Result<(Vec<u8>, Vec<u8>), String>,
 ) -> Result<(), String> {
     let wasm =
         files.iter_mut().find(|(f, _)| f == "game.wasm").ok_or("the build has no game.wasm")?;
-    let (code, lines) = optimize(&wasm.1)?;
+    let (code, lines) = optimize(&wasm.1, false)?;
     wasm.1 = code;
     files.push((LINES.to_string(), lines));
+    // A relaxed module, through `wasm-opt` with relaxed SIMD allowed (its own trap lines: the
+    // relaxed module's offsets are its own).
+    if let Some(relaxed) = files.iter_mut().find(|(f, _)| f == wrela_driver::build::RELAXED_WASM) {
+        let (code, lines) = optimize(&relaxed.1, true)?;
+        relaxed.1 = code;
+        files.push((RELAXED_LINES.to_string(), lines));
+    }
     wrela_driver::build::restate_abi(files)
 }
+
+/// An optimized relaxed module's trap locations, beside it.
+const RELAXED_LINES: &str = "game.relaxed.lines";
 
 /// An optimized build's trap locations, beside `game.wasm` (`wrela_abi::lines::SIDECAR`).
 const LINES: &str = "game.lines";

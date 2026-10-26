@@ -17,6 +17,9 @@
 //!   doesn't compare the logs' WASM hashes.
 //! - `wrela-host --version`: its release and source revision.
 //!
+//! `--relaxed`, with any of them, runs a relaxed-SIMD build's relaxed module (`wrela build
+//! --relaxed-simd`), as a browser that runs relaxed SIMD would.
+//!
 //! A build of this binary without the `gpu` feature runs ticks only, with `--no-gpu` or
 //! `--replay` (an x86-64 build run under Rosetta, say, which checks the sim's bits on x86's code
 //! generation); `--compare-ticks` and `--version` work in either build.
@@ -50,7 +53,7 @@ state hash and each tick's (`tick K HASH`). --log writes the ticks as a tick log
 at the first that differs, naming it. --compare-ticks reads two tick logs (two builds run on the
 same input) and prints `equal`, or the first tick whose state hash differs; it exits 1 if they
 differ. --workers sets the threads that run parallel work (the
-program's own among them).";
+program's own among them). --relaxed runs a relaxed-SIMD build's relaxed module.";
 
 struct Args {
     dir: PathBuf,
@@ -127,6 +130,7 @@ fn parse(mut argv: impl Iterator<Item = String>) -> Result<Args, String> {
             "--timestamps" => args.timestamps = true,
             "--serial" => args.serial = true,
             "--no-gpu" => args.no_gpu = true,
+            "--relaxed" => wrela_host::load_relaxed_simd(),
             "-h" | "--help" => return Err(USAGE.into()),
             flag if flag.starts_with("--") => {
                 return Err(format!("unknown option {flag}\n\n{USAGE}"));

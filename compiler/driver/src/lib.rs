@@ -190,6 +190,15 @@ pub fn build(root: &Path) -> Output {
     on_compiler_thread(|| compile(root, Mode::RELEASE, wrela_lower::Roots::of, &[]))
 }
 
+/// [`build`], with a second module beside `game.wasm` whose presentation code uses relaxed SIMD
+/// (`game.relaxed.wasm`, `Manifest::wasm_relaxed`): the code deterministic code reaches is the
+/// same in both.
+pub fn build_relaxed(root: &Path) -> Output {
+    on_compiler_thread(|| {
+        compile(root, Mode { relaxed_simd: true, ..Mode::RELEASE }, wrela_lower::Roots::of, &[])
+    })
+}
+
 /// [`build`] in debug mode: the build pays for checks a release build doesn't make, such as a
 /// trap where a float operation creates a NaN (language.md §11).
 pub fn build_debug(root: &Path) -> Output {
@@ -794,11 +803,19 @@ struct Mode {
     testing: bool,
     /// Each pipeline site's [`PipelineSummary::conditional`] worked out.
     conditions: bool,
+    /// A second module, with relaxed SIMD outside deterministic code ([`build_relaxed`]).
+    relaxed_simd: bool,
 }
 
 impl Mode {
-    const CHECK: Mode =
-        Mode { emit: false, debug: false, no_simd: false, testing: false, conditions: false };
+    const CHECK: Mode = Mode {
+        emit: false,
+        debug: false,
+        no_simd: false,
+        testing: false,
+        conditions: false,
+        relaxed_simd: false,
+    };
     const RELEASE: Mode = Mode { emit: true, ..Mode::CHECK };
 }
 
@@ -936,7 +953,8 @@ fn compile_loaded_in(
             // one may go over.
             let budgets = !(mode.debug || mode.no_simd || mode.testing) && lift.is_empty();
             let tier1: Vec<bool> = pipelines.iter().map(|p| p.tier() == 1).collect();
-            let out = build::emit(&lowered, &sources, !data.no_simd, budgets, &tier1);
+            let relaxed = mode.relaxed_simd && !data.no_simd;
+            let out = build::emit(&lowered, &sources, !data.no_simd, budgets, &tier1, relaxed);
             diagnostics.extend(out.diagnostics);
             files.extend(out.files);
             files.append(&mut shipped_files);
@@ -946,15 +964,17 @@ fn compile_loaded_in(
         }
         let mut client = None;
         let mut server = None;
+        let mut relaxed = None;
         for (path, bytes) in &mut files {
             match path.as_str() {
                 "game.wasm" => client = Some(bytes),
+                build::RELAXED_WASM => relaxed = Some(bytes),
                 build::SERVER_WASM => server = Some(bytes),
                 _ => {}
             }
         }
         if client.is_some() || server.is_some() {
-            build::pair(client, server);
+            build::pair(client, server, relaxed);
         }
     }
     sort_and_dedup(&mut diagnostics);

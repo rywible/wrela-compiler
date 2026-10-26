@@ -99,8 +99,37 @@ export class Handed {
 }
 
 /** Fetches and validates a build; its files resolve against `base`. */
+/** A module of one function that does an `f32x4.relaxed_madd`: what a browser that runs relaxed
+ * SIMD validates (Chrome and Bun do). */
+export const RELAXED_PROBE = new Uint8Array([
+  0x00, 0x61, 0x73, 0x6d, 0x01, 0x00, 0x00, 0x00,
+  // A type: () -> v128.
+  0x01, 0x05, 0x01, 0x60, 0x00, 0x01, 0x7b,
+  0x03, 0x02, 0x01, 0x00,
+  // Its body: three zero vectors, `f32x4.relaxed_madd` (0xfd 0x105), `end`.
+  0x0a, 0x3d, 0x01, 0x3b, 0x00,
+  ...[0, 1, 2].flatMap(() => [0xfd, 0x0c, ...new Array<number>(16).fill(0)]),
+  0xfd, 0x85, 0x02, 0x0b,
+]);
+
+/** Whether this browser runs relaxed SIMD. */
+export function runsRelaxedSimd(): boolean {
+  try {
+    return WebAssembly.validate(RELAXED_PROBE);
+  } catch {
+    return false;
+  }
+}
+
+/** `manifest` as this browser loads it: a relaxed-SIMD build's relaxed module where the browser
+ * runs relaxed SIMD (`relaxed`), its standard one elsewhere. */
+export function chooseWasm(manifest: Manifest, relaxed: boolean = runsRelaxedSimd()): Manifest {
+  if (manifest.wasm_relaxed === null || !relaxed) return manifest;
+  return { ...manifest, wasm: manifest.wasm_relaxed, wasm_abi: manifest.wasm_relaxed_abi };
+}
+
 export async function loadBuild(base: string, fetchFn: Fetch = networkFetch): Promise<Build> {
-  const manifest = parseManifest(await getText(fetchFn, new URL("manifest.json", base)));
+  const manifest = chooseWasm(parseManifest(await getText(fetchFn, new URL("manifest.json", base))));
   // The WASM's response stays unread: `Program.compile` compiles it as it streams in.
   const [wasm, shaders] = await Promise.all([
     get(fetchFn, new URL(manifest.wasm, base)),
