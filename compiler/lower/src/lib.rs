@@ -670,7 +670,17 @@ impl<'a> Cx<'a> {
             }
             return id;
         }
-        let f = self.signature(mb, &key);
+        let mut f = self.signature(mb, &key);
+        if let InstanceKey::Fn { func, .. } = &key {
+            f.known = match self.checked.program.func(*func).lang {
+                Some(Lang::Smin) => Some(ir::Known::Smin),
+                Some(Lang::ValueNoise) => Some(ir::Known::ValueNoise),
+                Some(Lang::Lattice) => Some(ir::Known::Lattice),
+                Some(Lang::LatticeCoord) => Some(ir::Known::LatticeCoord),
+                Some(Lang::Pcg) => Some(ir::Known::Pcg),
+                _ => None,
+            };
+        }
         let id = mb.m.add_function(f);
         mb.instances.insert(key.clone(), id);
         if let Some(name) = self.source_name(&key) {

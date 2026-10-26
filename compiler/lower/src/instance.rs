@@ -43,6 +43,9 @@ pub enum DeriveKind {
     Literals,
     /// The lifted literals the callable can read (§23): `output` is the run's type.
     Reads,
+    /// The tape of a function of a point (`std::derive::tape`): `input` is the tape's type;
+    /// with an `output` `T`, `tape_with`'s, whose function returns `(f32, T)`.
+    Tape,
 }
 
 /// GPU only: what a parameter is bound to.

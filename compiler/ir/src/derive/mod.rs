@@ -11,8 +11,10 @@ pub mod ad;
 mod exits;
 pub mod interval;
 pub mod literal;
+pub mod tape;
 
 pub use literal::literal_gradient;
+pub use tape::{TapeFns, TapeOf};
 
 use crate::*;
 use std::collections::HashMap;
@@ -22,6 +24,7 @@ use std::collections::HashMap;
 pub struct DeriveCache {
     ad: HashMap<(FuncId, Vec<Bits>, u8), FuncId>,
     interval: HashMap<(FuncId, Vec<Bits>), FuncId>,
+    tape: HashMap<(FuncId, Vec<Bits>), FuncId>,
     /// What a call does with active arguments, by derivation and active parameters: `None`
     /// while the callee is still being analyzed.
     effects: HashMap<(Mode, FuncId, Vec<Bits>), Option<Effect>>,
@@ -86,6 +89,20 @@ pub fn interval(
     interval_ty: TypeId,
 ) -> Result<FuncId> {
     interval::interval(m, cache, f, ncap, target, box_ty, interval_ty)
+}
+
+/// A function of `f`'s captures that builds the tape (`of.tape`, a `std::stage::Taped`) of `f`,
+/// a function of a `vec3` (its last parameter), on the CPU: `std::derive::tape`. With `of.with`,
+/// `f` returns `(f32, T)`, and the tape's last registers are the value and `T`'s floats. std's
+/// functions add its operations, and finish it (`of.fns`).
+pub fn tape(
+    m: &mut Module,
+    cache: &mut DeriveCache,
+    f: FuncId,
+    target: Target,
+    of: TapeOf,
+) -> Result<FuncId> {
+    tape::tape(m, cache, f, target, of)
 }
 
 /// Activity by part: a bit for each **leaf** of a value's type, in field order. A leaf is a
@@ -760,7 +777,7 @@ pub(super) struct Track {
     /// A load's earlier twin.
     same: HashMap<ValueId, ValueId>,
     /// Where in the source the statement being derived is (the last `Stmt::At`), for errors.
-    at: Option<wrela_diag::Span>,
+    pub(super) at: Option<wrela_diag::Span>,
 }
 
 impl Track {

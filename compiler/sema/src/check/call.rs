@@ -11,6 +11,9 @@ use crate::ty::*;
 use wrela_diag::{Diagnostic, Edit, Span, codes};
 use wrela_syntax::ast;
 
+/// Arguments by their parameters' positions.
+type Positional<T> = Vec<(usize, T)>;
+
 /// A parameter as call checking sees it.
 #[derive(Clone, Copy)]
 pub(crate) struct CallParam<'p> {
@@ -2952,7 +2955,7 @@ impl<'p> Checker<'p> {
         &mut self,
         func: FnId,
         args: Vec<(usize, Expr)>,
-    ) -> (Vec<(usize, Expr)>, Vec<(usize, ConstArg)>) {
+    ) -> (Positional<Expr>, Positional<ConstArg>) {
         let mut plain = Vec::new();
         let mut consts = Vec::new();
         for (i, x) in args {

@@ -2,6 +2,8 @@
 // body (language.md §14), and the ranges and boxes they work over. Any function that qualifies
 // has them; nothing here is specific to fields.
 
+use std::stage::{Tape, Taped}
+
 /// A closed range `[lo, hi]` of `f32` values.
 pub struct Interval: Copy + GpuData {
     pub lo: f32,
@@ -258,6 +260,26 @@ pub fn interval<X: Domain, Y: Domain>(f: fn(X) -> Y, over: X::Box) -> Y::Box {}
 /// best a product of its stripes).
 @intrinsic
 pub fn filtered<X: Domain>(f: fn(X) -> f32, at: X, width: X) -> f32 {}
+
+/// The tape of `f` (`std::stage`): its body as a run of the tape's operations, built once, on
+/// the CPU, for a GPU kernel or the CPU to interpret. What doesn't depend on the point (a part's
+/// placement, a radius, a seed, a loop's count) is computed as `f` computes it, and reaches the
+/// tape as constants; a branch on the point runs both sides and selects. A function a tape
+/// can't hold (a loop that leaves on the point, an index into what depends on it) is E0709.
+/// A tape past its capacity panics.
+@intrinsic
+pub fn tape(f: fn(vec3) -> f32) -> Tape {}
+
+/// The tape of `f`'s value and the rest of what it returns, `T`'s floats (scalars and vectors
+/// of them, in field order), in the tape's last `1 + n` registers: what `interpret_with` reads.
+/// How a field's channels (a colour, a material's weights) travel with its distance.
+@intrinsic
+pub fn tape_with<T: GpuData>(f: fn(vec3) -> (f32, T)) -> Tape {}
+
+/// `tape` into a `Taped` of another room (`Taped<N, K>`): what a tape too long for a `Tape`
+/// needs, to be pruned.
+@intrinsic
+pub fn tape_sized<const N: u32, const K: u32>(f: fn(vec3) -> f32) -> Taped<N, K> {}
 
 // ---- tests (the suite runs std's: `std_tests_pass`) --------------------------------------------
 

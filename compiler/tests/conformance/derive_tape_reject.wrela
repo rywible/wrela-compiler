@@ -1,0 +1,27 @@
+// rejects: derive.tape
+use std::derive::tape
+
+fn marks(p: vec3) -> f32 {
+    var seen = [0.0; 4]
+    let i = u32(clamp(p.x, 0.0, 3.0))
+    seen[i] = 1.0 //~ E0709
+    seen[0] + seen[1] - p.y
+}
+
+pub fn marks_tape() -> u32 {
+    tape(marks).len()
+}
+
+fn hops(p: vec3) -> f32 {
+    var d = p.x
+    while d > 0.0 { //~ E0709
+        d -= 1.0
+    }
+    d
+}
+
+pub fn hops_tape() -> u32 {
+    tape(hops).len()
+}
+
+pub fn frame(time: f32, width: u32, height: u32) {}

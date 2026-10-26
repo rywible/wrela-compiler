@@ -15,7 +15,8 @@
 // name, so a tool can say what a point belongs to without knowing what made the surface.
 
 use std::collections::Vec
-use std::derive::{Box3, Interval, gradient, interval, value_and_gradient}
+use std::derive::{Box3, Interval, gradient, interval, tape, value_and_gradient}
+use std::stage::Tape
 use std::quat::Quat
 use std::hash::StateHash
 use std::mem::debug_build
@@ -66,6 +67,12 @@ pub trait Surface: Copy + GpuData {
     /// A range holding every distance in `over`, derived by interval arithmetic.
     fn interval(self, over: Box3) -> Interval {
         interval(|q| self.distance(q), over)
+    }
+
+    /// Its distance as a tape (`std::derive::tape`): what a kernel interprets when the surface
+    /// is built at run time, or chosen from many.
+    fn to_tape(self) -> Tape {
+        tape(|q| self.distance(q))
     }
 
     /// A bound on the length of `distance`'s gradient wherever |distance| < `near` (§20), so
@@ -1684,9 +1691,15 @@ impl<S: Surface> Surface for Named<S> {
 
 /// A 32-bit integer hash (PCG-style), the same bits on the CPU and the GPU.
 pub fn hash_u32(x: u32) -> u32 {
-    var h = x.wrapping_mul(747796405).wrapping_add(2891336453)
-    h = ((h >> ((h >> 28) + 4)) ^ h).wrapping_mul(277803737)
-    (h >> 22) ^ h
+    pcg(x.wrapping_mul(747796405).wrapping_add(2891336453))
+}
+
+/// PCG's output of the state `h`: a random-looking permutation of it (`hash_u32` advances the
+/// state, then this). One operation of a tape's (`std::stage::PCG`), so a hash built on it tapes
+/// short.
+pub fn pcg(h: u32) -> u32 {
+    let x = ((h >> ((h >> 28) + 4)) ^ h).wrapping_mul(277803737)
+    (x >> 22) ^ x
 }
 
 /// `i32(x)` for a whole number `x`, wrapped to 32 bits as the lattice's hash wraps its

@@ -235,6 +235,10 @@ pub const RULES: &[(&str, &str)] = &[
         "derive.interval",
         "`interval` over a box, of a function whose loops run a fixed count, whatever its input",
     ),
+    (
+        "derive.tape",
+        "`tape` of a function of a `vec3`, whose work on the point is the tape's operations, on the CPU",
+    ),
     // §15.3 client, server and tool roles
     (
         "gpu.roles",

@@ -1,0 +1,41 @@
+// accepts: derive.tape
+use std::derive::{tape, tape_with}
+use std::field::{Surface, smin, sphere, value_noise}
+
+// A branch on the point, an early return, a loop of fixed count, std's noise and a smooth
+// minimum: each a run of the tape's operations.
+fn shape(p: vec3) -> f32 {
+    if p.z > 2.0 {
+        return p.z - 2.0
+    }
+    var d = smin(length(p) - 1.0, p.y + 0.5, 0.2)
+    for i in 0..3 {
+        d = min(d, length(p - vec3(f32(i), 0.0, 0.0)) - 0.3)
+    }
+    d + 0.01 * value_noise(p * 3.0)
+}
+
+pub fn shape_tape() -> u32 {
+    tape(shape).len()
+}
+
+pub fn ball_tape() -> u32 {
+    sphere(0.5).to_tape().len()
+}
+
+// A hash of the point's lattice cell, in 32-bit integers: pairs of the tape's registers.
+fn cells(p: vec3) -> f32 {
+    let i = u32(i32(floor(p.x * 4.0)) + 1000)
+    let h = (i.wrapping_mul(2654435761) ^ (i >> 7)).wrapping_mul(2246822519)
+    f32(h % 7) * 0.1 - p.y
+}
+
+pub fn cells_tape() -> u32 {
+    tape(cells).len()
+}
+
+pub fn tinted() -> u32 {
+    tape_with(|p: vec3| (length(p) - 1.0, vec3(saturate(p.y), 0.5, 0.25))).len()
+}
+
+pub fn frame(time: f32, width: u32, height: u32) {}

@@ -743,6 +743,23 @@ pub struct Function {
     /// rather than inline it (`opt::outlined`), since nested derivations call the same ones
     /// from many places.
     pub interval: bool,
+    /// One of std's functions that a derivation knows by what it computes (`derive::tape`).
+    pub known: Option<Known>,
+}
+
+/// A function of std's that a tape holds as one of its operations rather than as its body.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Known {
+    /// `std::field::smin(a, b, k)`: `SMIN`.
+    Smin,
+    /// `std::field::value_noise(p)`: `NOISE3`.
+    ValueNoise,
+    /// `std::field::lattice(x, y, z)`: `HASH`.
+    Lattice,
+    /// `std::field::lattice_coord(x)`: `x` toward zero, as `HASH` takes it.
+    LatticeCoord,
+    /// `std::field::pcg(h)`: `PCG`.
+    Pcg,
 }
 
 impl Function {
@@ -783,6 +800,7 @@ impl Function {
             body: Vec::new(),
             counted: self.counted,
             interval: false,
+            known: None,
         }
     }
 
