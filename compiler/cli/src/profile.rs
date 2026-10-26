@@ -72,6 +72,8 @@ struct Args {
     checked: bool,
     /// The WASM through `wasm-opt` (`--optimize size|speed`), as a shipped build's is.
     optimize: Option<wrela_driver::optimize::Level>,
+    /// How many of the slowest frames to name (`--worst n`).
+    worst: usize,
 }
 
 fn parse(args: &[String]) -> Option<Args> {
@@ -92,6 +94,7 @@ fn parse(args: &[String]) -> Option<Args> {
         features: None,
         checked: false,
         optimize: None,
+        worst: 5,
     };
     let mut dir = None;
     let mut it = args.iter();
@@ -112,6 +115,7 @@ fn parse(args: &[String]) -> Option<Args> {
             "--size" => a.size = crate::parse_size(it.next()?)?,
             "--input" => a.input = Some(PathBuf::from(it.next()?)),
             "--serial" => a.serial = true,
+            "--worst" => a.worst = it.next()?.parse().ok()?,
             "--chrome" => a.chrome = true,
             "--checked" => a.checked = true,
             "--optimize" => a.optimize = Some(wrela_driver::optimize::Level::parse(it.next()?)?),
@@ -176,6 +180,48 @@ struct Profile {
     /// Chrome's: the bytes the page loaded over the wire (compressed where the server
     /// compressed them), and how many files.
     loaded: Option<(u64, usize)>,
+    /// The slowest frames (`--worst`): by their interval in Chrome, by their call natively.
+    worst: Vec<Worst>,
+}
+
+/// A frame of the run, as `--worst` names it: when it ran, how long it took, and where its
+/// time went.
+#[derive(Clone, Debug, Default)]
+struct Worst {
+    frame: usize,
+    /// Chrome's: from its start to the next frame's, ms.
+    interval: Option<f64>,
+    /// Its call, ms.
+    cpu: f64,
+    /// Its span on the GPU, ms.
+    gpu: Option<f64>,
+    /// Its phases and its labels' GPU time, ms, largest first.
+    phases: Vec<(String, f64)>,
+    labels: Vec<(String, f64)>,
+}
+
+/// The `n` frames of `frames` that took longest by `by`, longest first.
+fn slowest(mut frames: Vec<Worst>, n: usize, by: impl Fn(&Worst) -> f64) -> Vec<Worst> {
+    frames.sort_by(|x, y| by(y).total_cmp(&by(x)));
+    frames.truncate(n);
+    for f in &mut frames {
+        f.phases.sort_by(|x, y| y.1.total_cmp(&x.1));
+        f.labels.sort_by(|x, y| y.1.total_cmp(&x.1));
+    }
+    frames
+}
+
+/// Each frame's labels and their GPU ms (a label run twice in a frame summed), by frame.
+fn labels_by_frame(timings: &[GpuTiming]) -> BTreeMap<usize, Vec<(String, f64)>> {
+    let mut per: BTreeMap<usize, Vec<(String, f64)>> = BTreeMap::new();
+    for t in timings {
+        let labels = per.entry(t.frame).or_default();
+        match labels.iter_mut().find(|(l, _)| *l == t.label) {
+            Some((_, ms)) => *ms += t.nanos / 1e6,
+            None => labels.push((t.label.clone(), t.nanos / 1e6)),
+        }
+    }
+    per
 }
 
 /// A time over the frames, ms: the median and the 95th percentile.
@@ -402,11 +448,19 @@ fn measure(
     let init_warmup_ms = started.elapsed().as_secs_f64() * 1e3;
     let mut calls = Vec::with_capacity(a.frames as usize);
     let mut counted: Vec<wrela_host::Counters> = Vec::with_capacity(a.frames as usize);
+    // Each frame's phases, and the run's.
+    let mut phases = wrela_host::Traced::default();
+    let mut frames = Vec::with_capacity(a.frames as usize);
     for k in a.warmup..a.warmup + a.frames {
         let t = Instant::now();
         host.lockstep_frame(k, 60.0, w, h, script).map_err(|e| format!("in frame {k}: {e}"))?;
-        calls.push(t.elapsed().as_secs_f64() * 1e3);
+        let ms = t.elapsed().as_secs_f64() * 1e3;
+        calls.push(ms);
         counted.push(host.take_counters());
+        let traced = host.trace().take();
+        let mine = traced.phases.iter().map(|ph| (ph.name.clone(), ph.seconds * 1e3)).collect();
+        frames.push(Worst { frame: k as usize, cpu: ms, phases: mine, ..Worst::default() });
+        phases.merge(traced);
     }
     let counters = counter_names()
         .enumerate()
@@ -416,9 +470,15 @@ fn measure(
         })
         .collect();
     let timings = host.take_timings().map_err(|e| e.to_string())?;
-    let phases = host.trace().take();
-    let spans: Vec<f64> = wrela_host::frame_spans(&timings).into_iter().map(|(_, ms)| ms).collect();
+    let framed_spans = wrela_host::frame_spans(&timings);
+    let mut labels = labels_by_frame(&timings);
+    for f in &mut frames {
+        f.gpu = framed_spans.iter().find(|(k, _)| *k == f.frame).map(|(_, ms)| *ms);
+        f.labels = labels.remove(&f.frame).unwrap_or_default();
+    }
+    let spans: Vec<f64> = framed_spans.into_iter().map(|(_, ms)| ms).collect();
     Ok(Profile {
+        worst: slowest(frames, a.worst, |f| f.cpu),
         host: "native",
         interval: None,
         counters,
@@ -596,6 +656,31 @@ fn text(a: &Args, p: &Profile, baseline: Option<&Baseline>) -> String {
     if !p.phases.phases.is_empty() {
         s.push_str(&format!("  phases over the run: {}\n", p.phases.phases_line()));
     }
+    if !p.worst.is_empty() {
+        let by = if p.interval.is_some() { "interval" } else { "call" };
+        s.push_str(&format!("\nthe slowest frames, by their {by}\n"));
+        for f in &p.worst {
+            let mut line = format!("  frame {}:", f.frame);
+            if let Some(i) = f.interval {
+                line.push_str(&format!(" {i:.3} ms to the next,"));
+            }
+            line.push_str(&format!(" its call {:.3} ms", f.cpu));
+            if let Some(g) = f.gpu {
+                line.push_str(&format!(", the GPU's span {g:.3} ms"));
+            }
+            s.push_str(&line);
+            s.push('\n');
+            let list = |xs: &[(String, f64)]| {
+                xs.iter().map(|(n, ms)| format!("{n} {ms:.3}")).collect::<Vec<_>>().join(", ")
+            };
+            if !f.phases.is_empty() {
+                s.push_str(&format!("    phases, ms: {}\n", list(&f.phases)));
+            }
+            if !f.labels.is_empty() {
+                s.push_str(&format!("    labels, GPU ms: {}\n", list(&f.labels)));
+            }
+        }
+    }
     s.push_str("\nthe executor, each frame's median\n");
     for (name, v) in &p.counters {
         s.push_str(&format!("  {:<32} {:>9}\n", name.replace('_', " "), v));
@@ -675,6 +760,24 @@ fn json(a: &Args, p: &Profile, baseline: Option<&Baseline>) -> String {
     if let Some((bytes, files)) = p.loaded {
         all["loaded"] = serde_json::json!({ "bytes": bytes, "files": files });
     }
+    let pairs = |xs: &[(String, f64)]| -> Vec<serde_json::Value> {
+        xs.iter().map(|(n, ms)| serde_json::json!([n, ms])).collect()
+    };
+    all["worst"] = p
+        .worst
+        .iter()
+        .map(|f| {
+            serde_json::json!({
+                "frame": f.frame,
+                "interval_ms": f.interval,
+                "cpu_ms": f.cpu,
+                "gpu_span_ms": f.gpu,
+                "phases": pairs(&f.phases),
+                "labels": pairs(&f.labels),
+            })
+        })
+        .collect::<Vec<_>>()
+        .into();
     if let Some(i) = p.interval {
         all["cpu"]["frame_interval_ms"] = i.median.into();
         all["cpu"]["frame_interval_p95_ms"] = i.p95.into();
@@ -749,6 +852,60 @@ mod tests {
 
     /// The 95th percentile by nearest rank: of 120 frames the seventh slowest, of one frame
     /// that frame, of none nothing.
+    #[test]
+    fn the_slowest_frames_come_first_with_their_largest_parts() {
+        let f = |frame, cpu: f64, labels: Vec<(&str, f64)>| Worst {
+            frame,
+            cpu,
+            labels: labels.into_iter().map(|(n, ms)| (n.to_string(), ms)).collect(),
+            ..Worst::default()
+        };
+        let frames =
+            vec![f(1, 2.0, vec![]), f(2, 9.0, vec![("a", 1.0), ("b", 3.0)]), f(3, 5.0, vec![])];
+        let worst = slowest(frames, 2, |w| w.cpu);
+        assert_eq!(worst.iter().map(|w| w.frame).collect::<Vec<_>>(), [2, 3]);
+        assert_eq!(worst[0].labels[0].0, "b");
+    }
+
+    /// `--worst 2` in Chrome names two paced frames, each with its interval, its call, its
+    /// phases and its labels (the paced run's `frames.json` carries them).
+    #[test]
+    #[ignore = "needs a GPU and Chrome"]
+    fn chrome_names_the_two_slowest_frames() {
+        let dir = wrela_tests_root().join("compiler/tests/frozen/hello-field");
+        let args: Vec<String> = [
+            dir.to_str().unwrap(),
+            "--chrome",
+            "--worst",
+            "2",
+            "--frames",
+            "20",
+            "--warmup",
+            "5",
+            "--json",
+        ]
+        .map(String::from)
+        .to_vec();
+        let report = run_report(&parse(&args).unwrap()).unwrap();
+        let v: serde_json::Value = serde_json::from_str(&report).unwrap();
+        let worst = v["worst"].as_array().unwrap();
+        assert_eq!(worst.len(), 2);
+        for w in worst {
+            assert!(w["interval_ms"].as_f64().unwrap() > 0.0, "{w}");
+            assert!(w["cpu_ms"].as_f64().is_some() && w["phases"].is_array(), "{w}");
+            assert!(!w["labels"].as_array().unwrap().is_empty(), "{w}");
+        }
+        assert!(worst[0]["interval_ms"].as_f64() >= worst[1]["interval_ms"].as_f64());
+        let framed =
+            std::fs::read_to_string(dir.join("build/profile/results/frames.json")).unwrap();
+        let framed: serde_json::Value = serde_json::from_str(&framed).unwrap();
+        assert!(framed["labels"][10][0][0].is_string(), "a frame's labels");
+    }
+
+    fn wrela_tests_root() -> PathBuf {
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../..")
+    }
+
     #[test]
     fn percentiles_are_by_nearest_rank() {
         let frames: Vec<f64> = (1..=120).rev().map(f64::from).collect();

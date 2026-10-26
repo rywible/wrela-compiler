@@ -579,6 +579,17 @@ export interface GpuTiming {
   submission: number;
 }
 
+/** Each of `frames` frames' labels and their GPU ms, largest first: `[label, ms]`s. */
+export function frameLabels(timings: GpuTiming[], frames: number): [string, number][][] {
+  const per: Map<string, number>[] = Array.from({ length: frames }, () => new Map());
+  for (const t of timings) {
+    const m = per[t.frame];
+    if (m !== undefined) m.set(t.label, (m.get(t.label) ?? 0) + t.nanos / 1e6);
+  }
+  return per.map((m) => [...m.entries()].sort((a, b) => b[1] - a[1]));
+}
+
+
 /** `capacity` doubled until it's at least `n`. */
 function doubled(capacity: number, n: number): number {
   let c = capacity * 2;

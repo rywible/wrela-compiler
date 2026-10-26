@@ -7,7 +7,7 @@ import { MAX_WORKERS, SCREEN_FORMAT, TICK_ORIGIN } from "./abi.gen.ts";
 import { deviceFeatures, GpuError, openDevice } from "./device.ts";
 import { errorMessage, UnsupportedError } from "./errors.ts";
 import { fitSize, frameSeconds, VisibleClock } from "./frame.ts";
-import { alignTo, type Counters, type GpuExecutor, type PipelineCache, screenFormat, type ScreenTarget, type Timing, timeEachPipeline } from "./gpu.ts";
+import { alignTo, type Counters, frameLabels, type GpuExecutor, type PipelineCache, screenFormat, type ScreenTarget, type Timing, timeEachPipeline } from "./gpu.ts";
 import { arrivals, epochNow, InputRing, type Scripted } from "./input.ts";
 import { type Asked, HandOvers } from "./handover.ts";
 import { browserIo, type Build, Handed, loadBuild, loadLines, loadScript, networkFetch, startProgram } from "./loader.ts";
@@ -807,6 +807,10 @@ async function saveResults(
     await clipSaved.promise;
   }
   const { printed, cpu, began_ms, printed_in, pipelinesMs, tier1Ms } = record;
+  // With timestamps, each frame's labels and their GPU ms (a label run twice in a frame summed),
+  // beside its CPU time and phases: one file a tool reads per frame.
+  const timings = timing !== "off" ? await executor.timings() : null;
+  const labels = timings === null ? undefined : frameLabels(timings, cpu.length);
   // The audio and ticker threads' print messages precede their completion messages, so their
   // lines are in the program's print sink before its log is serialized here.
   await Promise.all([
@@ -815,8 +819,8 @@ async function saveResults(
     putResult(base, "hash.txt", `${hash ? hash.hex() : "none"}\n`),
     putResult(base, "workers.txt", `${program.workerChunks()}\n`),
     putResult(base, "log.txt", printed.map((l) => `${l}\n`).join("")),
-    putResult(base, "frames.json", JSON.stringify({ cpu_ms: cpu, began_ms, printed_in, phases: record.phases })),
-    timing !== "off" ? executor.timings().then((t) => putResult(base, "timings.json", JSON.stringify(t))) : null,
+    putResult(base, "frames.json", JSON.stringify({ cpu_ms: cpu, began_ms, printed_in, phases: record.phases, labels })),
+    timings !== null ? putResult(base, "timings.json", JSON.stringify(timings)) : null,
     params.salt > 0 ? putResult(base, "pipelines.json", JSON.stringify({ ms: pipelinesMs, tier1_ms: tier1Ms, count: build.manifest.pipelines.length, tier1: build.manifest.pipelines.filter((p) => p.conditional).length, each })) : null,
     putResult(base, "counters.json", JSON.stringify(record.counters)),
     putResult(base, "device.json", JSON.stringify(deviceInfo(device))),
