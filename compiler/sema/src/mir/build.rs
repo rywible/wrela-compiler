@@ -2286,6 +2286,15 @@ impl<'a> Builder<'a> {
         self.fs.cur = exit;
     }
 
+    /// A loop's body, its temporaries ended with each pass: a body that ends with a call
+    /// returning nothing has that call for its value, whose temporaries are the body's to drop,
+    /// as a statement's are (before the pass's loop variable ends).
+    fn loop_body(&mut self, body: &thir::Block) {
+        self.open_scope(ScopeKind::Temps);
+        let _ = self.block(body, Want::Read);
+        self.close_scope();
+    }
+
     /// `if cond { break }`: a loop's own test.
     fn break_if(&mut self, cond: Operand, lp: BlockId, span: Span) {
         let (t, e, m) = (self.new_block(), self.new_block(), self.new_block());
@@ -2312,7 +2321,7 @@ impl<'a> Builder<'a> {
                 self.break_if(nc, lp, c.span);
             }
         }
-        let _ = self.block(body, Want::Read);
+        self.loop_body(body);
         self.end_loop(lp, cont, exit, span, |_| {});
     }
 
@@ -2354,7 +2363,7 @@ impl<'a> Builder<'a> {
         self.push(StatementKind::Live(var), span);
         let c = copy(self);
         self.set(var, c, span);
-        let _ = self.block(body, Want::Read);
+        self.loop_body(body);
         self.push(StatementKind::Dead(var), span);
         self.end_loop(lp, cont, exit, span, |b| {
             let c = copy(b);
@@ -2435,7 +2444,7 @@ impl<'a> Builder<'a> {
             let v = self.materialize(OperandKind::Copy(elem), et, span);
             self.set(var, v, span);
         }
-        let _ = self.block(body, Want::Read);
+        self.loop_body(body);
         self.push(StatementKind::Dead(var), span);
         self.end_loop(lp, cont, exit, span, |b| {
             let i = b.materialize(OperandKind::Copy(Place::local(index)), u32_ty, span);

@@ -2,10 +2,12 @@
 // as a receiver, a call's argument, an f-string's hole, operands written out of order, and an
 // `assert`'s comparison, which binds the values its operands project into first (§6.1). A
 // value made after a temporary was freed would take its block, so a projection read after it
-// would read that value's bytes. Each temporary is freed once (`apart()` is 21 when no block
-// is handed out twice) and freed at all (a 1 MiB one made 2,048 times would need 2 GiB; the
-// memory stops at 1 GiB). An `assert` evaluates its operands' parts once each, in the order
-// written: an index is read before a later argument changes it.
+// would read that value's bytes. A loop's body that ends with a call returning nothing has
+// that call's temporaries freed on each pass, as a statement's are. Each temporary is freed
+// once (`apart()` is 21 when no block is handed out twice) and freed at all (a 1 MiB one made
+// 2,048 times would need 2 GiB; the memory stops at 1 GiB). An `assert` evaluates its
+// operands' parts once each, in the order written: an index is read before a later argument
+// changes it.
 // expect: receiver() = 97
 // expect: call_argument() = 97
 // expect: fstring_hole() = 3
@@ -21,6 +23,10 @@
 // expect: named_panics_first() panics "made"
 // expect: twice() = 21
 // expect: in_a_loop(2048) = 2048
+// expect: loop_ends_with_a_call(2048) = 2048
+// expect: while_ends_with_a_call(2048) = 2048
+// expect: each_ends_with_a_call(2048) = 2048
+// expect: continued_or_broken(2048) = 1025
 
 fn made(s: str) -> String {
     var out = String::new()
@@ -212,6 +218,59 @@ pub fn in_a_loop(n: u32) -> u32 {
     for _ in 0..n {
         assert(first(large()) == 1)
         count += first(large())
+    }
+    count
+}
+
+/// Adds `v`'s first element to `count`, returning nothing: a loop body's last call is its value.
+fn add_first(count: mut u32, v: [u32]) {
+    count += v[0]
+}
+
+pub fn loop_ends_with_a_call(n: u32) -> u32 {
+    var count = 0
+    for _ in 0..n {
+        add_first(mut count, large())
+    }
+    count
+}
+
+pub fn while_ends_with_a_call(n: u32) -> u32 {
+    var count = 0
+    var i = 0
+    while i < n {
+        i += 1
+        add_first(mut count, large())
+    }
+    count
+}
+
+pub fn each_ends_with_a_call(n: u32) -> u32 {
+    var count = 0
+    var passes: Vec<u32> = Vec::new()
+    for _ in 0..n {
+        passes.push(1)
+    }
+    for _ in passes {
+        add_first(mut count, large())
+    }
+    count
+}
+
+/// Every other pass leaves by `continue` before its last call, and the last by `break`: the
+/// passes that reach the call free its temporary, those that don't have nothing to free.
+pub fn continued_or_broken(n: u32) -> u32 {
+    var count = 0
+    var i = 0
+    loop {
+        i += 1
+        if i > n + 1 {
+            break
+        }
+        if i % 2 == 0 {
+            continue
+        }
+        add_first(mut count, large())
     }
     count
 }

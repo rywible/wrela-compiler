@@ -370,11 +370,12 @@ impl Recorded {
             b.iter().map(|b| [b.handle, b.offset, b.size]).collect()
         };
         let mut r = Recorded { kind: c.opcode().name(), ..Recorded::default() };
+        if let Some((pipeline, bindings)) = c.pipeline() {
+            (r.pipeline, r.bindings) = (named(pipeline), bound(bindings));
+        }
         match c {
             C::Label { name } => r.label = bounded(name),
-            C::Dispatch { pipeline, groups, bindings, .. } => {
-                (r.pipeline, r.groups, r.bindings) = (named(*pipeline), *groups, bound(bindings));
-            }
+            C::Dispatch { groups, .. } => r.groups = *groups,
             C::StorageRead { path, .. }
             | C::Fetch { url: path, .. }
             | C::Prepare { path, .. }
@@ -384,12 +385,6 @@ impl Recorded {
             | C::Post { url: path, body: bytes, .. }
             | C::HostRequest { service: path, body: bytes, .. } => {
                 (r.target, r.bytes) = (bounded(path), bytes.to_vec());
-            }
-            C::Draw { pipeline, bindings, .. }
-            | C::DispatchIndirect { pipeline, bindings, .. }
-            | C::DrawIndirect { pipeline, bindings, .. }
-            | C::DrawIndexedIndirect { pipeline, bindings, .. } => {
-                (r.pipeline, r.bindings) = (named(*pipeline), bound(bindings));
             }
             _ => {}
         }
@@ -997,4 +992,56 @@ impl Actor {
 /// cut.
 fn bounded(line: &str) -> String {
     bounded_to(line, MOST_BYTES / 2)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::Recorded;
+    use wrela_abi::stream::{Binding, Command};
+
+    /// Every draw names its pipeline, indexed and multi-draws too, and a dispatch its pipeline
+    /// and groups: the pass viewer lists them. What neither draws nor dispatches names none.
+    #[test]
+    fn every_draw_names_its_pipeline() {
+        let names = [String::from("a"), String::from("b")];
+        let bound = vec![Binding { handle: 7, offset: 0, size: 0 }];
+        let indexed = Command::DrawIndexed {
+            pipeline: 1,
+            indices: 3,
+            index_offset: 0,
+            index_size: 0,
+            index_count: 6,
+            instances: 1,
+            first_index: 0,
+            base_vertex: 0,
+            first_instance: 0,
+            bindings: bound.clone(),
+            uniforms: &[],
+        };
+        let multi = Command::MultiDrawIndirect {
+            pipeline: 1,
+            indices: Some([3, 0, 0]),
+            arguments: 4,
+            offset: 0,
+            count: 8,
+            count_buffer: 5,
+            count_offset: 0,
+            bindings: bound.clone(),
+            uniforms: &[],
+        };
+        let dispatch = Command::Dispatch {
+            pipeline: 1,
+            groups: [2, 3, 4],
+            bindings: bound.clone(),
+            uniforms: &[],
+        };
+        for c in [indexed, multi, dispatch] {
+            let r = Recorded::of(&c, &names);
+            assert_eq!((r.pipeline.as_str(), r.bindings.as_slice()), ("b", &[[7, 0, 0]][..]));
+        }
+        let groups =
+            Command::Dispatch { pipeline: 0, groups: [2, 3, 4], bindings: bound, uniforms: &[] };
+        assert_eq!(Recorded::of(&groups, &names).groups, [2, 3, 4]);
+        assert!(Command::Present.pipeline().is_none());
+    }
 }
