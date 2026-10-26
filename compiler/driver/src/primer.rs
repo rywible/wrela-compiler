@@ -459,8 +459,24 @@ pub fn primer(area: Option<&str>) -> Option<String> {
             }
         }
     }
+    if let Some((_, notes)) = NOTES.iter().find(|(a, _)| *a == area) {
+        out.push_str(&format!("\n## Not rules, but how it's built\n\n{notes}\n"));
+    }
     Some(out)
 }
+
+/// What an area's rules don't say but a writer of its code needs: how its work is built.
+const NOTES: &[(&str, &str)] = &[(
+    "gpu",
+    "- **Tiers** (§18.9): a pipeline whose every site runs under a runtime condition is tier 1, \
+     built after tier 0's, so the first frame waits for less. `wrela pipelines` shows each \
+     pipeline's tier. Put an optional system's dispatches under its switch.
+- **`const` parameters** (§18.1, `gpu.const` above) are pipeline constants: each set of values \
+  a site gives is a pipeline of its own, the branch on them folded where the driver compiles it.
+- **Tapes** (§14.4): `field.to_tape()` turns a field into a tape of operations, built on the \
+  CPU, that one kernel interprets (`std::stage::interpret`): one pipeline for every field, \
+  instead of one per field.",
+)];
 
 fn short(s: &str, n: usize) -> String {
     if s.chars().count() <= n {

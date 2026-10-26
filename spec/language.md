@@ -3014,7 +3014,7 @@ These commands let an agent read what the compiler knows about a package, instea
 | `wrela migrate <package-dir> [--dry-run] [--json]` | Makes every migration's fix and nothing else (§10.2): after a workspace moves its toolchain pin, one command brings each member to the new forms |
 | `wrela solve <package> --minimize <fn> --free <file>:<lines>` | Minimizes a function of no arguments over the literals on those lines, and rounds them to their decimals. It builds a program around the function that uses `std::lift::Minimize` (BFGS on `std::lift::gradient`). `--write` writes the literals through `wrela edit` |
 | `wrela precision <package> <fn> --box <lo>..<hi>,...` | Says, operation by operation, where a half-float twin of a function of a point would be safe, from `std::derive::precision` over each box (§14.3), and names the first operation that isn't. `<fn>` is `<module>::<name>` in the package, or a path in std |
-| `wrela run <package> [--port N]` | Serves the program lifted on 127.0.0.1 with hot reload (§23.2): a saved literal reaches the running program at its next frame, and any other edit swaps in a new build, in the same page |
+| `wrela run <package> [--port N] [--lan]` | Serves the program lifted on 127.0.0.1 with hot reload (§23.2): a saved literal reaches the running program at its next frame, and any other edit swaps in a new build, in the same page. `--lan` serves this machine's LAN addresses too, and prints each (§15.5) |
 | `wrela trace <package> --watch <exports>` | Runs frames, in lockstep with the program's ticker if it has one (as `wrela-host` does), and prints what the exports say after each frame (`--csv`) |
 | `wrela bisect <package> --until "<export> <op> <number>"` | Finds the first frame at which a condition holds (`nan <export>` too) |
 | `wrela same <package> --against <build-dir>` | Whether the package built now behaves as a saved build of it does (below) |
@@ -3046,7 +3046,7 @@ It also answers on a program with errors. A function whose body has an error has
 - the median frame call's CPU time, and the phases that the program timed (`std::time::phase`);
 - each pipeline's WGSL bytes.
 
-Each time is a median, with its 95th percentile beside it, because a budget is about the slow frames too. `--serial` runs each pass alone, so a label's time is its own where passes overlap (as on Apple GPUs). Times belong to the machine: compare a change with a profile from before it. `--baseline <report.json>` (an earlier `--json` report) does this: each time shows its earlier value and how it changed, and the report lists the labels that no longer run.
+Each time is a median, with its 95th percentile beside it, because a budget is about the slow frames too. `--worst n` (5 by default) names the slowest frames as well: natively by their call, and with `--chrome` by their paced interval. Each shows its call, its GPU span, its phases and its labels' GPU time. `--serial` runs each pass alone, so a label's time is its own where passes overlap (as on Apple GPUs). Times belong to the machine: compare a change with a profile from before it. `--baseline <report.json>` (an earlier `--json` report) does this: each time shows its earlier value and how it changed, and the report lists the labels that no longer run.
 
 **Agent runs are debug builds.** `wrela test` builds the program as a debug build (§11.3). `wrela trace` and `wrela bisect` do too, unless given `--release`. So a simulation that makes a NaN, or indexes a GPU buffer out of range, stops at the frame where it did, and the agent looks there.
 
