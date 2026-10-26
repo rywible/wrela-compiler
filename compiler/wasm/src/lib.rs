@@ -831,9 +831,24 @@ pub fn check_relaxed_only_in(bytes: &[u8], presents: &str) -> Result<(), String>
             Payload::StartSection { func, .. } => roots.push(func),
             Payload::ElementSection(s) => {
                 for e in s {
-                    if let ElementItems::Functions(fs) = e.map_err(|e| e.to_string())?.items {
-                        for f in fs {
-                            roots.push(f.map_err(|e| e.to_string())?);
+                    match e.map_err(|e| e.to_string())?.items {
+                        ElementItems::Functions(fs) => {
+                            for f in fs {
+                                roots.push(f.map_err(|e| e.to_string())?);
+                            }
+                        }
+                        // `ref.func`s, as Binaryen may write a table's elements.
+                        ElementItems::Expressions(_, es) => {
+                            for x in es {
+                                let mut ops = x.map_err(|e| e.to_string())?.get_operators_reader();
+                                while !ops.eof() {
+                                    if let Operator::RefFunc { function_index } =
+                                        ops.read().map_err(|e| e.to_string())?
+                                    {
+                                        roots.push(function_index);
+                                    }
+                                }
+                            }
                         }
                     }
                 }

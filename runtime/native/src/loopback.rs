@@ -426,9 +426,12 @@ fn gzipped(
     Ok(Some(bytes))
 }
 
-/// A file's version, as an entity tag: its length and when it was last written.
+/// A file's version, as an entity tag: which file it is (its device and inode), its length and
+/// when it was last written, as the gzip cache keys it: a file replaced by another of the same
+/// length and time is another file.
 fn tag_of(meta: &std::fs::Metadata) -> String {
-    format!("\"{:x}-{:x}\"", meta.len(), written(meta))
+    use std::os::unix::fs::MetadataExt;
+    format!("\"{:x}-{:x}-{:x}-{:x}\"", meta.dev(), meta.ino(), meta.len(), written(meta))
 }
 
 /// When a file was last written, in nanoseconds since 1970 (0 if the system can't say): its

@@ -82,6 +82,10 @@ fn accept_limited(
             if stopping.load(Ordering::SeqCst) {
                 break;
             }
+            // Listening on every interface (`--lan`), only this machine and private networks.
+            if !stream.peer_addr().is_ok_and(wrela_host::interfaces::local_peer) {
+                continue;
+            }
             if active
                 .fetch_update(Ordering::AcqRel, Ordering::Acquire, |n| (n < limit).then_some(n + 1))
                 .is_err()

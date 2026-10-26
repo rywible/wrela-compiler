@@ -119,8 +119,8 @@ test("checks=0 turns the checker off, as a release build plays; anything but 0 o
 });
 
 test("test mode runs on this machine and on a private network's addresses, never a name", () => {
-  for (const h of ["localhost", "127.0.0.1", "10.0.0.7", "172.16.4.2", "172.31.255.1", "192.168.1.20"]) expect(mayTest(h)).toBe(true);
-  for (const h of ["example.com", "8.8.8.8", "172.32.0.1", "192.169.0.1", "10.0.0.256", "192.168.1.20.example.com"]) expect(mayTest(h)).toBe(false);
+  for (const h of ["localhost", "127.0.0.1", "10.0.0.7", "172.16.4.2", "172.31.255.1", "192.168.1.20", "100.74.48.38", "169.254.3.4"]) expect(mayTest(h)).toBe(true);
+  for (const h of ["example.com", "8.8.8.8", "172.32.0.1", "192.169.0.1", "10.0.0.256", "192.168.1.20.example.com", "100.128.0.1"]) expect(mayTest(h)).toBe(false);
 });
 
 test("show=1's summary names the intervals, when it was playable, and the adapter", () => {

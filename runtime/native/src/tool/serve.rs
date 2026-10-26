@@ -381,7 +381,10 @@ fn accept(s: &Arc<Services>, server: &Arc<Server>, listener: TcpListener) {
     while !server.stopping.load(Ordering::SeqCst) {
         expire(s, server);
         match listener.accept() {
-            Ok((stream, _)) => {
+            Ok((stream, peer)) => {
+                if !crate::interfaces::local_peer(peer) {
+                    continue;
+                }
                 // A post's deadline counts from here.
                 let taken = Instant::now();
                 let mut conns = locked(&server.conns);

@@ -157,7 +157,9 @@ export function mayTest(hostname: string): boolean {
   const m = /^(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})$/.exec(hostname);
   if (m === null || m.slice(1).some((x) => Number(x) > 255)) return false;
   const [a, b] = [Number(m[1]), Number(m[2])];
-  return a === 10 || (a === 172 && b >= 16 && b < 32) || (a === 192 && b === 168);
+  // As a LAN server's own addresses are (runtime/native `interfaces::private`): RFC 1918's, the
+  // shared 100.64/10 (an overlay's, Tailscale's), and link-local.
+  return a === 10 || (a === 172 && b >= 16 && b < 32) || (a === 192 && b === 168) || (a === 100 && b >= 64 && b < 128) || (a === 169 && b === 254);
 }
 
 /** The nearest-rank `p`th percentile of `xs`. */

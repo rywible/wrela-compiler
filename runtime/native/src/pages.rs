@@ -387,7 +387,10 @@ fn accept(listener: &TcpListener, state: Arc<ServerState>) {
     let mut next = 0u64;
     while !state.stopping.load(Ordering::Acquire) {
         match listener.accept() {
-            Ok((stream, _)) => {
+            Ok((stream, peer)) => {
+                if !crate::interfaces::local_peer(peer) {
+                    continue;
+                }
                 threads.retain(|t| !t.is_finished());
                 let mut open = locked(&state.conns);
                 if state.stopping.load(Ordering::Acquire) || open.len() >= state.most_connections {
