@@ -14,7 +14,7 @@ import { browserIo, type Build, Handed, loadBuild, loadLines, loadScript, networ
 import { locate } from "./lines.ts";
 import { Live } from "./live.ts";
 import { type Inbox, Net } from "./net.ts";
-import { type PrintSink, type Program, type ProgramOptions, runWorker, type SpawnWorker } from "./program.ts";
+import { type Compiled, type PrintSink, type Program, type ProgramOptions, runWorker, type SpawnWorker } from "./program.ts";
 import type { FromHelper, FromTicker, FromWorker, Loaded, Replay, TickerOptions, TickerStart, TickReport, ToWorker, VoiceOptions } from "./messages.ts";
 import { encodePng } from "./png.ts";
 import { Resampler } from "./resample.ts";
@@ -537,6 +537,8 @@ interface TestRecord {
   latency: { frames: number[]; delivered: { sent: number; frame: number }[] };
   /** How long the pipelines took to build. */
   pipelinesMs: number | null;
+  /** How long every pipeline took, tier 1's too (ms). */
+  tier1Ms: number | null;
 }
 
 /** The program a test runs, and the frame its ticks count from: a build handed over to starts
@@ -596,6 +598,7 @@ async function runTest(canvas: OffscreenCanvas, device: GPUDevice, build: Build,
     counters: [],
     latency: { frames: [], delivered: [] },
     pipelinesMs: null,
+    tier1Ms: null,
   };
   let frameNow = 0;
   canvas.width = width;
@@ -655,6 +658,9 @@ async function runTest(canvas: OffscreenCanvas, device: GPUDevice, build: Build,
         timing,
         onPipelines: (ms) => {
           record.pipelinesMs = ms;
+        },
+        onTier1: (ms) => {
+          record.tier1Ms = ms;
         },
         cache: pipelineCache,
         hashWasm: tickHashes,
@@ -760,7 +766,7 @@ async function runTest(canvas: OffscreenCanvas, device: GPUDevice, build: Build,
   }
   await draining;
   if (failed) return;
-  await saveResults(device, salted, params, r, screen, timing, record);
+  await saveResults(device, build, params, r, screen, timing, record, salted.compiled);
 }
 
 /** A test's results, once its frames have run (`results/`), then `DONE`. */
@@ -772,6 +778,7 @@ async function saveResults(
   screen: GPUTexture,
   timing: Timing,
   record: TestRecord,
+  compiled: Compiled | undefined,
 ): Promise<void> {
   const { frames, width, height } = params;
   // Where the pipelines' time went: each built again alone, from code no cache has seen.
@@ -799,7 +806,7 @@ async function saveResults(
     if (params.clipfrom + params.clip >= frames) self.postMessage({ type: "clip-stop" } satisfies FromWorker);
     await clipSaved.promise;
   }
-  const { printed, cpu, began_ms, printed_in, pipelinesMs } = record;
+  const { printed, cpu, began_ms, printed_in, pipelinesMs, tier1Ms } = record;
   // The audio and ticker threads' print messages precede their completion messages, so their
   // lines are in the program's print sink before its log is serialized here.
   await Promise.all([
@@ -810,7 +817,7 @@ async function saveResults(
     putResult(base, "log.txt", printed.map((l) => `${l}\n`).join("")),
     putResult(base, "frames.json", JSON.stringify({ cpu_ms: cpu, began_ms, printed_in, phases: record.phases })),
     timing !== "off" ? executor.timings().then((t) => putResult(base, "timings.json", JSON.stringify(t))) : null,
-    params.salt > 0 ? putResult(base, "pipelines.json", JSON.stringify({ ms: pipelinesMs, count: build.manifest.pipelines.length, each })) : null,
+    params.salt > 0 ? putResult(base, "pipelines.json", JSON.stringify({ ms: pipelinesMs, tier1_ms: tier1Ms, count: build.manifest.pipelines.length, tier1: build.manifest.pipelines.filter((p) => p.conditional).length, each })) : null,
     putResult(base, "counters.json", JSON.stringify(record.counters)),
     putResult(base, "device.json", JSON.stringify(deviceInfo(device))),
     putResult(base, "memory.json", JSON.stringify({ gpu: executor.memory, wasm: program.memoryBytes })),
@@ -819,7 +826,6 @@ async function saveResults(
   const page = await pageLoaded.promise;
   const resources = [...page.resources, ...loaded(["resource"])];
   // How the WASM compiled: a second open of the same build streams it from the code cache.
-  const compiled = build.compiled;
   const wasm = compiled ? { compile_ms: compiled.compile_ms, instantiate_ms: compiled.instantiate_ms ?? null, streamed: compiled.streamed } : null;
   const load = { opened_ms: page.opened_ms, first_frame_ms: began_ms[0] ?? null, wasm, resources };
   await putResult(base, "load.json", JSON.stringify(load));

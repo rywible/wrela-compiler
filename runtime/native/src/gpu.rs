@@ -2988,6 +2988,7 @@ mod tests {
             }],
             debug_flag: None,
             requires: Vec::new(),
+            conditional: false,
         });
         let shader = "@group(0) @binding(0) var<storage, read_write> count: array<u32>;\n\
                       @compute @workgroup_size(1) fn increment() { count[0] += 1u; }";
@@ -3254,6 +3255,7 @@ mod tests {
             bindings: Vec::new(),
             debug_flag: None,
             requires: Vec::new(),
+            conditional: false,
         };
         let key = pipeline_key(&p("pipeline_0.wgsl", "main"), "fn main() {}");
         assert_eq!(key, pipeline_key(&p("pipeline_3.wgsl", "main"), "fn main() {}"));

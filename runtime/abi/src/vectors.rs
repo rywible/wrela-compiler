@@ -533,6 +533,7 @@ pub fn check_manifest() -> Manifest {
         bindings: vec![bind(1, BindingKind::Read), bind(2, BindingKind::ReadWrite)],
         debug_flag: None,
         requires: Vec::new(),
+        conditional: false,
     };
     let render = target_bound(false, false);
     m.pipelines.push(shape("draw", render.clone()));
@@ -1297,6 +1298,7 @@ pub(crate) fn sample_manifest() -> Manifest {
         bindings: vec![bind(1, BindingKind::ReadWrite)],
         debug_flag: None,
         requires: Vec::new(),
+        conditional: false,
     });
     m.pipelines.push(Pipeline {
         name: "cover+shade".into(),
@@ -1306,6 +1308,7 @@ pub(crate) fn sample_manifest() -> Manifest {
         bindings: vec![bind(0, BindingKind::Texture), bind(1, BindingKind::Sampler)],
         debug_flag: None,
         requires: Vec::new(),
+        conditional: false,
     });
     m
 }

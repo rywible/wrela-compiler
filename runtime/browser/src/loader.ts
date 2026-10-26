@@ -187,8 +187,11 @@ export function browserIo(
 export interface GpuOptions {
   /** Whether passes and dispatches are timed, and how. */
   timing?: Timing;
-  /** Called with how long building every pipeline took (ms). */
+  /** Called with how long building every tier-0 pipeline took (ms): when the program's
+   * unconditional commands can all run. */
   onPipelines?: (ms: number) => void;
+  /** Called with how long building every pipeline, tier 1's too, took (ms). */
+  onTier1?: (ms: number) => void;
   /** Hot reload: the pipelines built so far, which the build keeps where they're the same
    * (`buildPipelines`). */
   cache?: PipelineCache | undefined;
@@ -211,9 +214,11 @@ export async function startProgram(
 ): Promise<Program> {
   const started = performance.now();
   const pipelines = buildPipelines(device, build.manifest, build.shaders, screen.format, gpu.cache);
+  // Every pipeline, tier 1's too: how long the whole set took.
+  Promise.all(pipelines.each).then(() => gpu.onTier1?.(performance.now() - started), () => {});
   const compiled = (build.compiled ??= await Program.compile(build.wasm, build.manifest.wasm_abi, gpu.hashWasm ?? false));
   const debug = build.manifest.pipelines.some((p) => p.debug_flag !== null);
-  const executor = new GpuExecutor(device, pipelines, screen, gpu.timing, debug);
+  const executor = new GpuExecutor(device, pipelines.each, screen, gpu.timing, debug, pipelines);
   executor.built.then(() => gpu.onPipelines?.(performance.now() - started), () => {});
   const checker = new Checker(build.manifest, deviceLimits(device));
   try {

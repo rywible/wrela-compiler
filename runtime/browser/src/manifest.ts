@@ -150,6 +150,9 @@ export type Pipeline = Stage & {
   debug_flag: number | null;
   /** The device features its shader needs (WebGPU's names). */
   requires: string[];
+  /** Reached only under runtime conditions: tier 1, built once tier 0 is (or when a command
+   * needs it first). */
+  conditional: boolean;
 };
 
 export interface Manifest {
@@ -356,7 +359,9 @@ function pipeline(v: unknown, i: number): Pipeline {
   const debug_flag = d === null ? null : asU32(d, `${where}.debug_flag`);
   // Missing `requires` is none.
   const requires: string[] = names(o, "requires", where, FEATURES, "a feature this host knows", true);
-  return { ...stage, name, shader, uniform, bindings, debug_flag, requires };
+  // A missing `conditional` is tier 0.
+  const conditional = flag(o, "conditional", where, false);
+  return { ...stage, name, shader, uniform, bindings, debug_flag, requires, conditional };
 }
 
 /** The manifest's `wasm_abi`. */

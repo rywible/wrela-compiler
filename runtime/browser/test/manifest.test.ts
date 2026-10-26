@@ -59,6 +59,7 @@ test("parses the Rust crate's golden manifest", () => {
         bindings: [{ binding: 1, kind: "read_write", stage: "both", format: null }],
         debug_flag: null,
         requires: [],
+        conditional: false,
       },
       {
         kind: "render",
@@ -80,6 +81,7 @@ test("parses the Rust crate's golden manifest", () => {
         ],
         debug_flag: null,
         requires: [],
+        conditional: false,
       },
     ],
   });

@@ -178,6 +178,10 @@ pub struct Pipeline {
     /// The device features its shader needs (WebGPU's names).
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub requires: Vec<String>,
+    /// Reached only under runtime conditions: tier 1, which a host builds once tier 0 is built
+    /// (or at once, when a command needs it first).
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub conditional: bool,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize)]
@@ -1239,7 +1243,9 @@ mod read {
         let requires = list_or_empty(o, "requires", &place, |rp, f| {
             Ok(named(f, rp, "a feature this host knows", &features)?.to_string())
         })?;
-        Ok(Pipeline { name, shader, stage, uniform, bindings, debug_flag, requires })
+        // A missing `conditional` is tier 0.
+        let conditional = flag(o, "conditional", &place, false)?;
+        Ok(Pipeline { name, shader, stage, uniform, bindings, debug_flag, requires, conditional })
     }
 
     /// A manifest whose version has been checked.
@@ -1384,6 +1390,18 @@ mod tests {
 "#;
         assert_eq!(json, expected);
         assert_eq!(Manifest::parse(&json).expect("valid"), sample());
+    }
+
+    /// `conditional` (tier 1) is optional: a manifest without it is tier 0 throughout.
+    #[test]
+    fn a_pipeline_is_tier_0_unless_conditional() {
+        let parsed = Manifest::parse(&sample().to_json()).expect("valid");
+        assert!(parsed.pipelines.iter().all(|p| !p.conditional));
+        let mut m = sample();
+        m.pipelines[1].conditional = true;
+        let json = m.to_json();
+        assert_eq!(json.matches("\"conditional\": true").count(), 1, "{json}");
+        assert_eq!(Manifest::parse(&json).expect("valid"), m);
     }
 
     /// `wasm_abi` is optional: a manifest without it has none, and one with it round-trips.

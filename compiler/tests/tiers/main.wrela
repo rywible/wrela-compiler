@@ -1,0 +1,51 @@
+// Pipeline tiers (language.md §18.9): `fill` is dispatched every frame, so it's tier 0; `mark`
+// only in frame 1, under a runtime condition, so it's tier 1, which a host builds once tier 0
+// is built. Frame 1 comes before that, most likely: its dispatch starts `mark`'s build at
+// once, and the frame waits for it rather than fail. The test reads the buffer back after.
+use std::gpu::{GlobalId, GpuBuffer, Slots, buffer, dispatch, read}
+use std::io::Pending
+
+@compute(64)
+fn fill(out: mut Slots<u32>, id: GlobalId, value: u32) {
+    out[id] = value
+}
+
+@compute(64)
+fn mark(out: mut Slots<u32>, id: GlobalId) {
+    if id.x == 0 {
+        out[id] = out[id] + 1000
+    }
+}
+
+pub struct State {
+    frame: u32,
+    out: GpuBuffer<u32>,
+    pending: Option<Pending<u32>>,
+    seen: Vec<u32>,
+}
+
+pub fn init() -> State {
+    State { frame: 0, out: buffer(64), pending: None, seen: Vec::new() }
+}
+
+pub fn frame(s: mut State, time: f32, width: u32, height: u32) {
+    dispatch(fill.bind(out: mut s.out, value: s.frame + 1), groups: 1)
+    if s.frame == 1 {
+        dispatch(mark.bind(out: mut s.out), groups: 1)
+        s.pending = Some(read(s.out.items()))
+    }
+    match mut s.pending {
+        Some(p) => {
+            if let Some(Ok(v)) = p.poll() {
+                s.seen = take v
+            }
+        },
+        None => {},
+    }
+    s.frame += 1
+}
+
+@test(frames: 4, gpu: true, hosts: both)
+fn the_tier_1_pipeline_runs_when_its_frame_first_needs_it(s: State) {
+    assert(s.seen.len() == 64 && s.seen[0] == 1002 && s.seen[1] == 2)
+}

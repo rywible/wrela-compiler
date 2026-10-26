@@ -55,8 +55,9 @@ pub fn text(pipelines: &[PipelineSummary]) -> String {
         ));
         for p in ps {
             let verb = if p.kind == "compute" { "dispatched" } else { "drawn" };
+            let tier = if p.tier() == 1 { ", tier 1" } else { "" };
             s.push_str(&format!(
-                "  {} ({}), {verb} at {}\n",
+                "  {} ({}{tier}), {verb} at {}\n",
                 p.entries.join(" + "),
                 p.kind,
                 (p.sites.iter().enumerate())
@@ -81,11 +82,12 @@ pub fn json(pipelines: &[PipelineSummary]) -> String {
         .iter()
         .map(|p| {
             format!(
-                "{{\"kind\": {}, \"entries\": {}, \"sites\": {}, \"conditional\": [{}]}}",
+                "{{\"kind\": {}, \"entries\": {}, \"sites\": {}, \"conditional\": [{}], \"tier\": {}}}",
                 q(p.kind),
                 list(&p.entries),
                 list(&p.sites),
-                p.conditional.iter().map(|c| c.to_string()).collect::<Vec<_>>().join(", ")
+                p.conditional.iter().map(|c| c.to_string()).collect::<Vec<_>>().join(", "),
+                p.tier()
             )
         })
         .collect();
@@ -111,6 +113,14 @@ mod tests {
         };
         assert!(text(std::slice::from_ref(&p)).contains("at main.wrela:3:5, main.wrela:9:5\n"));
         let p = PipelineSummary { conditional: vec![false, true], ..p };
-        assert!(text(&[p]).contains("at main.wrela:3:5, main.wrela:9:5 (under a condition)\n"));
+        assert!(
+            text(std::slice::from_ref(&p))
+                .contains("at main.wrela:3:5, main.wrela:9:5 (under a condition)\n")
+        );
+        assert!(json(std::slice::from_ref(&p)).contains("\"tier\": 0"));
+        // Every site under a condition: tier 1.
+        let p = PipelineSummary { conditional: vec![true, true], ..p };
+        assert!(text(std::slice::from_ref(&p)).contains("  fill (compute, tier 1), dispatched at"));
+        assert!(json(&[p]).contains("\"tier\": 1"));
     }
 }

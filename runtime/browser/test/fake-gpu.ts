@@ -333,4 +333,4 @@ export const SCREEN_TARGET: ScreenTarget = { format: SCREEN_FORMAT, texture: () 
 
 /** Every pipeline of `m`, built on `device` from `SHADER`, its screen targets in `SCREEN_FORMAT`. */
 export const buildAll = (device: FakeDevice, m: Manifest) =>
-  Promise.all(buildPipelines(device.gpu, m, m.pipelines.map(() => SHADER), SCREEN_FORMAT));
+  Promise.all(buildPipelines(device.gpu, m, m.pipelines.map(() => SHADER), SCREEN_FORMAT).each);

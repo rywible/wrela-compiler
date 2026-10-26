@@ -29,9 +29,18 @@ pub const MAX_WGSL_BYTES: usize = 256 * 1024;
 
 /// Runs the back ends over a lowered program. `sources` names the locations a trap reports.
 /// With `budgets`, a shipped build's, it's E0707 to have a pipeline whose WGSL is over
-/// `MAX_WGSL_BYTES`.
-pub fn emit(l: &Lowered, sources: &SourceMap, simd: bool, budgets: bool) -> BuildOutput {
-    emit_in(l, sources, wrela_wasm::Options { simd, ..Default::default() }, budgets, true)
+/// `MAX_WGSL_BYTES`. `conditional[i]` says pipeline `i` is reached only under runtime
+/// conditions (every site of it is): the manifest puts it in tier 1, which a host builds second
+/// (§18.9); a pipeline past the slice's end is tier 0.
+pub fn emit(
+    l: &Lowered,
+    sources: &SourceMap,
+    simd: bool,
+    budgets: bool,
+    conditional: &[bool],
+) -> BuildOutput {
+    let options = wrela_wasm::Options { simd, ..Default::default() };
+    emit_in(l, sources, options, budgets, true, conditional)
 }
 
 /// A server's or a tool's build's files (language.md §15.3): its module alone, at
@@ -50,7 +59,7 @@ pub fn emit_headless(
     let max_pages =
         if tool { wrela_abi::memory::TOOL_MAX_PAGES } else { wrela_abi::memory::MAX_PAGES };
     let options = wrela_wasm::Options { simd, shared_memory: tool, max_pages };
-    let mut out = emit_in(l, sources, options, false, false);
+    let mut out = emit_in(l, sources, options, false, false, &[]);
     out.files.retain(|(path, _)| path == "game.wasm");
     for (path, _) in &mut out.files {
         *path = module.to_string();
@@ -80,7 +89,7 @@ pub fn pair(client: Option<&mut Vec<u8>>, server: Option<&mut Vec<u8>>) {
 /// A CPU frame test's files: its WASM and the manifest the host uses to check its commands.
 /// There are no shader or browser files; `CpuBuild`'s explicit CPU-only loaders read it.
 pub(crate) fn emit_for_cpu(l: &Lowered, sources: &SourceMap, simd: bool) -> BuildOutput {
-    emit_in(l, sources, wrela_wasm::Options { simd, ..Default::default() }, false, false)
+    emit_in(l, sources, wrela_wasm::Options { simd, ..Default::default() }, false, false, &[])
 }
 
 fn emit_in(
@@ -89,6 +98,7 @@ fn emit_in(
     options: wrela_wasm::Options,
     budgets: bool,
     shaders: bool,
+    conditional: &[bool],
 ) -> BuildOutput {
     let mut diagnostics = Vec::new();
     let mut files = Vec::new();
@@ -222,6 +232,7 @@ fn emit_in(
             bindings: p.bindings.clone(),
             debug_flag: p.debug_flag,
             requires,
+            conditional: conditional.get(i).copied().unwrap_or(false),
         });
     }
     if let Err(e) = manifest.validate() {
@@ -336,7 +347,7 @@ fn records_commands() {}
             let data = wrela_lower::BuildData::default();
             let (full, errors) = wrela_lower::lower(checked, &roots, &data, true);
             assert!(!wrela_diag::has_errors(&errors), "{errors:?}");
-            let out = emit(&full, sources, true, false);
+            let out = emit(&full, sources, true, false, &[]);
             let page = String::from_utf8(file(&out, "index.html").to_vec()).expect("UTF-8");
             let head = &page[..page.find("</head>").expect("a head")];
             for f in ["manifest.json", "game.wasm", "pipeline_0.wgsl", "pipeline_1.wgsl"] {
@@ -364,7 +375,7 @@ fn records_commands() {}
                 if debug {
                     assert!(full.pipelines.iter().any(|p| p.debug_flag.is_some()));
                 }
-                let full = emit(&full, sources, true, false);
+                let full = emit(&full, sources, true, false, &[]);
                 let cpu = emit_for_cpu(&cpu, sources, true);
                 assert!(!wrela_diag::has_errors(&full.diagnostics), "{:?}", full.diagnostics);
                 assert!(!wrela_diag::has_errors(&cpu.diagnostics), "{:?}", cpu.diagnostics);

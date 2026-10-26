@@ -104,3 +104,32 @@ fn std_counts_the_gpu_memory_the_host_does() {
     // The program's two most were held at once, before the buffer dropped.
     assert_eq!(memory["gpu"]["peak"].as_u64(), Some(peak_buffers + peak_textures), "{memory}");
 }
+
+/// Pipeline tiers (compiler/tests/tiers, language.md §18.9): the manifest marks `mark`, which
+/// only frame 1 dispatches, tier 1 (`conditional`) and `fill` tier 0; Chrome reports tier 0's
+/// time as `ms` and every pipeline's as `tier1_ms` (`pipelines.json`), and the frames run.
+#[test]
+#[ignore = "needs the runtime"]
+fn tier_1_builds_after_tier_0_and_is_reported() {
+    let (dir, rel) = wrela_tests::page("compiler/tests/tiers", "tiers-browser");
+    let manifest: serde_json::Value = serde_json::from_str(
+        &std::fs::read_to_string(dir.join("manifest.json")).expect("manifest"),
+    )
+    .expect("JSON");
+    let tiers: Vec<(&str, bool)> = manifest["pipelines"]
+        .as_array()
+        .expect("pipelines")
+        .iter()
+        .map(|p| (p["name"].as_str().unwrap_or(""), p["conditional"].as_bool().unwrap_or(false)))
+        .collect();
+    assert_eq!(tiers, [("fill", false), ("mark", true)]);
+    wrela_tests::run_in_chrome_with(
+        &rel,
+        wrela_tests::ChromeRun { salt: 1, ..wrela_tests::ChromeRun::new(4, 64, 64, 60.0) },
+    );
+    let p = wrela_tests::result_json(&dir.join("results"), "pipelines.json");
+    eprintln!("pipelines.json: {p}");
+    assert_eq!(p["tier1"].as_u64(), Some(1), "{p}");
+    let (tier0, all) = (p["ms"].as_f64().expect("ms"), p["tier1_ms"].as_f64().expect("tier1_ms"));
+    assert!(tier0 > 0.0 && all >= tier0, "{p}");
+}

@@ -2390,6 +2390,7 @@ A pipeline is an entry point compiled for one set of type arguments: a generic k
   - A pipeline is in the build only if a command in the optimized CPU code records it. A pipeline behind a constant branch, such as `if test_build() && counting`, leaves the build with the code that records it. (The `&&` holds its value in a local, which constant folding sees through.)
 - **The number of pipelines in a build isn't limited.** The time to create them counts in the cold start's budget, measured cold in Chrome.
 - **The hosts start the program while they create its pipelines,** the biggest shaders first. A command that needs a pipeline not yet created waits for it, and so do the commands after it.
+- **Pipelines come in two tiers.** A pipeline every site of which runs only under a runtime condition (`(under a condition)` above) is tier 1; any other is tier 0. The manifest marks tier 1 (`"conditional": true`), and `wrela pipelines` prints `tier 1` beside it (in `--json`, `"tier": 0` or `1`). The browser host creates tier 0's pipelines first, and tier 1's once those have all settled; a command that needs a tier-1 pipeline before its turn starts its creation at once, and waits for it as above. A program can't see the tiers: the test mode's `pipelines.json` reports tier 0's time as `ms` and every pipeline's as `tier1_ms`, so "pipelines ready" means tier 0.
 
 ```wrela
 /// Generic over any field; monomorphized per concrete field type.

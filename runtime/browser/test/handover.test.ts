@@ -36,7 +36,7 @@ async function running() {
   const { fetch, requested } = server();
   const first = await loadBuild(RUNNING, fetch);
   const cache: PipelineCache = new Map();
-  await Promise.all(buildPipelines(device.gpu, first.manifest, first.shaders, SCREEN_FORMAT, cache));
+  await Promise.all(buildPipelines(device.gpu, first.manifest, first.shaders, SCREEN_FORMAT, cache).each);
   const compiled = spyOn(device, "createShaderModule");
   const handOvers = new HandOvers(device.gpu, SCREEN_FORMAT, () => RUNNING, () => [cache], fetch);
   return { handOvers, compiled, requested };

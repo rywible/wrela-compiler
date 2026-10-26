@@ -83,6 +83,14 @@ pub struct PipelineSummary {
     pub conditional: Vec<bool>,
 }
 
+impl PipelineSummary {
+    /// Its tier (§18.9): 1 when every site of it is under a runtime condition (a host builds it
+    /// once tier 0 is built), else 0. A summary without its sites' conditions is tier 0.
+    pub fn tier(&self) -> u8 {
+        u8::from(!self.conditional.is_empty() && self.conditional.iter().all(|&c| c))
+    }
+}
+
 impl Output {
     pub fn has_errors(&self) -> bool {
         has_errors(&self.diagnostics)
@@ -906,7 +914,9 @@ fn compile_loaded_in(
             let ok = !has_errors(&d);
             diagnostics.extend(d);
             if role == wrela_sema::defs::Role::Client {
-                pipelines = summarize(&checked, &sources, &lowered, mode.conditions);
+                // A build works out which pipelines are reached only under a condition: the
+                // manifest's tiers (§18.9).
+                pipelines = summarize(&checked, &sources, &lowered, mode.conditions || mode.emit);
                 data_report = wrela_wasm::data_report(&lowered.cpu).ok();
             }
             if !ok || !mode.emit {
@@ -921,7 +931,8 @@ fn compile_loaded_in(
             // A shipped build keeps its budgets; a test's, a debug, a lifted or a SIMD-less
             // one may go over.
             let budgets = !(mode.debug || mode.no_simd || mode.testing) && lift.is_empty();
-            let out = build::emit(&lowered, &sources, !data.no_simd, budgets);
+            let tier1: Vec<bool> = pipelines.iter().map(|p| p.tier() == 1).collect();
+            let out = build::emit(&lowered, &sources, !data.no_simd, budgets, &tier1);
             diagnostics.extend(out.diagnostics);
             files.extend(out.files);
             files.append(&mut shipped_files);

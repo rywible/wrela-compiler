@@ -403,34 +403,73 @@ export function preparePipelines(
   return out;
 }
 
-/** Starts building every pipeline, all at once: each one's promise. `shaders[i]` is pipeline
- * `i`'s WGSL, and screen targets draw in `screenFormat` (`ScreenTarget.format`). With `cache` (a
- * hot reload), a pipeline whose manifest entry and WGSL are the same as one of the last build's
- * is kept, and the cache then holds this build's pipelines alone. */
+/** A build's pipelines as they're built: each one's promise, in manifest order; `tier0`, settled
+ * when every tier-0 pipeline is (`Pipeline.conditional` is tier 1); `start(i)`, which starts
+ * pipeline `i`'s build now if it hasn't started (a command needs it before its tier's turn);
+ * and the order the builds started in. */
+export interface Building {
+  each: Promise<BuiltPipeline>[];
+  tier0: Promise<unknown>;
+  start(i: number): void;
+  order: number[];
+}
+
+/** Starts building the pipelines: tier 0's all at once, the biggest first, then, once those
+ * have settled, tier 1's (those reached only under a runtime condition), unless a command needs
+ * one sooner (`Building.start`). `shaders[i]` is pipeline `i`'s WGSL, and screen targets draw in
+ * `screenFormat` (`ScreenTarget.format`). With `cache` (a hot reload), a pipeline whose manifest
+ * entry and WGSL are the same as one of the last build's is kept, and the cache then holds this
+ * build's pipelines alone. */
 export function buildPipelines(
   device: GPUDevice,
   manifest: Manifest,
   shaders: string[],
   screenFormat: GPUTextureFormat,
   cache?: PipelineCache,
-): Promise<BuiltPipeline>[] {
+): Building {
   const order = biggestFirst(shaders);
-  const built: Promise<BuiltPipeline>[] = [];
-  if (!cache) {
-    for (const i of order) built[i] = buildPipeline(device, manifest.pipelines[i]!, shaders[i]!, screenFormat);
-    return built;
-  }
+  const each: Promise<BuiltPipeline>[] = [];
+  const started: number[] = [];
+  const starts = new Map<number, () => void>();
+  const build = (i: number) => {
+    started.push(i);
+    return buildPipeline(device, manifest.pipelines[i]!, shaders[i]!, screenFormat);
+  };
+  // Tier 1's, started at their turn or when first needed.
+  const later = (i: number): Promise<BuiltPipeline> => {
+    const d = Promise.withResolvers<BuiltPipeline>();
+    starts.set(i, () => {
+      starts.delete(i);
+      build(i).then(d.resolve, d.reject);
+    });
+    return d.promise;
+  };
   const used: PipelineCache = new Map();
   for (const i of order) {
     const p = manifest.pipelines[i]!;
+    if (!cache) {
+      each[i] = p.conditional ? later(i) : build(i);
+      continue;
+    }
     const key = pipelineKey(p, shaders[i]!);
-    const pipeline = used.get(key) ?? cache.get(key) ?? buildPipeline(device, p, shaders[i]!, screenFormat);
+    const pipeline = used.get(key) ?? cache.get(key) ?? (p.conditional ? later(i) : build(i));
     used.set(key, pipeline);
-    built[i] = pipeline;
+    each[i] = pipeline;
   }
-  cache.clear();
-  for (const [key, pipeline] of used) cache.set(key, pipeline);
-  return built;
+  if (cache) {
+    cache.clear();
+    for (const [key, pipeline] of used) cache.set(key, pipeline);
+  }
+  const tier0 = Promise.all(order.filter((i) => !manifest.pipelines[i]!.conditional).map((i) => each[i]!));
+  // Tier 1 builds once tier 0 has settled, whether it built or not (a failure fails the program
+  // through its own pipeline's promise).
+  void tier0.then(
+    () => {},
+    () => {},
+  ).then(() => {
+    for (const i of order) starts.get(i)?.();
+  });
+  return { each, tier0, start: (i) => starts.get(i)?.(), order: started };
 }
 
 /** What a pass records, waiting for it to end: draws, with their own copies of their uniform
@@ -848,8 +887,11 @@ export class GpuExecutor {
   #failed: unknown = null;
   /** Hot reload retired this executor: no asynchronous pipeline completion may run more work. */
   #retired = false;
-  /** Resolved when every pipeline is built; rejected, with why, if one can't be. */
+  /** Resolved when every tier-0 pipeline is built (every pipeline, unless the executor was
+   * given its tiers); rejected, with why, if one can't be. */
   readonly built: Promise<void>;
+  /** Starts building pipeline `i` now, if it hasn't started (`Building.start`). */
+  readonly #start: (i: number) => void;
 
   /** Timed, on a device with "timestamp-query", each pass's GPU time is recorded (`timings`); in
    * the serial mode each pass and dispatch runs alone, so its time is its own (the program's
@@ -860,11 +902,13 @@ export class GpuExecutor {
     readonly screen: ScreenTarget,
     timing: Timing = "off",
     debug = pipelines.some((p) => !(p instanceof Promise) && p.debugFlag !== null),
+    tiers?: Pick<Building, "tier0" | "start">,
   ) {
     this.#deferred = timing === "serial" ? [] : null;
     this.#pipelines = pipelines.map((p) => (p instanceof Promise ? undefined : p));
     this.#building = pipelines.map((p) => Promise.resolve(p));
-    this.built = Promise.all(this.#building).then(
+    this.#start = tiers?.start ?? (() => {});
+    this.built = (tiers ? tiers.tier0 : Promise.all(this.#building)).then(
       () => {},
       (e: unknown) => {
         // A superseded build's late shader failure belongs to it, not to the running build.
@@ -1019,6 +1063,8 @@ export class GpuExecutor {
     if ("pipeline" in cmd && cmd.pipeline >= this.#pipelines.length) {
       throw new CommandError(cmd.op, `there's no pipeline ${cmd.pipeline} (the manifest has ${this.#pipelines.length})`);
     }
+    // A tier-1 pipeline a command needs before its tier's turn starts building now.
+    if ("pipeline" in cmd && !this.#ready(cmd)) this.#start(cmd.pipeline);
     const queue = this.#deferred ?? (this.#waitingAt < this.#waiting.length || !this.#ready(cmd) ? this.#waiting : null);
     if (queue !== null) queue.push({ cmd: copied(cmd), at: { frame: this.#frame, generation: this.#generation } });
     else this.#run(cmd);
