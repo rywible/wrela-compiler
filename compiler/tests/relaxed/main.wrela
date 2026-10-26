@@ -6,19 +6,34 @@
 
 pub fn frame(state: mut Seen, time: f32, width: u32, height: u32) {
     state.loose = loose(u32(time))
+    state.kept = kept(u32(time))
 }
 
 pub struct Seen {
     loose: u32,
+    kept: u32,
 }
 
 pub fn init() -> Seen {
-    Seen { loose: 0 }
+    Seen { loose: 0, kept: 0 }
 }
 
 /// What `frame` last saw.
 pub fn seen(state: Seen) -> u32 {
     state.loose
+}
+
+/// What `frame` last saw of `kept`.
+pub fn seen_kept(state: Seen) -> u32 {
+    state.kept
+}
+
+/// The same `a * b + c`, `@deterministic`, small enough to be inlined into `frame`: inlined, it
+/// stays strict there.
+@deterministic
+fn kept(seed: u32) -> u32 {
+    let a = factor(seed)
+    bits(a * a + C)
 }
 
 /// Factors whose square needs more than a float's 24 bits: `(1 + 2^-12)^2` is `1 + 2^-11 + 2^-24`,

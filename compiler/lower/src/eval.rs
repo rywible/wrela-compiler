@@ -55,6 +55,9 @@ pub struct BuildData {
     /// A build whose WASM uses no SIMD (`wrela_wasm::Options::simd`): its results are the same,
     /// bit for bit, which a test checks.
     pub no_simd: bool,
+    /// A relaxed-SIMD build (`wrela build --relaxed-simd`, §11.2): presentation code is marked
+    /// relaxable (`mark_relaxable`). In any other build no function is.
+    pub relaxed_simd: bool,
     /// A lifted build's literals (language.md §23).
     pub lift: Option<crate::LiftTable>,
     /// Which host runs the build (§15.3): its entries, and what it may reach.

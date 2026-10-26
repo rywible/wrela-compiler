@@ -904,6 +904,7 @@ fn compile_loaded_in(
         debug: mode.debug,
         no_simd: mode.no_simd,
         testing: mode.testing,
+        relaxed_simd: mode.relaxed_simd,
         ..Default::default()
     };
     let cache = scope.cache_of(root);

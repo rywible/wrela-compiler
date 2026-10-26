@@ -1170,7 +1170,8 @@ A relaxed-SIMD build (`wrela build --relaxed-simd`, release only) has a second m
 
 - **Only presentation code relaxes.** A function relaxes when only the client's `frame` reaches it. What `init`, any other export, a test, a job or a task reaches stays strict, and so does everything an `@deterministic` function or an `@audio` entry point reaches. `init` makes the world that the simulation starts from, so it's strict too.
 - **What relaxes:** a vector multiply whose only use is a later add in the same block fuses into one `f32x4.relaxed_madd`, and vector `min` and `max` become `f32x4.relaxed_min` and `f32x4.relaxed_max`. Their results may differ in the last bit, or in which NaN or which zero comes back, from engine to engine.
-- **The simulation's bits don't change.** `game.wasm` is the build without the option, byte for byte. Both modules run the same ticks, so their tick logs compare `equal` (`wrela-host --compare-ticks`). Presentation results reach the simulation only as input, which a tick log records.
+- **Strict code stays strict where presentation code calls it.** A relaxable function doesn't inline a strict one: the call stays a call, so a `@deterministic` helper that `frame` calls isn't fused there.
+- **The simulation's bits don't change.** `game.wasm` has no relaxed SIMD, and a build without the option marks no function relaxable, so it's as it was. Both modules of a relaxed build run the same ticks, so their tick logs compare `equal` (`wrela-host --compare-ticks`). Presentation results reach the simulation only as input, which a tick log records.
 
 ### 11.3 What each target does
 

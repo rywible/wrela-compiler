@@ -495,7 +495,9 @@ fn lower_in(
     rewrite_cpu_math(&mut cx, &mut cpu);
     cx.drain(&mut cpu);
     check_deterministic(&mut cx, &cpu);
-    mark_relaxable(&cx, &mut cpu, role, also);
+    if data.relaxed_simd {
+        mark_relaxable(&cx, &mut cpu, role, also);
+    }
     thread_entries(&mut cx, &mut cpu);
     mark_counted(&mut cx, &mut cpu);
     if data.debug {

@@ -12,8 +12,7 @@
 //! - the run-pass suite's expectations (`run_pass.rs` checks both builds).
 //!
 //! A relaxed-SIMD build (`wrela build --relaxed-simd`, §11.2) keeps that for deterministic code:
-//! its relaxed module fuses a multiply-add only outside it, and its standard module is the build's
-//! without the option, byte for byte.
+//! its relaxed module fuses a multiply-add only outside it, and both modules run the same ticks.
 //!
 //! The speed-up on a loop of `vec4` math is measured, not gated: `cargo test --release -p
 //! wrela-tests --test suite simd_speed -- --ignored --nocapture` prints it.
@@ -206,8 +205,7 @@ fn a_voice_renders_the_same_samples_with_simd() {
 
 /// `compiler/tests/relaxed`: `strict` (an export) and `loose` (which only `frame` reaches) do the
 /// same `a * b + c`, on values a fused multiply-add rounds differently. In the relaxed module
-/// `loose` fuses it and `strict` doesn't; the standard module is the build without
-/// `--relaxed-simd`'s.
+/// `loose` fuses it and `strict` doesn't, nor `kept`, a `@deterministic` helper `frame` calls.
 #[test]
 fn relaxed_simd_fuses_only_in_presentation_code() {
     let pkg = "compiler/tests/relaxed";
@@ -216,9 +214,10 @@ fn relaxed_simd_fuses_only_in_presentation_code() {
     let relaxed = read("game.relaxed.wasm");
     assert!(wrela_wasm::check_no_relaxed_simd(&read("game.wasm")).is_ok(), "the standard module");
     assert!(wrela_wasm::check_no_relaxed_simd(&relaxed).is_err(), "the relaxed module has none");
+    // Without the option no function is relaxable: the build's module is as before it.
     let plain = wrela_driver::build(&wrela_tests::repo_root().join(pkg));
     let wasm = plain.files.iter().find(|(f, _)| f == "game.wasm").expect("game.wasm");
-    assert!(wasm.1 == read("game.wasm"), "the standard module is the plain build's");
+    assert!(wrela_wasm::check_no_relaxed_simd(&wasm.1).is_ok(), "the plain build's module");
     let mut a = CpuHost::load(&dir).expect("load");
     let relaxed_build = wrela_host::CpuBuild::load_choosing(&dir, true);
     let mut b = relaxed_build.and_then(|b| b.start()).expect("load the relaxed module");
@@ -234,6 +233,9 @@ fn relaxed_simd_fuses_only_in_presentation_code() {
         let (p, q) = (seen(&mut a), seen(&mut b));
         assert!(same(&p, &x), "loose({seed}) unfused is strict's");
         fused += usize::from(!same(&p, &q));
+        // `kept` is `@deterministic`: inlined into `frame` or not, it isn't fused.
+        let k = (a.call_export("seen_kept", &[]), b.call_export("seen_kept", &[]));
+        assert!(same(&k.0, &x) && same(&k.1, &x), "kept({seed}): {k:?}, strict {x:?}");
     }
     assert_eq!(fused, 3, "the relaxed module's `loose` fuses its multiply-add");
 }

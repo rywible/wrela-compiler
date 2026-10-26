@@ -1256,9 +1256,14 @@ struct Inliner<'a> {
 }
 
 impl Inliner<'_> {
-    /// Whether a call to `g` is inlined: it's not kept, and it fits the budget (whose size it
-    /// then takes).
+    /// Whether a call to `g` is inlined: it's not kept, it fits the budget (whose size it then
+    /// takes), and it's not strict code called from relaxable code.
     fn inlines(&mut self, g: FuncId) -> bool {
+        // Strict code stays a call in presentation code (a relaxed build's, lowering's
+        // `mark_relaxable`): inlined, relaxed SIMD would reach what it computes.
+        if self.f.relaxable && !self.m.functions[g.index()].relaxable {
+            return false;
+        }
         let in_loop = self.loops > 0 && self.in_loops.get(g.index()).copied().unwrap_or(false);
         if self.keep[g.index()] && !in_loop {
             return false;
