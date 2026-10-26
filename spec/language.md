@@ -1282,7 +1282,7 @@ A constant can ship files beside the program (`std::io::Shipped`). This is for d
 - `ship(dir, files)` makes a `Shipped` value from (name, bytes) pairs.
 - A build writes a computed constant of this type as files under `files/<dir>/` of its output.
 - The program's copy keeps each file's name and size, not its bytes. The program fetches a file with `fetch(i)`, a request like `std::io::fetch`'s (§17.1). Or it gives the file's path in the build to the host, for example as a page's icon: `path(i)` is `files/<dir>/<name>`.
-- Build-time code reads the bytes in place with `bytes(i)`: a constant computed from the value, or a test, which sees the whole value. `bytes` panics in a program that a build shipped.
+- Build-time code reads the bytes in place with `bytes(i)`: a constant computed from the value, or a test, which sees the whole value. `bytes` panics in a program that a build shipped. A frame test's build holds the files too, so its program fetches them as a shipped build's does.
 - A name contains only letters, digits, `_`, `-` and `.`. Another name panics, which fails the build.
 - Two constants that ship into one directory are E0704.
 

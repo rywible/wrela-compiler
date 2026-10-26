@@ -687,8 +687,8 @@ fn gpu_frame_tests_read_back_what_the_gpu_wrote() {
 }
 
 /// Held requests (§13.2, `hold: [...]`): compiler/tests/held's fetch and storage read arrive on
-/// the frames their holds name, a hold past the last frame never arrives, and unheld ones arrive
-/// on the first frame.
+/// the frames their holds name, a hold past the last frame never arrives, unheld ones arrive on
+/// the first frame, and a file the build ships is in the test's build.
 #[test]
 fn frame_tests_hold_requests_until_their_frames() {
     let dir = wrela_tests::repo_root().join("compiler/tests/held");
@@ -701,6 +701,7 @@ fn frame_tests_hold_requests_until_their_frames() {
             ("requests_arrive_on_the_first_frame", true),
             ("held_requests_arrive_on_their_frames", true),
             ("a_hold_past_the_last_frame_never_arrives", true),
+            ("a_shipped_file_arrives_in_a_test", true),
         ],
         "{:?}",
         out.results

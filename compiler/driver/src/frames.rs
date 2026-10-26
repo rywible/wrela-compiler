@@ -68,9 +68,15 @@ pub fn run(
     if has_errors(&diags) {
         return (Vec::new(), diags);
     }
+    // The files its shipped constants ship too, so what the program fetches is there.
+    let shipped = if full_build { crate::shipped::files(checked, data) } else { Vec::new() };
     let written = crate::Scratch::new("wrela-test").and_then(|dir| {
-        for (path, bytes) in &out.files {
-            std::fs::write(dir.0.join(path), bytes).map_err(|e| e.to_string())?;
+        for (path, bytes) in out.files.iter().chain(&shipped) {
+            let at = dir.0.join(path);
+            if let Some(parent) = at.parent() {
+                std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
+            }
+            std::fs::write(at, bytes).map_err(|e| e.to_string())?;
         }
         Ok(dir)
     });
