@@ -1,7 +1,6 @@
 // Pipeline tiers (language.md §18.9): `fill` is dispatched every frame, so it's tier 0; `mark`
 // only in frame 1, under a runtime condition, so it's tier 1, which a host builds once tier 0
-// is built; `bump` is dispatched by `bumped` whenever it runs, but `bumped` runs only under a
-// condition, so it's tier 1 too (0.9.0: tiers follow calls). Frame 1 comes before that, most likely: its dispatch starts `mark`'s build at
+// is built. Frame 1 comes before that, most likely: its dispatch starts `mark`'s build at
 // once, and the frame waits for it rather than fail. The test reads the buffer back after.
 use std::gpu::{GlobalId, GpuBuffer, Slots, buffer, dispatch, read}
 use std::io::Pending
@@ -16,16 +15,6 @@ fn mark(out: mut Slots<u32>, id: GlobalId) {
     if id.x == 0 {
         out[id] = out[id] + 1000
     }
-}
-
-@compute(64)
-fn bump(out: mut Slots<u32>, id: GlobalId) {
-    out[id] = out[id] + 1
-}
-
-/// `bump`, dispatched whenever this runs: it runs in frame 2 alone.
-fn bumped(out: mut GpuBuffer<u32>) {
-    dispatch(bump.bind(out: mut out), groups: 1)
 }
 
 pub struct State {
@@ -44,9 +33,6 @@ pub fn frame(s: mut State, time: f32, width: u32, height: u32) {
     if s.frame == 1 {
         dispatch(mark.bind(out: mut s.out), groups: 1)
         s.pending = Some(read(s.out.items()))
-    }
-    if s.frame == 2 {
-        bumped(mut s.out)
     }
     match mut s.pending {
         Some(p) => {

@@ -1060,9 +1060,8 @@ fn finish_diagnostics(sources: &SourceMap, diags: &mut Vec<Diagnostic>) -> Vec<D
 }
 
 /// Each dispatch and draw of the functions that hold one of `sites`, by its statement's span,
-/// and whether it runs only under a runtime condition: one of its function, or one every way
-/// into its function passes (`entered_under_condition`). A site is a span lowering recorded: a
-/// command's statement, or inside it.
+/// and whether it runs only under a runtime condition of its function. A site is a span lowering
+/// recorded: a command's statement, or inside it.
 fn conditional_commands(
     checked: &wrela_sema::Checked,
     sites: &[Span],
@@ -1076,10 +1075,9 @@ fn conditional_commands(
         )
     };
     let holds = |k: Span| sites.iter().any(|s| holds_site(k, s));
-    let entered = entered_under_condition(checked);
     let mut out = std::collections::HashMap::new();
-    for (owner, body) in &checked.mir {
-        for (n, f) in body.fns.iter().enumerate() {
+    for body in checked.mir.values() {
+        for f in &body.fns {
             // Each command, with its block.
             let commands: Vec<(usize, Span)> = (f.blocks.iter().enumerate())
                 .flat_map(|(i, b)| {
@@ -1090,62 +1088,12 @@ fn conditional_commands(
                 continue;
             }
             let under = wrela_sema::mir::control::under_condition(f);
-            // A closure runs whenever what holds it calls it: only its own conditions count.
-            let entered = n == 0 && entered.contains(owner);
             for (i, k) in commands {
-                out.insert(k, under[i] || entered);
+                out.insert(k, under[i]);
             }
         }
     }
     out
-}
-
-/// The functions that run only under a runtime condition, wherever they're called from: every
-/// use of each is a call (not a closure's) that's under a condition of its caller, or whose
-/// caller is one of them, to the fixed point. A function used any other way (through a trait,
-/// as a value, from a closure) or never called (an entry point) isn't one: what calls it isn't
-/// known here. So a realizer's kernels dispatched by a function that a game calls only when it
-/// realizes a kind's own way are built second (§18.9).
-fn entered_under_condition(
-    checked: &wrela_sema::Checked,
-) -> std::collections::HashSet<wrela_sema::ty::FnId> {
-    use wrela_sema::mir::{FnUse, StatementKind, fn_uses};
-    let mut calls: std::collections::HashMap<wrela_sema::ty::FnId, Vec<_>> = Default::default();
-    let mut other = std::collections::HashSet::new();
-    for (&owner, body) in &checked.mir {
-        for (n, f) in body.fns.iter().enumerate() {
-            let under = wrela_sema::mir::control::under_condition(f);
-            for (i, b) in f.blocks.iter().enumerate() {
-                for s in &b.stmts {
-                    let (StatementKind::Assign(_, r) | StatementKind::Eval(r)) = &s.kind else {
-                        continue;
-                    };
-                    fn_uses(&checked.program, s, r, |u, _| match u {
-                        FnUse::Call(g) if n == 0 => {
-                            calls.entry(g).or_default().push((owner, under[i]))
-                        }
-                        FnUse::Dispatch(_) | FnUse::Draw(_) => {}
-                        u => {
-                            other.insert(u.func());
-                        }
-                    });
-                }
-            }
-        }
-    }
-    let mut entered: std::collections::HashSet<_> =
-        calls.keys().copied().filter(|g| !other.contains(g)).collect();
-    loop {
-        let dropped: Vec<_> = (entered.iter().copied())
-            .filter(|g| !calls[g].iter().all(|&(caller, under)| under || entered.contains(&caller)))
-            .collect();
-        if dropped.is_empty() {
-            return entered;
-        }
-        for g in dropped {
-            entered.remove(&g);
-        }
-    }
 }
 
 /// Whether the command whose statement is at `command` holds the site `site`.
