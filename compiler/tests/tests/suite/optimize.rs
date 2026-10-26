@@ -178,3 +178,73 @@ fn a_build_holds_no_compressed_files() {
         .collect();
     assert!(compressed.is_empty(), "{compressed:?}");
 }
+
+/// A predicate whose body folds to `false` (`ON && s.n == 3` with `ON` false) is `false` where
+/// it's inlined, so the dispatch under it folds away after inlining, and its pipeline with it:
+/// neither the manifest nor `wrela pipelines` has it. A comparison of two integer constants
+/// folds the same way.
+#[test]
+fn a_dispatch_under_a_predicate_that_folds_to_false_leaves_the_build() {
+    let dir = crate::package(
+        "optimize/folded-predicate",
+        r#"
+use std::gpu::{GlobalId, GpuBuffer, Slots, buffer, dispatch}
+
+const ON: bool = false
+const SIDES: u32 = 4
+
+pub struct State {
+    n: u32,
+    out: GpuBuffer<u32>,
+}
+
+@compute(64)
+fn kept(out: mut Slots<u32>, id: GlobalId) {
+    out[id] = 1
+}
+
+@compute(64)
+fn dead(out: mut Slots<u32>, id: GlobalId) {
+    out[id] = 2
+}
+
+@compute(64)
+fn also_dead(out: mut Slots<u32>, id: GlobalId) {
+    out[id] = 3
+}
+
+fn on(s: State) -> bool {
+    ON && s.n == 3
+}
+
+fn square() -> bool {
+    SIDES == 3
+}
+
+pub fn init() -> State {
+    State { n: 0, out: buffer(64) }
+}
+
+pub fn frame(s: mut State, time: f32, width: u32, height: u32) {
+    dispatch(kept.bind(out: mut s.out), groups: 1)
+    if on(s) {
+        dispatch(dead.bind(out: mut s.out), groups: 1)
+    }
+    if square() {
+        dispatch(also_dead.bind(out: mut s.out), groups: 1)
+    }
+    s.n += 1
+}
+"#,
+    );
+    let built = wrela_driver::build(&dir);
+    assert!(!built.has_errors(), "{:?}", built.diagnostics);
+    let manifest = built.files.iter().find(|(f, _)| f == "manifest.json").expect("manifest");
+    let manifest =
+        wrela_abi::Manifest::parse(std::str::from_utf8(&manifest.1).unwrap()).expect("valid");
+    let names: Vec<&str> = manifest.pipelines.iter().map(|p| p.name.as_str()).collect();
+    assert_eq!(names, ["kept"]);
+    let listed = wrela_driver::check_pipelines(&dir);
+    let entries: Vec<String> = listed.pipelines.iter().flat_map(|p| p.entries.clone()).collect();
+    assert_eq!(entries, ["kept"]);
+}

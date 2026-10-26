@@ -909,7 +909,11 @@ fn compile_loaded_in(
         for role in roles(&checked) {
             scope.stop()?;
             data.role = role;
-            let (lowered, d) = wrela_lower::lower(&checked, &roots, &data, mode.emit);
+            // The pipeline-count query lowers as a build does, inlining and all, so it lists the
+            // pipelines a build makes (a constant branch's are gone): only the back ends are
+            // skipped.
+            let (lowered, d) =
+                wrela_lower::lower(&checked, &roots, &data, mode.emit || mode.conditions);
             scope.stop()?;
             let ok = !has_errors(&d);
             diagnostics.extend(d);
