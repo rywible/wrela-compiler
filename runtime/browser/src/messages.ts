@@ -50,6 +50,7 @@ export type ToWorker =
   | { type: "latency-sent" }
   /** Test mode, `clip`: the main thread has saved the clip (`clip.webm`). */
   | { type: "clip-saved" }
+  | { type: "summary-shown" }
   /** To the ticker's thread the render worker starts: run the program's ticks (ticker.ts). */
   | ({ type: "ticker" } & TickerStart)
   /** Test mode: what the page loaded, for `load.json`. */
@@ -80,6 +81,8 @@ export type FromWorker =
   | { type: "latency-start"; ms: number }
   /** Test mode: the main thread answers with what the page loaded (`load`). */
   | { type: "load-query" }
+  /** Test mode, `show=1`: the run's summary, to draw over the canvas. */
+  | { type: "summary"; lines: string[] }
   /** Test mode, `clip`: start recording the canvas, or stop and save the recording. */
   | { type: "clip-start" }
   | { type: "clip-stop" }

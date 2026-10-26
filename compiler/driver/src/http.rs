@@ -117,13 +117,18 @@ pub(crate) fn stop(port: u16, stopping: &AtomicBool) -> bool {
 
 /// Reads a request from `stream`, for a server on `port`: `None` if it was refused (the
 /// refusal is answered).
-pub(crate) fn read(stream: &TcpStream, port: u16) -> std::io::Result<Option<Request>> {
-    read_with_timeout(stream, port, REQUEST_DEADLINE)
+pub(crate) fn read(
+    stream: &TcpStream,
+    port: u16,
+    hosts: &[String],
+) -> std::io::Result<Option<Request>> {
+    read_with_timeout(stream, port, hosts, REQUEST_DEADLINE)
 }
 
 fn read_with_timeout(
     stream: &TcpStream,
     port: u16,
+    hosts: &[String],
     timeout: Duration,
 ) -> io::Result<Option<Request>> {
     let input = DeadlineIo {
@@ -133,7 +138,9 @@ fn read_with_timeout(
     };
     let mut reader = BufReader::new(input);
     let mut out = stream.try_clone()?;
-    let Some(head) = loopback::read_head(&mut reader, &mut out, port)? else { return Ok(None) };
+    let Some(head) = loopback::read_head(&mut reader, &mut out, port, hosts)? else {
+        return Ok(None);
+    };
     // The body is read, or refused, by what answers the request.
     let body = Some((reader, head.length));
     Ok(Some(Request {
@@ -216,7 +223,7 @@ mod tests {
             response
         });
         let (mut stream, _) = listener.accept().expect("accept");
-        let mut request = read(&stream, port).expect("request").expect("allowed");
+        let mut request = read(&stream, port, &[]).expect("request").expect("allowed");
         put_result(&mut stream, &root_dir, "shoot.txt", &mut request).expect("write result");
         drop(request);
         drop(stream);
@@ -239,7 +246,7 @@ mod tests {
             .expect("request head");
         });
         let (stream, _) = listener.accept().expect("accept");
-        let mut request = read(&stream, port).expect("request").expect("allowed");
+        let mut request = read(&stream, port, &[]).expect("request").expect("allowed");
         assert_eq!(request.body.as_ref().map(|(_, n)| *n), Some(loopback::MAX_RESULT));
         assert!(
             request.read_body(loopback::MAX_RESULT - 1).expect("refused").is_none(),
@@ -306,7 +313,7 @@ mod tests {
             send_finished.store(true, Ordering::Release);
         });
         let (stream, _) = listener.accept().expect("accept");
-        let result = read_with_timeout(&stream, port, Duration::from_millis(100));
+        let result = read_with_timeout(&stream, port, &[], Duration::from_millis(100));
         assert!(result.is_err(), "an incomplete request cannot succeed");
         assert!(!finished.load(Ordering::Acquire), "the peer was still sending at the deadline");
         stop_sending.store(true, Ordering::Release);
@@ -338,7 +345,7 @@ mod tests {
                 response
             });
             let (mut stream, _) = listener.accept().expect("accept");
-            let request = read(&stream, port).expect("read request").expect("allowed request");
+            let request = read(&stream, port, &[]).expect("read request").expect("allowed request");
             get_file(
                 &mut stream,
                 &build_dir,

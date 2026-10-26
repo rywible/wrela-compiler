@@ -347,7 +347,7 @@ impl Server {
         most_connections: usize,
         request_deadline: Duration,
     ) -> Result<Server, String> {
-        let (listener, port) = loopback::listen(0)?;
+        let (listener, port, _) = loopback::listen(0, false)?;
         listener.set_nonblocking(true).map_err(|e| e.to_string())?;
         let done = Arc::new(Mutex::new(None));
         let stopping = Arc::new(AtomicBool::new(false));
@@ -439,7 +439,7 @@ fn connection(
     stream.set_nonblocking(false)?;
     let mut reader = BufReader::new(DeadlineIo { stream: stream.try_clone()?, due, idle: IDLE });
     let mut out = DeadlineIo { stream, due, idle: IDLE };
-    let Some(head) = loopback::read_head(&mut reader, &mut out, port)? else { return Ok(()) };
+    let Some(head) = loopback::read_head(&mut reader, &mut out, port, &[])? else { return Ok(()) };
     let path = head.path.trim_start_matches('/');
     let Some(decoded) = loopback::decode_path(path) else {
         return loopback::respond(&mut out, 404, "text/plain", b"not found");

@@ -193,7 +193,7 @@ fn a_page_opened_after_hot_reloads_loads_the_newest_build() {
     let server = wrela_driver::live::serve(
         &pkg,
         &out,
-        0,
+        Default::default(),
         &["main".into()],
         Default::default(),
         true,
@@ -247,7 +247,7 @@ fn a_page_open_through_hot_reloads_keeps_running() {
     let server = wrela_driver::live::serve(
         &pkg,
         &out,
-        0,
+        Default::default(),
         &["main".into()],
         Default::default(),
         true,

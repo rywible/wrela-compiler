@@ -31,6 +31,7 @@ mod gpu;
 mod handover;
 #[cfg(feature = "gpu")]
 pub mod image;
+mod interfaces;
 pub mod loopback;
 pub mod pages;
 mod program;

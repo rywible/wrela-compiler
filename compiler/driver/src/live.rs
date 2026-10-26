@@ -318,6 +318,8 @@ pub struct Shown {
 struct State {
     out: Dir,
     port: u16,
+    /// The hosts it answers for besides the loopback names: its LAN addresses, with `--lan`.
+    hosts: Vec<String>,
     live: Mutex<Live>,
     changed: Condvar,
 }
@@ -343,8 +345,18 @@ impl Live {
 }
 
 /// A running `wrela run` server: its port, and its threads, which stop when it's dropped.
+/// Where a live server listens: its port (0: a free one), and whether on the LAN too.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct Listen {
+    pub port: u16,
+    pub lan: bool,
+}
+
 pub struct Server {
     pub port: u16,
+    /// With `lan`, the URL a device on the LAN opens it at, one for each of this machine's
+    /// addresses.
+    pub lan: Vec<String>,
     state: Arc<State>,
     stopping: Arc<AtomicBool>,
 }
@@ -395,7 +407,7 @@ impl Drop for Server {
 pub fn serve(
     pkg: &Path,
     out: &Path,
-    port: u16,
+    at: Listen,
     lift: &[String],
     kind: crate::BuildKind,
     quiet: bool,
@@ -403,7 +415,8 @@ pub fn serve(
 ) -> Result<Server, String> {
     check_output_path(pkg, out)?;
     // The port first: a server already on it keeps its output.
-    let (listener, port) = http::listen(port)?;
+    let (listener, port, hosts) = http::listen(at.port, at.lan)?;
+    let lan = wrela_host::loopback::lan_urls(&hosts, port);
     let _ = std::fs::remove_dir_all(out);
     let mut watcher = Watcher::start(pkg, out, lift, kind)?;
     built(&watcher.dir());
@@ -411,6 +424,7 @@ pub fn serve(
     let state = Arc::new(State {
         out: output,
         port,
+        hosts,
         live: Mutex::new(Live {
             version: watcher.version(),
             events: Vec::new(),
@@ -460,7 +474,7 @@ pub fn serve(
     http::accept(listener, Arc::clone(&stopping), move |stream| {
         let _ = handle(stream, &accepting, &stop_accepting, quiet);
     });
-    Ok(Server { port, state, stopping })
+    Ok(Server { port, lan, state, stopping })
 }
 
 /// A live build owned below `<pkg>/build` must not escape through a link in that path. Other
@@ -540,7 +554,7 @@ fn handle(
     stopping: &AtomicBool,
     quiet: bool,
 ) -> std::io::Result<()> {
-    let Some(mut req) = http::read(&stream, state.port)? else { return Ok(()) };
+    let Some(mut req) = http::read(&stream, state.port, &state.hosts)? else { return Ok(()) };
     let mut out = stream;
     match (req.method.as_str(), req.path.as_str()) {
         ("GET", "/live/next") => {
@@ -785,8 +799,16 @@ mod tests {
         std::fs::write(pkg.join("main.wrela"), frame(1)).expect("program");
         let built = |dir: &Path| std::fs::write(dir.join("marked"), b"").expect("mark");
         let out = root.join("out");
-        let server =
-            serve(&pkg, &out, 0, &[], crate::BuildKind::default(), true, built).expect("serve");
+        let server = serve(
+            &pkg,
+            &out,
+            Listen { port: 0, lan: false },
+            &[],
+            crate::BuildKind::default(),
+            true,
+            built,
+        )
+        .expect("serve");
         assert!(out.join("1/marked").exists(), "the first build is given to `built`");
         std::fs::write(pkg.join("main.wrela"), frame(2)).expect("edit");
         let began = Instant::now();
@@ -820,9 +842,19 @@ mod tests {
         .expect("program");
         let out = root.join("out");
         let kind = crate::BuildKind::default();
-        let first = serve(&pkg, &out, 0, &[], kind, true, |_: &Path| {}).expect("serve");
+        let first =
+            serve(&pkg, &out, Listen { port: 0, lan: false }, &[], kind, true, |_: &Path| {})
+                .expect("serve");
         std::fs::write(out.join("1/marked"), b"").expect("mark");
-        let second = serve(&pkg, &out, first.port, &[], kind, true, |_: &Path| {});
+        let second = serve(
+            &pkg,
+            &out,
+            Listen { port: first.port, lan: false },
+            &[],
+            kind,
+            true,
+            |_: &Path| {},
+        );
         assert!(second.is_err_and(|e| e.contains("can't listen")));
         assert!(out.join("1/marked").exists(), "the first server's build is where it was");
         first.stop();
@@ -886,6 +918,7 @@ mod tests {
         let state = State {
             out: Dir::open_ambient_dir(&out.0, cap_std::ambient_authority()).expect("output"),
             port,
+            hosts: Vec::new(),
             live: Mutex::new(Live { version: 1, events: Vec::new(), shown: Vec::new(), polls: 0 }),
             changed: Condvar::new(),
         };
@@ -920,6 +953,7 @@ mod tests {
         let state = State {
             out: Dir::open_ambient_dir(&out, cap_std::ambient_authority()).expect("output handle"),
             port,
+            hosts: Vec::new(),
             live: Mutex::new(Live {
                 version: 1,
                 events: vec![Event {

@@ -18,7 +18,7 @@ import { type Compiled, type PrintSink, type Program, type ProgramOptions, runWo
 import type { FromHelper, FromTicker, FromWorker, Loaded, Replay, TickerOptions, TickerStart, TickReport, ToWorker, VoiceOptions } from "./messages.ts";
 import { encodePng } from "./png.ts";
 import { Resampler } from "./resample.ts";
-import { frameTime, holdFor, inputUrl, loaded, putResult, sleepUntil, type TestParams } from "./testmode.ts";
+import { frameTime, holdFor, inputUrl, loaded, putResult, sleepUntil, summaryLines, type TestParams } from "./testmode.ts";
 import { lockstepTicks, runTicker, TickerControl, TickerMode } from "./ticker.ts";
 import { failAudioRender } from "./worker-audio.ts";
 
@@ -833,6 +833,14 @@ async function saveResults(
   const wasm = compiled ? { compile_ms: compiled.compile_ms, instantiate_ms: compiled.instantiate_ms ?? null, streamed: compiled.streamed } : null;
   const load = { opened_ms: page.opened_ms, first_frame_ms: began_ms[0] ?? null, wasm, resources };
   await putResult(base, "load.json", JSON.stringify(load));
+  if (params.show > 0) {
+    // Drawn before DONE, so whatever reads the screen after it sees the summary.
+    const info = deviceInfo(device);
+    const adapter = [info.vendor, info.architecture, info.description].filter((x) => x).join(" ");
+    const run = { began_ms, printed, printed_in, opened_ms: page.opened_ms, pipelines_ms: pipelinesMs };
+    self.postMessage({ type: "summary", lines: summaryLines(run, adapter) } satisfies FromWorker);
+    await summaryShown.promise;
+  }
   // An asynchronous device or voice failure may arrive while results are being saved. Its
   // DONE report is final; a later successful write must not replace it.
   if (failed) return;
@@ -860,6 +868,9 @@ const latencySent = Promise.withResolvers<void>();
 
 /** Test mode, `clip`: resolved when the main thread has saved the clip. */
 const clipSaved = Promise.withResolvers<void>();
+
+/** Test mode, `show`: resolved when the main thread has drawn the summary. */
+const summaryShown = Promise.withResolvers<void>();
 
 /** Test mode: resolved with what the page loaded, when the main thread answers. */
 const pageLoaded = Promise.withResolvers<{ opened_ms: number; resources: Loaded[] }>();
@@ -896,6 +907,9 @@ function receive(msg: ToWorker, reply: (message: FromTicker | FromHelper) => voi
       return;
     case "latency-sent":
       latencySent.resolve();
+      return;
+    case "summary-shown":
+      summaryShown.resolve();
       return;
     case "clip-saved":
       clipSaved.resolve();

@@ -136,7 +136,7 @@ pub(crate) fn usage() -> ExitCode {
         "wrela refactor <package-dir> (rename <item> <new-name> | move <item> <module> | add-param <fn> \"<name>: <type>\" (--value <expr> | --default <expr>) | change-mode <fn> <param> <borrow|mut|take> | extract-const <file>:<line>:<col> <NAME> | inline <fn> | extract-fn <file>:<first>-<last> <name> | apply <plan.json>) [--dry-run] [--json]",
         "wrela trace <package-dir> --watch <export>[,<export>...] [--frames n] [--csv] [--fps f] [--size WxH] [--input <script.json>] [--release] [--no-gpu] [--workers N]",
         "wrela bisect <package-dir> --until \"<export> <op> <number>\" [--frames n] [--json] [--fps f] [--size WxH] [--input <script.json>] [--release] [--no-gpu] [--workers N]",
-        "wrela run <package-dir> [--port N] [--lift <package>]... [--debug]",
+        "wrela run <package-dir> [--port N] [--lan] [--lift <package>]... [--debug]",
         "wrela same <package-dir> --against <build-dir> [--frames n] [--fps f] [--size WxH] [--input <script.json>] [--within x] [--no-gpu] [--json]",
         "wrela suite [fmt | allow | wrela::<package-path>::[<test-name>]] [--workspace <dir>]",
         "wrela tool (<package-dir> | <name>) [--read NAME=DIR]... [--write NAME=DIR]... [--secret NAME]... [--net HOST]... [--allow-run NAME[=PATH]]... [--browser] [--timeout S] [--workers N] [--blob-budget B] [-- args...]",

@@ -124,6 +124,9 @@ impl State {
 /// A running server.
 pub(crate) struct Server {
     port: u16,
+    /// The hosts it answers for besides the loopback names: its LAN addresses, if it serves the
+    /// LAN.
+    hosts: Vec<String>,
     /// The served directory's handle, and whether its root is a write root.
     dir: Dir,
     writable: bool,
@@ -148,6 +151,12 @@ impl Server {
     /// The `results/DONE` it has kept for browser session `session`, if it has.
     pub(crate) fn done(&self, session: &str) -> Option<Result<String, String>> {
         locked(&self.done).get(session).cloned()
+    }
+
+    /// Forgets session `session`'s `results/DONE`: its browser goes to a page again, whose own
+    /// is still to come.
+    pub(crate) fn forget_done(&self, session: &str) {
+        locked(&self.done).remove(session);
     }
 
     /// Closes it: its waiters fail, its posts' bytes are given back, its listener and
@@ -245,9 +254,10 @@ pub(crate) fn route(name: &str, b: &mut Body) -> Work {
                 let port = b.u32()?;
                 let port = u16::try_from(port).map_err(|_| format!("{port} isn't a port"))?;
                 let posts = super::http::deadline(f64::from_bits(b.u64()?), POST_DEADLINE)?;
+                let lan = b.u32()? != 0;
                 b.end()?;
                 Work::Long(Box::new(move |s, request| {
-                    super::services::answer(start(s, request, &root, port, posts))
+                    super::services::answer(start(s, request, &root, port, posts, lan))
                 }))
             }
             "next_post" => {
@@ -307,20 +317,26 @@ fn answer(s: &Services, handle: u32, post: u32, data: Data) -> Result<(), String
     reply.send(bytes).map_err(|_| format!("post {post}'s connection closed before the answer"))
 }
 
-/// Starts a server over the directory at `root` on 127.0.0.1:`port` (0: a free one) for
-/// `request`: its handle, port and origin.
+/// Starts a server over the directory at `root` on 127.0.0.1:`port` (0: a free one), or with
+/// `lan` on every interface, for `request`: its handle, port, origin and LAN URLs.
 fn start(
     s: &Arc<Services>,
     request: u32,
     root: &str,
     port: u16,
     posts: Duration,
+    lan: bool,
 ) -> Result<Vec<u8>, String> {
     let (_, dir) = s.caps.open_dir(root)?;
     let writable = s.caps.writable(root).is_ok();
-    let (listener, port) = crate::loopback::listen(port)?;
+    let (listener, port, hosts) = crate::loopback::listen(port, lan)?;
     listener.set_nonblocking(true).map_err(|e| format!("the server's listener: {e}"))?;
+    let urls = crate::loopback::lan_urls(&hosts, port);
+    for url in &urls {
+        eprintln!("serving the LAN at {url}");
+    }
     let server = Arc::new(Server {
+        hosts,
         port,
         dir,
         writable,
@@ -351,6 +367,10 @@ fn start(
     }
     let mut out = Out::default();
     out.u32(handle).u32(u32::from(port)).str(&format!("http://127.0.0.1:{port}"));
+    out.u32(urls.len() as u32);
+    for url in &urls {
+        out.str(url);
+    }
     Ok(out.0)
 }
 
@@ -426,7 +446,8 @@ fn connection(
     stream.set_write_timeout(Some(IDLE))?;
     let mut reader = BufReader::new(stream.try_clone()?);
     let mut out = stream;
-    let Some(head) = crate::loopback::read_head(&mut reader, &mut out, server.port)? else {
+    let Some(head) = crate::loopback::read_head(&mut reader, &mut out, server.port, &server.hosts)?
+    else {
         return Ok(());
     };
     let respond = crate::loopback::respond;

@@ -582,7 +582,7 @@ impl Browser {
             target: target.to_string(),
             session: String::new(),
             state: state.clone(),
-            done: options.done.clone(),
+            done: Mutex::new(options.done.clone()),
             thread: None,
             tag: 0,
             closed: AtomicBool::new(false),
@@ -843,7 +843,8 @@ pub struct Tab {
     target: String,
     session: String,
     state: Arc<TabState>,
-    done: Option<Done>,
+    /// What tells it its page's result: a navigation gives it its new page's.
+    done: Mutex<Option<Done>>,
     thread: Option<std::thread::JoinHandle<()>>,
     /// The tag of its sessions' route.
     tag: u64,
@@ -935,12 +936,23 @@ impl Tab {
     /// What the page put in `results/DONE`, once its server has kept it (or why it can't be
     /// read whole): `None` until then, and for a tab opened with nothing to tell it.
     pub fn done(&self) -> Option<Result<String, String>> {
-        self.done.as_ref().and_then(|d| d())
+        lock(&self.done).as_ref().and_then(|d| d())
     }
 
     /// Whether the tab was opened with what tells it its page's result.
     pub fn knows_done(&self) -> bool {
-        self.done.is_some()
+        lock(&self.done).is_some()
+    }
+
+    /// Loads `url` in the tab, by `deadline`, its page's result told by `done` from now on: the
+    /// same browser and profile, so what it cached (the code cache, the HTTP cache) is warm.
+    pub fn navigate(&self, url: &str, done: Option<Done>, deadline: Instant) -> Result<(), String> {
+        *lock(&self.done) = done;
+        let went = self.call("Page.navigate", json!({"url": url}), deadline)?;
+        if let Some(why) = went.get("errorText").and_then(Value::as_str) {
+            return Err(format!("Chrome couldn't open {url}: {why}"));
+        }
+        Ok(())
     }
 
     /// Why the tab's connection to Chrome ended, if it has: the browser closed, or Chrome

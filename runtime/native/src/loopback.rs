@@ -1,10 +1,13 @@
 //! The little HTTP the toolchain's local servers speak: `wrela run`'s (the driver's `live.rs`),
 //! and a tool's (`std::tool::serve`, language.md §15.5). One request per connection, on
-//! 127.0.0.1 only. A request must name this machine as its host (so a
-//! page elsewhere can't reach a server through DNS rebinding), and a post must come from the
-//! server's own pages (their `Origin`), so another site open in the browser can't change files. A
-//! put (test mode's results) isn't checked for its origin: a browser asks a server before another
-//! site's page may put, and these servers answer no such question.
+//! 127.0.0.1, or on every interface when it's asked to serve the LAN (`--lan`, `lan: true`). A
+//! request must name this machine as its host: a loopback name, or on the LAN one of this
+//! machine's own addresses, never a name (so a page elsewhere can't reach a server through DNS
+//! rebinding). A post must come from the server's own pages (their `Origin`), so another site
+//! open in the browser can't change files. A put (test mode's results) isn't checked for its
+//! origin: a browser asks a server before another site's page may put, and these servers answer
+//! no such question; on the LAN any device can put, which is what serving the LAN is for (a
+//! phone's bench run reporting back).
 //!
 //! Every answer is cross-origin isolated (COOP and COEP, which `SharedArrayBuffer` needs, and
 //! CORP), and keeps nothing cached. Files are reached through a
@@ -84,22 +87,36 @@ impl Head {
     }
 }
 
-/// Listens on 127.0.0.1:`port` (0: a free port): the listener, and its port.
-pub fn listen(port: u16) -> Result<(TcpListener, u16), String> {
-    let listener = TcpListener::bind(("127.0.0.1", port))
-        .map_err(|e| format!("can't listen on 127.0.0.1:{port}: {e}"))?;
+/// Listens on 127.0.0.1:`port` (0: a free port), or with `lan` on every interface: the
+/// listener, its port, and the hosts a request may name besides the loopback names (with `lan`,
+/// this machine's addresses on its networks; else none).
+pub fn listen(port: u16, lan: bool) -> Result<(TcpListener, u16, Vec<String>), String> {
+    let at = if lan { "0.0.0.0" } else { "127.0.0.1" };
+    let listener =
+        TcpListener::bind((at, port)).map_err(|e| format!("can't listen on {at}:{port}: {e}"))?;
     let port = listener.local_addr().map_err(|e| e.to_string())?.port();
-    Ok((listener, port))
+    let hosts = if lan {
+        crate::interfaces::lan_addresses().iter().map(|a| a.to_string()).collect()
+    } else {
+        Vec::new()
+    };
+    Ok((listener, port, hosts))
 }
 
-/// Reads a request's head from `reader`, for a server on `port`: `None` if it was refused (the
-/// refusal is answered on `out`): one for another host, a post from another origin, a body past
-/// [`MAX_BODY`] ([`MAX_RESULT`] for a put), a body framed other than by its length, or a head
-/// past 64 KiB.
+/// The URLs a LAN device opens a server on `port` at: one an address in `hosts`.
+pub fn lan_urls(hosts: &[String], port: u16) -> Vec<String> {
+    hosts.iter().map(|h| format!("http://{h}:{port}/")).collect()
+}
+
+/// Reads a request's head from `reader`, for a server on `port` that also answers for `hosts`
+/// (its LAN addresses, from [`listen`]): `None` if it was refused (the refusal is answered on
+/// `out`): one for another host, a post from another origin, a body past [`MAX_BODY`]
+/// ([`MAX_RESULT`] for a put), a body framed other than by its length, or a head past 64 KiB.
 pub fn read_head(
     reader: &mut impl BufRead,
     out: &mut impl Write,
     port: u16,
+    hosts: &[String],
 ) -> std::io::Result<Option<Head>> {
     let mut left = MAX_HEAD;
     let mut line = |reader: &mut dyn BufRead| -> std::io::Result<Option<String>> {
@@ -154,7 +171,8 @@ pub fn read_head(
         }
     }
     let local = ["127.0.0.1", "localhost", "[::1]"];
-    if !local.iter().any(|h| host == *h || host == format!("{h}:{port}")) {
+    let named = |h: &str| host == h || host == format!("{h}:{port}");
+    if !local.iter().any(|h| named(h)) && !hosts.iter().any(|h| named(h)) {
         respond(out, 403, "text/plain", b"this server answers only requests for this machine")?;
         return Ok(None);
     }
@@ -525,7 +543,7 @@ mod tests {
 
     fn head_of(text: &str) -> (Option<Head>, String) {
         let mut out = Vec::new();
-        let head = read_head(&mut text.as_bytes(), &mut out, 8000).expect("read");
+        let head = read_head(&mut text.as_bytes(), &mut out, 8000, &[]).expect("read");
         (head, String::from_utf8_lossy(&out).into_owned())
     }
 
