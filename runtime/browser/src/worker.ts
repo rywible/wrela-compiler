@@ -332,6 +332,9 @@ let handOvers: HandOvers | null = null;
 /** The pipelines of the build that handed over to the running one that the running one doesn't
  * use: going back to it builds none. */
 let leftovers: PipelineCache = new Map();
+/** The screen the running program draws, once there is one: its format is what a hand-over
+ * prepares the next build's screen pipelines in. */
+let shown: ScreenTarget | null = null;
 
 /** Test mode keeps what the host says, as the program's printed lines (`results/log.txt`). */
 let hostLine: ((line: string) => void) | null = null;
@@ -406,11 +409,11 @@ async function run(canvas: OffscreenCanvas, device: GPUDevice, format: GPUTextur
   const usage = GPUTextureUsage.RENDER_ATTACHMENT;
   const ctx = context(canvas, device, format, usage);
   clock.startAt(epochNow());
-  const screen: ScreenTarget = {
+  const screen: ScreenTarget = (shown = {
     format,
     texture: () => ctx.getCurrentTexture(),
     show: { sdr: format, apply: (f, hdr, gamut) => showCanvas(ctx, device, usage, f, hdr, gamut) },
-  };
+  });
   const start: Start = (b, carried) =>
     startProgram(
       device,
@@ -668,7 +671,7 @@ async function runTest(canvas: OffscreenCanvas, device: GPUDevice, build: Build,
   };
   hostLine = print;
   const salted = params.salt > 0 ? salt(build, params.salt) : build;
-  const target: ScreenTarget = {
+  const target: ScreenTarget = (shown = {
     format: SCREEN_FORMAT,
     texture: () => screen,
     // A test shows the screen another way only when it asks (`hdr=1`): otherwise its screen,
@@ -691,7 +694,7 @@ async function runTest(canvas: OffscreenCanvas, device: GPUDevice, build: Build,
         encoder.copyTextureToTexture({ texture: screen }, { texture: ctx.getCurrentTexture() }, [width, height]);
       }
     },
-  };
+  });
   // `timestamps=1` times each pass; `timestamps=2` runs each alone too (testmode.ts).
   const timing: Timing = params.timestamps === 2 ? "serial" : params.timestamps > 0 ? "span" : "off";
   const start: Start = (b, carried) =>
@@ -1002,7 +1005,7 @@ function receive(msg: ToWorker, reply: (message: FromTicker | FromHelper) => voi
       Promise.all([openDevice(fatal, test?.features ?? null), loadBuild(base, handed.fetch(networkFetch))])
         .then(([device, build]) => {
           const format = screenFormat(test !== null);
-          handOvers = new HandOvers(device, format, () => buildBase, () => [pipelineCache, leftovers], undefined, test !== null);
+          handOvers = new HandOvers(device, () => shown?.format ?? format, () => buildBase, () => [pipelineCache, leftovers], undefined, test !== null);
           return test ? runTest(msg.canvas, device, build, test, live) : run(msg.canvas, device, format, build, live);
         })
         .catch(fatal);

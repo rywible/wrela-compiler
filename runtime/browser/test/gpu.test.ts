@@ -1488,3 +1488,48 @@ describe("pipeline constants", () => {
     expect(desc?.fragment?.constants).toEqual({ wide: 1, taps: 4 });
   });
 });
+
+describe("the screen", () => {
+  /** A screen whose `apply` records what it was asked, and always shows it. */
+  const shown = () => {
+    const applied: [GPUTextureFormat, boolean, number][] = [];
+    const screen: ScreenTarget = {
+      format: SCREEN_FORMAT,
+      texture: () => fakeTexture("screen"),
+      show: {
+        sdr: SCREEN_FORMAT,
+        apply: (format, hdr, gamut) => {
+          applied.push([format, hdr, gamut]);
+          return true;
+        },
+      },
+    };
+    return { screen, applied };
+  };
+  const settled = () => new Promise((go) => setTimeout(go, 20));
+
+  test("a request a later one replaced is never applied", async () => {
+    const { screen, applied } = shown();
+    const { executor } = await setup(shapes(), screen);
+    // HDR's variants are still being built when SDR is asked for again.
+    executor.execute({ op: "ConfigureScreen", hdr: true, gamut: 1 });
+    executor.execute({ op: "ConfigureScreen", hdr: false, gamut: 0 });
+    await settled();
+    expect(applied).toEqual([[SCREEN_FORMAT, false, 0]]);
+    expect(executor.screenState).toBe(0);
+    // The same request again does nothing.
+    executor.execute({ op: "ConfigureScreen", hdr: false, gamut: 0 });
+    await settled();
+    expect(applied.length).toBe(1);
+  });
+
+  test("a program started on the same screen reads how it's shown", async () => {
+    const { screen } = shown();
+    const first = await setup(shapes(), screen);
+    first.executor.execute({ op: "ConfigureScreen", hdr: true, gamut: 1 });
+    await settled();
+    expect(first.executor.screenState).toBe(3);
+    const second = await setup(shapes(), screen);
+    expect(second.executor.screenState).toBe(3);
+  });
+});

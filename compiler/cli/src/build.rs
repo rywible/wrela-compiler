@@ -185,7 +185,8 @@ const RELAXED_LINES: &str = "game.relaxed.lines";
 /// An optimized build's trap locations, beside `game.wasm` (`wrela_abi::lines::SIDECAR`).
 const LINES: &str = "game.lines";
 
-/// Whether a build writes a file with this name: `game.wasm`, `manifest.json`, a pipeline's
+/// Whether a build writes a file with this name: `game.wasm` (and a relaxed-SIMD build's
+/// `game.relaxed.wasm`), their trap locations, `manifest.json`, a pipeline's
 /// `pipeline_<n>.wgsl`, a file of the runtime, a server build's `server/game.wasm` or a tool
 /// build's `tool/tool.wasm`.
 pub(crate) fn written_by_build(name: &str) -> bool {
@@ -202,6 +203,8 @@ pub(crate) fn written_by_build(name: &str) -> bool {
         || shipped
         || name == "game.wasm"
         || name == LINES
+        || name == wrela_driver::build::RELAXED_WASM
+        || name == RELAXED_LINES
         || name == "manifest.json"
         || name == "lift.json"
         || name == wrela_driver::build::SERVER_WASM

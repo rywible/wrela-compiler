@@ -357,20 +357,57 @@ fn gzip(bytes: &[u8]) -> std::io::Result<Vec<u8>> {
     encoder.finish()
 }
 
+/// The largest file a server gzips; a larger one is sent as it is.
+const MOST_GZIPPED: u64 = 64 << 20;
+
+/// The most bytes the process's servers compress at once (the plain bytes read for it); past
+/// it, a file is sent as it is rather than wait.
+const MOST_COMPRESSING: usize = 256 << 20;
+
+/// The plain bytes being compressed now.
+static COMPRESSING: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+/// `n` bytes of [`MOST_COMPRESSING`], taken until it's dropped; none if they aren't free.
+struct Compressing(usize);
+
+impl Compressing {
+    fn take(n: usize) -> Option<Compressing> {
+        use std::sync::atomic::Ordering;
+        COMPRESSING
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |held| {
+                held.checked_add(n).filter(|&total| total <= MOST_COMPRESSING)
+            })
+            .ok()
+            .map(|_| Compressing(n))
+    }
+}
+
+impl Drop for Compressing {
+    fn drop(&mut self) {
+        COMPRESSING.fetch_sub(self.0, std::sync::atomic::Ordering::AcqRel);
+    }
+}
+
 /// The file `file` (whose metadata is `meta`, at most `len` bytes of it read), gzipped: from
 /// the process's cache when the same file at the same version was compressed before, so a
-/// second load costs no compression. Nothing is written to disk.
+/// second load costs no compression. Nothing is written to disk. `None`, with nothing read,
+/// when the file is over [`MOST_GZIPPED`] or compressing it now would pass
+/// [`MOST_COMPRESSING`]: a LAN server's peer can't make it hold more than that.
 fn gzipped(
     file: &mut dyn Read,
     meta: &std::fs::Metadata,
     len: u64,
-) -> std::io::Result<std::sync::Arc<Vec<u8>>> {
+) -> std::io::Result<Option<std::sync::Arc<Vec<u8>>>> {
     use std::os::unix::fs::MetadataExt;
     let key = (meta.dev(), meta.ino(), len, written(meta));
     let lock = || COMPRESSED.lock().unwrap_or_else(|p| p.into_inner());
     if let Some((_, bytes)) = lock().files.iter().find(|(k, _)| *k == key) {
-        return Ok(bytes.clone());
+        return Ok(Some(bytes.clone()));
     }
+    if len > MOST_GZIPPED {
+        return Ok(None);
+    }
+    let Some(_held) = Compressing::take(len as usize) else { return Ok(None) };
     let mut plain = Vec::with_capacity(len as usize);
     file.take(len).read_to_end(&mut plain)?;
     if (plain.len() as u64) < len {
@@ -386,7 +423,7 @@ fn gzipped(
             kept.bytes -= old.len();
         }
     }
-    Ok(bytes)
+    Ok(Some(bytes))
 }
 
 /// A file's version, as an entity tag: its length and when it was last written.
@@ -458,8 +495,11 @@ pub fn get_file(
         }
     };
     // Compressed as it's served, never as a file: the release's edge compresses the same types.
-    if gzip_ok && compressible(mime(&rel)) {
-        return send_gzipped(out, mime(&rel), &gzipped(&mut file, &meta, len)?, tag.as_deref());
+    if gzip_ok
+        && compressible(mime(&rel))
+        && let Some(body) = gzipped(&mut file, &meta, len)?
+    {
+        return send_gzipped(out, mime(&rel), &body, tag.as_deref());
     }
     head_with(out, 200, mime(&rel), len, tag.as_deref(), false)?;
     // At most the length the head gave, though the file grows meanwhile.

@@ -118,6 +118,9 @@ export interface ScreenTarget {
    * `format`, HDR or not, in a gamut (0 sRGB, 1 Display P3), whether it could. Without it (test
    * mode's screen) the command changes nothing. */
   show?: { sdr: GPUTextureFormat; apply(format: GPUTextureFormat, hdr: boolean, gamut: number): boolean };
+  /** How it's shown, as `wrela.limit`'s `SCREEN_LIMIT` gives it (bit 0 HDR, bit 1 Display P3):
+   * kept here, so a program a hot reload or a hand-over starts reads what the canvas shows. */
+  state?: number;
 }
 
 /** The format the screen is drawn in. Test mode's is `SCREEN_FORMAT`, which it reads back and
@@ -926,10 +929,14 @@ export class GpuExecutor {
   /** Starts building pipeline `i` now, if it hasn't started (`Building.start`). */
   readonly #start: (i: number) => void;
   /** How the screen is shown, as `wrela.limit`'s `SCREEN_LIMIT` gives it: bit 0 HDR, bit 1
-   * Display P3. It changes once a `ConfigureScreen` is done. */
-  screenState = 0;
-  /** The screen a `ConfigureScreen` under way changes to, if one is. */
+   * Display P3 (`ScreenTarget.state`). It changes once a `ConfigureScreen` is done. */
+  get screenState(): number {
+    return this.screen.state ?? 0;
+  }
+  /** The screen the latest `ConfigureScreen` asked for, while its variants are built; only
+   * that request is applied when it's ready, never one it replaced. */
   #screenWanted: number | undefined;
+  #screenAsked = 0;
 
   /** A variant of each render pipeline that draws the screen, in `format`: what showing the
    * screen in another format needs first. Every pipeline is started, so none is built later in
@@ -1369,15 +1376,16 @@ export class GpuExecutor {
         // Asked again for what it shows, or what it's changing to: nothing to do.
         if (want === (this.#screenWanted ?? this.screenState)) return;
         this.#screenWanted = want;
+        const asked = ++this.#screenAsked;
         // The frames go on in the old format until every pipeline that draws the screen can
         // draw it in the new one; then, between frames, the canvas changes.
         this.screenVariants(format).then(() => {
-          if (this.#retired) return;
+          if (this.#retired || asked !== this.#screenAsked) return;
+          this.#screenWanted = undefined;
           if (show.apply(format, cmd.hdr, cmd.gamut)) {
             this.screen.format = format;
-            this.screenState = want;
+            this.screen.state = want;
           }
-          if (this.#screenWanted === want) this.#screenWanted = undefined;
         }, (e: unknown) => this.#fail(e));
         return;
       }
