@@ -1023,6 +1023,16 @@ impl<const N: u32, const K: u32> Taped<N, K> {
         r
     }
 
+    /// The field's interval over `over`: every value it takes there lies within it (the bound
+    /// `prune` reads, its last operation's), so a realizer culls a block by it as a compiled
+    /// field's `interval`. An empty tape's is 0.
+    pub fn interval(self, over: Box3) -> Interval {
+        if self.len == 0 {
+            return Interval { lo: 0.0, hi: 0.0 }
+        }
+        self.register_intervals(over)[self.len - 1]
+    }
+
     /// The same field within `over`, with less work: each minimum or maximum whose operands'
     /// intervals over `over` don't overlap (by the smooth minimum's width, for one), and each
     /// selection or step whose condition has one sign there, becomes the operand it always
@@ -1348,4 +1358,24 @@ fn a_tape_with_carries_its_channels() {
     let p = vec3(0.25, 0.75, -2.0)
     let (d, rest) = interpret_with::<TAPE_LEN, TAPE_CONSTS, 3>(t, p)
     assert(d == length(p) - 1.0 && rest[0] == 0.75 && rest[1] == 0.5 && rest[2] == -0.5)
+}
+
+@test
+fn a_tapes_interval_holds_every_value_it_takes() {
+    var t: Tape = Taped::new()
+    let x = t.x()
+    let y = t.y()
+    let s = t.sphere(vec3(0.0), 1.0)
+    let xy = t.mul(x, y)
+    let _ = t.add(xy, s)
+    let over = Box3 { lo: vec3(0.5, -1.0, 0.0), hi: vec3(1.5, 0.5, 0.25) }
+    let iv = t.interval(over)
+    for i in 0..64 {
+        let u = vec3(f32(i % 4) / 3.0, f32((i / 4) % 4) / 3.0, f32(i / 16) / 3.0)
+        let p = over.lo + (over.hi - over.lo) * u
+        let v = interpret(t, p)
+        assert(v >= iv.lo && v <= iv.hi, f"{v} outside [{iv.lo}, {iv.hi}] at {p}")
+    }
+    let empty: Tape = Taped::new()
+    assert(empty.interval(over).lo == 0.0 && empty.interval(over).hi == 0.0)
 }
