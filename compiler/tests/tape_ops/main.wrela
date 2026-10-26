@@ -13,8 +13,7 @@ use std::stage::{
     ABS, AND, ATAN2, CLAMP01, CONST, COPY, DOT3, F2I, F2U, FBM3, FLOOR, FRACT, HASH, I2F, IADD,
     IDIV, IEQ, ILT, IMAX, IMIN, IMUL, IREM, ISHR, ISUB, LEN3, LERP_LOAD, LOAD, LOG, MIX, MOD,
     NOISE3, IMAD, NORM3, OR, PCG, POW, SELECT, SHL, STEP, Taped, U2F, UDIV, ULT, UMAX, UMIN, UREM,
-    BOXNOISE3,
-    USHR, X, XOR, Y, Z, interpret,
+    BOXNOISE3, USHR, X, XOR, Y, Z, interpret,
 }
 
 /// The operations checked, in their tapes' order.
@@ -41,8 +40,6 @@ const OPS: [u32; 21] = [
     ATAN2,
     BOXNOISE3,
 ]
-/// The box noise's case (`OPS`'s last).
-const BOX_CASE: u32 = 20
 /// The integer operations checked: those that write an integer, each half of it (the high,
 /// then the low), and those that write a float.
 const INTS: [u32; 26] = [
@@ -365,7 +362,9 @@ fn compare(tapes: [Small], worst: mut Atomics<u32>, id: GlobalId) {
         // A box noise's sum over its box's lattice points, rounded as a GPU compiler arranges it
         // in each (it may contract a product and a sum where the other doesn't): within 2⁻²⁰ of
         // its twin, wherever near 0 its ulps are.
-        let off = if k == BOX_CASE && abs(got - want) <= 1.0 / 1048576.0 { 0 } else {
+        let off = if k < FLOATS && OPS[k] == BOXNOISE3 && abs(got - want) <= 1.0 / 1048576.0 {
+            0
+        } else {
             ulps(got, want)
         }
         let _ = worst.max(k, off)
@@ -430,7 +429,7 @@ fn each_operation_matches_its_twin_on_the_cpu() {
             worst = max(worst, ulps(interpret(t, p), twin(k, p)))
         }
         print(f"cpu op {case(k).0} (#{k}): worst {worst} ulps")
-        let exact = k >= FLOATS || OPS[k] == NOISE3 || OPS[k] == FBM3 || OPS[k] == HASH || OPS[k] == BOXNOISE3
+        let exact = exact(k)
         assert(worst == 0 || (!exact && worst <= 1), "an operation differs from its twin")
     }
 }
@@ -439,7 +438,13 @@ fn each_operation_matches_its_twin_on_the_cpu() {
 fn each_operation_matches_its_twin_on_the_gpu(s: State) {
     assert(s.seen.len() == COUNT, "the GPU's worst came back")
     for k in 0..COUNT {
-        let exact = k >= FLOATS || OPS[k] == NOISE3 || OPS[k] == FBM3 || OPS[k] == HASH || OPS[k] == BOXNOISE3
+        let exact = exact(k)
         assert(s.seen[k] == 0 || (!exact && s.seen[k] <= 1), "an operation differs from its twin")
     }
+}
+
+/// Whether case `k`'s value is to be equal bit for bit on both targets: an integer's, or a
+/// noise's or a hash's (std::field's own code, not a library's rounding).
+fn exact(k: u32) -> bool {
+    k >= FLOATS || OPS[k] == NOISE3 || OPS[k] == FBM3 || OPS[k] == HASH || OPS[k] == BOXNOISE3
 }

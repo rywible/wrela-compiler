@@ -380,7 +380,8 @@ impl Recorded {
             // colour target's texture, then the depth or `NONE`) as its bindings.
             C::BeginPass(p) => {
                 r.groups = [u32::from(p.join), p.count, 0];
-                r.bindings = p.colors[..p.count as usize]
+                r.bindings = p
+                    .colors()
                     .iter()
                     .map(|t| [t.texture, t.level, t.layer])
                     .chain([[p.depth, 0, p.depth_layer]])
