@@ -47,10 +47,32 @@ fn empty_vec() -> Value {
 /// bytes, and the errors (two constants shipping one directory). Each such constant's value keeps
 /// its names and sizes, its bytes emptied.
 pub fn take(checked: &Checked, data: &mut BuildData) -> (Vec<(String, Vec<u8>)>, Vec<Diagnostic>) {
+    let (files, diags, stripped) = read(checked, data);
+    for (c, v) in stripped {
+        data.values.insert(c, std::rc::Rc::new(v));
+    }
+    (files, diags)
+}
+
+/// The files `data`'s shipped constants ship, each at its path in the build, and their errors,
+/// leaving the constants as they are: a test's build writes them beside its code, so what the
+/// program fetches is there, while its constants keep their bytes for build-time code to read.
+pub fn files(checked: &Checked, data: &BuildData) -> (Vec<(String, Vec<u8>)>, Vec<Diagnostic>) {
+    let (files, diags, _) = read(checked, data);
+    (files, diags)
+}
+
+/// The shipped constants' files and errors, and each constant's value with its bytes emptied.
+#[allow(clippy::type_complexity)]
+fn read(
+    checked: &Checked,
+    data: &BuildData,
+) -> (Vec<(String, Vec<u8>)>, Vec<Diagnostic>, Vec<(ConstId, Value)>) {
     let p = &checked.program;
     let mut files = Vec::new();
     let mut diags = Vec::new();
     let mut dirs = BTreeSet::new();
+    let mut emptied = Vec::new();
     let shipped: Vec<ConstId> = data
         .values
         .keys()
@@ -114,10 +136,10 @@ pub fn take(checked: &Checked, data: &mut BuildData) -> (Vec<(String, Vec<u8>)>,
             .enumerate()
             .map(|(i, part)| if i == 3 { empty_vec() } else { part.clone() })
             .collect();
-        data.values.insert(c, std::rc::Rc::new(Value::Parts(stripped)));
+        emptied.push((c, Value::Parts(stripped)));
     }
     files.sort_by(|a, b| a.0.cmp(&b.0));
-    (files, diags)
+    (files, diags, emptied)
 }
 
 /// A name that occurs more than once, if one does.

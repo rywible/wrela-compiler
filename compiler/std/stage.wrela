@@ -13,7 +13,7 @@
 
 use std::derive::{Box2, Box3, Interval, interval}
 use std::math::is_finite
-use std::field::{Surface, lattice, lattice_coord, smin, value_noise}
+use std::field::{Surface, lattice, lattice_coord, smin, value_noise, value_noise_box}
 use std::hash::pcg
 
 /// The most operations a `Tape` holds, and the most constants in its table.
@@ -166,6 +166,9 @@ pub const F2U: u32 = 59
 pub const PCG: u32 = 60
 /// `a * b + t` of integers (wrapping; `t` the third register's pair): a hash's mixing.
 pub const IMAD: u32 = 61
+/// `value_noise_box(r[a..a+3], r[b..b+3])`: value noise averaged over the box round a point
+/// (`std::field::value_noise_box`), a filtered field's noise seen a width wide.
+pub const BOXNOISE3: u32 = 62
 
 /// How many registers an operation reads (`a`, `b`, then the third), the vector operations
 /// aside (`reads`).
@@ -187,11 +190,16 @@ fn arity(code: u32) -> u32 {
         3
     } else if code == LOAD || code == LERP_LOAD || code == NORM3 || code == LEN3 {
         1
-    } else if code == DOT3 {
+    } else if two_vectors(code) {
         2
     } else {
         1
     }
+}
+
+/// Whether an operation reads two vectors, `a..a+3` and `b..b+3`.
+fn two_vectors(code: u32) -> bool {
+    code == DOT3 || code == BOXNOISE3
 }
 
 /// Whether an operation reads its operands as integers: register pairs, `a..a+2` (and `b..b+2`,
@@ -200,14 +208,20 @@ fn pair_op(code: u32) -> bool {
     (code >= IADD && code < F2I) || code == PCG || code == IMAD
 }
 
+/// Whether an operation is an integer one (`IADD` to `IMAD`): its registers are integers' halves
+/// or comparisons, and a box noise past them is a float's.
+fn integer_op(code: u32) -> bool {
+    code >= IADD && code <= IMAD
+}
+
 /// Whether an operation writes half an integer (`c` says which).
 fn half_op(code: u32) -> bool {
-    (code >= IADD && code < ULT) || code >= F2I
+    (code >= IADD && code < ULT) || (code >= F2I && code <= IMAD)
 }
 
 /// Whether an operation reads its registers three in a row: `a..a+3` (and `b..b+3`).
 fn vector_op(code: u32) -> bool {
-    code == DOT3 || code == LEN3 || code == NORM3
+    code == DOT3 || code == LEN3 || code == NORM3 || code == BOXNOISE3
 }
 
 /// One operation: its register gets `code` (the opcode in the low 16 bits; a ternary
@@ -279,6 +293,44 @@ pub fn interpret<const N: u32, const K: u32>(tape: Taped<N, K>, p: vec3) -> f32 
             let u = vec3(r[op.a], r[op.a + 1], r[op.a + 2])
             if code == DOT3 {
                 dot(u, vec3(r[op.b], r[op.b + 1], r[op.b + 2]))
+            } else if code == BOXNOISE3 {
+                value_noise_box(u, vec3(r[op.b], r[op.b + 1], r[op.b + 2]))
+            } else if code == LEN3 {
+                length(u)
+            } else {
+                vector_component(normalize(u), op.c)
+            }
+        } else if code == LOAD || code == LERP_LOAD {
+            table(tape, op, r[op.a])
+        } else if code == FBM3 {
+            fbm3(tape, op, vec3(r[op.a], r[op.b], r[op.third()]))
+        } else {
+            apply(op, p, r[op.a], r[op.b], r[op.third()])
+        }
+    }
+    if tape.len == 0 { 0.0 } else { r[tape.len - 1] }
+}
+
+/// `interpret` for an interval: a box noise's register is every number (its loops run as often
+/// as its box is wide, which no derivation follows), so what reads one has every number's
+/// interval, and what doesn't keeps its own.
+fn interpret_unboxed<const N: u32, const K: u32>(tape: Taped<N, K>, p: vec3) -> f32 {
+    var r = [0.0; N]
+    for i in 0..tape.len {
+        let op = tape.ops[i]
+        let code = op.opcode()
+        // The integers first: one comparison for every float operation.
+        r[i] = if code >= IADD && pair_op(code) {
+            let t = if code == IMAD { whole(r[op.third()], r[op.third() + 1]) } else { 0 }
+            integer(op, whole(r[op.a], r[op.a + 1]), whole(r[op.b], r[op.b + 1]), t)
+        } else if vector_op(code) {
+            let u = vec3(r[op.a], r[op.a + 1], r[op.a + 2])
+            if code == DOT3 {
+                dot(u, vec3(r[op.b], r[op.b + 1], r[op.b + 2]))
+            } else if code == BOXNOISE3 {
+                // Every number, to an interval (a divisor whose interval holds zero): a box
+                // noise's loops have no derivation. Only intervals run this.
+                1.0 / (0.0 * u.x)
             } else if code == LEN3 {
                 length(u)
             } else {
@@ -308,6 +360,8 @@ fn run<const N: u32, const K: u32>(tape: Taped<N, K>, p: vec3, r: mut [f32; N]) 
             let u = vec3(r[op.a], r[op.a + 1], r[op.a + 2])
             if code == DOT3 {
                 dot(u, vec3(r[op.b], r[op.b + 1], r[op.b + 2]))
+            } else if code == BOXNOISE3 {
+                value_noise_box(u, vec3(r[op.b], r[op.b + 1], r[op.b + 2]))
             } else if code == LEN3 {
                 length(u)
             } else {
@@ -621,6 +675,13 @@ impl<const N: u32, const K: u32> Surface for Taped<N, K> {
         interpret(self, p)
     }
 
+    /// The interval derived through `interpret_unboxed`: every number's where a box noise
+    /// reaches the value. (`Taped::interval`, each operation's interval in turn, is tighter, and
+    /// a shader too large to build.)
+    fn interval(self, over: Box3) -> Interval {
+        interval(|q| interpret_unboxed(self, q), over)
+    }
+
     /// Itself, as a `Tape`.
     fn to_tape(self) -> Tape {
         match self.resized() {
@@ -908,6 +969,12 @@ impl<const N: u32, const K: u32> Taped<N, K> {
         self.op(DOT3, u, v, 0.0)
     }
 
+    /// Value noise averaged over the box `p ± half`, each three registers in a row from `p`
+    /// and `half` (`std::field::value_noise_box`).
+    pub fn noise_box(mut self, p: Reg, half: Reg) -> Reg {
+        self.op(BOXNOISE3, p, half, 0.0)
+    }
+
     /// `length` of the vector three registers in a row from `u`.
     pub fn length3(mut self, u: Reg) -> Reg {
         self.op(LEN3, u, u, 0.0)
@@ -944,11 +1011,12 @@ impl<const N: u32, const K: u32> Taped<N, K> {
         self.sub(d, r)
     }
 
-    /// The register `k`'s value over `over`, as `interval` derives it from `interpret`.
+    /// The register `k`'s value over `over`, as `interval` derives it from `interpret`
+    /// (`interpret_unboxed`: every number's past a box noise that reaches it).
     fn register_interval(self, k: u32, over: Box3) -> Interval {
         var upto = self
         upto.len = k + 1
-        interval(|q| interpret(upto, q), over)
+        interval(|q| interpret_unboxed(upto, q), over)
     }
 
     /// Each register's `register_interval` over `over`, from one pass: each operation's interval
@@ -975,13 +1043,13 @@ impl<const N: u32, const K: u32> Taped<N, K> {
                     known = known && finite[op.a + k]
                 }
             }
-            if n >= 2 && code != DOT3 {
+            if n >= 2 && !two_vectors(code) {
                 known = known && finite[op.b]
             }
             if n == 3 {
                 known = known && finite[op.third()]
             }
-            r[i] = if code >= IADD {
+            r[i] = if integer_op(code) {
                 // An integer's halves are whole numbers to 65535; a comparison 0 or 1.
                 let hi = if half_op(code) { 65535.0 } else if code == I2F {
                     2147483647.0
@@ -989,6 +1057,9 @@ impl<const N: u32, const K: u32> Taped<N, K> {
                 Interval { lo: if code == I2F { -2147483648.0 } else { 0.0 }, hi }
             } else if n == 0 {
                 interval(|q: vec3| apply(op, q, a: 0.0, b: 0.0, t: 0.0), over)
+            } else if code == BOXNOISE3 {
+                // A mean of lattice values, each in [-1, 1].
+                Interval { lo: -1.0, hi: 1.0 }
             } else if !known || code == DOT3 {
                 self.register_interval(i, over)
             } else if vector_op(code) {
@@ -1021,6 +1092,16 @@ impl<const N: u32, const K: u32> Taped<N, K> {
             finite[i] = is_finite(r[i].lo) && is_finite(r[i].hi)
         }
         r
+    }
+
+    /// The field's interval over `over`: every value it takes there lies within it (the bound
+    /// `prune` reads, its last operation's), so a realizer culls a block by it as a compiled
+    /// field's `interval`. An empty tape's is 0.
+    pub fn interval(self, over: Box3) -> Interval {
+        if self.len == 0 {
+            return Interval { lo: 0.0, hi: 0.0 }
+        }
+        self.register_intervals(over)[self.len - 1]
     }
 
     /// The same field within `over`, with less work: each minimum or maximum whose operands'
@@ -1107,7 +1188,11 @@ impl<const N: u32, const K: u32> Taped<N, K> {
                     }
                 }
                 if n >= 2 {
-                    let wb = if code == DOT3 { 3 } else if pair_op(code) { 2 } else { 1 }
+                    let wb = if two_vectors(code) { 3 } else if pair_op(code) {
+                        2
+                    } else {
+                        1
+                    }
                     for k in 0..wb {
                         used[op.b + k] = true
                         in_row[op.b + k] = in_row[op.b + k] || wb > 1
@@ -1348,4 +1433,24 @@ fn a_tape_with_carries_its_channels() {
     let p = vec3(0.25, 0.75, -2.0)
     let (d, rest) = interpret_with::<TAPE_LEN, TAPE_CONSTS, 3>(t, p)
     assert(d == length(p) - 1.0 && rest[0] == 0.75 && rest[1] == 0.5 && rest[2] == -0.5)
+}
+
+@test
+fn a_tapes_interval_holds_every_value_it_takes() {
+    var t: Tape = Taped::new()
+    let x = t.x()
+    let y = t.y()
+    let s = t.sphere(vec3(0.0), 1.0)
+    let xy = t.mul(x, y)
+    let _ = t.add(xy, s)
+    let over = Box3 { lo: vec3(0.5, -1.0, 0.0), hi: vec3(1.5, 0.5, 0.25) }
+    let iv = t.interval(over)
+    for i in 0..64 {
+        let u = vec3(f32(i % 4) / 3.0, f32((i / 4) % 4) / 3.0, f32(i / 16) / 3.0)
+        let p = over.lo + (over.hi - over.lo) * u
+        let v = interpret(t, p)
+        assert(v >= iv.lo && v <= iv.hi, f"{v} outside [{iv.lo}, {iv.hi}] at {p}")
+    }
+    let empty: Tape = Taped::new()
+    assert(empty.interval(over).lo == 0.0 && empty.interval(over).hi == 0.0)
 }

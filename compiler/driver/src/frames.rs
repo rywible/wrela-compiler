@@ -68,9 +68,28 @@ pub fn run(
     if has_errors(&diags) {
         return (Vec::new(), diags);
     }
+    // The files its shipped constants ship too, so what the program fetches or names to the host
+    // is there (and their errors: two constants shipping into one directory).
+    let shipped = if full_build {
+        let (files, errors) = crate::shipped::files(checked, data);
+        diags.extend(errors);
+        if has_errors(&diags) {
+            return (Vec::new(), diags);
+        }
+        files
+    } else {
+        Vec::new()
+    };
     let written = crate::Scratch::new("wrela-test").and_then(|dir| {
-        for (path, bytes) in &out.files {
-            std::fs::write(dir.0.join(path), bytes).map_err(|e| e.to_string())?;
+        let mut made = std::collections::BTreeSet::new();
+        for (path, bytes) in out.files.iter().chain(&shipped) {
+            let at = dir.0.join(path);
+            if let Some(parent) = at.parent()
+                && made.insert(parent.to_path_buf())
+            {
+                std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
+            }
+            std::fs::write(at, bytes).map_err(|e| e.to_string())?;
         }
         Ok(dir)
     });

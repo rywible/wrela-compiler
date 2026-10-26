@@ -1,7 +1,14 @@
-// Held requests (language.md §13.2): a fetch of the build's own manifest and a storage read,
-// each made in `init` and polled on every frame, and the frame each answer arrives on. A test's
-// `hold` holds a path's requests until a frame: the answer arrives on that frame, not before.
-use std::io::{Pending, fetch, load, store}
+// Held requests (language.md §13.2): a fetch of the build's own manifest, a storage read and a
+// fetch of a file the build ships, each made in `init` and polled on every frame, and the frame
+// each answer arrives on. A test's `hold` holds a path's requests until a frame: the answer
+// arrives on that frame, not before. A test's build holds the files its constants ship.
+use std::io::{Pending, Shipped, fetch, load, ship, store}
+
+/// A file the build ships (`files/data/three.bin`).
+pub const SHIPPED: Shipped = ship(
+    "data",
+    Vec::from([(String::from("three.bin"), Vec::from([1, 2, 3]))]),
+)
 
 /// Not arrived yet.
 pub const NEVER: u32 = 0xFFFFFFFF
@@ -11,7 +18,10 @@ pub struct State {
     stored: Pending<u8>,
     fetched: Pending<u8>,
     loaded: Pending<u8>,
+    shipped: Pending<u8>,
     pub fetched_at: u32,
+    pub shipped_at: u32,
+    pub shipped_bytes: u32,
     pub loaded_at: u32,
     pub loaded_bytes: u32,
 }
@@ -22,7 +32,10 @@ pub fn init() -> State {
         stored: store("slot", [7, 8, 9]),
         fetched: fetch("manifest.json"),
         loaded: load("slot"),
+        shipped: SHIPPED.fetch(0),
         fetched_at: NEVER,
+        shipped_at: NEVER,
+        shipped_bytes: 0,
         loaded_at: NEVER,
         loaded_bytes: 0,
     }
@@ -39,6 +52,12 @@ pub fn frame(s: mut State, time: f32, width: u32, height: u32) {
         if let Some(Ok(b)) = s.loaded.poll() {
             s.loaded_at = s.frame
             s.loaded_bytes = b.len()
+        }
+    }
+    if s.shipped_at == NEVER {
+        if let Some(Ok(b)) = s.shipped.poll() {
+            s.shipped_at = s.frame
+            s.shipped_bytes = b.len()
         }
     }
     s.frame += 1
@@ -62,4 +81,10 @@ fn held_requests_arrive_on_their_frames(s: State) {
 @test(frames: 8, hold: [("manifest.json", 100)])
 fn a_hold_past_the_last_frame_never_arrives(s: State) {
     assert(s.fetched_at == NEVER && s.loaded_at == 0)
+}
+
+/// The shipped file is in the test's build: it arrives, whole, on the frame its hold names.
+@test(frames: 20, hold: [("files/data/three.bin", 12)])
+fn a_shipped_file_arrives_in_a_test(s: State) {
+    assert(s.shipped_at == 12 && s.shipped_bytes == 3, f"on frame {s.shipped_at}")
 }

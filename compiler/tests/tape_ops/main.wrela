@@ -2,22 +2,22 @@
 // each, on the CPU (`each_operation_matches_its_twin_on_the_cpu`) and the GPU (a kernel over the
 // points, `each_operation_matches_its_twin_on_the_gpu`): the tape's value against the function
 // it stands for, in ulps. The noises and the hash call std's own code, so they agree bit for
-// bit; the rest within an ulp. Each operation reads the point's coordinates (registers 0 to 2,
+// bit (and the box noise, 0.9.0); the rest within an ulp. Each operation reads the point's coordinates (registers 0 to 2,
 // and their copies 3 to 5, for a dot product's second vector); its inputs are drawn from a
 // range its function is defined on. The integer operations (a pair of registers each) read
 // two 32-bit integers made from the point's x and y, and each half they write is a case.
-use std::field::{fbm, lattice, lattice_coord, value_noise, Noise}
+use std::field::{fbm, lattice, lattice_coord, value_noise, value_noise_box, Noise}
 use std::gpu::{Atomics, GlobalId, GpuBuffer, buffer, dispatch, read}
 use std::io::{Pending, print}
 use std::stage::{
     ABS, AND, ATAN2, CLAMP01, CONST, COPY, DOT3, F2I, F2U, FBM3, FLOOR, FRACT, HASH, I2F, IADD,
     IDIV, IEQ, ILT, IMAX, IMIN, IMUL, IREM, ISHR, ISUB, LEN3, LERP_LOAD, LOAD, LOG, MIX, MOD,
     NOISE3, IMAD, NORM3, OR, PCG, POW, SELECT, SHL, STEP, Taped, U2F, UDIV, ULT, UMAX, UMIN, UREM,
-    USHR, X, XOR, Y, Z, interpret,
+    BOXNOISE3, USHR, X, XOR, Y, Z, interpret,
 }
 
 /// The operations checked, in their tapes' order.
-const OPS: [u32; 20] = [
+const OPS: [u32; 21] = [
     FLOOR,
     FRACT,
     STEP,
@@ -38,6 +38,7 @@ const OPS: [u32; 20] = [
     NORM3,
     NORM3,
     ATAN2,
+    BOXNOISE3,
 ]
 /// The integer operations checked: those that write an integer, each half of it (the high,
 /// then the low), and those that write a float.
@@ -71,7 +72,7 @@ const INTS: [u32; 26] = [
 ]
 /// Of `INTS`, those that write an integer, two cases each.
 const HALVES: u32 = 21
-const FLOATS: u32 = 20
+const FLOATS: u32 = 21
 const COUNT: u32 = FLOATS + 2 * HALVES + (26 - HALVES)
 /// The integers an integer operation's case reads: the point's whole x, y and z, times these.
 const SPREAD: [u32; 3] = [2654435761, 2246822519, 3266489917]
@@ -161,6 +162,12 @@ fn tape_for(k: u32) -> Small {
         t.length3(x)
     } else if code == ATAN2 {
         t.atan2(x, y)
+    } else if code == BOXNOISE3 {
+        // The box's half widths: three constants in a row after the point's registers.
+        let half = t.constant(0.3)
+        let _ = t.constant(0.1)
+        let _ = t.constant(0.7)
+        t.noise_box(x, half)
     } else {
         t.normalize3(x, k - 16)
     }
@@ -284,6 +291,8 @@ fn twin(k: u32, p: vec3) -> f32 {
         length(p)
     } else if code == ATAN2 {
         atan2(x, y)
+    } else if code == BOXNOISE3 {
+        value_noise_box(p, vec3(0.3, 0.1, 0.7))
     } else {
         let n = normalize(p)
         if k == 16 { n.x } else if k == 17 { n.y } else { n.z }
@@ -349,7 +358,16 @@ fn compare(tapes: [Small], worst: mut Atomics<u32>, id: GlobalId) {
     for k in 0..COUNT {
         let p = point(k, i)
         let got = interpret(tapes[k], p)
-        let _ = worst.max(k, ulps(got, twin(k, p)))
+        let want = twin(k, p)
+        // A box noise's sum over its box's lattice points, rounded as a GPU compiler arranges it
+        // in each (it may contract a product and a sum where the other doesn't): within 2⁻²⁰ of
+        // its twin, wherever near 0 its ulps are.
+        let off = if k < FLOATS && OPS[k] == BOXNOISE3 && abs(got - want) <= 1.0 / 1048576.0 {
+            0
+        } else {
+            ulps(got, want)
+        }
+        let _ = worst.max(k, off)
     }
 }
 
@@ -411,7 +429,7 @@ fn each_operation_matches_its_twin_on_the_cpu() {
             worst = max(worst, ulps(interpret(t, p), twin(k, p)))
         }
         print(f"cpu op {case(k).0} (#{k}): worst {worst} ulps")
-        let exact = k >= FLOATS || OPS[k] == NOISE3 || OPS[k] == FBM3 || OPS[k] == HASH
+        let exact = exact(k)
         assert(worst == 0 || (!exact && worst <= 1), "an operation differs from its twin")
     }
 }
@@ -420,7 +438,13 @@ fn each_operation_matches_its_twin_on_the_cpu() {
 fn each_operation_matches_its_twin_on_the_gpu(s: State) {
     assert(s.seen.len() == COUNT, "the GPU's worst came back")
     for k in 0..COUNT {
-        let exact = k >= FLOATS || OPS[k] == NOISE3 || OPS[k] == FBM3 || OPS[k] == HASH
+        let exact = exact(k)
         assert(s.seen[k] == 0 || (!exact && s.seen[k] <= 1), "an operation differs from its twin")
     }
+}
+
+/// Whether case `k`'s value is to be equal bit for bit on both targets: an integer's, or a
+/// noise's or a hash's (std::field's own code, not a library's rounding).
+fn exact(k: u32) -> bool {
+    k >= FLOATS || OPS[k] == NOISE3 || OPS[k] == FBM3 || OPS[k] == HASH || OPS[k] == BOXNOISE3
 }

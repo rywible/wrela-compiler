@@ -680,6 +680,7 @@ impl<'a> Cx<'a> {
             f.known = match self.checked.program.func(*func).lang {
                 Some(Lang::Smin) => Some(ir::Known::Smin),
                 Some(Lang::ValueNoise) => Some(ir::Known::ValueNoise),
+                Some(Lang::ValueNoiseBox) => Some(ir::Known::ValueNoiseBox),
                 Some(Lang::LatticeCoord) => Some(ir::Known::LatticeCoord),
                 Some(Lang::Pcg) => Some(ir::Known::Pcg),
                 _ => None,

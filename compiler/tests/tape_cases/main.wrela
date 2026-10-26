@@ -1,11 +1,12 @@
 // What a tape must take as compiled code does (language.md §14.4), each found by the 0.8.0
 // council: a branch on the point whose sides write through a call's `mut` argument; a value
 // only part of which depends on the point; an integer table with values past 2²⁴; `lattice`
-// and `lattice_coord` past `i32`'s range; one function taped at two sizes in one program; and a
-// pruned tape of `tape_with`, which keeps its channels.
+// and `lattice_coord` past `i32`'s range; one function taped at two sizes in one program; a
+// pruned tape of `tape_with`, which keeps its channels; and box-filtered value noise (0.9.0), one
+// operation, whose interval holds every value it takes.
 // Each tape is interpreted at points on both sides of what it branches on, against the field.
 use std::derive::{Box3, tape, tape_sized, tape_with}
-use std::field::{lattice, lattice_coord}
+use std::field::{Surface, lattice, lattice_coord, value_noise_box}
 use std::stage::{Taped, interpret, interpret_with}
 
 pub fn frame(time: f32, width: u32, height: u32) {}
@@ -48,6 +49,12 @@ fn lattices(p: vec3) -> f32 {
     f32((lattice_coord(p.x) >> 8) & 255) + lattice(2147483647, lattice_coord(p.y), 16777217)
 }
 
+/// A sphere roughened by value noise averaged over a box whose width grows with x: a filtered
+/// field's noise, its loops as many as its box is wide.
+fn filtered(p: vec3) -> f32 {
+    length(p) - 1.0 + 0.2 * value_noise_box(p * 3.0, vec3(0.05 + 0.4 * abs(p.x)))
+}
+
 fn sphere(p: vec3) -> f32 {
     length(p) - 1.0
 }
@@ -88,6 +95,85 @@ fn lattices_past_an_i32_are_the_compiled_codes() {
 fn one_function_tapes_at_two_sizes() {
     let small: Taped<64, 64> = tape_sized(sphere)
     assert(worst(tape(sphere), sphere, 2.0) < 1.0e-6 && worst(small, sphere, 2.0) < 1.0e-6)
+}
+
+@test
+fn box_filtered_noise_is_one_operation() {
+    let t = tape(filtered)
+    assert(worst(t, filtered, 2.0) < 1.0e-6, "the box noise's value")
+    let over = Box3 { lo: vec3(0.2, -0.4, 0.1), hi: vec3(0.9, 0.3, 0.6) }
+    let iv = t.interval(over)
+    for i in 0..27 {
+        let u = vec3(f32(i % 3), f32((i / 3) % 3), f32(i / 9)) * 0.5
+        let v = filtered(over.lo + (over.hi - over.lo) * u)
+        assert(v >= iv.lo && v <= iv.hi, f"{v} outside [{iv.lo}, {iv.hi}]")
+    }
+    assert(worst(t.prune(over), filtered, 0.5) < 1.0e-6, "pruned, its value within the box")
+}
+
+/// A box noise under a floor: `min(noise, -0.25)`, which takes the noise wherever it's below the
+/// floor.
+fn floored(p: vec3) -> f32 {
+    min(value_noise_box(p * 3.0, vec3(0.2)), -0.25)
+}
+
+/// A box noise's interval holds its negative values too (it's a float's, not an integer's half),
+/// so a tape that takes the lesser of it and a floor isn't pruned to the floor.
+@test
+fn a_box_noises_interval_holds_its_negative_values() {
+    let t = tape(floored)
+    let over = Box3 { lo: vec3(-1.0), hi: vec3(1.0) }
+    let iv = t.interval(over)
+    assert(iv.lo < -0.25, f"[{iv.lo}, {iv.hi}]: the noise's negative values aren't in it")
+    var below = 0
+    for i in 0..512 {
+        let u = vec3(f32(i % 8), f32((i / 8) % 8), f32(i / 64)) / 7.0
+        if floored(over.lo + (over.hi - over.lo) * u) < -0.25 {
+            below += 1
+        }
+    }
+    assert(below > 0, "no point of the box has the noise under the floor")
+    assert(worst(t.prune(over), floored, 1.0) < 1.0e-6, "pruned, the tape lost the noise")
+}
+
+/// A box noise beside a dot product that doesn't read it: the lesser is always the dot product
+/// within a unit box.
+fn beside(p: vec3) -> f32 {
+    min(value_noise_box(p, vec3(0.2)) + 5.0, dot(p, p))
+}
+
+/// Only what reads a box noise has every number's interval: a dot product after one that doesn't
+/// read it keeps its own, so the tape's interval is the dot product's and pruning keeps it alone.
+@test
+fn a_box_noise_widens_only_what_reads_it() {
+    let t = tape(beside)
+    let over = Box3 { lo: vec3(-1.0), hi: vec3(1.0) }
+    let iv = t.interval(over)
+    assert(iv.hi < 4.0, f"[{iv.lo}, {iv.hi}]: the dot product's interval went with the noise")
+    let pruned = t.prune(over)
+    for i in 0..27 {
+        let p = over.lo + (over.hi - over.lo) * vec3(f32(i % 3), f32((i / 3) % 3), f32(i / 9)) * 0.5
+        assert(interpret(pruned, p) == beside(p), f"pruned, the tape changed at {p}")
+    }
+}
+
+/// What a generic surface's interval is, through `Surface`.
+fn bounds<S: Surface>(s: S, over: Box3) -> std::derive::Interval {
+    s.interval(over)
+}
+
+/// A tape as a `Surface` has an interval though its box noise's loops have no derivation: every
+/// value it takes over a box lies within it.
+@test
+fn a_tape_as_a_surface_has_its_interval() {
+    let t = tape(filtered)
+    let over = Box3 { lo: vec3(0.2, -0.4, 0.1), hi: vec3(0.9, 0.3, 0.6) }
+    let iv = bounds(t, over)
+    for i in 0..27 {
+        let u = vec3(f32(i % 3), f32((i / 3) % 3), f32(i / 9)) * 0.5
+        let v = filtered(over.lo + (over.hi - over.lo) * u)
+        assert(v >= iv.lo && v <= iv.hi, f"{v} outside [{iv.lo}, {iv.hi}]")
+    }
 }
 
 /// A distance and a channel beside it.
