@@ -184,7 +184,8 @@ impl Host {
             ),
             _ => {
                 let dir = dir.to_path_buf();
-                prepare(move || compile_build(&dir, None), builder, have)
+                let relaxed = self.options.relaxed_simd;
+                prepare(move || compile_build(&dir, None, relaxed), builder, have)
             }
         };
         self.prepared.insert(dir.to_path_buf(), Prepared::Going(job, Vec::new()));

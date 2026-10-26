@@ -1,0 +1,41 @@
+// A tape (`std::derive::tape`, `Surface::to_tape`) of a function that does, with what depends
+// on the point, something a tape's operations can't: a loop whose count depends on the point,
+// a write at an index that depends on it, a 64-bit number, a float's bits. A tape is a straight
+// run of operations, built once: each loop runs its own count, a branch on the point runs both
+// sides, and integers are 32-bit. Loop a fixed count, leaving early with `break`, or keep the
+// field compiled.
+// ---- wrong
+use std::derive::tape
+
+fn rings(p: vec3) -> f32 {
+    var d = length(p)
+    while d > 1.0 {
+        d -= 1.0
+    }
+    d - 0.5
+}
+
+pub fn build() -> u32 {
+    tape(rings).len()
+}
+
+pub fn frame(time: f32, width: u32, height: u32) {}
+// ---- fixed
+use std::derive::tape
+
+fn rings(p: vec3) -> f32 {
+    var d = length(p)
+    for _ in 0..8 {
+        if d <= 1.0 {
+            break
+        }
+        d -= 1.0
+    }
+    d - 0.5
+}
+
+pub fn build() -> u32 {
+    tape(rings).len()
+}
+
+pub fn frame(time: f32, width: u32, height: u32) {}

@@ -29,9 +29,19 @@ pub const MAX_WGSL_BYTES: usize = 256 * 1024;
 
 /// Runs the back ends over a lowered program. `sources` names the locations a trap reports.
 /// With `budgets`, a shipped build's, it's E0707 to have a pipeline whose WGSL is over
-/// `MAX_WGSL_BYTES`.
-pub fn emit(l: &Lowered, sources: &SourceMap, simd: bool, budgets: bool) -> BuildOutput {
-    emit_in(l, sources, wrela_wasm::Options { simd, ..Default::default() }, budgets, true)
+/// `MAX_WGSL_BYTES`. `conditional[i]` says pipeline `i` is reached only under runtime
+/// conditions (every site of it is): the manifest puts it in tier 1, which a host builds second
+/// (§18.9); a pipeline past the slice's end is tier 0.
+pub fn emit(
+    l: &Lowered,
+    sources: &SourceMap,
+    simd: bool,
+    budgets: bool,
+    conditional: &[bool],
+    relaxed: bool,
+) -> BuildOutput {
+    let options = wrela_wasm::Options { simd, relaxed, ..Default::default() };
+    emit_in(l, sources, options, budgets, true, conditional)
 }
 
 /// A server's or a tool's build's files (language.md §15.3): its module alone, at
@@ -49,14 +59,17 @@ pub fn emit_headless(
     let module = if tool { TOOL_WASM } else { SERVER_WASM };
     let max_pages =
         if tool { wrela_abi::memory::TOOL_MAX_PAGES } else { wrela_abi::memory::MAX_PAGES };
-    let options = wrela_wasm::Options { simd, shared_memory: tool, max_pages };
-    let mut out = emit_in(l, sources, options, false, false);
+    let options = wrela_wasm::Options { simd, shared_memory: tool, max_pages, relaxed: false };
+    let mut out = emit_in(l, sources, options, false, false, &[]);
     out.files.retain(|(path, _)| path == "game.wasm");
     for (path, _) in &mut out.files {
         *path = module.to_string();
     }
     out
 }
+
+/// Where a relaxed-SIMD build's second module is, beside `game.wasm` (`build_relaxed`).
+pub const RELAXED_WASM: &str = "game.relaxed.wasm";
 
 /// Where a server build's module is, in the build's directory.
 pub const SERVER_WASM: &str = "server/game.wasm";
@@ -65,13 +78,18 @@ pub const SERVER_WASM: &str = "server/game.wasm";
 pub const TOOL_WASM: &str = "tool/tool.wasm";
 
 /// Puts the program's pair id ([`wrela_abi::pair_id`]) into each of its builds' modules, as
-/// the custom section [`wrela_abi::PAIR_SECTION`]: `client` and `server` are their bytes.
-pub fn pair(client: Option<&mut Vec<u8>>, server: Option<&mut Vec<u8>>) {
+/// the custom section [`wrela_abi::PAIR_SECTION`]: `client` and `server` are their bytes, and
+/// `relaxed` the client's relaxed-SIMD module's, which is the same program.
+pub fn pair(
+    client: Option<&mut Vec<u8>>,
+    server: Option<&mut Vec<u8>>,
+    relaxed: Option<&mut Vec<u8>>,
+) {
     let id = wrela_abi::pair_id(
         client.as_deref().map(|w| w.as_slice()),
         server.as_deref().map(|w| w.as_slice()),
     );
-    for wasm in [client, server].into_iter().flatten() {
+    for wasm in [client, server, relaxed].into_iter().flatten() {
         let bytes = std::mem::take(wasm);
         *wasm = wrela_wasm::with_custom_section(bytes, wrela_abi::PAIR_SECTION, &id.to_le_bytes());
     }
@@ -80,7 +98,29 @@ pub fn pair(client: Option<&mut Vec<u8>>, server: Option<&mut Vec<u8>>) {
 /// A CPU frame test's files: its WASM and the manifest the host uses to check its commands.
 /// There are no shader or browser files; `CpuBuild`'s explicit CPU-only loaders read it.
 pub(crate) fn emit_for_cpu(l: &Lowered, sources: &SourceMap, simd: bool) -> BuildOutput {
-    emit_in(l, sources, wrela_wasm::Options { simd, ..Default::default() }, false, false)
+    emit_in(l, sources, wrela_wasm::Options { simd, ..Default::default() }, false, false, &[])
+}
+
+/// Where each of a module's code offsets came from (`wrela_wasm::Emitted::lines`).
+type CodeLines = Vec<(u32, Option<wrela_diag::Span>)>;
+
+/// The program's module with `options`: its bytes, its trap locations in a section of their
+/// own; the locations; and its interface.
+fn module(
+    l: &Lowered,
+    sources: &SourceMap,
+    options: wrela_wasm::Options,
+) -> Result<(Vec<u8>, CodeLines, wrela_abi::manifest::WasmAbi), String> {
+    let out = wrela_wasm::emit_with(&l.cpu, options)
+        .map_err(|e| format!("the WASM back end failed: {e}"))?;
+    let section = code_lines_section(&out.lines, sources);
+    let wasm = wrela_wasm::with_custom_section(out.wasm, wrela_abi::lines::SECTION, &section);
+    let abi = wrela_wasm::interface(&wasm)
+        .map_err(|e| format!("the WASM back end's module doesn't read: {e}"))?;
+    if options.relaxed {
+        wrela_wasm::check_relaxed_only_in(&wasm, wrela_abi::EXPORT_FRAME)?;
+    }
+    Ok((wasm, out.lines, abi))
 }
 
 fn emit_in(
@@ -89,28 +129,35 @@ fn emit_in(
     options: wrela_wasm::Options,
     budgets: bool,
     shaders: bool,
+    conditional: &[bool],
 ) -> BuildOutput {
     let mut diagnostics = Vec::new();
     let mut files = Vec::new();
     let mut code_lines = Vec::new();
-    match wrela_wasm::emit_with(&l.cpu, options) {
-        Ok(out) => {
-            // Where each part of the code came from, as `file:line:column`, for trap messages.
-            let entries: Vec<(u32, Option<String>)> = out
-                .lines
-                .iter()
-                .map(|&(offset, span)| {
-                    (offset, span.map(|s| sources.file(s.file).location(s.start)))
-                })
-                .collect();
-            let lines = wrela_abi::lines::Lines::new(entries).encode();
-            let wasm = wrela_wasm::with_custom_section(out.wasm, wrela_abi::lines::SECTION, &lines);
-            code_lines = out.lines;
+    let mut wasm_abi = None;
+    let mut relaxed = None;
+    if options.relaxed {
+        // The presentation code with relaxed SIMD, beside the standard module.
+        match module(l, sources, options) {
+            Ok((wasm, _, abi)) => relaxed = Some((wasm, abi)),
+            Err(e) => diagnostics.push(Diagnostic::internal(format!("its relaxed module: {e}"))),
+        }
+    }
+    match module(l, sources, wrela_wasm::Options { relaxed: false, ..options }) {
+        Ok((wasm, lines, abi)) => {
+            code_lines = lines;
+            wasm_abi = Some(abi);
             files.push(("game.wasm".to_string(), wasm));
         }
-        Err(e) => diagnostics.push(Diagnostic::internal(format!("the WASM back end failed: {e}"))),
+        Err(e) => diagnostics.push(Diagnostic::internal(e)),
     }
     let mut manifest = wrela_abi::Manifest::new("game.wasm");
+    manifest.wasm_abi = wasm_abi;
+    if let Some((wasm, abi)) = relaxed {
+        files.push((RELAXED_WASM.to_string(), wasm));
+        manifest.wasm_relaxed = Some(RELAXED_WASM.to_string());
+        manifest.wasm_relaxed_abi = Some(abi);
+    }
     for (i, p) in l.pipelines.iter().enumerate() {
         let shader = format!("pipeline_{i}.wgsl");
         let wgsl = if shaders {
@@ -194,6 +241,23 @@ fn emit_in(
                 "move work that its own pass can do there, or keep a big function a call (`ir::opt`)",
             ));
         }
+        // Each override's name as the WGSL writer wrote it, with its value from the pipeline's
+        // key; a CPU build's, as the module names it.
+        let names: Vec<String> = wgsl.as_ref().map_or_else(
+            || p.module.overrides.iter().map(|(n, _)| wrela_ir::ident(n)).collect(),
+            |w| w.overrides.clone(),
+        );
+        let constants = names
+            .into_iter()
+            .zip(&p.constants)
+            .map(|(name, &c)| {
+                let value = match c {
+                    wrela_sema::thir::ConstArg::Bool(b) => wrela_abi::manifest::Constant::Bool(b),
+                    c => wrela_abi::manifest::Constant::Number(c.number()),
+                };
+                (name, value)
+            })
+            .collect();
         if let Some(wgsl) = wgsl {
             files.push((shader.clone(), wgsl.text.into_bytes()));
         }
@@ -214,6 +278,8 @@ fn emit_in(
             bindings: p.bindings.clone(),
             debug_flag: p.debug_flag,
             requires,
+            conditional: conditional.get(i).copied().unwrap_or(false),
+            constants,
         });
     }
     if let Err(e) = manifest.validate() {
@@ -229,12 +295,50 @@ fn emit_in(
     BuildOutput { files, diagnostics, lines: code_lines }
 }
 
+/// Where each part of the code came from, as `file:line:column`, for trap messages: the lines
+/// section of a module whose offsets are `lines`.
+fn code_lines_section(lines: &[(u32, Option<wrela_diag::Span>)], sources: &SourceMap) -> Vec<u8> {
+    let entries: Vec<(u32, Option<String>)> = lines
+        .iter()
+        .map(|&(offset, span)| (offset, span.map(|s| sources.file(s.file).location(s.start))))
+        .collect();
+    wrela_abi::lines::Lines::new(entries).encode()
+}
+
+/// States `game.wasm`'s interface in `manifest.json` again, after something rewrote the module
+/// (`wasm-opt` may drop an import nothing calls).
+pub fn restate_abi(files: &mut [(String, Vec<u8>)]) -> Result<(), String> {
+    let wasm = files.iter().find(|(f, _)| f == "game.wasm").ok_or("the build has no game.wasm")?;
+    let abi = wrela_wasm::interface(&wasm.1)?;
+    let relaxed = files
+        .iter()
+        .find(|(f, _)| f == RELAXED_WASM)
+        .map(|(_, w)| wrela_wasm::interface(w))
+        .transpose()?;
+    let Some(manifest) = files.iter_mut().find(|(f, _)| f == "manifest.json") else {
+        return Ok(());
+    };
+    let text = std::str::from_utf8(&manifest.1).map_err(|_| "manifest.json isn't UTF-8")?;
+    let mut m = wrela_abi::Manifest::parse(text).map_err(|e| e.to_string())?;
+    m.wasm_abi = Some(abi);
+    if relaxed.is_some() {
+        m.wasm_relaxed_abi = relaxed;
+    }
+    manifest.1 = m.to_json().into_bytes();
+    Ok(())
+}
+
 /// The runtime's page for a build: it preloads the build's manifest, WASM and shaders as soon as
 /// it is parsed, and its script hands them to the render worker (runtime/browser `preload.ts`),
 /// which would otherwise ask for them only once its own script and then the manifest had come.
 /// `crossorigin` makes each preload what the page's `fetch` asks for, so the fetch takes it.
+/// A relaxed-SIMD build preloads neither of its WASMs: which one the worker takes is the
+/// browser's to say (loader.ts `chooseWasm`), and the other would be bytes for nothing.
 fn page(runtime: &[u8], manifest: &wrela_abi::Manifest) -> Vec<u8> {
-    let mut files = vec!["manifest.json", manifest.wasm.as_str()];
+    let mut files = vec!["manifest.json"];
+    if manifest.wasm_relaxed.is_none() {
+        files.push(&manifest.wasm);
+    }
     for p in &manifest.pipelines {
         if !files.contains(&p.shader.as_str()) {
             files.push(&p.shader);
@@ -313,7 +417,7 @@ fn records_commands() {}
             let data = wrela_lower::BuildData::default();
             let (full, errors) = wrela_lower::lower(checked, &roots, &data, true);
             assert!(!wrela_diag::has_errors(&errors), "{errors:?}");
-            let out = emit(&full, sources, true, false);
+            let out = emit(&full, sources, true, false, &[], false);
             let page = String::from_utf8(file(&out, "index.html").to_vec()).expect("UTF-8");
             let head = &page[..page.find("</head>").expect("a head")];
             for f in ["manifest.json", "game.wasm", "pipeline_0.wgsl", "pipeline_1.wgsl"] {
@@ -341,7 +445,7 @@ fn records_commands() {}
                 if debug {
                     assert!(full.pipelines.iter().any(|p| p.debug_flag.is_some()));
                 }
-                let full = emit(&full, sources, true, false);
+                let full = emit(&full, sources, true, false, &[], false);
                 let cpu = emit_for_cpu(&cpu, sources, true);
                 assert!(!wrela_diag::has_errors(&full.diagnostics), "{:?}", full.diagnostics);
                 assert!(!wrela_diag::has_errors(&cpu.diagnostics), "{:?}", cpu.diagnostics);

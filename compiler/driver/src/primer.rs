@@ -235,6 +235,10 @@ pub const RULES: &[(&str, &str)] = &[
         "derive.interval",
         "`interval` over a box, of a function whose loops run a fixed count, whatever its input",
     ),
+    (
+        "derive.tape",
+        "`tape` of a function of a `vec3`, whose work on the point is the tape's operations, on the CPU",
+    ),
     // §15.3 client, server and tool roles
     (
         "gpu.roles",
@@ -265,6 +269,10 @@ pub const RULES: &[(&str, &str)] = &[
     (
         "gpu.entry",
         "an entry point takes builtins, uniforms, buffers, textures, groups and outputs, and returns what its stage does",
+    ),
+    (
+        "gpu.const",
+        "an entry point's `const` parameter is a `bool`, `u32`, `i32` or `f32` whose value is a build-time constant, written where it's dispatched or drawn",
     ),
     ("gpu.cpu", "GPU builtins, derivatives and sampling only in GPU code"),
     ("gpu.workgroup", "a workgroup's size is within WebGPU's limits"),
@@ -451,8 +459,24 @@ pub fn primer(area: Option<&str>) -> Option<String> {
             }
         }
     }
+    if let Some((_, notes)) = NOTES.iter().find(|(a, _)| *a == area) {
+        out.push_str(&format!("\n## Not rules, but how it's built\n\n{notes}\n"));
+    }
     Some(out)
 }
+
+/// What an area's rules don't say but a writer of its code needs: how its work is built.
+const NOTES: &[(&str, &str)] = &[(
+    "gpu",
+    "- **Tiers** (§18.9): a pipeline whose every site runs under a runtime condition is tier 1, \
+     built after tier 0's, so the first frame waits for less. `wrela pipelines` shows each \
+     pipeline's tier. Put an optional system's dispatches under its switch.
+- **`const` parameters** (§18.1, `gpu.const` above) are pipeline constants: each set of values \
+  a site gives is a pipeline of its own, the branch on them folded where the driver compiles it.
+- **Tapes** (§14.4): `field.to_tape()` turns a field into a tape of operations, built on the \
+  CPU, that one kernel interprets (`std::stage::interpret`): one pipeline for every field, \
+  instead of one per field.",
+)];
 
 fn short(s: &str, n: usize) -> String {
     if s.chars().count() <= n {

@@ -47,6 +47,9 @@ test("parses the Rust crate's golden manifest", () => {
     manifest_version: MANIFEST_VERSION,
     stream_version: STREAM_VERSION,
     wasm: "game.wasm",
+    wasm_abi: null,
+    wasm_relaxed: null,
+    wasm_relaxed_abi: null,
     pipelines: [
       {
         kind: "compute",
@@ -58,6 +61,8 @@ test("parses the Rust crate's golden manifest", () => {
         bindings: [{ binding: 1, kind: "read_write", stage: "both", format: null }],
         debug_flag: null,
         requires: [],
+        conditional: false,
+        constants: [],
       },
       {
         kind: "render",
@@ -79,6 +84,8 @@ test("parses the Rust crate's golden manifest", () => {
         ],
         debug_flag: null,
         requires: [],
+        conditional: false,
+        constants: [],
       },
     ],
   });
@@ -118,4 +125,13 @@ test("only kernels bind storage textures", () => {
     Object.assign(m.pipelines[0].bindings[0], { kind, format: "rgba8unorm" });
     expect(() => parseManifest(JSON.stringify(m))).not.toThrow();
   }
+});
+
+test("reads wasm_abi where given, and none where not", () => {
+  const json = JSON.parse(readFixtureText("manifest.json"));
+  expect(parseManifest(readFixtureText("manifest.json")).wasm_abi?.memory).toEqual({ initial: 1, maximum: 16384, shared: true });
+  delete json.wasm_abi;
+  expect(parseManifest(JSON.stringify(json)).wasm_abi).toBeNull();
+  json.wasm_abi = { imports: [["wrela", "submit", 7]], exports: [] };
+  expectInvalid(() => parseManifest(JSON.stringify(json)), "wasm_abi.imports[0] must be an array of 3 strings");
 });

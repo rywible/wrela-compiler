@@ -1,0 +1,60 @@
+// Relaxed SIMD in presentation code alone (language.md §11.2): `strict` and `loose` do the same
+// vector `a * b + c`, on values where a fused multiply-add rounds differently from a multiply and
+// then an add. compiler/tests/tests/suite/simd.rs builds this with `--relaxed-simd` and checks that
+// `strict`, an export, gives the same bits in both modules, and that `loose`, which only `frame`
+// reaches, is fused in the relaxed one.
+
+pub fn frame(state: mut Seen, time: f32, width: u32, height: u32) {
+    state.loose = loose(u32(time))
+    state.kept = kept(u32(time))
+}
+
+pub struct Seen {
+    loose: u32,
+    kept: u32,
+}
+
+pub fn init() -> Seen {
+    Seen { loose: 0, kept: 0 }
+}
+
+/// What `frame` last saw.
+pub fn seen(state: Seen) -> u32 {
+    state.loose
+}
+
+/// What `frame` last saw of `kept`.
+pub fn seen_kept(state: Seen) -> u32 {
+    state.kept
+}
+
+/// The same `a * b + c`, `@deterministic`, small enough to be inlined into `frame`: inlined, it
+/// stays strict there.
+@deterministic
+fn kept(seed: u32) -> u32 {
+    let a = factor(seed)
+    bits(a * a + C)
+}
+
+/// Factors whose square needs more than a float's 24 bits: `(1 + 2^-12)^2` is `1 + 2^-11 + 2^-24`,
+/// and adding `-(1 + 2^-11)` leaves `2^-24` fused and `0` rounded first.
+fn factor(seed: u32) -> vec4 {
+    let e = 1.0 / 4096.0
+    vec4(1.0 + e, 1.0 + e * f32(seed % 3 + 1), 1.0 + e * 2.0, 1.0 - e)
+}
+
+const C: vec4 = vec4(-(1.0 + 2.0 / 4096.0))
+
+fn bits(v: vec4) -> u32 {
+    bitcast_u32(v.x) ^ (bitcast_u32(v.y) << 1) ^ (bitcast_u32(v.z) << 2) ^ (bitcast_u32(v.w) << 3)
+}
+
+pub fn strict(seed: u32) -> u32 {
+    let a = factor(seed)
+    bits(a * a + C)
+}
+
+fn loose(seed: u32) -> u32 {
+    let a = factor(seed)
+    bits(a * a + C)
+}

@@ -428,6 +428,12 @@ pub fn scalar_page(pkg: &str, name: &str) -> (PathBuf, String) {
     page_built_by(pkg, name, "scalar", wrela_driver::build_without_simd)
 }
 
+/// [`page`] with a relaxed-SIMD build (`wrela_driver::build_relaxed`): `game.relaxed.wasm` beside
+/// `game.wasm`.
+pub fn relaxed_page(pkg: &str, name: &str) -> (PathBuf, String) {
+    page_built_by(pkg, name, "relaxed", wrela_driver::build_relaxed)
+}
+
 /// [`page`], the package built by `build` (`kind` names it).
 fn page_built_by(
     pkg: &str,
@@ -488,6 +494,19 @@ pub fn run_page(
         fragment,
         timeout: std::time::Duration::from_secs(u64::from(timeout)),
         script,
+    })
+}
+
+/// [`run_page`] twice in one browser profile (`wrela_host::pages::run_twice`): the first open's
+/// results are in `results-first/`.
+pub fn run_page_twice(rel: &str, fragment: &str, timeout: u32) -> Result<(), String> {
+    let root = repo_root();
+    wrela_host::pages::run_twice(wrela_host::pages::Page {
+        root: &root,
+        page: rel,
+        fragment,
+        timeout: std::time::Duration::from_secs(u64::from(timeout)),
+        script: None,
     })
 }
 

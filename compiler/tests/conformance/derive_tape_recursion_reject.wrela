@@ -1,0 +1,16 @@
+// rejects: derive.tape
+use std::derive::tape
+
+// A recursion under a branch on the point: a tape runs both sides, so it would never end.
+fn steps(p: vec3) -> f32 {
+    if p.x > 0.0 {
+        return steps(p - vec3(1.0, 0.0, 0.0)) + 1.0 //~ E0709
+    }
+    p.y
+}
+
+pub fn steps_tape() -> u32 {
+    tape(steps).len()
+}
+
+pub fn frame(time: f32, width: u32, height: u32) {}

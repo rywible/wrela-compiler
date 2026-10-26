@@ -2,7 +2,7 @@
 //!
 //! ```text
 //! wrela check <package-dir> [--json]      check a package; exit 1 if it has errors
-//! wrela build <package-dir> [-o <dir>] [--debug] [--testing] [--optimize] [--lift <package>]...
+//! wrela build <package-dir> [-o <dir>] [--debug] [--testing] [--optimize] [--lift <package>]... [--report data]
 //!                                         check and build; writes <dir> (default
 //!                                         <package>/build); --debug adds checks (§11);
 //!                                         --testing keeps the `@testing` exports (§9);
@@ -40,6 +40,9 @@
 //! wrela solve <package-dir> (--minimize <fn> | --spec) --free <file>:<lines>...
 //!                                         choose literals that minimize a function, or that
 //!                                         make the package's spec hold (§23)
+//! wrela precision <package-dir> <fn> --box <lo>..<hi>,...
+//!                                         where a half-float twin of a function would be
+//!                                         safe, operation by operation, from its interval
 //! wrela same <package-dir> --against <build-dir> [--frames n] [--within x] [--no-gpu] [--json]
 //!                                         whether the package built now behaves as a saved
 //!                                         build does: the same commands each frame, the
@@ -100,6 +103,7 @@ mod fmt;
 mod migrate;
 mod pin;
 mod pipelines;
+mod precision;
 mod primer;
 mod profile;
 mod query;
@@ -117,7 +121,7 @@ mod trace;
 pub(crate) fn usage() -> ExitCode {
     let lines = [
         "wrela check <package-dir> [--json]",
-        "wrela build <package-dir> [-o <out-dir>] [--debug] [--testing] [--optimize [size|speed]] [--lift <package>]... [--json]",
+        "wrela build <package-dir> [-o <out-dir>] [--debug] [--testing] [--optimize [size|speed]] [--relaxed-simd] [--lift <package>]... [--report data] [--json]",
         "wrela fmt <file-or-dir>... [--check]",
         "wrela fix <package-dir> [--dry-run] [--json]",
         "wrela migrate <package-dir> [--dry-run] [--json]",
@@ -126,17 +130,18 @@ pub(crate) fn usage() -> ExitCode {
         "wrela doc <item> [<package-dir>]",
         "wrela doc --export <dir> [--commit <sha>] [<package-dir>...]",
         "wrela pipelines <package-dir> [--json]",
-        "wrela profile <package-dir> [--frames n] [--warmup n] [--workers n] [--size WxH] [--input <script.json>] [--scenario name] [--serial] [--chrome [--features none|<list>] [--checked]] [--optimize size|speed] [--json] [--baseline <report.json> | --compare <build-dir> [--pairs n]]",
+        "wrela profile <package-dir> [--frames n] [--warmup n] [--workers n] [--size WxH] [--input <script.json>] [--scenario name] [--serial] [--worst n] [--chrome [--features none|<list>] [--checked]] [--optimize size|speed] [--relaxed-simd] [--json] [--baseline <report.json> | --compare <build-dir> [--pairs n]]",
         "wrela test <package-dir> [<filter>] [--exact] [--std] [--bless] [--json]",
         "wrela script <package-dir> <module>::<NAME> [-o <file>]",
         "wrela primer [area]",
         "wrela solve <package-dir> (--minimize <module>::<function> | --spec) --free <file>[:<lines>]... [--steps n] [--exact] [--write] [--json]",
+        "wrela precision <package-dir> <module>::<function> --box <lo>..<hi>[,<lo>..<hi>]... [--box ...] [--tol t] [--json]",
         "wrela query <package-dir> [<query>...] [--json]",
         "wrela context <item> [<package-dir>] [--budget n]",
         "wrela refactor <package-dir> (rename <item> <new-name> | move <item> <module> | add-param <fn> \"<name>: <type>\" (--value <expr> | --default <expr>) | change-mode <fn> <param> <borrow|mut|take> | extract-const <file>:<line>:<col> <NAME> | inline <fn> | extract-fn <file>:<first>-<last> <name> | apply <plan.json>) [--dry-run] [--json]",
         "wrela trace <package-dir> --watch <export>[,<export>...] [--frames n] [--csv] [--fps f] [--size WxH] [--input <script.json>] [--release] [--no-gpu] [--workers N]",
         "wrela bisect <package-dir> --until \"<export> <op> <number>\" [--frames n] [--json] [--fps f] [--size WxH] [--input <script.json>] [--release] [--no-gpu] [--workers N]",
-        "wrela run <package-dir> [--port N] [--lift <package>]... [--debug]",
+        "wrela run <package-dir> [--port N] [--lan] [--lift <package>]... [--debug]",
         "wrela same <package-dir> --against <build-dir> [--frames n] [--fps f] [--size WxH] [--input <script.json>] [--within x] [--no-gpu] [--json]",
         "wrela suite [fmt | allow | wrela::<package-path>::[<test-name>]] [--workspace <dir>]",
         "wrela tool (<package-dir> | <name>) [--read NAME=DIR]... [--write NAME=DIR]... [--secret NAME]... [--net HOST]... [--allow-run NAME[=PATH]]... [--browser] [--timeout S] [--workers N] [--blob-budget B] [-- args...]",
@@ -204,6 +209,7 @@ fn main() -> ExitCode {
         "same" => same::run(rest),
         "tool" => tool::run(rest),
         "solve" => solve::run(rest),
+        "precision" => precision::run(rest),
         "script" => script::run(rest),
         "primer" => primer::run(rest),
         "query" => query::query(rest),
@@ -252,6 +258,11 @@ pub(crate) struct PackageArgs {
     /// `--optimize [size|speed]`, which only `build` takes: the WASM through `wasm-opt`
     /// (`wrela_driver::optimize`), for size or speed (alone, `Level::DEFAULT`).
     pub optimize: Option<wrela_driver::optimize::Level>,
+    /// `--report data`, which only `build` takes: what the build's constant data holds.
+    pub report_data: bool,
+    /// `--relaxed-simd`, which only `build` takes: a second module beside `game.wasm` whose
+    /// presentation code uses relaxed SIMD (`wrela_driver::build_relaxed`).
+    pub relaxed_simd: bool,
 }
 
 /// Reads the arguments of `check`, or of `build` (`takes_out`), and checks that the package is
@@ -260,6 +271,8 @@ pub(crate) struct PackageArgs {
 pub(crate) fn package_args(args: &[String], takes_out: bool) -> Result<PackageArgs, ExitCode> {
     let (mut dir, mut out, mut json, mut debug, mut testing) = (None, None, false, false, false);
     let mut optimize = None;
+    let mut report_data = false;
+    let mut relaxed_simd = false;
     let mut lift = Vec::new();
     let mut it = args.iter().peekable();
     while let Some(a) = it.next() {
@@ -271,6 +284,7 @@ pub(crate) fn package_args(args: &[String], takes_out: bool) -> Result<PackageAr
             "--json" => json = true,
             "--debug" if takes_out => debug = true,
             "--testing" if takes_out => testing = true,
+            "--relaxed-simd" if takes_out => relaxed_simd = true,
             "--optimize" if takes_out => {
                 use wrela_driver::optimize::Level;
                 optimize = Some(match it.peek().and_then(|l| Level::parse(l)) {
@@ -281,6 +295,10 @@ pub(crate) fn package_args(args: &[String], takes_out: bool) -> Result<PackageAr
                     None => Level::DEFAULT,
                 });
             }
+            "--report" if takes_out => match it.next().map(String::as_str) {
+                Some("data") => report_data = true,
+                _ => return Err(usage()),
+            },
             "--lift" if takes_out => match it.next() {
                 Some(p) => lift.extend(p.split(',').map(String::from)),
                 None => return Err(usage()),
@@ -306,7 +324,13 @@ pub(crate) fn package_args(args: &[String], takes_out: bool) -> Result<PackageAr
         );
         return Err(ExitCode::from(2));
     }
-    Ok(PackageArgs { dir, json, out, debug, testing, lift, optimize })
+    if relaxed_simd && (debug || testing || !lift.is_empty()) {
+        eprintln!(
+            "error: `--relaxed-simd` makes a release build: not with --debug, --testing or --lift"
+        );
+        return Err(ExitCode::from(2));
+    }
+    Ok(PackageArgs { dir, json, out, debug, testing, lift, optimize, report_data, relaxed_simd })
 }
 
 /// Checks that the package `dir` is a directory. If it isn't, the message is printed and the
@@ -353,16 +377,40 @@ pub(crate) fn generated_path(package: &Path, path: &Path) -> Result<(), String> 
         .map_err(|e| format!("can't use `{}`: {e}", path.display()))
 }
 
+/// A program written around the package in `dir` (`wrela solve`'s, `wrela precision`'s):
+/// `<dir>/build/<name>/`, a package named `name` that depends on it, with `main(package)` as its
+/// `main.wrela`. Its directory, and the package's name.
+pub(crate) fn glue_package(
+    dir: &Path,
+    name: &str,
+    main: impl FnOnce(&str) -> String,
+) -> Result<(PathBuf, String), String> {
+    let package = wrela_driver::manifest::name_in(dir)
+        .ok_or_else(|| format!("`{}` has no wrela.toml with a package name", dir.display()))?;
+    let glue_dir = dir.join("build").join(name);
+    generated_path(dir, &glue_dir)?;
+    wrela_driver::ensure_no_symlinks(&glue_dir, ["wrela.toml", "main.wrela"])
+        .map_err(|e| e.to_string())?;
+    std::fs::create_dir_all(&glue_dir).map_err(|e| e.to_string())?;
+    let toml = format!(
+        "[package]\nname = \"{name}\"\n\n[dependencies]\n{package} = {{ path = \"../..\" }}\n"
+    );
+    std::fs::write(glue_dir.join("wrela.toml"), toml).map_err(|e| e.to_string())?;
+    std::fs::write(glue_dir.join("main.wrela"), main(&package)).map_err(|e| e.to_string())?;
+    Ok((glue_dir, package))
+}
+
 /// The package in `dir` built as `wrela build` builds it (its `game.wasm` through `wasm-opt`,
 /// if `optimize` says so), into `<dir>/build/<name>`: where it is.
 pub(crate) fn build_into(
     dir: &Path,
     name: &str,
     optimize: Option<wrela_driver::optimize::Level>,
+    relaxed: bool,
 ) -> Result<PathBuf, String> {
     let built = dir.join("build").join(name);
     generated_path(dir, &built)?;
-    let mut out = wrela_driver::build(dir);
+    let mut out = if relaxed { wrela_driver::build_relaxed(dir) } else { wrela_driver::build(dir) };
     if let Some(level) = optimize
         && !out.has_errors()
     {

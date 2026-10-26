@@ -1,0 +1,55 @@
+// `const` parameters of entry points (language.md §18.1): `scale`'s `double` and `add` are its
+// pipeline's constants, so its two dispatches below are two pipelines, each its constants set
+// where it's created; the branch on `double` folds where the driver compiles each. Frame 0
+// dispatches both and reads both back; the test checks what each computed.
+use std::gpu::{GlobalId, GpuBuffer, Slots, buffer, dispatch, read}
+use std::io::Pending
+
+const ADD: u32 = 5
+
+@compute(64)
+fn scale(out: mut Slots<u32>, id: GlobalId, double: const bool, add: const u32) {
+    out[id] = if double { id.x * 2 + add } else { id.x + add }
+}
+
+pub struct State {
+    frame: u32,
+    doubled: GpuBuffer<u32>,
+    plain: GpuBuffer<u32>,
+    pending: Vec<Pending<u32>>,
+    seen: Vec<Vec<u32>>,
+}
+
+pub fn init() -> State {
+    State {
+        frame: 0,
+        doubled: buffer(64),
+        plain: buffer(64),
+        pending: Vec::new(),
+        seen: Vec::new(),
+    }
+}
+
+pub fn frame(s: mut State, time: f32, width: u32, height: u32) {
+    if s.frame == 0 {
+        dispatch(scale.bind(out: mut s.doubled, double: true, add: ADD), groups: 1)
+        dispatch(scale.bind(out: mut s.plain, double: false, add: 7), groups: 1)
+        s.pending.push(read(s.doubled.items()))
+        s.pending.push(read(s.plain.items()))
+    }
+    for i in 0..s.pending.len() {
+        if s.seen.len() == i {
+            if let Some(Ok(v)) = s.pending[i].poll() {
+                s.seen.push(take v)
+            }
+        }
+    }
+    s.frame += 1
+}
+
+@test(frames: 4, gpu: true, hosts: both)
+fn each_constant_set_is_a_pipeline_of_its_own(s: State) {
+    assert(s.seen.len() == 2)
+    assert(s.seen[0][3] == 3 * 2 + 5 && s.seen[0][63] == 63 * 2 + 5)
+    assert(s.seen[1][3] == 3 + 7 && s.seen[1][63] == 63 + 7)
+}

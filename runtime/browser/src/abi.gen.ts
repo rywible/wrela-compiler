@@ -1,8 +1,8 @@
 // Generated from the wrela-abi crate (runtime/abi): the one definition of the
 // command stream and manifest. Don't edit; run `cargo run -p wrela-abi --bin generate`.
 
-export const STREAM_VERSION = 12;
-export const MANIFEST_VERSION = 10;
+export const STREAM_VERSION = 13;
+export const MANIFEST_VERSION = 11;
 /** The bytes `WRCS`, read as a little-endian u32. */
 export const STREAM_MAGIC = 0x53435257;
 export const HEADER_LEN = 12;
@@ -10,6 +10,8 @@ export const COMMAND_HEADER_LEN = 8;
 /** A pass's attachment that isn't there, and a pass's colour attachment that is the screen. */
 export const NONE = 0xffffffff;
 export const SCREEN = 0xfffffffe;
+/** `wrela.limit`'s index of how the host shows the screen (`std::gpu::screen_is`). */
+export const SCREEN_LIMIT = 13;
 /** The upload ring's starting size, and the largest write it takes: a bigger one goes through
  * the queue, between submissions. */
 export const UPLOAD_START = 262144;
@@ -53,6 +55,7 @@ export const Opcode = {
   DrawIndexed: 36,
   MultiDrawIndirect: 37,
   MultiDrawIndexedIndirect: 38,
+  ConfigureScreen: 39,
 } as const;
 
 /** A texture's format, by its number in the stream: the format table (runtime/abi
@@ -249,7 +252,7 @@ export const EXPORT_INIT = "init";
 export const EXPORT_MEMORY = "memory";
 export const SCREEN_FORMAT = "rgba8unorm";
 /** What a pipeline binds at a binding, as the manifest names it. */
-export const BINDING_KINDS = ["read", "read_write", "texture", "depth_texture", "sampler", "comparison_sampler", "storage_texture", "texture_3d", "storage_texture_3d", "texture_2d_array", "texture_cube", "depth_texture_2d_array", "storage_texture_2d_array"] as const;
+export const BINDING_KINDS = ["read", "read_write", "texture", "depth_texture", "sampler", "comparison_sampler", "storage_texture", "texture_3d", "storage_texture_3d", "texture_2d_array", "texture_cube", "depth_texture_2d_array", "storage_texture_2d_array", "non_filtering_sampler"] as const;
 /** What each binding kind is (runtime/abi `BindingKind`): a colour texture, which names its
  * format; a texture kernels write (a storage texture); a texture of depths; its view dimension;
  * and the per-stage limit it counts against. */
@@ -267,6 +270,7 @@ export const BINDING_KIND_TRAITS = [
   { name: "texture_cube", has_format: true, is_storage: false, is_depth: false, dimension: "cube", limit: "sampled textures" },
   { name: "depth_texture_2d_array", has_format: false, is_storage: false, is_depth: true, dimension: "2d-array", limit: "sampled textures" },
   { name: "storage_texture_2d_array", has_format: true, is_storage: true, is_depth: false, dimension: "2d-array", limit: "storage textures" },
+  { name: "non_filtering_sampler", has_format: false, is_storage: false, is_depth: false, dimension: null, limit: "samplers" },
 ] as const;
 /** WebGPU's default per-stage limits (runtime/abi `StageLimit`): what each counts, and the most a
  * shader stage may have. */

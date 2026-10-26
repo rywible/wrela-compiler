@@ -52,3 +52,17 @@ test("the page hands each preloaded file to the worker, or null where its fetch 
   expect(transferred).toBe(1);
   expect(redirects).toEqual(["manual", "manual", "manual"]);
 });
+
+test("the page hands the WASM over as its URL alone, without fetching it", async () => {
+  const posted: ToWorker[] = [];
+  const fetched: string[] = [];
+  const worker = { postMessage: (msg: ToWorker) => posted.push(msg) };
+  const fetch = (async (url: string) => {
+    fetched.push(url);
+    return new Response(`bytes of ${url}`);
+  }) as typeof globalThis.fetch;
+  handOver(worker as Pick<Worker, "postMessage">, ["http://x/manifest.json", "http://x/game.wasm"], fetch);
+  await new Promise((r) => setTimeout(r, 10));
+  expect(fetched).toEqual(["http://x/manifest.json"]);
+  expect(posted.find((m) => m.type === "file" && m.url === "http://x/game.wasm")).toEqual({ type: "file", url: "http://x/game.wasm", bytes: null });
+});

@@ -936,7 +936,7 @@ impl<'a> Parser<'a> {
             let t = p.tokens[first];
             let name = p.name_at(first).or_else(|| (t.kind == T::Ident).then(|| p.ident_of(t)))?;
             let ty = TypeExpr::error(span);
-            Some(Param::Named { name, mode, ty, default: None, span })
+            Some(Param::Named { name, mode, konst: false, ty, default: None, span })
         });
         let params_close = self.close_list(T::RParen, "`,` or `)`");
         let ret = if self.eat(T::Arrow) {
@@ -1011,7 +1011,7 @@ impl<'a> Parser<'a> {
         if self.at(T::Fn) || self.at(T::At) { self.parse_fn_type() } else { self.parse_path_type() }
     }
 
-    /// param ::= mode? "self" | IDENT ":" mode? type ("=" expr)?
+    /// param ::= mode? "self" | IDENT ":" "const"? mode? type ("=" expr)?
     fn parse_param(&mut self) -> PResult<Param> {
         // `&self`, `&mut self`: reported, then read without the `&`.
         if self.at(T::Amp)
@@ -1052,10 +1052,11 @@ impl<'a> Parser<'a> {
             return Err(Failed);
         }
         self.bump();
+        let konst = self.eat(T::Const);
         let mode = self.parse_mode();
         let ty = self.parse_trait_position_type()?;
         let default = self.opt_default()?;
-        Ok(Param::Named { name, mode, ty, default, span: start.to(self.prev_span()) })
+        Ok(Param::Named { name, mode, konst, ty, default, span: start.to(self.prev_span()) })
     }
 
     /// ("=" expr)?: a parameter's or a field's default.
@@ -1093,7 +1094,7 @@ impl<'a> Parser<'a> {
         self.error(d);
         let ty = self.parse_type()?;
         let default = self.opt_default()?;
-        Ok(Param::Named { name, mode, ty, default, span: start.to(self.prev_span()) })
+        Ok(Param::Named { name, mode, konst: false, ty, default, span: start.to(self.prev_span()) })
     }
 
     /// mode ::= "mut" | "take" (borrow is the default and isn't written)

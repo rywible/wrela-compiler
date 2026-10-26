@@ -392,6 +392,17 @@ pub fn open(url: str, width: u32 = 1280, height: u32 = 720, timeout: f64 = 0.0) 
     ask("browser/open", take w.into_bytes())
 }
 
+/// Takes `b`'s page to `url` (one `open` may open), in the same browser and profile, so what it
+/// cached is warm: a page's warm run is it opened again this way. A following
+/// `run(b, Script::new().wait(Until::done(), ...))` waits for the new page's `results/DONE`.
+@tool
+pub fn navigate(b: Browser, url: str, timeout: f64 = 0.0) -> Call<Done> {
+    var w = handle_body(b)
+    w.write_str(url)
+    timeout_of(mut w, timeout)
+    ask("browser/navigate", take w.into_bytes())
+}
+
 /// Runs `script`'s steps on `b`'s page, in order: the request fails with the step that failed,
 /// and what the page had.
 @tool

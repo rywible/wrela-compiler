@@ -11,6 +11,9 @@
 //! - loops four iterations at a time, at every length to 64, and one that traps;
 //! - the run-pass suite's expectations (`run_pass.rs` checks both builds).
 //!
+//! A relaxed-SIMD build (`wrela build --relaxed-simd`, §11.2) keeps that for deterministic code:
+//! its relaxed module fuses a multiply-add only outside it, and both modules run the same ticks.
+//!
 //! The speed-up on a loop of `vec4` math is measured, not gated: `cargo test --release -p
 //! wrela-tests --test suite simd_speed -- --ignored --nocapture` prints it.
 
@@ -198,4 +201,55 @@ fn a_voice_renders_the_same_samples_with_simd() {
     let (x, y) = (a.render_audio(200).expect("render"), b.render_audio(200).expect("render"));
     let bits = |s: &[f32]| s.iter().map(|x| x.to_bits()).collect::<Vec<_>>();
     assert!(bits(&x) == bits(&y), "the samples differ with SIMD");
+}
+
+/// `compiler/tests/relaxed`: `strict` (an export) and `loose` (which only `frame` reaches) do the
+/// same `a * b + c`, on values a fused multiply-add rounds differently. In the relaxed module
+/// `loose` fuses it and `strict` doesn't, nor `kept`, a `@deterministic` helper `frame` calls.
+#[test]
+fn relaxed_simd_fuses_only_in_presentation_code() {
+    let pkg = "compiler/tests/relaxed";
+    let (dir, _) = wrela_tests::relaxed_page(pkg, "relaxed-simd");
+    let read = |name: &str| std::fs::read(dir.join(name)).expect(name);
+    let relaxed = read("game.relaxed.wasm");
+    assert!(wrela_wasm::check_no_relaxed_simd(&read("game.wasm")).is_ok(), "the standard module");
+    assert!(wrela_wasm::check_no_relaxed_simd(&relaxed).is_err(), "the relaxed module has none");
+    // Without the option no function is relaxable: the build's module is as before it.
+    let plain = wrela_driver::build(&wrela_tests::repo_root().join(pkg));
+    let wasm = plain.files.iter().find(|(f, _)| f == "game.wasm").expect("game.wasm");
+    assert!(wrela_wasm::check_no_relaxed_simd(&wasm.1).is_ok(), "the plain build's module");
+    let mut a = CpuHost::load(&dir).expect("load");
+    let relaxed_build = wrela_host::CpuBuild::load_choosing(&dir, true);
+    let mut b = relaxed_build.and_then(|b| b.start()).expect("load the relaxed module");
+    let mut fused = 0;
+    for seed in 0..3 {
+        let args = [Value::I32(seed)];
+        let (x, y) = (a.call_export("strict", &args), b.call_export("strict", &args));
+        assert!(same(&x, &y), "strict({seed}): {x:?} standard, {y:?} relaxed");
+        let seen = |h: &mut CpuHost| {
+            h.frame(seed as f32, 64, 64).expect("frame");
+            h.call_export("seen", &[])
+        };
+        let (p, q) = (seen(&mut a), seen(&mut b));
+        assert!(same(&p, &x), "loose({seed}) unfused is strict's");
+        fused += usize::from(!same(&p, &q));
+        // `kept` is `@deterministic`: inlined into `frame` or not, it isn't fused.
+        let k = (a.call_export("seen_kept", &[]), b.call_export("seen_kept", &[]));
+        assert!(same(&k.0, &x) && same(&k.1, &x), "kept({seed}): {k:?}, strict {x:?}");
+    }
+    assert_eq!(fused, 3, "the relaxed module's `loose` fuses its multiply-add");
+}
+
+/// The herd's ticks with its relaxed module: the same world, tick by tick. What `init` reaches,
+/// and the math `rewrite_cpu_math` calls in, stay strict (language.md §11.2).
+#[test]
+fn a_relaxed_build_ticks_the_same_world() {
+    let (dir, _) = wrela_tests::relaxed_page("compiler/tests/frozen/herd", "relaxed-herd");
+    let ticks = |relaxed: bool| {
+        let built = wrela_host::CpuBuild::load_choosing(&dir, relaxed).expect("load");
+        built.record_ticks(120, &[], 2).expect("ticks")
+    };
+    let (a, b) = (ticks(false), ticks(true));
+    let c = wrela_abi::ticks::TickComparison::of(&a, &b);
+    assert!(matches!(c, wrela_abi::ticks::TickComparison::Equal { .. }), "{c}");
 }

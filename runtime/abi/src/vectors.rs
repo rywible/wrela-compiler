@@ -169,6 +169,9 @@ fn command(c: &Command) -> Value {
         Command::SetScissor { x, y, width, height } => {
             json!({ "op": "SetScissor", "x": x, "y": y, "width": width, "height": height })
         }
+        Command::ConfigureScreen { hdr, gamut } => {
+            json!({ "op": "ConfigureScreen", "hdr": hdr, "gamut": gamut })
+        }
         Command::SetViewport { rect, min_depth, max_depth } => json!({
             "op": "SetViewport", "rect": rect, "minDepth": min_depth, "maxDepth": max_depth,
         }),
@@ -283,6 +286,7 @@ pub(crate) fn golden_batch() -> Vec<u8> {
         .draw_indexed(1, [3, 0, 12], [6, 2, 1, -1i32 as u32, 4], &[], &[])
         .multi_draw_indirect(1, None, [3, 16], [4, NONE, 0], &[], &[])
         .multi_draw_indirect(1, Some([3, 0, 12]), [5, 0], [2, 6, 8], &[], &[])
+        .configure_screen(true, 1)
         .finish()
 }
 
@@ -533,6 +537,8 @@ pub fn check_manifest() -> Manifest {
         bindings: vec![bind(1, BindingKind::Read), bind(2, BindingKind::ReadWrite)],
         debug_flag: None,
         requires: Vec::new(),
+        conditional: false,
+        constants: Vec::new(),
     };
     let render = target_bound(false, false);
     m.pipelines.push(shape("draw", render.clone()));
@@ -1297,6 +1303,8 @@ pub(crate) fn sample_manifest() -> Manifest {
         bindings: vec![bind(1, BindingKind::ReadWrite)],
         debug_flag: None,
         requires: Vec::new(),
+        conditional: false,
+        constants: Vec::new(),
     });
     m.pipelines.push(Pipeline {
         name: "cover+shade".into(),
@@ -1306,6 +1314,8 @@ pub(crate) fn sample_manifest() -> Manifest {
         bindings: vec![bind(0, BindingKind::Texture), bind(1, BindingKind::Sampler)],
         debug_flag: None,
         requires: Vec::new(),
+        conditional: false,
+        constants: Vec::new(),
     });
     m
 }

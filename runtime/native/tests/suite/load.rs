@@ -38,6 +38,29 @@ fn rejects_another_stream_version() {
     assert!(err.to_string().contains(&format!("command stream version {other}")), "{err}");
 }
 
+/// A 0.7.0 build (manifest 10, command stream 12) under this host: refused, naming its version
+/// and the host's.
+#[test]
+fn rejects_a_0_7_build() {
+    let err = load_with_manifest("from-0.7", |m| {
+        m.replace(
+            &format!("\"manifest_version\": {}", wrela_abi::manifest::VERSION),
+            "\"manifest_version\": 10",
+        )
+        .replace(
+            &format!("\"stream_version\": {}", wrela_abi::stream::VERSION),
+            "\"stream_version\": 12",
+        )
+    });
+    assert!(matches!(&err, Error::Manifest(_)), "{err}");
+    let want = format!(
+        "manifest version 10, but this host reads version {}",
+        wrela_abi::manifest::VERSION
+    );
+    assert!(err.to_string().contains(&want), "{err}");
+    assert_eq!((wrela_abi::manifest::VERSION, wrela_abi::stream::VERSION), (11, 13));
+}
+
 #[test]
 fn reports_missing_files() {
     let err = load_with_manifest("missing-shader", |m| m.replace("fill.wgsl", "nope.wgsl"));

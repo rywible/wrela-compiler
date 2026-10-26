@@ -25,6 +25,10 @@ pub(crate) struct Request {
     pub method: String,
     pub path: String,
     pub query: String,
+    /// Whether the request accepts a gzipped answer.
+    pub gzip: bool,
+    /// The entity tags of what the browser holds (`If-None-Match`).
+    pub if_none_match: Option<String>,
     body: Option<(BufReader<DeadlineIo>, usize)>,
 }
 
@@ -78,6 +82,10 @@ fn accept_limited(
             if stopping.load(Ordering::SeqCst) {
                 break;
             }
+            // Listening on every interface (`--lan`), only this machine and private networks.
+            if !stream.peer_addr().is_ok_and(wrela_host::interfaces::local_peer) {
+                continue;
+            }
             if active
                 .fetch_update(Ordering::AcqRel, Ordering::Acquire, |n| (n < limit).then_some(n + 1))
                 .is_err()
@@ -115,13 +123,18 @@ pub(crate) fn stop(port: u16, stopping: &AtomicBool) -> bool {
 
 /// Reads a request from `stream`, for a server on `port`: `None` if it was refused (the
 /// refusal is answered).
-pub(crate) fn read(stream: &TcpStream, port: u16) -> std::io::Result<Option<Request>> {
-    read_with_timeout(stream, port, REQUEST_DEADLINE)
+pub(crate) fn read(
+    stream: &TcpStream,
+    port: u16,
+    hosts: &[String],
+) -> std::io::Result<Option<Request>> {
+    read_with_timeout(stream, port, hosts, REQUEST_DEADLINE)
 }
 
 fn read_with_timeout(
     stream: &TcpStream,
     port: u16,
+    hosts: &[String],
     timeout: Duration,
 ) -> io::Result<Option<Request>> {
     let input = DeadlineIo {
@@ -131,10 +144,19 @@ fn read_with_timeout(
     };
     let mut reader = BufReader::new(input);
     let mut out = stream.try_clone()?;
-    let Some(head) = loopback::read_head(&mut reader, &mut out, port)? else { return Ok(None) };
+    let Some(head) = loopback::read_head(&mut reader, &mut out, port, hosts)? else {
+        return Ok(None);
+    };
     // The body is read, or refused, by what answers the request.
     let body = Some((reader, head.length));
-    Ok(Some(Request { method: head.method, path: head.path, query: head.query, body }))
+    Ok(Some(Request {
+        method: head.method,
+        path: head.path,
+        query: head.query,
+        gzip: head.gzip,
+        if_none_match: head.if_none_match,
+        body,
+    }))
 }
 
 /// Writes a test-mode result (`PUT /results/<name>`) under `root`: a plain file name only.
@@ -164,13 +186,21 @@ fn put_result_from(
 
 /// Answers a GET of the file at `rel` in `dir`, an `index.html` as `page` makes it of the
 /// file's text: not found if there's none, or `rel` isn't a plain path in `dir`.
+/// Gzipped as it's sent when `gzip` (the request accepts it, and the file's type is worth it).
+/// Kept by the browser and checked again on each use (its entity tag, `if_none_match` the one the
+/// browser holds): a hot reload that writes a file again under its name changes its tag, and a
+/// page's preload of a build's WASM is what its worker's fetch then finds. The page itself is
+/// never kept.
 pub(crate) fn get_file(
     out: &mut TcpStream,
     dir: &cap_std::fs::Dir,
     rel: &str,
+    gzip: bool,
+    if_none_match: Option<&str>,
     page: impl Fn(&str) -> String,
 ) -> std::io::Result<()> {
-    loopback::get_file(out, dir, rel, Some(&page))
+    let caching = loopback::Caching::Revalidate { if_none_match };
+    loopback::get_file(out, dir, rel, Some(&page), caching, gzip)
 }
 
 #[cfg(test)]
@@ -205,7 +235,7 @@ mod tests {
             response
         });
         let (mut stream, _) = listener.accept().expect("accept");
-        let mut request = read(&stream, port).expect("request").expect("allowed");
+        let mut request = read(&stream, port, &[]).expect("request").expect("allowed");
         put_result(&mut stream, &root_dir, "shoot.txt", &mut request).expect("write result");
         drop(request);
         drop(stream);
@@ -228,7 +258,7 @@ mod tests {
             .expect("request head");
         });
         let (stream, _) = listener.accept().expect("accept");
-        let mut request = read(&stream, port).expect("request").expect("allowed");
+        let mut request = read(&stream, port, &[]).expect("request").expect("allowed");
         assert_eq!(request.body.as_ref().map(|(_, n)| *n), Some(loopback::MAX_RESULT));
         assert!(
             request.read_body(loopback::MAX_RESULT - 1).expect("refused").is_none(),
@@ -295,7 +325,7 @@ mod tests {
             send_finished.store(true, Ordering::Release);
         });
         let (stream, _) = listener.accept().expect("accept");
-        let result = read_with_timeout(&stream, port, Duration::from_millis(100));
+        let result = read_with_timeout(&stream, port, &[], Duration::from_millis(100));
         assert!(result.is_err(), "an incomplete request cannot succeed");
         assert!(!finished.load(Ordering::Acquire), "the peer was still sending at the deadline");
         stop_sending.store(true, Ordering::Release);
@@ -327,9 +357,16 @@ mod tests {
                 response
             });
             let (mut stream, _) = listener.accept().expect("accept");
-            let request = read(&stream, port).expect("read request").expect("allowed request");
-            get_file(&mut stream, &build_dir, request.path.trim_start_matches('/'), str::to_string)
-                .expect("answer GET");
+            let request = read(&stream, port, &[]).expect("read request").expect("allowed request");
+            get_file(
+                &mut stream,
+                &build_dir,
+                request.path.trim_start_matches('/'),
+                false,
+                None,
+                str::to_string,
+            )
+            .expect("answer GET");
             // The request's unread body holds the connection open too.
             drop(request);
             drop(stream);
@@ -382,7 +419,8 @@ mod tests {
             client.join().expect("response")
         };
         let served = answer(&|stream| {
-            get_file(stream, &held, "visible.txt", str::to_string).expect("answer GET");
+            get_file(stream, &held, "visible.txt", false, None, str::to_string)
+                .expect("answer GET");
         });
         assert!(served.starts_with("HTTP/1.1 404"), "{served}");
         assert!(!served.contains("private"));
@@ -428,8 +466,9 @@ mod tests {
             drop(stream);
             client.join().expect("client")
         };
-        let served =
-            answer(&|out| get_file(out, &held, "index.html", str::to_string).expect("GET"));
+        let served = answer(&|out| {
+            get_file(out, &held, "index.html", false, None, str::to_string).expect("GET")
+        });
         assert!(served.ends_with("original"), "{served}");
         assert!(!served.contains("private"));
         let written = answer(&|out| {

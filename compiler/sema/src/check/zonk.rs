@@ -12,7 +12,7 @@ use wrela_diag::{Diagnostic, Span, codes};
 /// A command's entry point's types: its generic arguments, or its value's.
 fn shader_tys(sh: &mut Shader, f: &mut impl FnMut(&mut TyId)) {
     match sh {
-        Shader::Named(_, args) => args.iter_mut().for_each(&mut *f),
+        Shader::Named(_, args, _) => args.iter_mut().for_each(&mut *f),
         Shader::Value(e) => walk_tys(e, f),
     }
 }

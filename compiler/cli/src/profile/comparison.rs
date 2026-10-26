@@ -371,7 +371,7 @@ mod tests {
         let root = scratch.0.clone();
         std::fs::write(
             root.join("manifest.json"),
-            r#"{"manifest_version":10,"stream_version":12,"wasm":"game.wasm","pipelines":[]}"#,
+            r#"{"manifest_version":11,"stream_version":13,"wasm":"game.wasm","pipelines":[]}"#,
         )
         .unwrap();
         std::fs::write(root.join("game.wasm"), b"first program").unwrap();

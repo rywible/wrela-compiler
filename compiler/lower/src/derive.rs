@@ -21,9 +21,11 @@ pub(crate) fn call(
 ) -> Option<ir::ValueId> {
     let kind = match lang {
         Lang::IntervalOf => DeriveKind::Interval,
+        Lang::Precision => DeriveKind::Precision,
         Lang::Filtered => DeriveKind::Filtered,
         Lang::LiftGradient => DeriveKind::Literals,
         Lang::LiftReads => DeriveKind::Reads,
+        Lang::TapeOf | Lang::TapeWith | Lang::TapeSized => DeriveKind::Tape,
         _ => DeriveKind::ValueAndGradient,
     };
     let Some(Repr::Callable(callable, srcs)) = fl.callable_arg(&c.args[0]) else {
@@ -35,7 +37,7 @@ pub(crate) fn call(
         return None;
     };
     let (input, output) = match kind {
-        DeriveKind::Interval => (substs[0], substs.get(1).copied()),
+        DeriveKind::Interval | DeriveKind::Precision => (substs[0], substs.get(1).copied()),
         DeriveKind::Filtered => (substs[0], None),
         // `gradient<const N>`: the literals' type and the result's are the call's.
         DeriveKind::Literals => {
@@ -43,6 +45,9 @@ pub(crate) fn call(
             (which, ty.map(|t| fl.concrete(t)))
         }
         DeriveKind::Reads => (fl.cx.checked.program.types.unit, ty.map(|t| fl.concrete(t))),
+        DeriveKind::Tape => {
+            (fl.concrete(ty?), if lang == Lang::TapeWith { substs.first().copied() } else { None })
+        }
         DeriveKind::ValueAndGradient => {
             (substs[0], if lang == Lang::ValueGradientWith { substs.get(1).copied() } else { None })
         }
@@ -50,7 +55,7 @@ pub(crate) fn call(
     let key = InstanceKey::Derived { of: callable, kind, input, output };
     let callee = fl.cx.instance(fl.mb, key, Some((fl.id, c.span)));
     let mut args = fl.capture_args(&srcs)?;
-    if kind != DeriveKind::Reads {
+    if !matches!(kind, DeriveKind::Reads | DeriveKind::Tape) {
         let x = fl.arg_value(&c.args[1])?;
         args.push(ir::Arg::Value(x));
     }
@@ -58,7 +63,11 @@ pub(crate) fn call(
         let width = fl.arg_value(&c.args[2])?;
         args.push(ir::Arg::Value(width));
     }
-    let ret = fl.mb.m.functions[callee.index()].ret?;
+    let Some(ret) = fl.mb.m.functions[callee.index()].ret else {
+        // `precision`: a report, which returns nothing.
+        fl.emit(ir::Stmt::Eval(ir::Expr::Call(callee, args)));
+        return None;
+    };
     let v = fl.value(ret, ir::Expr::Call(callee, args));
     match lang {
         Lang::Gradient => {
@@ -68,6 +77,43 @@ pub(crate) fn call(
         }
         _ => Some(v),
     }
+}
+
+/// std's functions that build a tape of type `tape` (a `Taped<N, K>`), instantiated for it,
+/// and the `Building<N, K>` they build it in; `id` the derived instance that calls them.
+fn tape_fns(
+    cx: &mut Cx,
+    mb: &mut ModuleBuilder,
+    id: ir::FuncId,
+    tape: TyId,
+) -> Option<ir::derive::TapeFns> {
+    let program = &cx.checked.program;
+    let wrela_sema::ty::TyKind::Adt(_, args) = program.types.kind(tape).clone() else {
+        return None;
+    };
+    let building = program.types.adt(program.lang_adt(Lang::Building)?, args.clone());
+    let at = mb.callers.get(&id).map(|c| (id, c.1));
+    let span = match at {
+        Some((_, s)) => s,
+        None => program.func(program.lang_fn(Lang::TapeFinish)?).sig_span,
+    };
+    let f = |cx: &mut Cx, mb: &mut ModuleBuilder, l: Lang| {
+        let func = cx.checked.program.lang_fn(l)?;
+        Some(cx.instance(mb, InstanceKey::plain(func, args.clone()), at))
+    };
+    Some(ir::derive::TapeFns {
+        building: cx.lower_ty(mb, building, span)?,
+        one: f(cx, mb, Lang::PushOne)?,
+        two: f(cx, mb, Lang::PushTwo)?,
+        new: f(cx, mb, Lang::PushNew)?,
+        finish: f(cx, mb, Lang::TapeFinish)?,
+    })
+}
+
+/// The files std's code is in.
+fn std_files(cx: &Cx) -> std::collections::HashSet<wrela_diag::FileId> {
+    let program = &cx.checked.program;
+    program.fns.iter().filter(|f| program.is_std(f.module)).map(|f| f.sig_span.file).collect()
 }
 
 /// Where a callable is defined: a closure's expression, or a function's signature.
@@ -129,25 +175,41 @@ pub(crate) fn signature(cx: &mut Cx, mb: &mut ModuleBuilder, key: &InstanceKey) 
             let r = output.and_then(|o| cx.lower_ty(mb, o, span));
             ir::Function::new("literal_reads", params, r)
         }
-        DeriveKind::Interval => {
-            // The range of the result: an `Interval` for an `f32`, a box for a vector.
-            let interval = match output {
-                Some(y) => box_type(cx, *y),
-                None => cx
-                    .checked
-                    .program
-                    .lang_adt(Lang::Interval)
-                    .map(|a| cx.checked.program.types.adt(a, Vec::new())),
-            };
-            let box_ty = box_type(cx, *input);
-            let bt = box_ty.and_then(|b| cx.lower_ty(mb, b, span));
-            let it = interval.and_then(|i| cx.lower_ty(mb, i, span));
+        // `input` is the tape's type.
+        DeriveKind::Tape => ir::Function::new("tape", params, x),
+        DeriveKind::Interval | DeriveKind::Precision => {
+            let (bt, it) = box_types(cx, mb, *input, *output, span);
             if let Some(bt) = bt {
                 params.push(ir::Param::value("over", bt));
+            }
+            if *kind == DeriveKind::Precision {
+                return ir::Function::new("precision", params, None);
             }
             ir::Function::new("interval", params, it)
         }
     }
+}
+
+/// An interval's box over `input`, and the range of its result (`output`'s box, or an
+/// `Interval` for an `f32`), lowered.
+fn box_types(
+    cx: &mut Cx,
+    mb: &mut ModuleBuilder,
+    input: TyId,
+    output: Option<TyId>,
+    span: Span,
+) -> (Option<ir::TypeId>, Option<ir::TypeId>) {
+    let interval = match output {
+        Some(y) => box_type(cx, y),
+        None => cx
+            .checked
+            .program
+            .lang_adt(Lang::Interval)
+            .map(|a| cx.checked.program.types.adt(a, Vec::new())),
+    };
+    let box_ty = box_type(cx, input);
+    let bt = box_ty.and_then(|b| cx.lower_ty(mb, b, span));
+    (bt, interval.and_then(|i| cx.lower_ty(mb, i, span)))
 }
 
 /// `X::Box` for a domain type `X`.
@@ -218,6 +280,7 @@ pub(crate) fn build_next(cx: &mut Cx, mb: &mut ModuleBuilder) {
         let what = match &p.key {
             InstanceKey::Derived { kind: DeriveKind::Interval, .. } => "its interval",
             InstanceKey::Derived { kind: DeriveKind::Filtered, .. } => "its filtered value",
+            InstanceKey::Derived { kind: DeriveKind::Tape, .. } => "its tape",
             _ => "its gradient",
         };
         let msg = if r.contains(&p.id) {
@@ -320,7 +383,7 @@ fn build(
     id: ir::FuncId,
     inner: ir::FuncId,
 ) {
-    let InstanceKey::Derived { kind, output, .. } = key else { return };
+    let InstanceKey::Derived { of, kind, input, output } = key else { return };
     let target = mb.target();
     let result = match kind {
         DeriveKind::Reads => return build_reads(mb, id, inner),
@@ -359,6 +422,46 @@ fn build(
             match (mb.m.functions[id.index()].params.len() as u32).checked_sub(2) {
                 Some(ncap) => ir::derive::filtered(&mut mb.m, &mut mb.derived, inner, ncap, target),
                 None => Err(ir::Error::internal("a filtered value's signature has no input")),
+            }
+        }
+        DeriveKind::Tape => {
+            let sig = &mb.m.functions[id.index()];
+            let ncap = sig.params.len() as u32;
+            match (sig.ret, tape_fns(cx, mb, id, *input)) {
+                (Some(tape), Some(fns)) => ir::derive::tape(
+                    &mut mb.m,
+                    &mut mb.derived,
+                    inner,
+                    target,
+                    ir::derive::TapeOf { ncap, tape, with: output.is_some(), fns },
+                ),
+                _ => Err(ir::Error::internal(
+                    "a tape's signature returns no tape, or std has no `Building`",
+                )),
+            }
+        }
+        DeriveKind::Precision => {
+            let sig = &mb.m.functions[id.index()];
+            let ncap = (sig.params.len() as u32).saturating_sub(1);
+            let span = callable_span(cx, of);
+            let bt = sig.params.last().map(|p| p.ty);
+            let (_, it) = box_types(cx, mb, *input, *output, span);
+            let note = cx.checked.program.lang_fn(Lang::PrecisionNote);
+            let at = mb.callers.get(&id).map(|c| (id, c.1));
+            let note = note.map(|n| cx.instance(mb, InstanceKey::plain(n, Vec::new()), at));
+            match (bt, it, note) {
+                (Some(box_ty), Some(interval_ty), Some(note)) => ir::derive::precision(
+                    &mut mb.m,
+                    &mut mb.derived,
+                    inner,
+                    ncap,
+                    box_ty,
+                    interval_ty,
+                    note,
+                ),
+                _ => Err(ir::Error::internal(
+                    "a precision report's signature has no box, or std has no `precision_note`",
+                )),
             }
         }
         DeriveKind::Interval => {
@@ -416,7 +519,10 @@ fn build(
                     body.push(ir::Stmt::Let(v, ir::Expr::Call(derived, args)));
                     body.push(ir::Stmt::Return(Some(v)));
                 }
-                None => body.push(ir::Stmt::Return(None)),
+                None => {
+                    body.push(ir::Stmt::Eval(ir::Expr::Call(derived, args)));
+                    body.push(ir::Stmt::Return(None));
+                }
             }
             f.body.extend(body);
         }
@@ -430,19 +536,37 @@ fn build(
             let code = match &e {
                 ir::Error::NotDerivable(..) => codes::E0700,
                 ir::Error::ActiveLoopExit(..) => codes::E0701,
+                ir::Error::NotTapeable(..) => codes::E0709,
                 ir::Error::Internal(m) => {
                     cx.err(Diagnostic::internal(format!("deriving a function failed: {m}")));
                     return;
                 }
             };
-            let d = match e.span() {
+            // A tape's error in std's code is shown at the program's call that reached it.
+            let (span, inner) = match &e {
+                ir::Error::NotTapeable(_, Some(at), calls) => {
+                    let std = std_files(cx);
+                    let mine = std::iter::once(at).chain(calls).find(|s| !std.contains(&s.file));
+                    match mine {
+                        Some(m) if m != at => (Some(*m), Some(*at)),
+                        _ => (Some(*at), None),
+                    }
+                }
+                _ => (e.span(), None),
+            };
+            let mut d = match span {
                 Some(at) if at != call => {
                     Diagnostic::new(code, at, e.to_string()).with_secondary(call, "derived here")
                 }
                 _ => Diagnostic::new(code, call, format!("can't derive this function: {e}")),
             };
+            if let Some(inner) = inner {
+                d = d.with_secondary(inner, "in std's code here");
+            }
             cx.err(d.with_help(if code == codes::E0701 {
                 "make the loop run a fixed count: `for _ in 0..n { ... }`, leaving it early with `break`"
+            } else if code == codes::E0709 {
+                "compute what the tape can't hold from the field's data, outside the point's path, or tape the parts that can be taped and keep the rest compiled"
             } else {
                 "move what can't be derived out of the function, and pass its result in as a value the function captures"
             }));

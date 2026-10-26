@@ -57,7 +57,7 @@ use serde::Serialize;
 use serde_json::{Map, Value};
 use std::fmt;
 
-pub const VERSION: u32 = 10;
+pub const VERSION: u32 = 11;
 /// The screen's texture format: what a screen target's colour is, and the format of the bytes a
 /// host reads back from the screen.
 pub const SCREEN_TEXTURE: TextureFormat = TextureFormat::Rgba8;
@@ -131,6 +131,42 @@ pub struct Manifest {
     /// The program's WASM file, relative to the manifest.
     pub wasm: String,
     pub pipelines: Vec<Pipeline>,
+    /// The WASM's interface, as the build made it: what a host checks the module against
+    /// without reading its bytes (a browser compiles it as it streams in).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub wasm_abi: Option<WasmAbi>,
+    /// A build with relaxed SIMD (`wrela build --relaxed-simd`): the module whose presentation
+    /// code uses it, beside `wasm`, and its interface. A host that runs relaxed SIMD loads it;
+    /// any other, `wasm`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub wasm_relaxed: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub wasm_relaxed_abi: Option<WasmAbi>,
+}
+
+/// A module's interface (language.md §15): its imported memory's limits, and the type of each
+/// import and each exported function, in the module's order. JavaScript sees an import's or an
+/// export's name and kind but not a function's type, nor a memory's limits, so the build states
+/// them. A function's type is written `(i32, i32) -> ()`; any other import's is its kind
+/// (`memory`, `table`, `global`, `tag`).
+#[derive(Clone, Debug, PartialEq, Serialize)]
+pub struct WasmAbi {
+    /// The imported memory's limits, if the module imports one.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub memory: Option<MemoryLimits>,
+    /// Each import as `[module, name, type]`.
+    pub imports: Vec<[String; 3]>,
+    /// Each exported function as `[name, type]`.
+    pub exports: Vec<[String; 2]>,
+}
+
+/// A memory's limits, in 64 KiB pages.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+pub struct MemoryLimits {
+    pub initial: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub maximum: Option<u64>,
+    pub shared: bool,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize)]
@@ -149,6 +185,45 @@ pub struct Pipeline {
     /// The device features its shader needs (WebGPU's names).
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub requires: Vec<String>,
+    /// Reached only under runtime conditions: tier 1, which a host builds once tier 0 is built
+    /// (or at once, when a command needs it first).
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub conditional: bool,
+    /// Its shaders' pipeline-overridable constants, each by its name in the WGSL: what the host
+    /// sets when it creates the pipeline (WebGPU's `constants`).
+    #[serde(skip_serializing_if = "Vec::is_empty", serialize_with = "constants_map")]
+    pub constants: Vec<(String, Constant)>,
+}
+
+/// A pipeline-overridable constant's value: a `bool`, or a number (a `u32`, `i32` or `f32`).
+#[derive(Clone, Copy, Debug, PartialEq, Serialize)]
+#[serde(untagged)]
+pub enum Constant {
+    Bool(bool),
+    Number(f64),
+}
+
+impl Constant {
+    /// Its value as WebGPU's `constants` and wgpu's take it: a number, a bool 0 or 1.
+    pub fn number(self) -> f64 {
+        match self {
+            Constant::Bool(b) => f64::from(u8::from(b)),
+            Constant::Number(x) => x,
+        }
+    }
+}
+
+/// `constants` as a JSON object, in order.
+fn constants_map<S: serde::Serializer>(
+    constants: &[(String, Constant)],
+    s: S,
+) -> Result<S::Ok, S::Error> {
+    use serde::ser::SerializeMap;
+    let mut m = s.serialize_map(Some(constants.len()))?;
+    for (k, v) in constants {
+        m.serialize_entry(k, v)?;
+    }
+    m.end()
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize)]
@@ -429,6 +504,9 @@ pub enum BindingKind {
     Sampler,
     /// A comparison sampler.
     ComparisonSampler,
+    /// A sampler that gathers a depth texture's depths (`DepthTexture::gather`): WebGPU binds
+    /// it as one that doesn't filter, so the sampler's filters are nearest.
+    NonFilteringSampler,
     /// A colour texture a kernel writes, of its `format` (a storage texture, written only).
     StorageTexture,
     /// A colour 3D texture.
@@ -451,7 +529,7 @@ pub enum BindingKind {
 }
 
 impl BindingKind {
-    pub const ALL: [BindingKind; 13] = [
+    pub const ALL: [BindingKind; 14] = [
         BindingKind::Read,
         BindingKind::ReadWrite,
         BindingKind::Texture,
@@ -465,6 +543,7 @@ impl BindingKind {
         BindingKind::TextureCube,
         BindingKind::DepthTextureArray,
         BindingKind::StorageTextureArray,
+        BindingKind::NonFilteringSampler,
     ];
 
     pub fn is_buffer(self) -> bool {
@@ -546,7 +625,9 @@ impl BindingKind {
             | BindingKind::TextureArray
             | BindingKind::TextureCube
             | BindingKind::DepthTextureArray => StageLimit::SampledTextures,
-            BindingKind::Sampler | BindingKind::ComparisonSampler => StageLimit::Samplers,
+            BindingKind::Sampler
+            | BindingKind::ComparisonSampler
+            | BindingKind::NonFilteringSampler => StageLimit::Samplers,
             BindingKind::StorageTexture
             | BindingKind::StorageTexture3d
             | BindingKind::StorageTextureArray => StageLimit::StorageTextures,
@@ -562,6 +643,7 @@ impl BindingKind {
             BindingKind::DepthTexture => "depth_texture",
             BindingKind::Sampler => "sampler",
             BindingKind::ComparisonSampler => "comparison_sampler",
+            BindingKind::NonFilteringSampler => "non_filtering_sampler",
             BindingKind::StorageTexture => "storage_texture",
             BindingKind::Texture3d => "texture_3d",
             BindingKind::StorageTexture3d => "storage_texture_3d",
@@ -627,6 +709,9 @@ impl Manifest {
             stream_version: crate::stream::VERSION,
             wasm: wasm.into(),
             pipelines: Vec::new(),
+            wasm_abi: None,
+            wasm_relaxed: None,
+            wasm_relaxed_abi: None,
         }
     }
 
@@ -1209,7 +1294,36 @@ mod read {
         let requires = list_or_empty(o, "requires", &place, |rp, f| {
             Ok(named(f, rp, "a feature this host knows", &features)?.to_string())
         })?;
-        Ok(Pipeline { name, shader, stage, uniform, bindings, debug_flag, requires })
+        // A missing `conditional` is tier 0.
+        let conditional = flag(o, "conditional", &place, false)?;
+        // Missing `constants` are none.
+        let constants = match o.get("constants") {
+            None => Vec::new(),
+            Some(v) => {
+                let cp = format!("{place}.constants");
+                let co = object(v, &cp)?;
+                co.iter()
+                    .map(|(k, v)| match v {
+                        Value::Bool(b) => Ok((k.clone(), Constant::Bool(*b))),
+                        Value::Number(n) if n.as_f64().is_some_and(f64::is_finite) => {
+                            Ok((k.clone(), Constant::Number(n.as_f64().unwrap_or(0.0))))
+                        }
+                        _ => fail(format!("{cp}.{k} must be true, false or a number")),
+                    })
+                    .collect::<Result<Vec<_>>>()?
+            }
+        };
+        Ok(Pipeline {
+            name,
+            shader,
+            stage,
+            uniform,
+            bindings,
+            debug_flag,
+            requires,
+            conditional,
+            constants,
+        })
     }
 
     /// A manifest whose version has been checked.
@@ -1227,6 +1341,65 @@ mod read {
                 .enumerate()
                 .map(|(i, p)| pipeline(p, i))
                 .collect::<Result<_>>()?,
+            wasm_abi: match o.get("wasm_abi") {
+                None => None,
+                Some(v) => Some(wasm_abi(v)?),
+            },
+            wasm_relaxed: match o.get("wasm_relaxed") {
+                None => None,
+                Some(_) => Some(string(o, "wasm_relaxed", "the manifest")?),
+            },
+            wasm_relaxed_abi: match o.get("wasm_relaxed_abi") {
+                None => None,
+                Some(v) => Some(wasm_abi(v)?),
+            },
+        })
+    }
+
+    /// The manifest's `wasm_abi`: absent in a manifest that doesn't state it.
+    fn wasm_abi(v: &Value) -> Result<WasmAbi> {
+        let place = "wasm_abi";
+        let o = object(v, place)?;
+        let strings = |p: &str, v: &Value, n: usize| -> Result<Vec<String>> {
+            match v {
+                Value::Array(items) if items.len() == n && items.iter().all(|i| i.is_string()) => {
+                    Ok(items.iter().map(|i| i.as_str().unwrap_or_default().to_string()).collect())
+                }
+                _ => fail(format!("{p} must be an array of {n} strings")),
+            }
+        };
+        let memory = match o.get("memory") {
+            None => None,
+            Some(m) => {
+                let mp = format!("{place}.memory");
+                let mo = object(m, &mp)?;
+                let pages = |key: &str| -> Result<u64> {
+                    match field(mo, key, &mp)?.as_u64() {
+                        Some(n) => Ok(n),
+                        None => fail(format!("{mp}.{key} must be a count of pages")),
+                    }
+                };
+                Some(MemoryLimits {
+                    initial: pages("initial")?,
+                    maximum: if mo.contains_key("maximum") {
+                        Some(pages("maximum")?)
+                    } else {
+                        None
+                    },
+                    shared: flag(mo, "shared", &mp, false)?,
+                })
+            }
+        };
+        Ok(WasmAbi {
+            memory,
+            imports: list(o, "imports", place, |p, v| {
+                let s = strings(p, v, 3)?;
+                Ok([s[0].clone(), s[1].clone(), s[2].clone()])
+            })?,
+            exports: list(o, "exports", place, |p, v| {
+                let s = strings(p, v, 2)?;
+                Ok([s[0].clone(), s[1].clone()])
+            })?,
         })
     }
 }
@@ -1241,8 +1414,8 @@ mod tests {
     fn golden_json() {
         let json = sample().to_json();
         let expected = r#"{
-  "manifest_version": 10,
-  "stream_version": 12,
+  "manifest_version": 11,
+  "stream_version": 13,
   "wasm": "game.wasm",
   "pipelines": [
     {
@@ -1303,6 +1476,56 @@ mod tests {
 "#;
         assert_eq!(json, expected);
         assert_eq!(Manifest::parse(&json).expect("valid"), sample());
+    }
+
+    /// `constants` are optional, and round-trip as a JSON object.
+    #[test]
+    fn a_pipeline_may_set_constants() {
+        let mut m = sample();
+        m.pipelines[0].constants =
+            vec![("ambient".into(), Constant::Bool(true)), ("taps".into(), Constant::Number(4.0))];
+        let json = m.to_json();
+        assert!(
+            json.contains(
+                "\"constants\": {\n        \"ambient\": true,\n        \"taps\": 4.0\n      }"
+            ),
+            "{json}"
+        );
+        assert_eq!(Manifest::parse(&json).expect("valid"), m);
+        let bad = json.replace("\"taps\": 4.0", "\"taps\": \"4\"");
+        assert!(Manifest::parse(&bad).unwrap_err().to_string().contains("constants.taps"));
+    }
+
+    /// `conditional` (tier 1) is optional: a manifest without it is tier 0 throughout.
+    #[test]
+    fn a_pipeline_is_tier_0_unless_conditional() {
+        let parsed = Manifest::parse(&sample().to_json()).expect("valid");
+        assert!(parsed.pipelines.iter().all(|p| !p.conditional));
+        let mut m = sample();
+        m.pipelines[1].conditional = true;
+        let json = m.to_json();
+        assert_eq!(json.matches("\"conditional\": true").count(), 1, "{json}");
+        assert_eq!(Manifest::parse(&json).expect("valid"), m);
+    }
+
+    /// `wasm_abi` is optional: a manifest without it has none, and one with it round-trips.
+    #[test]
+    fn the_wasm_abi_is_read_where_given() {
+        assert_eq!(Manifest::parse(&sample().to_json()).expect("valid").wasm_abi, None);
+        let mut m = sample();
+        m.wasm_abi = Some(WasmAbi {
+            memory: Some(MemoryLimits { initial: 17, maximum: Some(16384), shared: true }),
+            imports: vec![
+                ["wrela".into(), "memory".into(), "memory".into()],
+                ["wrela".into(), "submit".into(), "(i32, i32) -> ()".into()],
+            ],
+            exports: vec![["frame".into(), "(f32, i32, i32) -> ()".into()]],
+        });
+        let json = m.to_json();
+        assert!(json.contains("\"wasm_abi\""), "{json}");
+        assert_eq!(Manifest::parse(&json).expect("valid"), m);
+        let bad = json.replace("\"(i32, i32) -> ()\"", "7");
+        assert!(Manifest::parse(&bad).unwrap_err().to_string().contains("wasm_abi.imports[1]"));
     }
 
     #[test]

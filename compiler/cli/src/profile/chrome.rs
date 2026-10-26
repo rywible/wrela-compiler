@@ -3,9 +3,10 @@
 //! - saturated (`timestamps=1&saturate=1&nohash=1`, or `timestamps=2` with `--serial`): each
 //!   frame starts once the last is recorded, at most two on the GPU, so the GPU's times are its
 //!   work; and the executor's counters;
-//! - paced (`paced=1&inflight=2&nohash=1`): frames at their times, two in flight, no timestamp
-//!   queries, as a player's are: each frame's CPU time (the program's `frame`, its commands
-//!   encoded, up to submission), its phases, and the intervals between frames.
+//! - paced (`paced=1&inflight=2&timestamps=1&nohash=1`): frames at their times, two in flight,
+//!   as a player's are: each frame's CPU time (the program's `frame`, its commands encoded, up
+//!   to submission), its phases, the intervals between frames, and each frame's labels' GPU
+//!   time, which name the slowest frames' work (`--worst`).
 //!
 //! Both run with the command checker off (`checks=0`), as a release build plays, unless
 //! `--checked` keeps it (to compare with a build whose runtime predates `checks`).
@@ -75,6 +76,25 @@ fn common(a: &Args) -> String {
     s
 }
 
+/// The GPU's times of `v` (a `timings.json`) in the frames from `warmup` on.
+fn gpu_timings(v: &Value, warmup: usize) -> Vec<wrela_host::GpuTiming> {
+    v.as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|t| {
+            Some(wrela_host::GpuTiming {
+                frame: t["frame"].as_u64()? as usize,
+                label: t["label"].as_str()?.to_string(),
+                nanos: t["nanos"].as_f64()?,
+                start: t["start"].as_f64()?,
+                end: t["end"].as_f64()?,
+                submission: t["submission"].as_u64()? as usize,
+            })
+        })
+        .filter(|t| t.frame >= warmup)
+        .collect()
+}
+
 /// The numbers of `v` (a JSON array) from index `from`.
 fn numbers(v: &Value, from: usize) -> Vec<f64> {
     v.as_array()
@@ -95,26 +115,19 @@ pub(super) fn measure(a: &Args, built: &Path) -> Result<(Profile, Value), String
     )?)
     .map_err(|_| "Chrome's results are incomplete")?;
     // The paced run: CPU times, phases and frame intervals as a player sees them.
-    let fragment = format!("#test{}&paced=1&inflight=2&nohash=1", common(a));
-    let [framed] = <[Value; 1]>::try_from(run_page(built, &fragment, frames, &["frames.json"])?)
-        .map_err(|_| "Chrome's paced results are incomplete")?;
+    let fragment = format!("#test{}&paced=1&inflight=2&timestamps=1&nohash=1", common(a));
+    let [framed, load, paced_timings] = <[Value; 3]>::try_from(run_page(
+        built,
+        &fragment,
+        frames,
+        &["frames.json", "load.json", "timings.json"],
+    )?)
+    .map_err(|_| "Chrome's paced results are incomplete")?;
+    // What the page loaded, as the wire carried it (`transferSize`: compressed where served so).
+    let resources = load["resources"].as_array().cloned().unwrap_or_default();
+    let loaded = (resources.iter().filter_map(|r| r["bytes"].as_u64()).sum(), resources.len());
     let warmup = a.warmup as usize;
-    let timings: Vec<wrela_host::GpuTiming> = timings
-        .as_array()
-        .into_iter()
-        .flatten()
-        .filter_map(|t| {
-            Some(wrela_host::GpuTiming {
-                frame: t["frame"].as_u64()? as usize,
-                label: t["label"].as_str()?.to_string(),
-                nanos: t["nanos"].as_f64()?,
-                start: t["start"].as_f64()?,
-                end: t["end"].as_f64()?,
-                submission: t["submission"].as_u64()? as usize,
-            })
-        })
-        .filter(|t| t.frame >= warmup)
-        .collect();
+    let timings = gpu_timings(&timings, warmup);
     let spans: Vec<f64> = wrela_host::frame_spans(&timings).into_iter().map(|(_, ms)| ms).collect();
     let calls = numbers(&framed["cpu_ms"], warmup);
     let began = numbers(&framed["began_ms"], 0);
@@ -149,6 +162,33 @@ pub(super) fn measure(a: &Args, built: &Path) -> Result<(Profile, Value), String
         .collect();
     let intervals: Vec<f64> =
         began.windows(2).skip(warmup.saturating_sub(1)).map(|w| w[1] - w[0]).collect();
+    // The paced frames, each from its start to the next's, with its call, its phases and its
+    // labels (frames.json's), and its GPU span (the paced run's timings).
+    let spans_paced = wrela_host::frame_spans(&gpu_timings(&paced_timings, warmup));
+    let all_cpu = numbers(&framed["cpu_ms"], 0);
+    let mut paced = Vec::new();
+    for k in warmup..began.len().saturating_sub(1) {
+        let pairs = |v: &Value| -> Vec<(String, f64)> {
+            match v {
+                Value::Object(m) => {
+                    m.iter().map(|(n, ms)| (n.clone(), ms.as_f64().unwrap_or(0.0))).collect()
+                }
+                Value::Array(xs) => xs
+                    .iter()
+                    .filter_map(|p| Some((p[0].as_str()?.to_string(), p[1].as_f64()?)))
+                    .collect(),
+                _ => Vec::new(),
+            }
+        };
+        paced.push(super::Worst {
+            frame: k,
+            interval: Some(began[k + 1] - began[k]),
+            cpu: all_cpu.get(k).copied().unwrap_or(0.0),
+            gpu: spans_paced.iter().find(|(f, _)| *f == k).map(|(_, ms)| *ms),
+            phases: pairs(&framed["phases"][k]),
+            labels: pairs(&framed["labels"][k]),
+        });
+    }
     let labels: Vec<Label> = by_label(&timings);
     Ok((
         Profile {
@@ -164,6 +204,8 @@ pub(super) fn measure(a: &Args, built: &Path) -> Result<(Profile, Value), String
             counters,
             phases: wrela_host::Traced { lines: Vec::new(), phases },
             wgsl: super::wgsl(built)?,
+            loaded: Some(loaded),
+            worst: super::slowest(paced, a.worst, |f| f.interval.unwrap_or(0.0)),
         },
         device,
     ))

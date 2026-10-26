@@ -195,11 +195,15 @@ pub struct Options {
     /// The most pages the memory grows to: [`memory::MAX_PAGES`] (1 GiB), or a tool build's
     /// [`memory::TOOL_MAX_PAGES`].
     pub max_pages: u32,
+    /// Relaxed SIMD in relaxable functions (`ir::Function::relaxable`): a vector multiply that
+    /// only an add takes is one `f32x4.relaxed_madd`, and `min` and `max` are relaxed. Every
+    /// other function stays standard, which the check after emitting proves of each.
+    pub relaxed: bool,
 }
 
 impl Default for Options {
     fn default() -> Options {
-        Options { shared_memory: true, simd: true, max_pages: memory::MAX_PAGES }
+        Options { shared_memory: true, simd: true, max_pages: memory::MAX_PAGES, relaxed: false }
     }
 }
 
@@ -211,7 +215,7 @@ pub fn emit(m: &ir::Module) -> Result<Emitted, String> {
 
 /// [`emit`], with these options.
 pub fn emit_with(m: &ir::Module, options: Options) -> Result<Emitted, String> {
-    let Options { shared_memory, simd, max_pages } = options;
+    let Options { shared_memory, simd, max_pages, relaxed } = options;
     if !m.entry_points.is_empty() || !m.resources.is_empty() {
         return Err("internal: a GPU module reached the WASM back end".into());
     }
@@ -332,7 +336,14 @@ pub fn emit_with(m: &ir::Module, options: Options) -> Result<Emitted, String> {
     }
     // The program's functions, and each one's locations.
     let mut body_lines = Vec::with_capacity(m.functions.len());
-    let at = func::At { first_fn, helpers: &helpers, data: &data_at, heap_base, simd };
+    let at = func::At {
+        first_fn,
+        helpers: &helpers,
+        data: &data_at,
+        heap_base,
+        simd,
+        relaxed: relaxed && simd,
+    };
     for (i, f) in m.functions.iter().enumerate() {
         let (params, results) = signature(m, f, simd);
         let ty = types.get(params, results);
@@ -368,9 +379,11 @@ pub fn emit_with(m: &ir::Module, options: Options) -> Result<Emitted, String> {
     // A shared memory's constants are copied once, by a start function, not by each instance
     // as it starts: a worker's instance starts while the program runs, and would overwrite
     // what's changed since (the program's state among it).
-    let passive = shared_memory && !data_bytes.is_empty();
+    // One segment per run of bytes that aren't zero: memory is zero where none lands.
+    let segments = nonzero_runs(&data_bytes);
+    let passive = shared_memory && !segments.is_empty();
     let start = passive.then(|| {
-        let body = func::init_data(data_base, data_bytes.len() as u32);
+        let body = func::init_data(data_base, &segments);
         let ty = types.get(vec![], vec![]);
         functions.function(ty);
         code.function(&body);
@@ -430,15 +443,18 @@ pub fn emit_with(m: &ir::Module, options: Options) -> Result<Emitted, String> {
         module.section(&elements);
     }
     if passive {
-        module.section(&DataCountSection { count: 1 });
+        module.section(&DataCountSection { count: segments.len() as u32 });
     }
     module.section(&code);
-    if !data_bytes.is_empty() {
+    if !segments.is_empty() {
         let mut data = DataSection::new();
-        if passive {
-            data.passive(data_bytes);
-        } else {
-            data.active(0, &ConstExpr::i32_const(data_base as i32), data_bytes);
+        for &(at, len) in &segments {
+            let bytes = data_bytes[at as usize..(at + len) as usize].iter().copied();
+            if passive {
+                data.passive(bytes);
+            } else {
+                data.active(0, &ConstExpr::i32_const((data_base + at) as i32), bytes);
+            }
         }
         module.section(&data);
     }
@@ -449,7 +465,14 @@ pub fn emit_with(m: &ir::Module, options: Options) -> Result<Emitted, String> {
     let mut k = 0usize;
     for payload in wasmparser::Parser::new(0).parse_all(&wasm) {
         if let wasmparser::Payload::CodeSectionEntry(body) = payload.map_err(|e| e.to_string())? {
-            no_relaxed_simd(&body)?;
+            // A relaxable function's body may use relaxed SIMD; every other must not.
+            let relaxable = k
+                .checked_sub(nhelpers)
+                .and_then(|i| m.functions.get(i))
+                .is_some_and(|f| relaxed && f.relaxable);
+            if !relaxable {
+                no_relaxed_simd(&body)?;
+            }
             let start = body.range().start as u32;
             lines.push((start, None));
             if let Some(ls) = k.checked_sub(nhelpers).and_then(|i| body_lines.get(i)) {
@@ -459,6 +482,74 @@ pub fn emit_with(m: &ir::Module, options: Options) -> Result<Emitted, String> {
         }
     }
     Ok(Emitted { wasm, lines })
+}
+
+/// What a program's constant data holds (`wrela build --report data`): each constant's
+/// laid-out size and how many of its bytes are zero, the largest first; the section's total,
+/// and its zero bytes.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct DataReport {
+    /// `(name, type, bytes, zero bytes)`, the largest first.
+    pub constants: Vec<(String, String, u32, u32)>,
+    pub total: u32,
+    pub zeros: u32,
+    /// The bytes the module's data segments hold, once the zero runs are left out.
+    pub segments: u32,
+}
+
+/// The program's constant data, as [`DataReport`] reports it.
+pub fn data_report(m: &ir::Module) -> Result<DataReport, String> {
+    let (addrs, base, bytes, _) = data(m)?;
+    let mut constants: Vec<(String, String, u32, u32)> = m
+        .data
+        .iter()
+        .zip(&addrs)
+        .map(|(d, &at)| {
+            let size = ir::layout::layout(&m.types, d.ty).size;
+            let from = (at - base) as usize;
+            let zeros = bytes[from..from + size as usize].iter().filter(|&&b| b == 0).count();
+            (d.name.clone(), m.types.display(d.ty), size, zeros as u32)
+        })
+        .collect();
+    constants.sort_by(|a, b| b.2.cmp(&a.2).then_with(|| a.0.cmp(&b.0)));
+    let segments = nonzero_runs(&bytes).iter().map(|&(_, len)| len).sum();
+    let zeros = bytes.iter().filter(|&&b| b == 0).count() as u32;
+    Ok(DataReport { constants, total: bytes.len() as u32, zeros, segments })
+}
+
+/// The shortest run of zero bytes that splits the data into two segments: a segment's header
+/// costs a few bytes, so shorter runs stay in their segment.
+const ZERO_RUN: usize = 256;
+
+/// The most segments a module's data is split into (engines take up to 100,000).
+const MOST_SEGMENTS: usize = 10_000;
+
+/// The runs of `bytes` that hold anything but zeros, as `(offset, length)`: split wherever
+/// [`ZERO_RUN`] zero bytes or more lie between two, with the zeros at either end left out.
+/// Memory is zero where no segment lands, so the module's data is the same.
+fn nonzero_runs(bytes: &[u8]) -> Vec<(u32, u32)> {
+    let zeros_at = |i: usize| bytes[i..].iter().take_while(|&&b| b == 0).count();
+    let mut gap = ZERO_RUN;
+    loop {
+        let mut runs: Vec<(u32, u32)> = Vec::new();
+        let mut i = zeros_at(0);
+        while i < bytes.len() {
+            let start = i;
+            let end = loop {
+                i += bytes[i..].iter().take_while(|&&b| b != 0).count();
+                let (end, zeros) = (i, zeros_at(i));
+                i += zeros;
+                if i == bytes.len() || zeros >= gap {
+                    break end;
+                }
+            };
+            runs.push((start as u32, (end - start) as u32));
+        }
+        if runs.len() <= MOST_SEGMENTS {
+            return runs;
+        }
+        gap *= 4;
+    }
 }
 
 /// Where the module's constant data goes: each one's address, where the data starts (above the
@@ -600,6 +691,107 @@ pub fn without_custom_section(
     Ok((out, payload))
 }
 
+/// A module's interface as a manifest states it ([`wrela_abi::manifest::WasmAbi`]): its imported
+/// memory's limits, and each import's and exported function's type, in the module's order.
+pub fn interface(bytes: &[u8]) -> Result<wrela_abi::manifest::WasmAbi, String> {
+    use wasmparser::{ExternalKind, Payload, TypeRef, ValType};
+    fn val(t: ValType) -> &'static str {
+        match t {
+            ValType::I32 => "i32",
+            ValType::I64 => "i64",
+            ValType::F32 => "f32",
+            ValType::F64 => "f64",
+            ValType::V128 => "v128",
+            ValType::Ref(r) if r.is_func_ref() && r.is_nullable() && !r.is_concrete_type_ref() => {
+                "funcref"
+            }
+            ValType::Ref(r) if r.is_extern_ref() && r.is_nullable() => "externref",
+            ValType::Ref(_) => "ref",
+        }
+    }
+    let mut types: Vec<String> = Vec::new();
+    let mut funcs: Vec<String> = Vec::new(); // each function index's type: imports first
+    let mut abi =
+        wrela_abi::manifest::WasmAbi { memory: None, imports: Vec::new(), exports: Vec::new() };
+    for payload in wasmparser::Parser::new(0).parse_all(bytes) {
+        match payload.map_err(|e| e.to_string())? {
+            Payload::TypeSection(reader) => {
+                for ty in reader.into_iter_err_on_gc_types() {
+                    let f = ty.map_err(|e| e.to_string())?;
+                    let list =
+                        |ts: &[ValType]| ts.iter().map(|&t| val(t)).collect::<Vec<_>>().join(", ");
+                    types.push(format!("({}) -> ({})", list(f.params()), list(f.results())));
+                }
+            }
+            Payload::ImportSection(reader) => {
+                for import in reader.into_imports() {
+                    let import = import.map_err(|e| e.to_string())?;
+                    let ty = match import.ty {
+                        TypeRef::Func(t) => {
+                            let ty = types.get(t as usize).cloned().unwrap_or_else(|| "(?)".into());
+                            funcs.push(ty.clone());
+                            ty
+                        }
+                        TypeRef::Memory(m) => {
+                            if import.module == wrela_abi::IMPORT_MODULE
+                                && import.name == wrela_abi::IMPORT_MEMORY
+                            {
+                                abi.memory = Some(wrela_abi::manifest::MemoryLimits {
+                                    initial: m.initial,
+                                    maximum: m.maximum,
+                                    shared: m.shared,
+                                });
+                            }
+                            "memory".into()
+                        }
+                        TypeRef::Table(_) => "table".into(),
+                        TypeRef::Global(_) => "global".into(),
+                        TypeRef::Tag(_) => "tag".into(),
+                        TypeRef::FuncExact(t) => {
+                            types.get(t as usize).cloned().unwrap_or_else(|| "(?)".into())
+                        }
+                    };
+                    abi.imports.push([import.module.to_string(), import.name.to_string(), ty]);
+                }
+            }
+            Payload::FunctionSection(reader) => {
+                for t in reader {
+                    let t = t.map_err(|e| e.to_string())?;
+                    funcs.push(types.get(t as usize).cloned().unwrap_or_else(|| "(?)".into()));
+                }
+            }
+            Payload::ExportSection(reader) => {
+                for export in reader {
+                    let export = export.map_err(|e| e.to_string())?;
+                    if export.kind == ExternalKind::Func {
+                        let ty = funcs
+                            .get(export.index as usize)
+                            .cloned()
+                            .unwrap_or_else(|| "(?)".into());
+                        abi.exports.push([export.name.to_string(), ty]);
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    Ok(abi)
+}
+
+/// How many data segments a module has, and the bytes they hold.
+pub fn data_segments(bytes: &[u8]) -> Result<(usize, usize), String> {
+    let (mut n, mut total) = (0, 0);
+    for payload in wasmparser::Parser::new(0).parse_all(bytes) {
+        if let wasmparser::Payload::DataSection(reader) = payload.map_err(|e| e.to_string())? {
+            for d in reader {
+                total += d.map_err(|e| e.to_string())?.data.len();
+                n += 1;
+            }
+        }
+    }
+    Ok((n, total))
+}
+
 /// Fails if a WASM module uses any relaxed-SIMD instruction (AC7): those are the only WASM
 /// instructions whose results may differ between engines, including fused multiply-add.
 pub fn check_no_relaxed_simd(bytes: &[u8]) -> Result<(), String> {
@@ -607,6 +799,80 @@ pub fn check_no_relaxed_simd(bytes: &[u8]) -> Result<(), String> {
         let payload = payload.map_err(|e| e.to_string())?;
         if let wasmparser::Payload::CodeSectionEntry(body) = payload {
             no_relaxed_simd(&body)?;
+        }
+    }
+    Ok(())
+}
+
+/// Fails if relaxed SIMD is reachable from anything but the export `presents`: a relaxed
+/// module's rule (language.md §11.2), checked on the module itself, so it holds after `wasm-opt`
+/// too. Reachable: every other export, the start function and every function a table holds (a
+/// task, called by index), and what they call.
+pub fn check_relaxed_only_in(bytes: &[u8], presents: &str) -> Result<(), String> {
+    use wasmparser::{ElementItems, Operator, Payload};
+    let (mut imported, mut roots, mut bodies) = (0u32, Vec::new(), Vec::new());
+    for payload in wasmparser::Parser::new(0).parse_all(bytes) {
+        match payload.map_err(|e| e.to_string())? {
+            Payload::ImportSection(s) => {
+                for i in s.into_imports() {
+                    if matches!(i.map_err(|e| e.to_string())?.ty, wasmparser::TypeRef::Func(_)) {
+                        imported += 1;
+                    }
+                }
+            }
+            Payload::ExportSection(s) => {
+                for e in s {
+                    let e = e.map_err(|e| e.to_string())?;
+                    if e.kind == wasmparser::ExternalKind::Func && e.name != presents {
+                        roots.push(e.index);
+                    }
+                }
+            }
+            Payload::StartSection { func, .. } => roots.push(func),
+            Payload::ElementSection(s) => {
+                for e in s {
+                    match e.map_err(|e| e.to_string())?.items {
+                        ElementItems::Functions(fs) => {
+                            for f in fs {
+                                roots.push(f.map_err(|e| e.to_string())?);
+                            }
+                        }
+                        // `ref.func`s, as Binaryen may write a table's elements.
+                        ElementItems::Expressions(_, es) => {
+                            for x in es {
+                                let mut ops = x.map_err(|e| e.to_string())?.get_operators_reader();
+                                while !ops.eof() {
+                                    if let Operator::RefFunc { function_index } =
+                                        ops.read().map_err(|e| e.to_string())?
+                                    {
+                                        roots.push(function_index);
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            Payload::CodeSectionEntry(body) => bodies.push(body),
+            _ => {}
+        }
+    }
+    let mut seen = vec![false; bodies.len()];
+    while let Some(f) = roots.pop() {
+        let Some(k) = f.checked_sub(imported).map(|k| k as usize) else { continue };
+        if k >= bodies.len() || std::mem::replace(&mut seen[k], true) {
+            continue;
+        }
+        no_relaxed_simd(&bodies[k])
+            .map_err(|e| format!("{e}, where `{presents}` isn't all that reaches it"))?;
+        let mut ops = bodies[k].get_operators_reader().map_err(|e| e.to_string())?;
+        while !ops.eof() {
+            match ops.read().map_err(|e| e.to_string())? {
+                Operator::Call { function_index } | Operator::RefFunc { function_index } => {
+                    roots.push(function_index)
+                }
+                _ => {}
+            }
         }
     }
     Ok(())
@@ -671,6 +937,80 @@ mod tests {
     fn module(body: &str) -> Vec<u8> {
         wat::parse_str(format!("(module (func (param v128 v128 v128) (result v128) {body}))"))
             .expect("valid WAT")
+    }
+
+    #[test]
+    fn the_interface_names_imports_exports_and_the_memory() {
+        let wasm = wat::parse_str(
+            r#"(module
+                (import "wrela" "memory" (memory 17 16384 shared))
+                (import "wrela" "submit" (func (param i32 i32)))
+                (import "wrela" "limit" (func (param i32) (result i32)))
+                (func (export "frame") (param f32 i32 i32))
+                (func $hidden)
+                (export "memory" (memory 0)))"#,
+        )
+        .expect("valid WAT");
+        let abi = interface(&wasm).expect("reads");
+        let m = abi.memory.expect("imported memory");
+        assert_eq!((m.initial, m.maximum, m.shared), (17, Some(16384), true));
+        let row = |a: &str, b: &str, c: &str| [a.to_string(), b.to_string(), c.to_string()];
+        assert_eq!(
+            abi.imports,
+            [
+                row("wrela", "memory", "memory"),
+                row("wrela", "submit", "(i32, i32) -> ()"),
+                row("wrela", "limit", "(i32) -> (i32)")
+            ]
+        );
+        assert_eq!(abi.exports, [["frame".to_string(), "(f32, i32, i32) -> ()".to_string()]]);
+    }
+
+    /// The hand-written first-light fixture's manifest states its module's interface.
+    #[test]
+    fn first_lights_manifest_states_its_interface() {
+        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../runtime/fixtures/first-light");
+        let wasm = std::fs::read(dir.join("game.wasm")).expect("game.wasm");
+        let json = std::fs::read_to_string(dir.join("manifest.json")).expect("manifest.json");
+        let stated = wrela_abi::Manifest::parse(&json).expect("valid").wasm_abi;
+        let read = interface(&wasm).expect("reads");
+        if std::env::var_os("WRELA_BLESS").is_some() {
+            let mut m = wrela_abi::Manifest::parse(&json).expect("valid");
+            m.wasm_abi = Some(read.clone());
+            std::fs::write(dir.join("manifest.json"), m.to_json()).expect("write");
+        }
+        assert_eq!(stated, Some(read));
+    }
+
+    #[test]
+    fn data_splits_at_long_zero_runs() {
+        let mut bytes = vec![0u8; 4096];
+        bytes[10] = 1;
+        bytes[11] = 2;
+        bytes[100] = 3; // a short gap: the same segment
+        bytes[2000] = 4; // a long one: another
+        bytes[4095] = 5;
+        assert_eq!(nonzero_runs(&bytes), [(10, 91), (2000, 1), (4095, 1)]);
+        assert_eq!(nonzero_runs(&[0; 600]), []);
+        assert_eq!(nonzero_runs(&[7, 0, 7]), [(0, 3)]);
+    }
+
+    #[test]
+    fn relaxed_simd_is_reached_only_from_frame() {
+        let module = |caller: &str| {
+            wat::parse_str(format!(
+                "(module (func $fused (result v128) v128.const i64x2 0 0 v128.const i64x2 0 0 \
+                 v128.const i64x2 0 0 f32x4.relaxed_madd) \
+                 (func $plain (result v128) v128.const i64x2 0 0) \
+                 (func (export \"frame\") (drop (call $fused))) \
+                 (func (export \"init\") (drop (call {caller}))))"
+            ))
+            .expect("wat")
+        };
+        assert_eq!(check_relaxed_only_in(&module("$plain"), "frame"), Ok(()));
+        let e = check_relaxed_only_in(&module("$fused"), "frame").expect_err("init reaches it");
+        assert!(e.contains("F32x4RelaxedMadd"), "{e}");
     }
 
     #[test]

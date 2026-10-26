@@ -333,7 +333,8 @@ pub struct Call {
 /// (`gpu::bound_fields` says which parameter each field binds).
 #[derive(Clone, Debug)]
 pub enum Shader {
-    Named(FnId, Vec<TyId>),
+    /// Its generic arguments, and its `const` parameters' values (`thir::Shader::Named`).
+    Named(FnId, Vec<TyId>, Vec<(usize, crate::thir::ConstArg)>),
     Value(Place, Span),
 }
 
@@ -659,13 +660,13 @@ pub fn fn_uses(p: &Program, s: &Statement, r: &Rvalue, mut each: impl FnMut(FnUs
         },
         Rvalue::FnRef(f, _) => each(FnUse::Value(*f), s.span),
         Rvalue::Dispatch(d) => {
-            if let Shader::Named(f, _) = d.kernel {
+            if let Shader::Named(f, ..) = d.kernel {
                 each(FnUse::Dispatch(f), s.span);
             }
         }
         Rvalue::Draw(d) => {
             for sh in [&d.vertex, &d.fragment] {
-                if let Shader::Named(f, _) = sh {
+                if let Shader::Named(f, ..) = sh {
                     each(FnUse::Draw(*f), s.span);
                 }
             }

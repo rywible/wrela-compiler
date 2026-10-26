@@ -154,7 +154,11 @@ export class FakeDevice {
     return { label: desc.label };
   }
 
+  /** Every render pipeline's descriptor, made at a draw or at load. */
+  readonly renders: GPURenderPipelineDescriptor[] = [];
+
   createRenderPipeline(desc: GPURenderPipelineDescriptor) {
+    this.renders.push(desc);
     const targets = Array.from(desc.fragment?.targets ?? []).map((t) => t?.format ?? "none");
     this.variants.push(`${desc.label} ${targets.join(",") || "none"}|${desc.depthStencil?.format ?? "none"}`);
     return { label: desc.label, kind: "render", desc };
@@ -183,13 +187,18 @@ export class FakeDevice {
     };
   }
 
+  /** The compute pipelines made, their descriptors. */
+  readonly computes: GPUComputePipelineDescriptor[] = [];
+
   async createComputePipelineAsync(desc: GPUComputePipelineDescriptor) {
     this.#reject(desc.label);
+    this.computes.push(desc);
     return { label: desc.label, kind: "compute" };
   }
 
   async createRenderPipelineAsync(desc: GPURenderPipelineDescriptor) {
     this.#reject(desc.label);
+    this.renders.push(desc);
     const targets = Array.from(desc.fragment?.targets ?? []).map((t) => t?.format ?? "none");
     this.made.push(`${desc.label} ${targets.join(",") || "none"}|${desc.depthStencil?.format ?? "none"}`);
     return { label: desc.label, kind: "render", desc };
@@ -333,4 +342,4 @@ export const SCREEN_TARGET: ScreenTarget = { format: SCREEN_FORMAT, texture: () 
 
 /** Every pipeline of `m`, built on `device` from `SHADER`, its screen targets in `SCREEN_FORMAT`. */
 export const buildAll = (device: FakeDevice, m: Manifest) =>
-  Promise.all(buildPipelines(device.gpu, m, m.pipelines.map(() => SHADER), SCREEN_FORMAT));
+  Promise.all(buildPipelines(device.gpu, m, m.pipelines.map(() => SHADER), SCREEN_FORMAT).each);

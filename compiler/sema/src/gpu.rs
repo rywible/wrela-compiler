@@ -7,16 +7,40 @@ use crate::program::Program;
 use crate::ty::{FloatTy, FnId, IntTy, TyId, TyKind, VecElem};
 use wrela_diag::{Diagnostic, Span, codes};
 
-/// Every entry point's signature.
+/// Every entry point's signature, and that only entry points take `const` parameters.
 pub fn check_entries(p: &Program) -> Vec<Diagnostic> {
     let mut out = Vec::new();
     for i in 0..p.fns.len() {
         let f = FnId(i as u32);
         if let Some((entry, _)) = p.func(f).attrs.entry {
             check_entry(p, f, entry, &mut out);
+        } else {
+            for ps in p.func(f).params.iter().filter(|ps| ps.is_const) {
+                out.push(
+                    Diagnostic::new(
+                        codes::E0602,
+                        ps.span,
+                        format!(
+                            "`{}` is `const`, which only a GPU entry point's parameter is",
+                            ps.name
+                        ),
+                    )
+                    .with_note("a `const` parameter is its pipeline's build-time constant (§18.1)")
+                    .with_help("remove `const`, or make the function an entry point"),
+                );
+            }
         }
     }
     out
+}
+
+/// Whether `t` may be a `const` parameter's type: `bool`, `u32`, `i32` or `f32`, the scalars a
+/// pipeline-overridable constant has.
+pub fn is_const_param_ty(p: &Program, t: TyId) -> bool {
+    matches!(
+        p.types.kind(t),
+        TyKind::Bool | TyKind::Int(IntTy::U32 | IntTy::I32) | TyKind::Float(FloatTy::F32)
+    )
 }
 
 /// The `ClipPosition` fields of an instantiated struct type; none for any other type.
@@ -77,7 +101,9 @@ pub fn bound_fields(p: &Program, f: FnId) -> Vec<BoundField> {
     for (param, ps) in p.func(f).params.iter().enumerate() {
         let ty = ps.ty;
         let lang = p.lang_of_ty(ty);
-        if BuiltinInput::of(p, ty).is_some()
+        // A `const` parameter's value is its pipeline's, not the bound value's (§18.1).
+        if ps.is_const
+            || BuiltinInput::of(p, ty).is_some()
             || lang.is_some_and(Lang::is_workgroup_memory)
             || is_varyings(p, entry, ty)
         {
@@ -512,6 +538,23 @@ fn check_entry(p: &Program, f: FnId, entry: Entry, out: &mut Vec<Diagnostic>) {
     }
     // What it takes.
     for ps in &def.params {
+        if ps.is_const {
+            if !is_const_param_ty(p, ps.ty)
+                && !p.types.any(ps.ty, &mut |k| matches!(k, TyKind::Error))
+            {
+                let ty = p.display_ty(ps.ty);
+                out.push(
+                    Diagnostic::new(
+                        codes::E0602,
+                        ps.span,
+                        format!("`{}` is a `const {ty}`; a `const` parameter is a `bool`, `u32`, `i32` or `f32`", ps.name),
+                    )
+                    .with_note("it's a pipeline-overridable constant, which WGSL has of those scalars")
+                    .with_help("pass anything else as an ordinary parameter"),
+                );
+            }
+            continue;
+        }
         let lang = p.lang_of_ty(ps.ty);
         let builtin_stage = BuiltinInput::of(p, ps.ty).map(|b| b.available(entry));
         if builtin_stage == Some(false) {

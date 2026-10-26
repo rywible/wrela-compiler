@@ -553,7 +553,11 @@ fn derived_callables(p: &Program, f: FnId, body: &Body) -> Vec<(BodyId, Span)> {
                     | Lang::ValueAndGradient
                     | Lang::ValueGradientWith
                     | Lang::IntervalOf
+                    | Lang::Precision
                     | Lang::Filtered
+                    | Lang::TapeOf
+                    | Lang::TapeWith
+                    | Lang::TapeSized
                     | Lang::LiftGradient,
             )
         );

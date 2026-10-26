@@ -1,5 +1,5 @@
 // A tool's local server (language.md §15.5): a static server over a directory in a granted
-// root, on 127.0.0.1, with the toolchain's servers' rules. It answers only requests that name
+// root, on 127.0.0.1 (or the LAN, `lan`), with the toolchain's servers' rules. It answers only requests that name
 // this machine as their host, so a page elsewhere can't reach it through DNS rebinding, and
 // every answer is cross-origin isolated, as the browser runtime needs. A GET is answered with
 // the file (`/`, or a path that ends in `/`, is its `index.html`), reached through the root's
@@ -32,11 +32,13 @@ impl Server {
     }
 }
 
-/// A started server, its port, and its origin: `http://127.0.0.1:<port>`.
+/// A started server, its port, its origin (`http://127.0.0.1:<port>`), and, serving the LAN,
+/// the URL a device there opens it at, one for each of this machine's addresses.
 pub struct Started: Clone {
     pub server: Server,
     pub port: u16,
     pub origin: String,
+    pub lan: Vec<String>,
 }
 
 /// A post a page made: its number, which `answer` names, the path (and query) it was sent to,
@@ -55,13 +57,24 @@ fn server_body(s: Server) -> Writer {
 
 /// Starts a server over the directory `root` (a root path, or a root) on 127.0.0.1:`port`, or a
 /// free port for 0, whose posts each wait at most `post_timeout` seconds for the tool's answer
-/// (0: 30 s).
+/// (0: 30 s). With `lan`, it listens on every interface and also answers requests that name one
+/// of this machine's addresses (never a name), so a device on the LAN can open its pages and
+/// put their results; the host prints the URLs, which `Started::lan` holds. Over plain HTTP a
+/// browser elsewhere gives such a page no WebGPU nor `SharedArrayBuffer` (they need a secure
+/// context): serve it over HTTPS, or start that device's Chrome with
+/// `--unsafely-treat-insecure-origin-as-secure=<the URL>`.
 @tool
-pub fn start(root: str, port: u16 = 0, post_timeout: f64 = 0.0) -> Call<Started> {
+pub fn start(
+    root: str,
+    port: u16 = 0,
+    post_timeout: f64 = 0.0,
+    lan: bool = false,
+) -> Call<Started> {
     var w = Writer::new()
     w.write_str(root)
     w.write_u32(u32(port))
     w.write_u64(bitcast_u64(post_timeout))
+    w.write_u32(u32(lan))
     ask("serve/start", take w.into_bytes())
 }
 
@@ -98,10 +111,16 @@ impl Answer for Started {
         let Ok(id) = r.read_u32() else { return Err(malformed("a started server")) }
         let Ok(port) = r.read_u32() else { return Err(malformed("a started server")) }
         let Ok(origin) = r.read_string() else { return Err(malformed("a started server")) }
+        let Ok(n) = r.read_u32() else { return Err(malformed("a started server")) }
+        var lan = Vec::new()
+        for _ in 0..n {
+            let Ok(url) = r.read_string() else { return Err(malformed("a started server")) }
+            lan.push(take url)
+        }
         if !r.at_end() || port > 65535 {
             return Err(malformed("a started server"))
         }
-        Ok(Started { server: Server { id }, port: u16(port), origin })
+        Ok(Started { server: Server { id }, port: u16(port), origin, lan })
     }
 }
 
@@ -125,9 +144,12 @@ fn a_start_and_a_post_read_back() {
     w.write_u32(2)
     w.write_u32(8123)
     w.write_str("http://127.0.0.1:8123")
+    w.write_u32(1)
+    w.write_str("http://10.0.0.5:8123/")
     let Ok(started) = Started::read(take w.into_bytes()) else { panic("started") }
     assert(started.server.id() == 2 && started.port == 8123)
     assert(started.origin.as_str() == "http://127.0.0.1:8123")
+    assert(started.lan.len() == 1 && started.lan[0].as_str() == "http://10.0.0.5:8123/")
     var p = Writer::new()
     p.write_u32(5)
     p.write_str("/done")

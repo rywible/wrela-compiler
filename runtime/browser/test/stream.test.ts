@@ -50,6 +50,7 @@ test("the test encoder writes the vectors' golden batch", () => {
     .words(Opcode.DrawIndexed, [1, 3, 0, 12, 6, 2, 1, 0xffff_ffff, 4, 0, 0])
     .words(Opcode.MultiDrawIndirect, [1, 3, 16, 4, NONE, 0, 0, 0])
     .words(Opcode.MultiDrawIndexedIndirect, [1, 3, 0, 12, 5, 0, 2, 6, 8, 0, 0])
+    .words(Opcode.ConfigureScreen, [1, 1])
     .finish();
   expect(Buffer.from(batch).toString("hex")).toBe(golden);
   expect(NONE).toBe(0xffffffff);

@@ -76,6 +76,9 @@ interface RenderParts {
   depthBias: { constant: number; slope_scale: number; clamp: number };
   /** The manifest's `depth`: how fragments' depths are tested, and whether they're kept. */
   depth: { compare: GPUCompareFunction; write: boolean };
+  /** The pipeline-overridable constants each stage is created with (the manifest's
+   * `constants`, by name). */
+  constants: Record<string, number>;
   /** By target formats: `colours|depth`, the colours joined by commas, each a format or `none`. */
   variants: Map<string, GPURenderPipeline>;
 }
@@ -85,6 +88,9 @@ export interface BuiltPipeline {
   layout: GPUBindGroupLayout;
   compute: GPUComputePipeline | null;
   render: RenderParts | null;
+  /** The depth formats of its screen targets (null: none): what a variant for another screen
+   * format takes (`GpuExecutor.screenVariants`). */
+  screenDepths: (GPUTextureFormat | null)[];
   uniform: UniformBlock | null;
   bindings: ResourceBinding[];
   /** A debug build's: where its bounds checks' flag is bound. */
@@ -103,11 +109,18 @@ export interface ScreenTarget {
    * bytes as `SCREEN_FORMAT` in another order), `SCREEN_FORMAT` in test mode, which reads the
    * screen back. Every program of a worker draws the screen in one format, so the pipelines a
    * hot reload or a hand-over keeps (`PipelineCache`) are built in it. */
-  readonly format: GPUTextureFormat;
+  format: GPUTextureFormat;
   /** The texture this frame's screen pass renders into, of `format`. */
   texture(): GPUTexture;
   /** Called after a screen pass is recorded, with its encoder, before it's submitted. */
   afterPass?(encoder: GPUCommandEncoder): void;
+  /** Shows the screen another way (`ConfigureScreen`): its SDR format, and what makes the canvas
+   * `format`, HDR or not, in a gamut (0 sRGB, 1 Display P3), whether it could. Without it (test
+   * mode's screen) the command changes nothing. */
+  show?: { sdr: GPUTextureFormat; apply(format: GPUTextureFormat, hdr: boolean, gamut: number): boolean };
+  /** How it's shown, as `wrela.limit`'s `SCREEN_LIMIT` gives it (bit 0 HDR, bit 1 Display P3):
+   * kept here, so a program a hot reload or a hand-over starts reads what the canvas shows. */
+  state?: number;
 }
 
 /** The format the screen is drawn in. Test mode's is `SCREEN_FORMAT`, which it reads back and
@@ -135,7 +148,7 @@ function renderDescriptor(
   return {
     label: name,
     layout: parts.layout,
-    vertex: { module: parts.module, entryPoint: parts.vertex, buffers: [] },
+    vertex: { module: parts.module, entryPoint: parts.vertex, buffers: [], constants: parts.constants },
     // Triangle list, counter-clockwise front faces (the default).
     primitive: { topology: "triangle-list", cullMode: parts.cull },
     ...(depth === null
@@ -153,12 +166,18 @@ function renderDescriptor(
     fragment: {
       module: parts.module,
       entryPoint: parts.fragment,
+      constants: parts.constants,
       targets: colors.map((format, c) => {
         const blend = BLENDS[parts.blends[c] ?? "replace"];
         return blend === null ? { format } : { format, blend: blend as GPUBlendState };
       }),
     },
   };
+}
+
+/** A pipeline's constants as WebGPU takes them: each a number by its name (a bool 0 or 1). */
+export function pipelineConstants(p: Pipeline): Record<string, number> {
+  return Object.fromEntries(p.constants.map(([name, v]) => [name, typeof v === "boolean" ? Number(v) : v]));
 }
 
 /** A colour texture binding's format, which the manifest's parser requires of it. */
@@ -237,10 +256,13 @@ async function buildPipeline(device: GPUDevice, p: Pipeline, source: string, scr
         break;
       case "sampler":
       case "comparison_sampler":
+      case "non_filtering_sampler":
         entries.push({
           binding: b.binding,
           visibility: seen,
-          sampler: { type: b.kind === "sampler" ? "filtering" : "comparison" },
+          sampler: {
+            type: b.kind === "sampler" ? "filtering" : b.kind === "comparison_sampler" ? "comparison" : "non-filtering",
+          },
         });
         break;
       // Only a kernel writes a texture's texels.
@@ -264,7 +286,7 @@ async function buildPipeline(device: GPUDevice, p: Pipeline, source: string, scr
   // that records it, naming the feature.
   if (p.requires.some((f) => !device.features.has(f))) {
     const layout = device.createBindGroupLayout({ label: p.name, entries: [] });
-    return { name: p.name, layout, compute: null, render: null, uniform: p.uniform, bindings: p.bindings, debugFlag: p.debug_flag };
+    return { name: p.name, layout, compute: null, render: null, screenDepths: [], uniform: p.uniform, bindings: p.bindings, debugFlag: p.debug_flag };
   }
   // Pipelines build at the same time and share the device's error scope stack, so the scope is
   // popped before anything awaits. The async creations below report through their promises.
@@ -284,7 +306,7 @@ async function buildPipeline(device: GPUDevice, p: Pipeline, source: string, scr
       compute = await device.createComputePipelineAsync({
         label: p.name,
         layout: pipelineLayout,
-        compute: { module, entryPoint: p.entry },
+        compute: { module, entryPoint: p.entry, constants: pipelineConstants(p) },
       });
     } else {
       render = {
@@ -296,6 +318,7 @@ async function buildPipeline(device: GPUDevice, p: Pipeline, source: string, scr
         cull: p.cull,
         depthBias: p.depth_bias,
         depth: p.depth,
+        constants: pipelineConstants(p),
         variants: new Map(),
       };
       // A variant for each of its targets (the passes the program draws it in, which the
@@ -325,7 +348,9 @@ async function buildPipeline(device: GPUDevice, p: Pipeline, source: string, scr
   } catch (e) {
     throw fail(errorMessage(e));
   }
-  return { name: p.name, layout, compute, render, uniform: p.uniform, bindings: p.bindings, debugFlag: p.debug_flag };
+  const screenDepths =
+    p.kind === "compute" ? [] : p.targets.filter((t) => t.screen).map((t): GPUTextureFormat | null => (t.depth ? "depth32float" : null));
+  return { name: p.name, layout, compute, render, screenDepths, uniform: p.uniform, bindings: p.bindings, debugFlag: p.debug_flag };
 }
 
 /** How long building each pipeline of `manifest` alone took (ms), one after another: where a
@@ -403,34 +428,73 @@ export function preparePipelines(
   return out;
 }
 
-/** Starts building every pipeline, all at once: each one's promise. `shaders[i]` is pipeline
- * `i`'s WGSL, and screen targets draw in `screenFormat` (`ScreenTarget.format`). With `cache` (a
- * hot reload), a pipeline whose manifest entry and WGSL are the same as one of the last build's
- * is kept, and the cache then holds this build's pipelines alone. */
+/** A build's pipelines as they're built: each one's promise, in manifest order; `tier0`, settled
+ * when every tier-0 pipeline is (`Pipeline.conditional` is tier 1); `start(i)`, which starts
+ * pipeline `i`'s build now if it hasn't started (a command needs it before its tier's turn);
+ * and the order the builds started in. */
+export interface Building {
+  each: Promise<BuiltPipeline>[];
+  tier0: Promise<unknown>;
+  start(i: number): void;
+  order: number[];
+}
+
+/** Starts building the pipelines: tier 0's all at once, the biggest first, then, once those
+ * have settled, tier 1's (those reached only under a runtime condition), unless a command needs
+ * one sooner (`Building.start`). `shaders[i]` is pipeline `i`'s WGSL, and screen targets draw in
+ * `screenFormat` (`ScreenTarget.format`). With `cache` (a hot reload), a pipeline whose manifest
+ * entry and WGSL are the same as one of the last build's is kept, and the cache then holds this
+ * build's pipelines alone. */
 export function buildPipelines(
   device: GPUDevice,
   manifest: Manifest,
   shaders: string[],
   screenFormat: GPUTextureFormat,
   cache?: PipelineCache,
-): Promise<BuiltPipeline>[] {
+): Building {
   const order = biggestFirst(shaders);
-  const built: Promise<BuiltPipeline>[] = [];
-  if (!cache) {
-    for (const i of order) built[i] = buildPipeline(device, manifest.pipelines[i]!, shaders[i]!, screenFormat);
-    return built;
-  }
+  const each: Promise<BuiltPipeline>[] = [];
+  const started: number[] = [];
+  const starts = new Map<number, () => void>();
+  const build = (i: number) => {
+    started.push(i);
+    return buildPipeline(device, manifest.pipelines[i]!, shaders[i]!, screenFormat);
+  };
+  // Tier 1's, started at their turn or when first needed.
+  const later = (i: number): Promise<BuiltPipeline> => {
+    const d = Promise.withResolvers<BuiltPipeline>();
+    starts.set(i, () => {
+      starts.delete(i);
+      build(i).then(d.resolve, d.reject);
+    });
+    return d.promise;
+  };
   const used: PipelineCache = new Map();
   for (const i of order) {
     const p = manifest.pipelines[i]!;
+    if (!cache) {
+      each[i] = p.conditional ? later(i) : build(i);
+      continue;
+    }
     const key = pipelineKey(p, shaders[i]!);
-    const pipeline = used.get(key) ?? cache.get(key) ?? buildPipeline(device, p, shaders[i]!, screenFormat);
+    const pipeline = used.get(key) ?? cache.get(key) ?? (p.conditional ? later(i) : build(i));
     used.set(key, pipeline);
-    built[i] = pipeline;
+    each[i] = pipeline;
   }
-  cache.clear();
-  for (const [key, pipeline] of used) cache.set(key, pipeline);
-  return built;
+  if (cache) {
+    cache.clear();
+    for (const [key, pipeline] of used) cache.set(key, pipeline);
+  }
+  const tier0 = Promise.all(order.filter((i) => !manifest.pipelines[i]!.conditional).map((i) => each[i]!));
+  // Tier 1 builds once tier 0 has settled, whether it built or not (a failure fails the program
+  // through its own pipeline's promise).
+  void tier0.then(
+    () => {},
+    () => {},
+  ).then(() => {
+    for (const i of order) starts.get(i)?.();
+  });
+  return { each, tier0, start: (i) => starts.get(i)?.(), order: started };
 }
 
 /** What a pass records, waiting for it to end: draws, with their own copies of their uniform
@@ -526,6 +590,17 @@ export interface GpuTiming {
    * alone). */
   submission: number;
 }
+
+/** Each of `frames` frames' labels and their GPU ms, largest first: `[label, ms]`s. */
+export function frameLabels(timings: GpuTiming[], frames: number): [string, number][][] {
+  const per: Map<string, number>[] = Array.from({ length: frames }, () => new Map());
+  for (const t of timings) {
+    const m = per[t.frame];
+    if (m !== undefined) m.set(t.label, (m.get(t.label) ?? 0) + t.nanos / 1e6);
+  }
+  return per.map((m) => [...m.entries()].sort((a, b) => b[1] - a[1]));
+}
+
 
 /** `capacity` doubled until it's at least `n`. */
 function doubled(capacity: number, n: number): number {
@@ -848,8 +923,40 @@ export class GpuExecutor {
   #failed: unknown = null;
   /** Hot reload retired this executor: no asynchronous pipeline completion may run more work. */
   #retired = false;
-  /** Resolved when every pipeline is built; rejected, with why, if one can't be. */
+  /** Resolved when every tier-0 pipeline is built (every pipeline, unless the executor was
+   * given its tiers); rejected, with why, if one can't be. */
   readonly built: Promise<void>;
+  /** Starts building pipeline `i` now, if it hasn't started (`Building.start`). */
+  readonly #start: (i: number) => void;
+  /** How the screen is shown, as `wrela.limit`'s `SCREEN_LIMIT` gives it: bit 0 HDR, bit 1
+   * Display P3 (`ScreenTarget.state`). It changes once a `ConfigureScreen` is done. */
+  get screenState(): number {
+    return this.screen.state ?? 0;
+  }
+  /** The screen the latest `ConfigureScreen` asked for, while its variants are built; only
+   * that request is applied when it's ready, never one it replaced. */
+  #screenWanted: number | undefined;
+  #screenAsked = 0;
+
+  /** A variant of each render pipeline that draws the screen, in `format`: what showing the
+   * screen in another format needs first. Every pipeline is started, so none is built later in
+   * the old format alone. */
+  async screenVariants(format: GPUTextureFormat): Promise<void> {
+    this.#building.forEach((_, i) => this.#start(i));
+    const built = await Promise.all(this.#building);
+    await Promise.all(
+      built.flatMap((b) => {
+        const render = b.render;
+        if (render === null) return [];
+        return b.screenDepths.map(async (depth) => {
+          const key = targetsKey([format], depth);
+          if (render.variants.has(key)) return;
+          const made = await this.device.createRenderPipelineAsync(renderDescriptor(b.name, render, [format], depth));
+          render.variants.set(key, made);
+        });
+      }),
+    );
+  }
 
   /** Timed, on a device with "timestamp-query", each pass's GPU time is recorded (`timings`); in
    * the serial mode each pass and dispatch runs alone, so its time is its own (the program's
@@ -860,11 +967,13 @@ export class GpuExecutor {
     readonly screen: ScreenTarget,
     timing: Timing = "off",
     debug = pipelines.some((p) => !(p instanceof Promise) && p.debugFlag !== null),
+    tiers?: Pick<Building, "tier0" | "start">,
   ) {
     this.#deferred = timing === "serial" ? [] : null;
     this.#pipelines = pipelines.map((p) => (p instanceof Promise ? undefined : p));
     this.#building = pipelines.map((p) => Promise.resolve(p));
-    this.built = Promise.all(this.#building).then(
+    this.#start = tiers?.start ?? (() => {});
+    this.built = (tiers ? tiers.tier0 : Promise.all(this.#building)).then(
       () => {},
       (e: unknown) => {
         // A superseded build's late shader failure belongs to it, not to the running build.
@@ -1019,6 +1128,8 @@ export class GpuExecutor {
     if ("pipeline" in cmd && cmd.pipeline >= this.#pipelines.length) {
       throw new CommandError(cmd.op, `there's no pipeline ${cmd.pipeline} (the manifest has ${this.#pipelines.length})`);
     }
+    // A tier-1 pipeline a command needs before its tier's turn starts building now.
+    if ("pipeline" in cmd && !this.#ready(cmd)) this.#start(cmd.pipeline);
     const queue = this.#deferred ?? (this.#waitingAt < this.#waiting.length || !this.#ready(cmd) ? this.#waiting : null);
     if (queue !== null) queue.push({ cmd: copied(cmd), at: { frame: this.#frame, generation: this.#generation } });
     else this.#run(cmd);
@@ -1257,6 +1368,27 @@ export class GpuExecutor {
       case "SetViewport":
         this.#pass?.draws.push(cmd);
         return;
+      case "ConfigureScreen": {
+        const show = this.screen.show;
+        if (show === undefined) return;
+        const format: GPUTextureFormat = cmd.hdr ? "rgba16float" : show.sdr;
+        const want = (cmd.hdr ? 1 : 0) | (cmd.gamut === 1 ? 2 : 0);
+        // Asked again for what it shows, or what it's changing to: nothing to do.
+        if (want === (this.#screenWanted ?? this.screenState)) return;
+        this.#screenWanted = want;
+        const asked = ++this.#screenAsked;
+        // The frames go on in the old format until every pipeline that draws the screen can
+        // draw it in the new one; then, between frames, the canvas changes.
+        this.screenVariants(format).then(() => {
+          if (this.#retired || asked !== this.#screenAsked) return;
+          this.#screenWanted = undefined;
+          if (show.apply(format, cmd.hdr, cmd.gamut)) {
+            this.screen.format = format;
+            this.screen.state = want;
+          }
+        }, (e: unknown) => this.#fail(e));
+        return;
+      }
       case "CopyTexture": {
         const { source: s, destination: d } = cmd;
         const from = this.#texture(s.texture);
@@ -1725,7 +1857,7 @@ export class GpuExecutor {
       const pipeline = this.#pipeline(draw.pipeline);
       for (const [i, binding] of draw.bindings.entries()) {
         const kind = pipeline.bindings[i]!.kind;
-        if (kind !== "sampler" && kind !== "comparison_sampler") {
+        if (kind !== "sampler" && kind !== "comparison_sampler" && kind !== "non_filtering_sampler") {
           if (!use(binding.handle, kind === "read_write" || isStorage(kind) ? 2 : 1)) return false;
         }
       }

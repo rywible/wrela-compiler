@@ -798,7 +798,8 @@ export class Checker {
           return;
         }
         case "sampler":
-        case "comparison_sampler": {
+        case "comparison_sampler":
+        case "non_filtering_sampler": {
           if (b.offset !== 0 || b.size !== 0) {
             throw err(`a sampler binding has offset ${b.offset} and size ${b.size}: both must be 0`);
           }

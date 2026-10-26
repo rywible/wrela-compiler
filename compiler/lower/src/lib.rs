@@ -404,6 +404,8 @@ fn lower_in(
     cx.make_table(&mut cpu);
     let role = data.role;
     let mut has_entry = false;
+    // What else the host runs (`mark_relaxable` keeps it strict).
+    let mut also = Vec::new();
     for &f in &roots.also {
         // A job's body is lowered as its `resume` (§16.3).
         let key = if checked.program.func(f).attrs.job.is_some() {
@@ -411,7 +413,7 @@ fn lower_in(
         } else {
             InstanceKey::plain(f, Vec::new())
         };
-        cx.instance(&mut cpu, key, None);
+        also.push(cx.instance(&mut cpu, key, None));
     }
     // The program's state (§15): what `init` returns (a server's `serve_init`), which the
     // other exports take first. A tool has none: `tool` runs the whole tool (§15.5).
@@ -493,6 +495,9 @@ fn lower_in(
     rewrite_cpu_math(&mut cx, &mut cpu);
     cx.drain(&mut cpu);
     check_deterministic(&mut cx, &cpu);
+    if data.relaxed_simd {
+        mark_relaxable(&cx, &mut cpu, role, also);
+    }
     thread_entries(&mut cx, &mut cpu);
     mark_counted(&mut cx, &mut cpu);
     if data.debug {
@@ -670,7 +675,16 @@ impl<'a> Cx<'a> {
             }
             return id;
         }
-        let f = self.signature(mb, &key);
+        let mut f = self.signature(mb, &key);
+        if let InstanceKey::Fn { func, .. } = &key {
+            f.known = match self.checked.program.func(*func).lang {
+                Some(Lang::Smin) => Some(ir::Known::Smin),
+                Some(Lang::ValueNoise) => Some(ir::Known::ValueNoise),
+                Some(Lang::LatticeCoord) => Some(ir::Known::LatticeCoord),
+                Some(Lang::Pcg) => Some(ir::Known::Pcg),
+                _ => None,
+            };
+        }
         let id = mb.m.add_function(f);
         mb.instances.insert(key.clone(), id);
         if let Some(name) = self.source_name(&key) {
@@ -1011,6 +1025,47 @@ impl<'a> Cx<'a> {
 
     pub fn entry_of(&self, f: FnId) -> Option<Entry> {
         self.checked.program.func(f).attrs.entry.map(|e| e.0)
+    }
+}
+
+/// Marks the CPU functions only a client's `frame` reaches relaxable (`--relaxed-simd`, §11.2):
+/// presentation, whose results reach the simulation only as recorded input. What any other export
+/// reaches (`init`, whose world the simulation starts from, the tests), what the host runs
+/// besides (`also`: the jobs), an `@deterministic` function, an `@audio` entry point, a job's
+/// resume or a task must be bit for bit the same on every engine, and stays strict. The calls
+/// are the bodies' own, the math `rewrite_cpu_math` called in among them. A function inlined
+/// later keeps its caller's flag.
+fn mark_relaxable(
+    cx: &Cx,
+    mb: &mut ModuleBuilder,
+    role: wrela_sema::defs::Role,
+    mut strict: Vec<ir::FuncId>,
+) {
+    let p = &cx.checked.program;
+    let presents =
+        |name: &str| role == wrela_sema::defs::Role::Client && name == wrela_abi::EXPORT_FRAME;
+    strict.extend(mb.m.exports.iter().filter(|(name, _)| !presents(name)).map(|&(_, id)| id));
+    strict.extend(mb.instances.iter().filter_map(|(k, &id)| match k {
+        InstanceKey::Fn { func, .. } => {
+            let a = &p.func(*func).attrs;
+            (a.deterministic.is_some() || a.audio.is_some()).then_some(id)
+        }
+        InstanceKey::JobResume { .. } => Some(id),
+        _ => None,
+    }));
+    strict.extend(mb.m.tasks.iter().copied());
+    let mut reached: std::collections::HashSet<ir::FuncId> = strict.iter().copied().collect();
+    while let Some(at) = strict.pop() {
+        ir::visit::walk(&mb.m.functions[at.index()].body, &mut |s| {
+            if let Some(to) = s.expr().and_then(ir::Expr::callee)
+                && reached.insert(to)
+            {
+                strict.push(to);
+            }
+        });
+    }
+    for (i, f) in mb.m.functions.iter_mut().enumerate() {
+        f.relaxable = !reached.contains(&ir::FuncId(i as u32));
     }
 }
 

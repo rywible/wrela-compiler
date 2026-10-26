@@ -344,6 +344,8 @@ impl Fa<'_, '_> {
         };
         match e {
             Expr::Load(p) => cf || self.place(p, st),
+            // A pipeline's constant: the same in every invocation.
+            Expr::Override(_) => cf,
             Expr::EntryInput(i) => {
                 cf || !matches!(
                     self.an.inputs.get(*i as usize),

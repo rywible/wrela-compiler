@@ -1,0 +1,74 @@
+// The microbench of language.md §18.1's `const` parameters: one kernel, as a `const` parameter
+// (`folded`, whose dead branch the driver drops when it makes the pipeline) and as a uniform
+// (`branched`, which tests it in every invocation), each dispatched 1,000 times in frame 1 and
+// timed (`std::gpu::timed`). The test only checks both were measured; the times are printed,
+// a record of whether the driver folded it, not a claim.
+use std::gpu::{GlobalId, GpuBuffer, Slots, buffer, dispatch, label, timed}
+use std::io::{Pending, print}
+
+const DISPATCHES: u32 = 1000
+
+@compute(64)
+fn folded(out: mut Slots<f32>, id: GlobalId, heavy: const bool) {
+    var x = f32(id.x)
+    if heavy {
+        for i in 0..64 {
+            x = sin(x) * 1.5 + cos(x * 0.5)
+        }
+    }
+    out[id] = x
+}
+
+@compute(64)
+fn branched(out: mut Slots<f32>, id: GlobalId, heavy: bool) {
+    var x = f32(id.x)
+    if heavy {
+        for i in 0..64 {
+            x = sin(x) * 1.5 + cos(x * 0.5)
+        }
+    }
+    out[id] = x
+}
+
+pub struct State {
+    frame: u32,
+    out: GpuBuffer<f32>,
+    asked: Vec<Pending<f32>>,
+    times: Vec<f32>,
+}
+
+pub fn init() -> State {
+    State { frame: 0, out: buffer(4096), asked: Vec::new(), times: Vec::new() }
+}
+
+pub fn frame(s: mut State, time: f32, width: u32, height: u32) {
+    if s.frame == 1 {
+        s.asked.push(timed("const"))
+        s.asked.push(timed("uniform"))
+        label("const")
+        for _ in 0..DISPATCHES {
+            dispatch(folded.bind(out: mut s.out, heavy: false), groups: 64)
+        }
+        label("uniform")
+        for _ in 0..DISPATCHES {
+            dispatch(branched.bind(out: mut s.out, heavy: false), groups: 64)
+        }
+    }
+    for i in 0..s.asked.len() {
+        if s.times.len() == i {
+            if let Some(Ok(t)) = s.asked[i].poll() {
+                s.times.push(t[0])
+            }
+        }
+    }
+    if s.times.len() == 2 && s.frame < 100 {
+        print(f"1000 dispatches: const {s.times[0]} us, uniform {s.times[1]} us")
+        s.frame = 100
+    }
+    s.frame += 1
+}
+
+@test(frames: 12, gpu: true)
+fn both_forms_are_timed(s: State) {
+    assert(s.times.len() == 2 && s.times[0] > 0.0 && s.times[1] > 0.0)
+}

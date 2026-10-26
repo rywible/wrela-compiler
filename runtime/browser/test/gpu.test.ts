@@ -13,7 +13,7 @@ import type { ScreenTarget } from "../src/gpu.ts";
 
 async function setup(manifest: Manifest = shapes(), screen: ScreenTarget = SCREEN_TARGET) {
   const device = new FakeDevice();
-  const pipelines = await Promise.all(buildPipelines(device.gpu, manifest, manifest.pipelines.map(() => SHADER), screen.format));
+  const pipelines = await Promise.all(buildPipelines(device.gpu, manifest, manifest.pipelines.map(() => SHADER), screen.format).each);
   const executor = new GpuExecutor(device.gpu, pipelines, screen);
   /** Runs a batch's commands (already valid: these tests are about the mapping). */
   const run = (e: Encoder) => {
@@ -42,9 +42,9 @@ describe("pipelines", () => {
   test("report WGSL errors with the pipeline, shader and line", async () => {
     const device = new FakeDevice();
     const m = shapes();
-    const build = Promise.all(buildPipelines(device.gpu, m, [SHADER, "fn main() {\n  ERROR;\n}"], SCREEN_FORMAT));
+    const build = Promise.all(buildPipelines(device.gpu, m, [SHADER, "fn main() {\n  ERROR;\n}"], SCREEN_FORMAT).each);
     await expect(build).rejects.toThrow(ShaderError);
-    await expect(Promise.all(buildPipelines(device.gpu, m, [SHADER, "\nERROR"], SCREEN_FORMAT))).rejects.toThrow(
+    await expect(Promise.all(buildPipelines(device.gpu, m, [SHADER, "\nERROR"], SCREEN_FORMAT).each)).rejects.toThrow(
       "pipeline `compute` (shader compute.wgsl) failed to build:\n2:3: unresolved identifier",
     );
   });
@@ -52,7 +52,7 @@ describe("pipelines", () => {
   test("report validation errors from building", async () => {
     const device = new FakeDevice();
     device.pipelineErrors.set("compute", "entry point `main` not found");
-    await expect(Promise.all(buildPipelines(device.gpu, shapes(), [SHADER, SHADER], SCREEN_FORMAT))).rejects.toThrow(
+    await expect(Promise.all(buildPipelines(device.gpu, shapes(), [SHADER, SHADER], SCREEN_FORMAT).each)).rejects.toThrow(
       "pipeline `compute` (shader compute.wgsl) failed to build:\nentry point `main` not found",
     );
   });
@@ -60,14 +60,14 @@ describe("pipelines", () => {
   test("report each layout's validation error against its own pipeline, though they build at once", async () => {
     const device = new FakeDevice();
     device.layoutErrors.set("draw", "binding 1 is used twice");
-    const build = Promise.all(buildPipelines(device.gpu, shapes(), [SHADER, SHADER], SCREEN_FORMAT));
+    const build = Promise.all(buildPipelines(device.gpu, shapes(), [SHADER, SHADER], SCREEN_FORMAT).each);
     await expect(build).rejects.toThrow("pipeline `draw` (shader draw.wgsl) failed to build:\nbinding 1 is used twice");
   });
 
   test("reject uniform blocks over the device's limit", async () => {
     const m = shapes();
     m.pipelines[0]!.uniform = { binding: 0, size: 65_552, space: "uniform" };
-    await expect(Promise.all(buildPipelines(new FakeDevice().gpu, m, [SHADER, SHADER], SCREEN_FORMAT))).rejects.toThrow(
+    await expect(Promise.all(buildPipelines(new FakeDevice().gpu, m, [SHADER, SHADER], SCREEN_FORMAT).each)).rejects.toThrow(
       "its uniform block is 65552 bytes; the limit is 65536",
     );
   });
@@ -506,13 +506,13 @@ describe("the screen's format", () => {
 
   test("is what screen targets are built in; a texture target keeps its own", async () => {
     const device = new FakeDevice();
-    await Promise.all(buildPipelines(device.gpu, targets, [SHADER, SHADER], "bgra8unorm"));
+    await Promise.all(buildPipelines(device.gpu, targets, [SHADER, SHADER], "bgra8unorm").each);
     expect(device.made).toEqual(["draw bgra8unorm|none", "draw rgba8unorm|none", "draw rgba16float|depth32float"]);
   });
 
   test("shares a variant with a texture target of the same format", async () => {
     const device = new FakeDevice();
-    await Promise.all(buildPipelines(device.gpu, targets, [SHADER, SHADER], SCREEN_FORMAT));
+    await Promise.all(buildPipelines(device.gpu, targets, [SHADER, SHADER], SCREEN_FORMAT).each);
     expect(device.made).toEqual(["draw rgba8unorm|none", "draw rgba16float|depth32float"]);
   });
 
@@ -915,11 +915,11 @@ test("a hot reload keeps the pipelines whose entries and WGSL are the same, wher
   const numbered = (ps: Pipeline[]) => ps.map((p, i) => ({ ...p, shader: `pipeline_${i}.wgsl` }));
   const m = shapes();
   m.pipelines = numbered(m.pipelines);
-  const first = buildPipelines(device.gpu, m, [SHADER, SHADER], SCREEN_FORMAT, cache);
+  const first = buildPipelines(device.gpu, m, [SHADER, SHADER], SCREEN_FORMAT, cache).each;
   // The next build has a pipeline before them: each of their files is one further on.
   const next = shapes();
   next.pipelines = numbered([{ ...next.pipelines[1]!, name: "another" }, ...next.pipelines]);
-  const second = buildPipelines(device.gpu, next, [SHADER, SHADER, SHADER], SCREEN_FORMAT, cache);
+  const second = buildPipelines(device.gpu, next, [SHADER, SHADER, SHADER], SCREEN_FORMAT, cache).each;
   expect(second[1]).toBe(first[0]!);
   expect(second[2]).toBe(first[1]!);
   expect(second[0]).not.toBe(first[1]!);
@@ -953,6 +953,7 @@ test("a late pipeline success runs no commands after another pipeline failed", a
     layout: {} as GPUBindGroupLayout,
     compute: { label: "compute" } as GPUComputePipeline,
     render: null,
+    screenDepths: [],
     uniform: null,
     bindings: [],
     debugFlag: null,
@@ -978,6 +979,7 @@ test("a retired executor runs no commands when a pipeline finishes late", async 
     layout: {} as GPUBindGroupLayout,
     compute: { label: "compute" } as GPUComputePipeline,
     render: null,
+    screenDepths: [],
     uniform: null,
     bindings: [],
     debugFlag: null,
@@ -1441,4 +1443,93 @@ test("a pass that joins one with a scissor starts from the whole target again", 
   expect(ev.map((e) => e.kind)).toEqual(["renderPass", "scissor", "draw", "scissor", "viewport", "draw"]);
   expect(ev[3]).toEqual({ kind: "scissor", rect: [0, 0, 8, 4] });
   expect(ev[4]).toEqual({ kind: "viewport", rect: [0, 0, 8, 4] });
+});
+
+describe("pipeline tiers", () => {
+  test("tier 0 builds first, biggest first, and tier 1 once it has settled", async () => {
+    const device = new FakeDevice();
+    const m = shapes();
+    m.pipelines[1] = { ...m.pipelines[1]!, conditional: true };
+    const building = buildPipelines(device.gpu, m, [SHADER, SHADER], SCREEN_FORMAT);
+    expect(building.order).toEqual([0]);
+    await building.tier0;
+    await new Promise((r) => setTimeout(r, 0));
+    expect(building.order).toEqual([0, 1]);
+    await Promise.all(building.each);
+  });
+
+  test("a command that needs a tier-1 pipeline starts it at once, and runs when it's built", async () => {
+    const device = new FakeDevice();
+    const m = shapes();
+    m.pipelines[1] = { ...m.pipelines[1]!, conditional: true };
+    const building = buildPipelines(device.gpu, m, [SHADER, SHADER], SCREEN_FORMAT);
+    const executor = new GpuExecutor(device.gpu, building.each, SCREEN_TARGET, "off", false, building);
+    for (const cmd of decode(new Encoder().createBuffer(1, 64).createBuffer(2, 64).dispatch(1, [1, 1, 1], [1, 2], u(0)).finish())) {
+      executor.execute(cmd);
+    }
+    // Bumped before tier 0 settled.
+    expect(building.order).toEqual([0, 1]);
+    await executor.caughtUp();
+    expect(kinds(device.events)).toContain("dispatch");
+    await executor.built;
+  });
+});
+
+describe("pipeline constants", () => {
+  test("a compute pipeline and each stage of a render pipeline are made with the manifest's constants, by name", async () => {
+    const device = new FakeDevice();
+    const m = shapes();
+    m.pipelines[0] = { ...m.pipelines[0]!, constants: [["wide", true], ["taps", 4]] };
+    m.pipelines[1] = { ...m.pipelines[1]!, constants: [["gain", -1.5]] };
+    await Promise.all(buildPipelines(device.gpu, m, [SHADER, SHADER], SCREEN_FORMAT).each);
+    expect(device.computes[0]!.compute.constants).toEqual({ gain: -1.5 });
+    const desc = device.renders.find((r) => r.label === "draw");
+    expect(desc?.vertex.constants).toEqual({ wide: 1, taps: 4 });
+    expect(desc?.fragment?.constants).toEqual({ wide: 1, taps: 4 });
+  });
+});
+
+describe("the screen", () => {
+  /** A screen whose `apply` records what it was asked, and always shows it. */
+  const shown = () => {
+    const applied: [GPUTextureFormat, boolean, number][] = [];
+    const screen: ScreenTarget = {
+      format: SCREEN_FORMAT,
+      texture: () => fakeTexture("screen"),
+      show: {
+        sdr: SCREEN_FORMAT,
+        apply: (format, hdr, gamut) => {
+          applied.push([format, hdr, gamut]);
+          return true;
+        },
+      },
+    };
+    return { screen, applied };
+  };
+  const settled = () => new Promise((go) => setTimeout(go, 20));
+
+  test("a request a later one replaced is never applied", async () => {
+    const { screen, applied } = shown();
+    const { executor } = await setup(shapes(), screen);
+    // HDR's variants are still being built when SDR is asked for again.
+    executor.execute({ op: "ConfigureScreen", hdr: true, gamut: 1 });
+    executor.execute({ op: "ConfigureScreen", hdr: false, gamut: 0 });
+    await settled();
+    expect(applied).toEqual([[SCREEN_FORMAT, false, 0]]);
+    expect(executor.screenState).toBe(0);
+    // The same request again does nothing.
+    executor.execute({ op: "ConfigureScreen", hdr: false, gamut: 0 });
+    await settled();
+    expect(applied.length).toBe(1);
+  });
+
+  test("a program started on the same screen reads how it's shown", async () => {
+    const { screen } = shown();
+    const first = await setup(shapes(), screen);
+    first.executor.execute({ op: "ConfigureScreen", hdr: true, gamut: 1 });
+    await settled();
+    expect(first.executor.screenState).toBe(3);
+    const second = await setup(shapes(), screen);
+    expect(second.executor.screenState).toBe(3);
+  });
 });

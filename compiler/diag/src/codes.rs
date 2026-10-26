@@ -259,6 +259,7 @@ codes! {
     E0706 = "E0706", "a `@test` that fails";
     E0707 = "E0707", "a shipped build over a budget: a pipeline's WGSL";
     E0708 = "E0708", "code only another role's build may run, reached from this role's entries";
+    E0709 = "E0709", "a tape of a function that uses what a tape can't hold";
 
     // ---- E09xx: not in tier 0 --------------------------------------------------------------
 

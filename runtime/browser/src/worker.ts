@@ -7,20 +7,19 @@ import { MAX_WORKERS, SCREEN_FORMAT, TICK_ORIGIN } from "./abi.gen.ts";
 import { deviceFeatures, GpuError, openDevice } from "./device.ts";
 import { errorMessage, UnsupportedError } from "./errors.ts";
 import { fitSize, frameSeconds, VisibleClock } from "./frame.ts";
-import { alignTo, type Counters, type GpuExecutor, type PipelineCache, screenFormat, type ScreenTarget, type Timing, timeEachPipeline } from "./gpu.ts";
+import { alignTo, type Counters, frameLabels, type GpuExecutor, type PipelineCache, screenFormat, type ScreenTarget, type Timing, timeEachPipeline } from "./gpu.ts";
 import { arrivals, epochNow, InputRing, type Scripted } from "./input.ts";
 import { type Asked, HandOvers } from "./handover.ts";
 import { browserIo, type Build, Handed, loadBuild, loadLines, loadScript, networkFetch, startProgram } from "./loader.ts";
 import { locate } from "./lines.ts";
 import { Live } from "./live.ts";
 import { type Inbox, Net } from "./net.ts";
-import { type PrintSink, type Program, type ProgramOptions, runWorker, type SpawnWorker } from "./program.ts";
+import { type Compiled, type PrintSink, type Program, type ProgramOptions, runWorker, type SpawnWorker } from "./program.ts";
 import type { FromHelper, FromTicker, FromWorker, Loaded, Replay, TickerOptions, TickerStart, TickReport, ToWorker, VoiceOptions } from "./messages.ts";
 import { encodePng } from "./png.ts";
 import { Resampler } from "./resample.ts";
-import { frameTime, holdFor, inputUrl, loaded, putResult, sleepUntil, type TestParams } from "./testmode.ts";
+import { frameTime, holdFor, inputUrl, loaded, putResult, sleepUntil, summaryLines, type TestParams } from "./testmode.ts";
 import { lockstepTicks, runTicker, TickerControl, TickerMode } from "./ticker.ts";
-import { wasmHash } from "./ticks.ts";
 import { failAudioRender } from "./worker-audio.ts";
 
 declare const self: DedicatedWorkerGlobalScope;
@@ -123,6 +122,25 @@ function context(canvas: OffscreenCanvas, device: GPUDevice, format: GPUTextureF
   return ctx;
 }
 
+/** Shows `ctx`'s canvas in `format` (`rgba16float` for HDR, tone mapped `extended` so values past
+ * 1 are brighter than SDR white where the display can), in sRGB or Display P3 (`gamut` 1):
+ * whether the browser took it. */
+function showCanvas(ctx: GPUCanvasContext, device: GPUDevice, usage: number, format: GPUTextureFormat, hdr: boolean, gamut: number): boolean {
+  try {
+    ctx.configure({
+      device,
+      format,
+      usage,
+      alphaMode: "opaque",
+      colorSpace: gamut === 1 ? "display-p3" : "srgb",
+      toneMapping: { mode: hdr ? "extended" : "standard" },
+    });
+    return true;
+  } catch {
+    return false;
+  }
+}
+
 // ---- The ticker's thread ----
 
 /** Visible time, which frames and ticks count (frame.ts). */
@@ -185,11 +203,12 @@ type TickSettings = Pick<TickerStart, "script" | "hashes" | "timing" | "delay" |
 const NORMAL_TICKS: TickSettings = { script: [], hashes: false, timing: false, delay: 0, replayable: false };
 
 /** What starts the program's ticker on its own thread, with `settings`: this script again, told
- * to run it. `wasm` is the build's, whose hash heads the tick log when hashes are kept. With
+ * to run it. `build` is the program's, whose WASM's hash (taken as it compiled) heads the tick
+ * log when hashes are kept. With
  * `replay`, a hot reload's: the ticker runs the replaced build's ticks again first, and reads
  * the input ring on from where the replaced one stopped. */
 function tickerStarter(
-  wasm: Uint8Array,
+  build: Build,
   settings: TickSettings,
   replay: Replay | null = null,
 ): (options: TickerOptions, onPrint: PrintSink) => void {
@@ -215,7 +234,7 @@ function tickerStarter(
       control: ticker.control.buffer,
       clock: clock.buffer,
       input: ring!.buffer,
-      wasmHash: settings.hashes ? wasmHash(wasm) : 0n,
+      wasmHash: settings.hashes ? (build.compiled?.hash ?? 0n) : 0n,
       replay,
       framesBeforeStart,
     } satisfies ToWorker);
@@ -250,7 +269,7 @@ function programOptions(b: Build, ticks: TickSettings, carried: Carried | null):
     builds: handOvers ?? undefined,
     spawnWorker,
     startVoice,
-    startTicker: tickerStarter(b.wasm, ticks, carried?.replay ?? null),
+    startTicker: tickerStarter(b, ticks, carried?.replay ?? null),
     kept: carried?.kept,
     inbox: carried?.inbox,
     net,
@@ -313,6 +332,9 @@ let handOvers: HandOvers | null = null;
 /** The pipelines of the build that handed over to the running one that the running one doesn't
  * use: going back to it builds none. */
 let leftovers: PipelineCache = new Map();
+/** The screen the running program draws, once there is one: its format is what a hand-over
+ * prepares the next build's screen pipelines in. */
+let shown: ScreenTarget | null = null;
 
 /** Test mode keeps what the host says, as the program's printed lines (`results/log.txt`). */
 let hostLine: ((line: string) => void) | null = null;
@@ -384,9 +406,14 @@ const normalWorkers = () => Math.max(0, Math.min((navigator.hardwareConcurrency 
 /** Runs the program, drawing the screen straight into the canvas in `format`. */
 async function run(canvas: OffscreenCanvas, device: GPUDevice, format: GPUTextureFormat, build: Build, live: Live | null): Promise<void> {
   self.postMessage({ type: "screen-limit", max: device.limits.maxTextureDimension2D } satisfies FromWorker);
-  const ctx = context(canvas, device, format, GPUTextureUsage.RENDER_ATTACHMENT);
+  const usage = GPUTextureUsage.RENDER_ATTACHMENT;
+  const ctx = context(canvas, device, format, usage);
   clock.startAt(epochNow());
-  const screen = { format, texture: () => ctx.getCurrentTexture() };
+  const screen: ScreenTarget = (shown = {
+    format,
+    texture: () => ctx.getCurrentTexture(),
+    show: { sdr: format, apply: (f, hdr, gamut) => showCanvas(ctx, device, usage, f, hdr, gamut) },
+  });
   const start: Start = (b, carried) =>
     startProgram(
       device,
@@ -501,8 +528,26 @@ async function scoped(device: GPUDevice, f: () => void | Promise<void>): Promise
 
 /** Copies a texture back: RGBA8, rows top to bottom, no padding. */
 async function readTexture(device: GPUDevice, texture: GPUTexture): Promise<Uint8Array<ArrayBuffer>> {
+  if (texture.format !== "rgba16float") return readTexels(device, texture, 4);
+  // An HDR screen's texels, as 8 bits a channel: each clamped to [0, 1].
+  const halves = new Uint16Array((await readTexels(device, texture, 8)).buffer);
+  return Uint8Array.from(halves, (h) => Math.round(Math.min(Math.max(halfToFloat(h), 0), 1) * 255));
+}
+
+/** An IEEE half float's value. */
+export function halfToFloat(h: number): number {
+  const sign = h & 0x8000 ? -1 : 1;
+  const exponent = (h >> 10) & 0x1f;
+  const fraction = h & 0x3ff;
+  if (exponent === 0) return sign * fraction * 2 ** -24;
+  if (exponent === 31) return fraction === 0 ? sign * Infinity : NaN;
+  return sign * (1 + fraction / 1024) * 2 ** (exponent - 15);
+}
+
+/** `texture`'s texels, `bytes` each, row after row. */
+async function readTexels(device: GPUDevice, texture: GPUTexture, bytes: number): Promise<Uint8Array<ArrayBuffer>> {
   const { width, height } = texture;
-  const row = width * 4;
+  const row = width * bytes;
   const padded = alignTo(row, 256);
   const staging = device.createBuffer({ size: padded * height, usage: GPUBufferUsage.MAP_READ | GPUBufferUsage.COPY_DST });
   try {
@@ -537,6 +582,8 @@ interface TestRecord {
   latency: { frames: number[]; delivered: { sent: number; frame: number }[] };
   /** How long the pipelines took to build. */
   pipelinesMs: number | null;
+  /** How long every pipeline took, tier 1's too (ms). */
+  tier1Ms: number | null;
 }
 
 /** The program a test runs, and the frame its ticks count from: a build handed over to starts
@@ -596,19 +643,23 @@ async function runTest(canvas: OffscreenCanvas, device: GPUDevice, build: Build,
     counters: [],
     latency: { frames: [], delivered: [] },
     pipelinesMs: null,
+    tier1Ms: null,
   };
   let frameNow = 0;
   canvas.width = width;
   canvas.height = height;
-  const ctx = context(canvas, device, SCREEN_FORMAT, GPUTextureUsage.RENDER_ATTACHMENT | GPUTextureUsage.COPY_DST);
+  const canvasUsage = GPUTextureUsage.RENDER_ATTACHMENT | GPUTextureUsage.COPY_DST;
+  const ctx = context(canvas, device, SCREEN_FORMAT, canvasUsage);
   // Screen passes render into a texture that can be read back; each is also copied to the
   // canvas so the page shows what ran.
-  const screen = device.createTexture({
-    label: "screen",
-    size: [width, height],
-    format: SCREEN_FORMAT,
-    usage: GPUTextureUsage.RENDER_ATTACHMENT | GPUTextureUsage.COPY_SRC,
-  });
+  const screenOf = (format: GPUTextureFormat) =>
+    device.createTexture({
+      label: "screen",
+      size: [width, height],
+      format,
+      usage: GPUTextureUsage.RENDER_ATTACHMENT | GPUTextureUsage.COPY_SRC,
+    });
+  let screen = screenOf(SCREEN_FORMAT);
   const script: Scripted[] = params.input ? await loadScript(inputUrl(base, params.input)) : [];
   const frameEvents = arrivals(script).frames;
   const hashes = params.nohash === 0;
@@ -620,17 +671,30 @@ async function runTest(canvas: OffscreenCanvas, device: GPUDevice, build: Build,
   };
   hostLine = print;
   const salted = params.salt > 0 ? salt(build, params.salt) : build;
-  const target: ScreenTarget = {
+  const target: ScreenTarget = (shown = {
     format: SCREEN_FORMAT,
     texture: () => screen,
-      // Saturated, the canvas is left alone: it shows a frame per display refresh, and would
-      // pace the frames by the display's.
+    // A test shows the screen another way only when it asks (`hdr=1`): otherwise its screen,
+    // and so its goldens and hashes, stay `SCREEN_FORMAT`'s.
+    ...(params.hdr > 0 && {
+      show: {
+        sdr: SCREEN_FORMAT,
+        apply: (format: GPUTextureFormat, hdr: boolean, gamut: number) => {
+          if (!showCanvas(ctx, device, canvasUsage, format, hdr, gamut)) return false;
+          screen.destroy();
+          screen = screenOf(format);
+          return true;
+        },
+      },
+    }),
+    // Saturated, the canvas is left alone: it shows a frame per display refresh, and would
+    // pace the frames by the display's.
     afterPass: (encoder: GPUCommandEncoder) => {
       if (params.saturate === 0) {
         encoder.copyTextureToTexture({ texture: screen }, { texture: ctx.getCurrentTexture() }, [width, height]);
       }
     },
-  };
+  });
   // `timestamps=1` times each pass; `timestamps=2` runs each alone too (testmode.ts).
   const timing: Timing = params.timestamps === 2 ? "serial" : params.timestamps > 0 ? "span" : "off";
   const start: Start = (b, carried) =>
@@ -656,7 +720,11 @@ async function runTest(canvas: OffscreenCanvas, device: GPUDevice, build: Build,
         onPipelines: (ms) => {
           record.pipelinesMs = ms;
         },
+        onTier1: (ms) => {
+          record.tier1Ms = ms;
+        },
         cache: pipelineCache,
+        hashWasm: tickHashes,
       },
     );
   running = salted;
@@ -759,7 +827,18 @@ async function runTest(canvas: OffscreenCanvas, device: GPUDevice, build: Build,
   }
   await draining;
   if (failed) return;
-  await saveResults(device, build, params, r, screen, timing, record);
+  if (params.hdr > 0) {
+    // How the canvas is shown, and the screen's middle texel as its values: an HDR white past 1
+    // stays past it.
+    const c = ctx.getConfiguration();
+    const at = (Math.floor(height / 2) * width + Math.floor(width / 2)) * 4;
+    const middle = screen.format === "rgba16float"
+      ? [...new Uint16Array((await readTexels(device, screen, 8)).buffer).slice(at, at + 4)].map(halfToFloat)
+      : [...(await readTexels(device, screen, 4)).slice(at, at + 4)].map((b) => b / 255);
+    const configuration = { format: c?.format, colorSpace: c?.colorSpace, toneMapping: c?.toneMapping?.mode ?? "standard" };
+    await putResult(base, "screen.json", JSON.stringify({ configuration, middle, state: (r.program.executor as GpuExecutor).screenState }));
+  }
+  await saveResults(device, build, params, r, screen, timing, record, salted.compiled);
 }
 
 /** A test's results, once its frames have run (`results/`), then `DONE`. */
@@ -771,6 +850,7 @@ async function saveResults(
   screen: GPUTexture,
   timing: Timing,
   record: TestRecord,
+  compiled: Compiled | undefined,
 ): Promise<void> {
   const { frames, width, height } = params;
   // Where the pipelines' time went: each built again alone, from code no cache has seen.
@@ -798,7 +878,11 @@ async function saveResults(
     if (params.clipfrom + params.clip >= frames) self.postMessage({ type: "clip-stop" } satisfies FromWorker);
     await clipSaved.promise;
   }
-  const { printed, cpu, began_ms, printed_in, pipelinesMs } = record;
+  const { printed, cpu, began_ms, printed_in, pipelinesMs, tier1Ms } = record;
+  // With timestamps, each frame's labels and their GPU ms (a label run twice in a frame summed),
+  // beside its CPU time and phases: one file a tool reads per frame.
+  const timings = timing !== "off" ? await executor.timings() : null;
+  const labels = timings === null ? undefined : frameLabels(timings, cpu.length);
   // The audio and ticker threads' print messages precede their completion messages, so their
   // lines are in the program's print sink before its log is serialized here.
   await Promise.all([
@@ -807,9 +891,9 @@ async function saveResults(
     putResult(base, "hash.txt", `${hash ? hash.hex() : "none"}\n`),
     putResult(base, "workers.txt", `${program.workerChunks()}\n`),
     putResult(base, "log.txt", printed.map((l) => `${l}\n`).join("")),
-    putResult(base, "frames.json", JSON.stringify({ cpu_ms: cpu, began_ms, printed_in, phases: record.phases })),
-    timing !== "off" ? executor.timings().then((t) => putResult(base, "timings.json", JSON.stringify(t))) : null,
-    params.salt > 0 ? putResult(base, "pipelines.json", JSON.stringify({ ms: pipelinesMs, count: build.manifest.pipelines.length, each })) : null,
+    putResult(base, "frames.json", JSON.stringify({ cpu_ms: cpu, began_ms, printed_in, phases: record.phases, labels })),
+    timings !== null ? putResult(base, "timings.json", JSON.stringify(timings)) : null,
+    params.salt > 0 ? putResult(base, "pipelines.json", JSON.stringify({ ms: pipelinesMs, tier1_ms: tier1Ms, count: build.manifest.pipelines.length, tier1: build.manifest.pipelines.filter((p) => p.conditional).length, each })) : null,
     putResult(base, "counters.json", JSON.stringify(record.counters)),
     putResult(base, "device.json", JSON.stringify(deviceInfo(device))),
     putResult(base, "memory.json", JSON.stringify({ gpu: executor.memory, wasm: program.memoryBytes })),
@@ -817,8 +901,18 @@ async function saveResults(
   self.postMessage({ type: "load-query" } satisfies FromWorker);
   const page = await pageLoaded.promise;
   const resources = [...page.resources, ...loaded(["resource"])];
-  const load = { opened_ms: page.opened_ms, first_frame_ms: began_ms[0] ?? null, resources };
+  // How the WASM compiled: a second open of the same build streams it from the code cache.
+  const wasm = compiled ? { compile_ms: compiled.compile_ms, instantiate_ms: compiled.instantiate_ms ?? null, streamed: compiled.streamed } : null;
+  const load = { opened_ms: page.opened_ms, first_frame_ms: began_ms[0] ?? null, wasm, resources };
   await putResult(base, "load.json", JSON.stringify(load));
+  if (params.show > 0) {
+    // Drawn before DONE, so whatever reads the screen after it sees the summary.
+    const info = deviceInfo(device);
+    const adapter = [info.vendor, info.architecture, info.description].filter((x) => x).join(" ");
+    const run = { began_ms, printed, printed_in, opened_ms: page.opened_ms, pipelines_ms: pipelinesMs };
+    self.postMessage({ type: "summary", lines: summaryLines(run, adapter) } satisfies FromWorker);
+    await summaryShown.promise;
+  }
   // An asynchronous device or voice failure may arrive while results are being saved. Its
   // DONE report is final; a later successful write must not replace it.
   if (failed) return;
@@ -846,6 +940,9 @@ const latencySent = Promise.withResolvers<void>();
 
 /** Test mode, `clip`: resolved when the main thread has saved the clip. */
 const clipSaved = Promise.withResolvers<void>();
+
+/** Test mode, `show`: resolved when the main thread has drawn the summary. */
+const summaryShown = Promise.withResolvers<void>();
 
 /** Test mode: resolved with what the page loaded, when the main thread answers. */
 const pageLoaded = Promise.withResolvers<{ opened_ms: number; resources: Loaded[] }>();
@@ -883,6 +980,9 @@ function receive(msg: ToWorker, reply: (message: FromTicker | FromHelper) => voi
     case "latency-sent":
       latencySent.resolve();
       return;
+    case "summary-shown":
+      summaryShown.resolve();
+      return;
     case "clip-saved":
       clipSaved.resolve();
       return;
@@ -905,7 +1005,7 @@ function receive(msg: ToWorker, reply: (message: FromTicker | FromHelper) => voi
       Promise.all([openDevice(fatal, test?.features ?? null), loadBuild(base, handed.fetch(networkFetch))])
         .then(([device, build]) => {
           const format = screenFormat(test !== null);
-          handOvers = new HandOvers(device, format, () => buildBase, () => [pipelineCache, leftovers]);
+          handOvers = new HandOvers(device, () => shown?.format ?? format, () => buildBase, () => [pipelineCache, leftovers], undefined, test !== null);
           return test ? runTest(msg.canvas, device, build, test, live) : run(msg.canvas, device, format, build, live);
         })
         .catch(fatal);

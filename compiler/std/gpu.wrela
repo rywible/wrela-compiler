@@ -248,6 +248,15 @@ pub struct WithDepth<C>: Copy {
     pub depth: f32,
 }
 
+/// A `WithDepth` whose depth is never less than its triangle's (a shader that only pushes its
+/// fragments away), which would let the GPU keep its early depth test. WGSL can't say it yet
+/// (Chrome 155 has no conservative-depth attribute, and naga 30.0.1's WGSL writer emits none),
+/// so it is a `WithDepth`: code names its intent now, and gets the early test when WGSL can.
+pub type WithDepthGreater<C> = WithDepth<C>
+
+/// As `WithDepthGreater`, for a depth never greater than its triangle's.
+pub type WithDepthLess<C> = WithDepth<C>
+
 /// A vertex output that isn't interpolated.
 pub struct Flat<T>: Copy {
     pub value: T,
@@ -1506,6 +1515,22 @@ impl<F: Filtered> Texture<F> {
         texture_sample_level(self, s, uv, level)
     }
 
+    /// The four texels a bilinear sample at `uv` reads, component `component` of each (0 to 3,
+    /// red to alpha), in WGSL's order: (min u, max v), (max u, max v), (max u, min v), (min u,
+    /// min v), at level 0. One fetch for what four loads read: any GPU code. Each component is
+    /// a fetch of its own, so a `component` that isn't a constant picks one with a branch.
+    pub fn gather(self, s: Sampler, uv: vec2, component: u32 = 0) -> vec4 {
+        if component == 0 {
+            texture_gather::<0, F>(self, s, uv)
+        } else if component == 1 {
+            texture_gather::<1, F>(self, s, uv)
+        } else if component == 2 {
+            texture_gather::<2, F>(self, s, uv)
+        } else {
+            texture_gather::<3, F>(self, s, uv)
+        }
+    }
+
     /// The texel at (`u`, `v`), at the level the footprint `ddx` and `ddy` (how `uv` changes
     /// from one pixel to the next, across and down) picks: any GPU code, so a kernel or a
     /// vertex shader filters as a fragment shader does.
@@ -1626,6 +1651,19 @@ impl<F: Filtered> TextureArray<F> {
         array_sample_level(self, s, uv, layer, level)
     }
 
+    /// As `Texture::gather`, of layer `layer`.
+    pub fn gather(self, s: Sampler, uv: vec2, layer: u32, component: u32 = 0) -> vec4 {
+        if component == 0 {
+            array_gather::<0, F>(self, s, uv, layer)
+        } else if component == 1 {
+            array_gather::<1, F>(self, s, uv, layer)
+        } else if component == 2 {
+            array_gather::<2, F>(self, s, uv, layer)
+        } else {
+            array_gather::<3, F>(self, s, uv, layer)
+        }
+    }
+
     /// Layer `layer`'s texel at (`u`, `v`), at the level the footprint picks: any GPU code.
     pub fn sample_grad(self, s: Sampler, uv: vec2, layer: u32, ddx: vec2, ddy: vec2) -> F::Texel {
         array_sample_grad(self, s, uv, layer, ddx, ddy)
@@ -1703,6 +1741,18 @@ impl DepthTexture {
         texture_sample_compare_level(self, s, uv, reference)
     }
 
+    /// The four depths a bilinear sample at `uv` reads, in `Texture::gather`'s order, at level
+    /// 0: any GPU code.
+    pub fn gather(self, s: Sampler, uv: vec2) -> vec4 {
+        depth_gather(self, s, uv)
+    }
+
+    /// Each of `gather`'s four depths against `reference` by `s`'s test, 1 or 0: four shadow
+    /// taps in one fetch. Any GPU code.
+    pub fn gather_compare(self, s: ComparisonSampler, uv: vec2, reference: f32) -> vec4 {
+        depth_gather_compare(self, s, uv, reference)
+    }
+
     /// The depth at (`x`, `y`): any GPU code.
     pub fn load(self, x: u32, y: u32) -> f32 {
         depth_load(self, x, y, 0)
@@ -1740,6 +1790,22 @@ impl DepthTextureArray {
         reference: f32,
     ) -> f32 {
         depth_array_compare_level(self, s, uv, layer, reference)
+    }
+
+    /// As `DepthTexture::gather`, of layer `layer`.
+    pub fn gather(self, s: Sampler, uv: vec2, layer: u32) -> vec4 {
+        depth_array_gather(self, s, uv, layer)
+    }
+
+    /// As `DepthTexture::gather_compare`, of layer `layer`.
+    pub fn gather_compare(
+        self,
+        s: ComparisonSampler,
+        uv: vec2,
+        layer: u32,
+        reference: f32,
+    ) -> vec4 {
+        depth_array_gather_compare(self, s, uv, layer, reference)
     }
 
     /// Layer `layer`'s depth at (`x`, `y`): any GPU code.
@@ -3055,6 +3121,35 @@ fn texture_sample<F: Filtered>(t: Texture<F>, s: Sampler, uv: vec2) -> F::Texel 
 fn texture_sample_level<F: Filtered>(t: Texture<F>, s: Sampler, uv: vec2, level: f32) -> F::Texel {}
 
 @intrinsic
+fn texture_gather<const C: u32, F: Filtered>(t: Texture<F>, s: Sampler, uv: vec2) -> vec4 {}
+
+@intrinsic
+fn array_gather<const C: u32, F: Filtered>(
+    t: TextureArray<F>,
+    s: Sampler,
+    uv: vec2,
+    layer: u32,
+) -> vec4 {}
+
+@intrinsic
+fn depth_gather(t: DepthTexture, s: Sampler, uv: vec2) -> vec4 {}
+
+@intrinsic
+fn depth_gather_compare(t: DepthTexture, s: ComparisonSampler, uv: vec2, reference: f32) -> vec4 {}
+
+@intrinsic
+fn depth_array_gather(t: DepthTextureArray, s: Sampler, uv: vec2, layer: u32) -> vec4 {}
+
+@intrinsic
+fn depth_array_gather_compare(
+    t: DepthTextureArray,
+    s: ComparisonSampler,
+    uv: vec2,
+    layer: u32,
+    reference: f32,
+) -> vec4 {}
+
+@intrinsic
 fn texture_sample_grad<F: Filtered>(
     t: Texture<F>,
     s: Sampler,
@@ -3240,6 +3335,48 @@ pub fn limits() -> Limits {
 
 @intrinsic
 fn limit(index: u32) -> u32 {}
+
+// ---- the screen ---------------------------------------------------------------------------------
+
+/// The colours a screen shows: sRGB's, or Display P3's wider ones.
+pub enum Gamut: Copy + Eq {
+    Srgb,
+    DisplayP3,
+}
+
+/// How the screen is shown (§18.8): HDR (a canvas of half floats, tone mapped `extended`, where
+/// 1.0 is SDR white and brighter is brighter where the display can), and its gamut.
+pub struct Screen: Copy + Eq {
+    pub hdr: bool,
+    pub gamut: Gamut,
+}
+
+/// Shows the screen `hdr` or not, in `gamut`, from a later frame on: once every pipeline that
+/// draws the screen is built for its new format, the host swaps it in between frames (until
+/// then, the frames go on as they were). A host that can't (the native host, which draws
+/// offscreen; a display that refuses) keeps the screen as it was, which `screen_is` says. In
+/// HDR a screen pass's fragments are linear values with headroom: a program's tone map gives
+/// them its own roll-off, not an SDR curve. Test mode keeps its screen as it was unless the
+/// test asks (`hdr=1`).
+pub fn screen(hdr: bool = false, gamut: Gamut = Gamut::Srgb) {
+    let p3 = match gamut {
+        Gamut::Srgb => 0,
+        Gamut::DisplayP3 => 1,
+    }
+    screen_command(u32(hdr), p3)
+}
+
+/// How the host shows the screen: what it did of the last `screen` it could. Nondeterministic:
+/// the display decides.
+pub fn screen_is() -> Screen {
+    let bits = limit(13)
+    Screen { hdr: (bits & 1) != 0, gamut: if (bits & 2) != 0 { Gamut::DisplayP3 } else {
+        Gamut::Srgb
+    } }
+}
+
+@intrinsic
+fn screen_command(hdr: u32, gamut: u32) {}
 
 /// The GPU's optional features (§18.10): the hosts open the device with every one the adapter
 /// has, and a program checks before it records what needs one (a format's capability, a kernel

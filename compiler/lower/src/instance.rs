@@ -36,6 +36,8 @@ pub enum DeriveKind {
     ValueAndGradient,
     /// The interval over a box.
     Interval,
+    /// A precision report over a box (`std::derive::precision`, `wrela precision`): nothing.
+    Precision,
     /// The value box-filtered over a footprint (`filtered`): `f32`.
     Filtered,
     /// A parameter gradient (§23): the value and its derivative by each of some lifted
@@ -43,6 +45,9 @@ pub enum DeriveKind {
     Literals,
     /// The lifted literals the callable can read (§23): `output` is the run's type.
     Reads,
+    /// The tape of a function of a point (`std::derive::tape`): `input` is the tape's type;
+    /// with an `output` `T`, `tape_with`'s, whose function returns `(f32, T)`.
+    Tape,
 }
 
 /// GPU only: what a parameter is bound to.

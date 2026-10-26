@@ -23,7 +23,10 @@ use wrela_host::tool::{Caps, End, Ended, Grants, Signal, Testing};
 /// - `done`: waits for the page's result, and prints it;
 /// - `never`: waits for a result that never comes, by its wait's timeout, then by the request's
 ///   deadline;
-/// - `trap`: panics with the browser open.
+/// - `trap`: panics with the browser open;
+/// - `navigate`: waits for the page's result, takes the browser to the page again, waits for its
+///   new result, and prints both;
+/// - `show`: waits for a test-mode run's result (60 s), and writes the screen to `show.png`.
 ///
 /// Each failure prints why, and the tool exits 1.
 const BROWSER_TOOL: &str = r##"
@@ -155,8 +158,11 @@ pub fn tool() -> u32 {
             .click(Element::css("button").with_text("Copy"))
             .wait(Until::clipboard(Match::is("copied!")))
     }
-    if what.as_str() == "done" || what.as_str() == "delayed" || what.as_str() == "huge" {
+    if what.as_str() == "done" || what.as_str() == "delayed" || what.as_str() == "huge" || what.as_str() == "navigate" {
         script = Script::new().wait(Until::done())
+    }
+    if what.as_str() == "show" {
+        script = Script::new().wait(Until::done(), timeout: 60.0)
     }
     if what.as_str() == "never" {
         script = Script::new().wait(Until::done(), timeout: 0.3)
@@ -248,6 +254,35 @@ pub fn tool() -> u32 {
         let Ok(Some(done)) = browser::results(b).wait() else { return 2 }
         print(f"done {done.as_str()}")
     }
+    if what.as_str() == "navigate" {
+        let Ok(Some(first)) = browser::results(b).wait() else { return 2 }
+        print(f"first {first.as_str()}")
+        if let Err(e) = browser::navigate(b, url.as_str()).wait() {
+            print(f"navigate: {e.message()}")
+            return 1
+        }
+        if let Err(e) = browser::run(b, Script::new().wait(Until::done())).wait() {
+            print(f"run again: {e.message()}")
+            return 1
+        }
+        let Ok(Some(second)) = browser::results(b).wait() else { return 2 }
+        print(f"second {second.as_str()}")
+    }
+    if what.as_str() == "show" {
+        let capture = match browser::capture(b).wait() {
+            Ok(c) => take c,
+            Err(e) => {
+                print(f"capture: {e.message()}")
+                return 1
+            },
+        }
+        let Data::Blob(png) = capture.png else { return 3 }
+        if let Err(e) = files::write_blob(f"{root.as_str()}/show.png".as_str(), png).wait() {
+            print(f"write: {e.message()}")
+            return 1
+        }
+        print("captured")
+    }
     if let Err(e) = browser::close(b).wait() {
         print(f"close: {e.message()}")
         return 1
@@ -286,6 +321,23 @@ const HUGE: &str = r#"<!doctype html>
 "#;
 
 const NEVER: &str = "<!doctype html><title>Never</title><p>This page never reports.</p>\n";
+
+/// A page whose result is how many times this tab has loaded it.
+const COUNTED: &str = r#"<!doctype html>
+<title>Counted</title>
+<script>
+sessionStorage.loads = String(Number(sessionStorage.loads || 0) + 1);
+fetch("results/DONE", { method: "PUT", body: "load " + sessionStorage.loads });
+</script>
+"#;
+
+/// A program whose screen is black.
+const BLACK: &str = "use std::gpu::begin_screen_pass
+
+pub fn frame(time: f32, width: u32, height: u32) {
+    begin_screen_pass(clear: vec4(0.0, 0.0, 0.0, 1.0)).present()
+}
+";
 
 /// A page that gathers ICE candidates against a STUN and a TURN server at `DATAGRAMS`, a UDP
 /// port of this machine, and says in its title when it has, or 5 s have passed.
@@ -686,4 +738,40 @@ fn a_trap_with_a_browser_open_leaves_no_chrome_and_no_profile() {
     assert!(!running.is_empty(), "Chrome ran with its profile in the run's directory");
     assert!(processes_naming(&work).is_empty(), "no Chrome is left: {:?}", processes_naming(&work));
     assert!(!work.exists(), "the run's directory, the profile in it, is gone");
+}
+
+/// `navigate` takes the browser to a page again, in the same tab, and the next wait sees that
+/// page's own result, not the first one's.
+#[test]
+#[ignore = "needs the runtime"]
+fn a_browser_navigates_and_waits_for_the_new_pages_result() {
+    let (printed, ended) =
+        browse("navigate", "navigate", "counted.html", COUNTED, grants, Testing::default());
+    assert_eq!(ended.end, End::Exit(0), "{printed:?}");
+    assert_eq!(printed, ["opened", "first load 1", "second load 2", "closed"]);
+}
+
+/// A test-mode run with `show=1` leaves its summary drawn over its canvas: white text on a
+/// program that draws black.
+#[test]
+#[ignore = "needs the runtime"]
+fn show_draws_the_runs_summary_over_the_screen() {
+    let pkg = crate::package("browser-show-black", BLACK);
+    let built = wrela_tests::build(&pkg).unwrap_or_else(|e| panic!("doesn't build:\n{e}"));
+    let root = scratch("browser-show");
+    built.write_to(&root).expect("the build");
+    let page = "index.html#test&frames=30&paced=1&show=1";
+    let (printed, ended) = browse_in(&root, "show", page, "scratch", grants, Testing::default());
+    assert_eq!(ended.end, End::Exit(0), "{printed:?}");
+    assert_eq!(printed, ["opened", "captured", "closed"]);
+    let (w, h, rgba) = wrela_host::image::read_png(&root.join("show.png")).expect("the screen");
+    // The summary's corner holds white text; the program's screen is black everywhere.
+    let lit = |x0: u32, y0: u32, x1: u32, y1: u32| {
+        (y0..y1.min(h)).flat_map(|y| (x0..x1.min(w)).map(move |x| (x, y))).any(|(x, y)| {
+            let i = ((y * w + x) * 4) as usize;
+            rgba[i] > 200 && rgba[i + 1] > 200 && rgba[i + 2] > 200
+        })
+    };
+    assert!(lit(0, 0, 300, 120), "the summary's text");
+    assert!(!lit(0, h / 2, w, h), "the program's black below it");
 }

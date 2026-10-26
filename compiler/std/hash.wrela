@@ -310,3 +310,11 @@ fn equal_signed_zeros_hash_alike() {
     let negative: f64 = -0.0
     assert(positive == negative && state_hash(positive) == state_hash(negative))
 }
+
+/// PCG's output of the state `h`: a random-looking permutation of it (`std::field::hash_u32`
+/// advances the state, then this). One operation of a tape's (`std::stage::PCG`), so a hash
+/// built on it tapes short.
+pub fn pcg(h: u32) -> u32 {
+    let x = ((h >> ((h >> 28) + 4)) ^ h).wrapping_mul(277803737)
+    (x >> 22) ^ x
+}

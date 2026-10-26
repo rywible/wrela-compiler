@@ -28,6 +28,21 @@ pub struct Phase {
 }
 
 impl Traced {
+    /// Adds `other`'s lines after these, and its phases' times to theirs (a phase it timed that
+    /// these didn't, after them).
+    pub fn merge(&mut self, other: Traced) {
+        self.lines.extend(other.lines);
+        for p in other.phases {
+            match self.phases.iter_mut().find(|q| q.name == p.name) {
+                Some(q) => {
+                    q.seconds += p.seconds;
+                    q.times += p.times;
+                }
+                None => self.phases.push(p),
+            }
+        }
+    }
+
     /// Whether it printed nothing and timed nothing.
     pub fn is_empty(&self) -> bool {
         self.lines.is_empty() && self.phases.is_empty()

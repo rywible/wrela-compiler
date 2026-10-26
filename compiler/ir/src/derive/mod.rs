@@ -11,8 +11,11 @@ pub mod ad;
 mod exits;
 pub mod interval;
 pub mod literal;
+pub mod tape;
 
+pub use interval::Report;
 pub use literal::literal_gradient;
+pub use tape::{TapeFns, TapeOf};
 
 use crate::*;
 use std::collections::HashMap;
@@ -22,6 +25,11 @@ use std::collections::HashMap;
 pub struct DeriveCache {
     ad: HashMap<(FuncId, Vec<Bits>, u8), FuncId>,
     interval: HashMap<(FuncId, Vec<Bits>), FuncId>,
+    /// A precision report's walks' ([`Report`]): the `f32` walk's, then the half walk's.
+    report: [HashMap<(FuncId, Vec<Bits>), FuncId>; 2],
+    /// By the function, its active parameters and the `Building` type it pushes onto (a tape of
+    /// another size takes another).
+    tape: HashMap<(FuncId, Vec<Bits>, TypeId), FuncId>,
     /// What a call does with active arguments, by derivation and active parameters: `None`
     /// while the callee is still being analyzed.
     effects: HashMap<(Mode, FuncId, Vec<Bits>), Option<Effect>>,
@@ -72,6 +80,16 @@ pub fn value_gradient_ty(types: &mut Types, x: TypeId, with: Option<TypeId>) -> 
     types.intern(TypeDef::Struct { name: format!("({})", names.join(", ")), fields })
 }
 
+impl DeriveCache {
+    /// The interval derivations for `report`'s walk, or the plain ones.
+    fn intervals(&mut self, report: Option<Report>) -> &mut HashMap<(FuncId, Vec<Bits>), FuncId> {
+        match report {
+            Some(r) => &mut self.report[r.half as usize],
+            None => &mut self.interval,
+        }
+    }
+}
+
 /// A function of `f`'s captures and a box (`box_ty`, with fields `lo` and `hi`) returning an
 /// interval (`interval_ty`, likewise) that contains `f(x)`, as the target computes it, for every
 /// `x` in the box. On the GPU each operation's result is widened by its WGSL error bound
@@ -85,7 +103,114 @@ pub fn interval(
     box_ty: TypeId,
     interval_ty: TypeId,
 ) -> Result<FuncId> {
-    interval::interval(m, cache, f, ncap, target, box_ty, interval_ty)
+    interval::interval(m, cache, f, ncap, target, (box_ty, interval_ty), None)
+}
+
+/// A function of `f`'s captures and a box (as [`interval`]'s) that returns nothing: it runs the
+/// interval of `f` over the box twice for `wrela precision`, once widened as the CPU rounds an
+/// `f32` and once as a half float rounds, and each walk notes each operation's range through
+/// `note`, std's `precision_note` ([`Report`]).
+pub fn precision(
+    m: &mut Module,
+    cache: &mut DeriveCache,
+    f: FuncId,
+    ncap: u32,
+    box_ty: TypeId,
+    interval_ty: TypeId,
+    note: FuncId,
+) -> Result<FuncId> {
+    let walks = [false, true].map(|half| {
+        let report = Some(Report { half, note });
+        interval::interval(m, cache, f, ncap, Target::Cpu, (box_ty, interval_ty), report)
+    });
+    let [w32, w16] = walks;
+    let (w32, w16) = (w32?, w16?);
+    let params = m.functions[w32.index()].params.clone();
+    let name = format!("{}_precision", m.functions[f.index()].name);
+    let mut g = Function::new(name, params.clone(), None);
+    let mut body = Vec::new();
+    for w in [w32, w16] {
+        let mut args: Vec<Arg> =
+            (0..params.len() as u32).map(|i| g.param_arg(i, &mut body)).collect();
+        if w == w16
+            && let Some(Arg::Value(over)) = args.last().cloned()
+        {
+            // A half float's input is the box rounded to it: each end out to the half floats'.
+            let rounded = half_box(&mut m.types, &mut g, &mut body, box_ty, over)?;
+            *args.last_mut().expect("the box") = Arg::Value(rounded);
+        }
+        body.push(Stmt::Eval(Expr::Call(w, args)));
+    }
+    body.push(Stmt::Return(None));
+    g.body = body;
+    Ok(m.add_function(g))
+}
+
+/// The box `over` (of type `box_ty`: `lo` and `hi`, an `f32` or a float vector each) as a half
+/// float holds it: each end rounded outward to the half floats' grid there (its spacing
+/// `2^(e - 10)` for an end of exponent `e`, at least `2⁻²⁴`, found from the end's bits), so an
+/// end a half float holds stays where it is, and one between two goes to the outer.
+fn half_box(
+    types: &mut Types,
+    g: &mut Function,
+    body: &mut Block,
+    box_ty: TypeId,
+    over: ValueId,
+) -> Result<ValueId> {
+    let TypeDef::Struct { fields, .. } = types.get(box_ty).clone() else {
+        return Err(Error::internal("a box that isn't a struct"));
+    };
+    let x_ty = fields.first().map(|f| f.1).ok_or_else(|| Error::internal("an empty box"))?;
+    let n = match *types.get(x_ty) {
+        TypeDef::Vector(_, n) => Some(n as u32),
+        _ => None,
+    };
+    let (f32, u32) = (types.f32(), types.u32());
+    let u =
+        |g: &mut Function, body: &mut Block, x: u32| g.let_(body, u32, Expr::Const(Const::U32(x)));
+    let mut ends = Vec::new();
+    for (k, outward) in [(0, Builtin::Floor), (1, Builtin::Ceil)] {
+        let end = g.let_(body, x_ty, Expr::Extract(over, k));
+        let mut comps = Vec::new();
+        for c in 0..n.unwrap_or(1) {
+            let x = match n {
+                Some(_) => g.let_(body, f32, Expr::Extract(end, c)),
+                None => end,
+            };
+            // The biased exponent, at least 2⁻¹⁴'s (113): the spacing's is 10 less.
+            let bits = g.let_(body, u32, Expr::Bitcast(x, Scalar::U32));
+            let (shift, mask, least, ten) =
+                (u(g, body, 23), u(g, body, 255), u(g, body, 113), u(g, body, 10));
+            let e = g.let_(body, u32, Expr::Binary(BinOp::Shr, bits, shift));
+            let e = g.let_(body, u32, Expr::Binary(BinOp::BitAnd, e, mask));
+            let e = g.let_(body, u32, Expr::Builtin(Builtin::Max, vec![e, least]));
+            let e = g.let_(body, u32, Expr::Binary(BinOp::Sub, e, ten));
+            let e = g.let_(body, u32, Expr::Binary(BinOp::Shl, e, shift));
+            let step = g.let_(body, f32, Expr::Bitcast(e, Scalar::F32));
+            let q = g.let_(body, f32, Expr::Binary(BinOp::Div, x, step));
+            let q = g.let_(body, f32, Expr::Builtin(outward, vec![q]));
+            comps.push(g.let_(body, f32, Expr::Binary(BinOp::Mul, q, step)));
+        }
+        ends.push(match n {
+            Some(_) => g.let_(body, x_ty, Expr::Construct(x_ty, comps)),
+            None => comps[0],
+        });
+    }
+    Ok(g.let_(body, box_ty, Expr::Construct(box_ty, ends)))
+}
+
+/// A function of `f`'s captures that builds the tape (`of.tape`, a `std::stage::Taped`) of `f`,
+/// a function of a `vec3` (its last parameter), on the CPU: `std::derive::tape`. With `of.with`,
+/// `f` returns `(f32, T)`, and the tape's last registers are the value and `T`'s floats. std's
+/// functions add its operations, and finish it (`of.fns`).
+pub fn tape(
+    m: &mut Module,
+    cache: &mut DeriveCache,
+    f: FuncId,
+    target: Target,
+    of: TapeOf,
+) -> Result<FuncId> {
+    tape::tape(m, cache, f, target, of)
 }
 
 /// Activity by part: a bit for each **leaf** of a value's type, in field order. A leaf is a
@@ -591,7 +716,7 @@ fn expr_bits(cx: &Walk<'_>, e: &Expr, a: &Activity, ty: TypeId) -> Bits {
     let any = |b: bool| if b { all } else { 0 };
     let v = |x: &ValueId| a.value(*x);
     match e {
-        Expr::Const(_) | Expr::Zero(_) | Expr::EntryInput(_) => 0,
+        Expr::Const(_) | Expr::Zero(_) | Expr::EntryInput(_) | Expr::Override(_) => 0,
         Expr::Texture(_, _, _, xs) | Expr::Subgroup(_, xs) => any(xs.iter().any(v)),
         Expr::Atomic(..) | Expr::TextureStore(..) | Expr::Barrier | Expr::Discard => all,
         Expr::Param(i) => a.params[*i as usize],
@@ -698,6 +823,43 @@ pub(super) fn effect(
     e
 }
 
+/// `orig` (function `f`) ready to derive as an interval or a tape does, with active parameters
+/// `mask`: with one exit (`single_exit`: a `return` under a branch on the input becomes a store
+/// that both sides can make), and a loop that leaves early on the input given its own count with
+/// flags (`exits.rs`) where that leaves no loop exit active. The function, the local its result
+/// is stored in (if `single_exit` made one), and its activity; a loop exit still active is the
+/// caller's to refuse.
+pub(super) fn one_exit(
+    m: &mut Module,
+    cache: &mut DeriveCache,
+    f: FuncId,
+    orig: Function,
+    mask: &[Bits],
+) -> (Function, Option<LocalId>, Activity) {
+    let (mut func, result, mut act) = match crate::single_exit::single_exit(m, &orig) {
+        None => (orig, None, body_activity(m, cache, f, mask, Mode::Interval)),
+        Some((func, result)) => {
+            let act = activity(m, &func, mask, Mode::Interval, &mut |g, mk| {
+                effect(m, cache, g, mk, Mode::Interval)
+            });
+            (func, result, act)
+        }
+    };
+    let bool_ty = m.types.bool();
+    if act.active_loop_exit.is_some()
+        && let Some(flagged) = exits::flag_exits(&func, bool_ty, &|v| act.value(v))
+    {
+        let again = activity(m, &flagged, mask, Mode::Interval, &mut |g, mk| {
+            effect(m, cache, g, mk, Mode::Interval)
+        });
+        if again.active_loop_exit.is_none() {
+            func = flagged;
+            act = again;
+        }
+    }
+    (func, result, act)
+}
+
 /// The activity of `f`'s body with active parameters `mask`: the one [`effect`] kept, if it
 /// did.
 pub(super) fn body_activity(
@@ -760,7 +922,7 @@ pub(super) struct Track {
     /// A load's earlier twin.
     same: HashMap<ValueId, ValueId>,
     /// Where in the source the statement being derived is (the last `Stmt::At`), for errors.
-    at: Option<wrela_diag::Span>,
+    pub(super) at: Option<wrela_diag::Span>,
 }
 
 impl Track {

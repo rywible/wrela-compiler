@@ -362,33 +362,43 @@ trait Visit {
 
 /// `v` done with corpus function `fi`. The order is the tests' (derive.rs, `NAMES`).
 fn with_function<V: Visit>(fi: u32, v: V) -> V::Out {
+    with_function_as(fi, tape: false, v: v)
+}
+
+/// `v` done with corpus function `fi`, or with its tape (`Surface::to_tape`).
+fn with_function_as<V: Visit>(fi: u32, tape: bool, v: V) -> V::Out {
     match fi {
-        0 => v.visit(sphere_()),
-        1 => v.visit(ellipsoid_()),
-        2 => v.visit(cone_()),
-        3 => v.visit(hoof_()),
-        4 => v.visit(blob_()),
-        5 => v.visit(Noise { freq: 2.5 }),
-        6 => v.visit(fbm_()),
-        7 => v.visit(creature()),
-        8 => v.visit(grazer_()),
-        9 => v.visit(Waves { s: 3.0 }),
-        10 => v.visit(Logs { s: 2.3 }),
-        11 => v.visit(Trig { s: 0.35 }),
-        12 => v.visit(Rational { s: 0.2 }),
-        13 => v.visit(Pieces { s: 2.0 }),
-        14 => v.visit(Vectors { c: vec3(0.3, 0.3, 0.3) }),
-        15 => v.visit(Branchy { n: 3 }),
-        16 => v.visit(Cells { s: 3.0 }),
-        17 => v.visit(sphere_tape()),
-        18 => v.visit(waves_tape(3.0)),
-        19 => v.visit(blob_tape()),
-        20 => v.visit(closures_(5.0)),
-        21 => v.visit(table_()),
-        22 => v.visit(Hyperbolic { s: 1.7 }),
-        23 => v.visit(Powers { n: 2.4 }),
-        _ => v.visit(March { dir: vec3(0.0, 0.0, 1.0) }),
+        0 => pick(sphere_(), tape, v),
+        1 => pick(ellipsoid_(), tape, v),
+        2 => pick(cone_(), tape, v),
+        3 => pick(hoof_(), tape, v),
+        4 => pick(blob_(), tape, v),
+        5 => pick(Noise { freq: 2.5 }, tape, v),
+        6 => pick(fbm_(), tape, v),
+        7 => pick(creature(), tape, v),
+        8 => pick(grazer_(), tape, v),
+        9 => pick(Waves { s: 3.0 }, tape, v),
+        10 => pick(Logs { s: 2.3 }, tape, v),
+        11 => pick(Trig { s: 0.35 }, tape, v),
+        12 => pick(Rational { s: 0.2 }, tape, v),
+        13 => pick(Pieces { s: 2.0 }, tape, v),
+        14 => pick(Vectors { c: vec3(0.3, 0.3, 0.3) }, tape, v),
+        15 => pick(Branchy { n: 3 }, tape, v),
+        16 => pick(Cells { s: 3.0 }, tape, v),
+        17 => pick(sphere_tape(), tape, v),
+        18 => pick(waves_tape(3.0), tape, v),
+        19 => pick(blob_tape(), tape, v),
+        20 => pick(closures_(5.0), tape, v),
+        21 => pick(table_(), tape, v),
+        22 => pick(Hyperbolic { s: 1.7 }, tape, v),
+        23 => pick(Powers { n: 2.4 }, tape, v),
+        _ => pick(March { dir: vec3(0.0, 0.0, 1.0) }, tape, v),
     }
+}
+
+/// `v` done with `f`, or with its tape.
+fn pick<V: Visit, F: Surface>(f: F, tape: bool, v: V) -> V::Out {
+    if tape { v.visit(f.to_tape()) } else { v.visit(f) }
 }
 
 /// `misses` in box `i`.
@@ -538,17 +548,25 @@ pub fn gradient(fi: u32, x: f32, y: f32, z: f32) -> vec3 {
 }
 
 // ---- fields built at runtime against their compiled twins (std::stage) ------------------------
-/// Twin `k`'s two fields: a tape and the compiled field it was built to match.
+/// Field `k`'s twins: corpus field `k` (`with_function`), or its tape (`Surface::to_tape`).
+/// The corpus's own runtime-built tapes (`sphere_tape`, `waves_tape`, `blob_tape`) are twins of
+/// the fields they were built to match: `TAPES` past the corpus.
 fn twin<V: Visit>(k: u32, tape: bool, v: V) -> V::Out {
-    match (k, tape) {
-        (0, false) => v.visit(sphere_()),
-        (0, true) => v.visit(sphere_tape()),
-        (1, false) => v.visit(Waves { s: 3.0 }),
-        (1, true) => v.visit(waves_tape(3.0)),
-        (_, false) => v.visit(blob_spheres()),
-        (_, true) => v.visit(blob_tape()),
+    if k >= CORPUS {
+        return match (k - CORPUS, tape) {
+            (0, false) => v.visit(sphere_()),
+            (0, true) => v.visit(sphere_tape()),
+            (1, false) => v.visit(Waves { s: 3.0 }),
+            (1, true) => v.visit(waves_tape(3.0)),
+            (_, false) => v.visit(blob_spheres()),
+            (_, true) => v.visit(blob_tape()),
+        }
     }
+    with_function_as(k, tape, v)
 }
+
+/// How many fields the corpus has (`with_function`).
+const CORPUS: u32 = 25
 
 /// A point in [-2, 2]³, the `i`th for `seed`.
 fn sample_point(seed: u32, i: u32) -> vec3 {
@@ -561,14 +579,55 @@ fn sample_point(seed: u32, i: u32) -> vec3 {
 /// On the CPU: the largest difference between twin `k`'s tape and its compiled field over
 /// `n` sampled points.
 pub fn tape_error_cpu(k: u32, seed: u32, n: u32) -> f32 {
+    // Each field made once, its values over the points: a tape is 72 KiB to build.
+    let a: Vec<f32> = twin(k, tape: true, v: Values { seed, n })
+    let b: Vec<f32> = twin(k, tape: false, v: Values { seed, n })
     var worst = 0.0
     for i in 0..n {
-        let p = sample_point(seed, i)
-        let a: f32 = twin(k, tape: true, v: Distance { p })
-        let b: f32 = twin(k, tape: false, v: Distance { p })
-        worst = max(worst, abs(a - b))
+        worst = max(worst, abs(a[i] - b[i]))
     }
     worst
+}
+
+/// On the CPU: the largest difference between the gradient of field `k`'s tape (derived through
+/// `interpret`) and the field's own, relative to the field's (or absolute where it's under 1),
+/// over `n` sampled points.
+pub fn tape_gradient_error(k: u32, seed: u32, n: u32) -> f32 {
+    let a: Vec<vec3> = twin(k, tape: true, v: Gradients { seed, n })
+    let b: Vec<vec3> = twin(k, tape: false, v: Gradients { seed, n })
+    var worst = 0.0
+    for i in 0..n {
+        worst = max(worst, length(a[i] - b[i]) / max(length(b[i]), 1.0))
+    }
+    worst
+}
+
+/// A field's gradients at `n` sampled points.
+struct Gradients: Copy {
+    seed: u32,
+    n: u32,
+}
+
+impl Visit for Gradients {
+    type Out = Vec<vec3>
+
+    fn visit<F: Surface>(self, f: F) -> Vec<vec3> {
+        Vec::from_fn(self.n, |i| f.gradient(sample_point(self.seed, i)))
+    }
+}
+
+/// A field's values at `n` sampled points.
+struct Values: Copy {
+    seed: u32,
+    n: u32,
+}
+
+impl Visit for Values {
+    type Out = Vec<f32>
+
+    fn visit<F: Surface>(self, f: F) -> Vec<f32> {
+        Vec::from_fn(self.n, |i| f.distance(sample_point(self.seed, i)))
+    }
 }
 
 @compute(64)
@@ -629,6 +688,11 @@ pub fn prune_blob(b: u32, n: u32) -> u32 {
 /// The blob tape's length.
 pub fn blob_tape_len() -> u32 {
     blob_tape().len()
+}
+
+/// The length of the grazer's tape (`to_tape`): a creature of the herd.
+pub fn grazer_tape_len() -> u32 {
+    grazer_().to_tape().len()
 }
 
 // ---- Lipschitz bounds (AC5) --------------------------------------------------------------------

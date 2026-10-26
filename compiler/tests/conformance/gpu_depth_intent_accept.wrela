@@ -1,0 +1,37 @@
+// accepts: gpu.entry
+// A fragment's own depth, with its intent (`WithDepthGreater`, `WithDepthLess`): a `WithDepth`
+// until WGSL can say a depth only grows or shrinks.
+use std::gpu::{
+    ClipPosition, DepthTexture, VertexIndex, WithDepthGreater, WithDepthLess,
+    begin_screen_pass_with_depth, depth_texture, draw,
+}
+
+@vertex
+fn v(i: VertexIndex) -> ClipPosition {
+    ClipPosition { position: vec4(0.0, 0.0, 0.5, 1.0) }
+}
+
+@fragment
+fn pushed() -> WithDepthGreater<vec4> {
+    WithDepthGreater { color: vec4(1.0), depth: 0.75 }
+}
+
+@fragment
+fn pulled() -> WithDepthLess<vec4> {
+    WithDepthLess { color: vec4(1.0), depth: 0.25 }
+}
+
+pub struct S {
+    depth: DepthTexture,
+}
+
+pub fn init() -> S {
+    S { depth: depth_texture(width: 4, height: 4) }
+}
+
+pub fn frame(s: mut S, time: f32, width: u32, height: u32) {
+    let p = begin_screen_pass_with_depth(mut s.depth, clear: vec4(0.0))
+    draw(p, v, pushed, vertices: 3)
+    draw(p, v, pulled, vertices: 3)
+    p.present()
+}

@@ -15,9 +15,14 @@ import { parseScript, type Scripted } from "./input.ts";
 
 export interface Build {
   manifest: Manifest;
-  wasm: Bytes;
+  /** The WASM: its response, not yet read (it compiles as it streams in), or its bytes. Once
+   * compiled, `compiled` holds the module and this isn't read again. */
+  wasm: Response | Bytes;
   /** Each pipeline's WGSL, in manifest order. */
   shaders: string[];
+  /** The WASM, compiled: set by the first start (`startProgram`) or a hand-over's getting ready,
+   * so a build started again reuses it. */
+  compiled?: Compiled;
 }
 
 export type Fetch = (url: URL, init?: RequestInit) => Promise<Response>;
@@ -93,11 +98,41 @@ export class Handed {
   }
 }
 
+/** A module of one function that does an `f32x4.relaxed_madd`: what a browser that runs relaxed
+ * SIMD validates (Chrome and Bun do). */
+export const RELAXED_PROBE = new Uint8Array([
+  0x00, 0x61, 0x73, 0x6d, 0x01, 0x00, 0x00, 0x00,
+  // A type: () -> v128.
+  0x01, 0x05, 0x01, 0x60, 0x00, 0x01, 0x7b,
+  0x03, 0x02, 0x01, 0x00,
+  // Its body: three zero vectors, `f32x4.relaxed_madd` (0xfd 0x105), `end`.
+  0x0a, 0x3d, 0x01, 0x3b, 0x00,
+  ...[0, 1, 2].flatMap(() => [0xfd, 0x0c, ...new Array<number>(16).fill(0)]),
+  0xfd, 0x85, 0x02, 0x0b,
+]);
+
+/** Whether this browser runs relaxed SIMD. */
+export function runsRelaxedSimd(): boolean {
+  try {
+    return WebAssembly.validate(RELAXED_PROBE);
+  } catch {
+    return false;
+  }
+}
+
+/** `manifest` as this browser loads it: a relaxed-SIMD build's relaxed module where the browser
+ * runs relaxed SIMD (`relaxed`), its standard one elsewhere. */
+export function chooseWasm(manifest: Manifest, relaxed: boolean = runsRelaxedSimd()): Manifest {
+  if (manifest.wasm_relaxed === null || !relaxed) return manifest;
+  return { ...manifest, wasm: manifest.wasm_relaxed, wasm_abi: manifest.wasm_relaxed_abi };
+}
+
 /** Fetches and validates a build; its files resolve against `base`. */
 export async function loadBuild(base: string, fetchFn: Fetch = networkFetch): Promise<Build> {
-  const manifest = parseManifest(await getText(fetchFn, new URL("manifest.json", base)));
+  const manifest = chooseWasm(parseManifest(await getText(fetchFn, new URL("manifest.json", base))));
+  // The WASM's response stays unread: `Program.compile` compiles it as it streams in.
   const [wasm, shaders] = await Promise.all([
-    get(fetchFn, new URL(manifest.wasm, base)).then(async (r) => new Uint8Array(await r.arrayBuffer())),
+    get(fetchFn, new URL(manifest.wasm, base)),
     Promise.all(manifest.pipelines.map((p) => getText(fetchFn, new URL(p.shader, base)))),
   ]);
   return { manifest, wasm, shaders };
@@ -181,35 +216,46 @@ export function browserIo(
 export interface GpuOptions {
   /** Whether passes and dispatches are timed, and how. */
   timing?: Timing;
-  /** Called with how long building every pipeline took (ms). */
+  /** Called with how long building every tier-0 pipeline took (ms): when the program's
+   * unconditional commands can all run. */
   onPipelines?: (ms: number) => void;
+  /** Called with how long building every pipeline, tier 1's too, took (ms). */
+  onTier1?: (ms: number) => void;
   /** Hot reload: the pipelines built so far, which the build keeps where they're the same
    * (`buildPipelines`). */
   cache?: PipelineCache | undefined;
+  /** Whether the WASM's bytes are hashed as it compiles (the tick log's header). */
+  hashWasm?: boolean;
 }
 
 /** Starts building every pipeline, compiles the WASM meanwhile (unless the build comes compiled:
- * one got ready for a hand-over), then instantiates the program with the decoder behind its
+ * one got ready for a hand-over, or one started before), then instantiates the program with the decoder behind its
  * import. A program whose `init` fails leaves nothing on the GPU. The program starts while its pipelines build: a command
  * that needs one waits for it (`GpuExecutor`), and the frames wait for the commands
  * (`GpuExecutor.caughtUp`). A pipeline that can't be built fails the program, through the
  * executor's `built`. */
 export async function startProgram(
   device: GPUDevice,
-  build: Build & { compiled?: Compiled },
+  build: Build,
   screen: ScreenTarget,
   options: ProgramOptions = {},
   gpu: GpuOptions = {},
 ): Promise<Program> {
   const started = performance.now();
   const pipelines = buildPipelines(device, build.manifest, build.shaders, screen.format, gpu.cache);
-  const compiled = build.compiled ?? (await Program.compile(build.wasm));
+  // Every pipeline, tier 1's too: how long the whole set took.
+  Promise.all(pipelines.each).then(() => gpu.onTier1?.(performance.now() - started), () => {});
+  const compiled = (build.compiled ??= await Program.compile(build.wasm, build.manifest.wasm_abi, gpu.hashWasm ?? false));
   const debug = build.manifest.pipelines.some((p) => p.debug_flag !== null);
-  const executor = new GpuExecutor(device, pipelines, screen, gpu.timing, debug);
+  const executor = new GpuExecutor(device, pipelines.each, screen, gpu.timing, debug, pipelines);
   executor.built.then(() => gpu.onPipelines?.(performance.now() - started), () => {});
   const checker = new Checker(build.manifest, deviceLimits(device));
   try {
-    return await Program.instantiate(compiled, checker, executor, options);
+    const instantiating = performance.now();
+    const program = await Program.instantiate(compiled, checker, executor, options);
+    // Its start function and `init`, where a lazily compiled module compiles what they call.
+    compiled.instantiate_ms ??= performance.now() - instantiating;
+    return program;
   } catch (e) {
     executor.destroyAll();
     throw e;

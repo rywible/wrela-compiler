@@ -1,5 +1,5 @@
 import { expect, test } from "bun:test";
-import { asksForTest, frameTime, inputUrl, isLoopback, parseTestParams, putResult, TEST_DEFAULTS } from "../src/testmode.ts";
+import { asksForTest, frameTime, inputUrl, isLoopback, mayTest, parseTestParams, putResult, summaryLines, TEST_DEFAULTS } from "../src/testmode.ts";
 
 test("only #test fragments ask for test mode", () => {
   expect(parseTestParams("")).toBeNull();
@@ -38,6 +38,8 @@ test("reads every parameter", () => {
     clip: 0,
     clipfrom: 0,
     checks: 1,
+    show: 0,
+    hdr: 0,
   });
   expect(parseTestParams("#test&clip=600&clipfrom=300")).toEqual({ ...TEST_DEFAULTS, clip: 600, clipfrom: 300 });
   expect(parseTestParams("#test&input=scripts/a.json&latency=40")).toEqual({ ...TEST_DEFAULTS, input: "scripts/a.json", latency: 40 });
@@ -114,4 +116,23 @@ test("checks=0 turns the checker off, as a release build plays; anything but 0 o
   expect(parseTestParams("#test&checks=0")!.checks).toBe(0);
   expect(parseTestParams("#test")!.checks).toBe(1);
   expect(() => parseTestParams("#test&checks=2")).toThrow("checks=2 must be 0 or 1");
+});
+
+test("test mode runs on this machine and on a private network's addresses, never a name", () => {
+  for (const h of ["localhost", "127.0.0.1", "10.0.0.7", "172.16.4.2", "172.31.255.1", "192.168.1.20", "100.74.48.38", "169.254.3.4"]) expect(mayTest(h)).toBe(true);
+  for (const h of ["example.com", "8.8.8.8", "172.32.0.1", "192.169.0.1", "10.0.0.256", "192.168.1.20.example.com", "100.128.0.1"]) expect(mayTest(h)).toBe(false);
+});
+
+test("show=1's summary names the intervals, when it was playable, and the adapter", () => {
+  const lines = summaryLines(
+    { began_ms: [1000, 1016, 1050, 1066], printed: ["hi", "playable"], printed_in: [0, 2], opened_ms: 900, pipelines_ms: 12.5 },
+    "apple metal-3",
+  );
+  expect(lines).toEqual([
+    "4 frames; intervals p50 16.0 ms, p95 34.0 ms, p99 34.0 ms; over 33 ms: 1",
+    "first frame 100.0 ms after the page opened",
+    "playable 150.0 ms",
+    "pipelines 12.5 ms",
+    "apple metal-3",
+  ]);
 });

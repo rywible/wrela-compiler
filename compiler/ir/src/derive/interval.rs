@@ -34,7 +34,6 @@
 //! is skipped).
 
 use super::*;
-use crate::single_exit::single_exit;
 use std::collections::HashMap;
 
 type R<T> = Result<T>;
@@ -43,6 +42,21 @@ type Iv = (ValueId, ValueId);
 
 const F32_EPS: f64 = 1.0 / 8_388_608.0; // 2^-23: one ulp at 1
 const F64_EPS: f64 = f64::EPSILON;
+/// A half float's rounding, for a precision report's second walk ([`Report`]): its unit
+/// roundoff, 2⁻¹¹, and its smallest normal, 2⁻¹⁴, below which a GPU may flush it to zero.
+const F16_EPS: f64 = 1.0 / 2048.0;
+const F16_TINY: f64 = 1.0 / 16384.0;
+
+/// A walk for a precision report (`wrela precision`, `std::derive::precision`): every active
+/// value's range is noted through `note`, std's `precision_note`, with where it's computed and
+/// what computes it. With `half`, each operation widens by a half float's rounding instead of an
+/// `f32`'s: `max(|x| k 2⁻¹¹, 2⁻¹⁴)` for `k` ulps, std's own table of them. The walk doesn't
+/// derive in `f16` (E0700): it's the `f32` walk, widened more.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct Report {
+    pub half: bool,
+    pub note: FuncId,
+}
 
 pub(super) fn interval(
     m: &mut Module,
@@ -50,8 +64,8 @@ pub(super) fn interval(
     f: FuncId,
     ncap: u32,
     target: Target,
-    box_ty: TypeId,
-    interval_ty: TypeId,
+    (box_ty, interval_ty): (TypeId, TypeId),
+    report: Option<Report>,
 ) -> R<FuncId> {
     let func = m.functions[f.index()].clone_signature();
     let xi = ncap as usize;
@@ -75,7 +89,7 @@ pub(super) fn interval(
     let out_ty = func.ret.unwrap_or(f32);
     let mut mask = vec![0; func.params.len()];
     mask[xi] = all_bits(&m.types, x_ty);
-    let d = derive(m, cache, f, mask.clone(), target, false)?;
+    let d = derive(m, cache, f, mask.clone(), target, false, report)?;
     let returns = returns_active(m, cache, f, mask, Mode::Interval) != 0;
 
     let mut params = func.params[..xi].to_vec();
@@ -148,8 +162,9 @@ fn derive(
     mask: Vec<Bits>,
     target: Target,
     speculative: bool,
+    report: Option<Report>,
 ) -> R<FuncId> {
-    if let Some(&d) = cache.interval.get(&(f, mask.clone())) {
+    if let Some(&d) = cache.intervals(report).get(&(f, mask.clone())) {
         // A call back into one being built recurses. If a call on the way runs under a branch
         // on the input, so does the recursion, and running both sides may never end.
         let open = cache.building.iter().position(|(g, mk, _)| *g == f && *mk == mask);
@@ -167,32 +182,8 @@ fn derive(
     }
     let orig = m.functions[f.index()].clone();
     no_gpu_work(&orig.body)?;
-    let exit = single_exit(m, &orig);
     let returns = returns_active(m, cache, f, mask.clone(), Mode::Interval) != 0;
-    let (mut func, result, mut act) = match exit {
-        None => (orig, None, body_activity(m, cache, f, &mask, Mode::Interval)),
-        Some((func, result)) => {
-            let act = activity(m, &func, &mask, Mode::Interval, &mut |g, mk| {
-                effect(m, cache, g, mk, Mode::Interval)
-            });
-            (func, result, act)
-        }
-    };
-    // A loop that leaves early on the input runs its own count instead, with flags
-    // (`exits.rs`); what's left is a loop whose own count depends on the input.
-    // (What a call of `f` does, its `effect`, is the flagged loop's too.)
-    let bool_ty = m.types.bool();
-    if act.active_loop_exit.is_some()
-        && let Some(flagged) = super::exits::flag_exits(&func, bool_ty, &|v| act.value(v))
-    {
-        let again = activity(m, &flagged, &mask, Mode::Interval, &mut |g, mk| {
-            effect(m, cache, g, mk, Mode::Interval)
-        });
-        if again.active_loop_exit.is_none() {
-            func = flagged;
-            act = again;
-        }
-    }
+    let (func, result, act) = super::one_exit(m, cache, f, orig, &mask);
     if let Some(at) = act.active_loop_exit {
         return Err(Error::ActiveLoopExit(
             "a loop exits here depending on the input; an interval needs loops that run the \
@@ -204,7 +195,10 @@ fn derive(
     no_write_through_mut(&func, &act, &mask, "a range")?;
     no_half_ranges(m, &func, &act)?;
     let mut nf = func.clone_signature();
-    nf.name = format!("{}_iv", func.name);
+    nf.name = match report {
+        Some(r) => format!("{}_iv{}", func.name, if r.half { 16 } else { 32 }),
+        None => format!("{}_iv", func.name),
+    };
     nf.interval = true;
     // A range's `lo` takes the original's slot, as a range type.
     let mut hparam = vec![None; func.params.len()];
@@ -242,7 +236,7 @@ fn derive(
     // Cached before its body is built, for calls back into it; removed again if building
     // fails, so a later request doesn't find the bodiless placeholder.
     let key = (f, mask);
-    cache.interval.insert(key.clone(), id);
+    cache.intervals(report).insert(key.clone(), id);
     cache.building.push((f, key.1.clone(), speculative));
     let ptrs = Pointers::of(m, &func);
     let local_src = single_stores(m, &func);
@@ -264,6 +258,7 @@ fn derive(
         returns,
         speculative: 0,
         track: Track::default(),
+        report,
     };
     let mut body = Vec::new();
     let built = (|| -> R<()> {
@@ -281,7 +276,7 @@ fn derive(
     })();
     b.cache.building.pop();
     if let Err(e) = built {
-        b.cache.interval.remove(&key);
+        b.cache.intervals(report).remove(&key);
         return Err(e);
     }
     let mut nf = b.nf;
@@ -395,6 +390,7 @@ struct Ivx<'a> {
     /// How many branches deep we are that run whether or not a point would take them.
     speculative: u32,
     track: Track,
+    report: Option<Report>,
 }
 
 impl Builder for Ivx<'_> {
@@ -516,13 +512,23 @@ impl<'a> Ivx<'a> {
     }
 
     fn eps(&self, ty: TypeId) -> f64 {
-        if self.elem(ty) == Scalar::F64 { F64_EPS } else { F32_EPS }
+        match self.elem(ty) {
+            Scalar::F64 => F64_EPS,
+            _ if self.half() => F16_EPS,
+            _ => F32_EPS,
+        }
+    }
+
+    /// Whether this is a precision report's half-float walk ([`Report`]).
+    fn half(&self) -> bool {
+        self.report.is_some_and(|r| r.half)
     }
 
     /// The smallest step a rounded result can be off by near zero.
     fn tiny(&self, ty: TypeId) -> f64 {
         match (self.target, self.elem(ty)) {
             (_, Scalar::F64) => f64::from_bits(1),
+            (_, _) if self.half() => F16_TINY,
             (Target::Cpu, _) => f32::from_bits(1) as f64,
             (Target::Gpu, _) => f32::MIN_POSITIVE as f64,
         }
@@ -530,6 +536,63 @@ impl<'a> Ivx<'a> {
 
     fn gpu(&self) -> bool {
         self.target == Target::Gpu
+    }
+
+    // ---- a precision report's notes --------------------------------------------------------
+
+    /// For a report ([`Report`]): notes `r`, the range of a value that `e` computes, through
+    /// std's `precision_note`: the walk, where (file and byte), whether it's an integer, the
+    /// operation's name (12 bytes of it, little-endian), and the range's hull over its
+    /// components, as `f32`s. Loads, constructions and projections aren't operations.
+    fn note(&mut self, out: &mut Block, e: &Expr, r: Iv) {
+        let (Some(report), Some(at)) = (self.report, self.track.at) else { return };
+        let op = match e {
+            Expr::Binary(op, ..) => format!("{op:?}"),
+            Expr::Unary(op, _) => format!("{op:?}"),
+            Expr::Builtin(b, _) => format!("{b:?}"),
+            Expr::Convert(..) => "Convert".to_string(),
+            _ => return,
+        };
+        let ty = self.ty(r.0);
+        let (s, n) = match *self.m.types.get(ty) {
+            TypeDef::Scalar(s) => (s, None),
+            TypeDef::Vector(s, n) => (s, Some(n as u32)),
+            _ => return,
+        };
+        if !matches!(s, Scalar::F32 | Scalar::U32 | Scalar::I32) {
+            return;
+        }
+        let f32t = self.m.types.f32();
+        let st = self.m.types.scalar(s);
+        let mut ends = [r.0, r.1].map(|v| {
+            (0..n.unwrap_or(1))
+                .map(|c| if n.is_some() { self.emit(out, st, Expr::Extract(v, c)) } else { v })
+                .collect::<Vec<_>>()
+        });
+        let mut hull = Vec::new();
+        for (k, comps) in ends.iter_mut().enumerate() {
+            let b = if k == 0 { Builtin::Min } else { Builtin::Max };
+            let mut x = comps[0];
+            for &c in &comps[1..] {
+                x = self.builtin(out, b, vec![x, c], st);
+            }
+            if s != Scalar::F32 {
+                x = self.emit(out, f32t, Expr::Convert(x, Scalar::F32));
+            }
+            hull.push(x);
+        }
+        let u32t = self.m.types.u32();
+        let mut name = op.to_lowercase().into_bytes();
+        name.resize(12, 0);
+        let mut words: Vec<u32> =
+            vec![report.half as u32, at.file.0, at.start, (s != Scalar::F32) as u32];
+        words.extend(name.chunks(4).map(|w| u32::from_le_bytes([w[0], w[1], w[2], w[3]])));
+        let mut args: Vec<Arg> = words
+            .into_iter()
+            .map(|w| Arg::Value(self.emit(out, u32t, Expr::Const(Const::U32(w)))))
+            .collect();
+        args.extend(hull.into_iter().map(Arg::Value));
+        out.push(Stmt::Eval(Expr::Call(report.note, args)));
     }
 
     // ---- widening ----------------------------------------------------------------------------
@@ -569,11 +632,13 @@ impl<'a> Ivx<'a> {
     ) -> Iv {
         let t = self.tiny(ty) + abs;
         let t = self.fc(out, ty, t);
+        // A half float's result is off by its rounding or, flushed, by at most its smallest
+        // normal: the larger of the two, not their sum.
         let dl = self.bin(out, BinOp::Mul, mag.0, k, ty);
-        let dl = self.bin(out, BinOp::Add, dl, t, ty);
+        let dl = self.near(out, dl, t, ty);
         let lo = self.bin(out, BinOp::Sub, x.0, dl, ty);
         let dh = self.bin(out, BinOp::Mul, mag.1, k, ty);
-        let dh = self.bin(out, BinOp::Add, dh, t, ty);
+        let dh = self.near(out, dh, t, ty);
         let hi = self.bin(out, BinOp::Add, x.1, dh, ty);
         if self.gpu() {
             return (lo, hi);
@@ -582,6 +647,16 @@ impl<'a> Ivx<'a> {
         // infinite here, so that no comparison or rule after it reads it as a decided answer.
         let inf = self.inf();
         (self.unless_nan(out, lo, ty, -inf), self.unless_nan(out, hi, ty, inf))
+    }
+
+    /// A rounding's margin `d` with the tiny `t` near zero: their sum, or for a half float
+    /// the larger.
+    fn near(&mut self, out: &mut Block, d: ValueId, t: ValueId, ty: TypeId) -> ValueId {
+        if self.half() {
+            self.builtin(out, Builtin::Max, vec![d, t], ty)
+        } else {
+            self.bin(out, BinOp::Add, d, t, ty)
+        }
     }
 
     /// `x`, or `to` in each component that's NaN.
@@ -1190,6 +1265,7 @@ impl<'a> Ivx<'a> {
             let r = self.expr(v, e, out)?;
             self.iv.insert(v, r);
             self.defs.insert(v, e.clone());
+            self.note(out, e, r);
         } else if let Expr::Extract(x, i) = e
             && self.act.value(*x)
         {
@@ -1286,7 +1362,15 @@ impl<'a> Ivx<'a> {
             out.push(let_or_eval(v, Expr::Call(g, args.to_vec())));
             return self.sync_hi(out, sync);
         }
-        let dg = derive(self.m, self.cache, g, mask.clone(), self.target, self.speculative > 0)?;
+        let dg = derive(
+            self.m,
+            self.cache,
+            g,
+            mask.clone(),
+            self.target,
+            self.speculative > 0,
+            self.report,
+        )?;
         let returns = returns_active(self.m, self.cache, g, mask.clone(), Mode::Interval) != 0;
         let mut new_args = Vec::new();
         let mut his = Vec::new();
@@ -1681,7 +1765,11 @@ impl<'a> Ivx<'a> {
                     (self.select(out, *cond, t.0, f.0), self.select(out, *cond, t.1, f.1))
                 }
             }
-            Expr::Const(_) | Expr::Zero(_) | Expr::EntryInput(_) | Expr::ArrayLength(_) => {
+            Expr::Const(_)
+            | Expr::Zero(_)
+            | Expr::EntryInput(_)
+            | Expr::Override(_)
+            | Expr::ArrayLength(_) => {
                 return Err(Error::internal("a constant marked active"));
             }
             Expr::Call(..) => unreachable!("calls are handled in `call_fn`"),
@@ -2838,8 +2926,9 @@ mod tests {
     fn an_empty_array_index_cannot_be_bounded() {
         for from_value in [false, true] {
             let (mut m, id) = indexed_array(0, Scalar::U32, from_value);
-            let err = derive(&mut m, &mut DeriveCache::default(), id, vec![1], Target::Cpu, false)
-                .expect_err("an empty array has no elements to bound");
+            let err =
+                derive(&mut m, &mut DeriveCache::default(), id, vec![1], Target::Cpu, false, None)
+                    .expect_err("an empty array has no elements to bound");
             assert!(matches!(err, Error::NotDerivable(..)), "{err}");
             assert!(err.message().contains("empty array"), "{err}");
         }
@@ -2848,7 +2937,7 @@ mod tests {
     #[test]
     fn signed_indices_into_large_arrays_have_valid_intervals() {
         let (mut m, id) = indexed_array(1 << 31, Scalar::I32, false);
-        derive(&mut m, &mut DeriveCache::default(), id, vec![1], Target::Cpu, false)
+        derive(&mut m, &mut DeriveCache::default(), id, vec![1], Target::Cpu, false, None)
             .expect("a signed index can reach the first half of a large array");
         verify(&m).expect("the derived array read has valid bounds and types");
     }
@@ -2892,7 +2981,7 @@ mod tests {
         f.body = body;
         let id = m.add_function(f);
         verify(&m).expect("the source is valid IR");
-        derive(&mut m, &mut DeriveCache::default(), id, vec![1], Target::Cpu, false)
+        derive(&mut m, &mut DeriveCache::default(), id, vec![1], Target::Cpu, false, None)
             .expect("the vector operation can be bounded");
         verify(&m).expect("the derived operation keeps every component's type");
     }

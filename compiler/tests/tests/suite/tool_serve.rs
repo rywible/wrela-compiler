@@ -21,6 +21,8 @@ use wrela_host::tool::{BlobBudget, Caps, End, Ended, Grants, Testing};
 ///   and `/quit` it answers `bye`, then ends);
 /// - `nothing`: waits 0.2 s for a post that doesn't come, and ends;
 /// - `end`: serves until it's interrupted;
+/// - `lan`: serves the LAN too, prints each URL a device there opens it at, and serves until
+///   it's interrupted;
 /// - `unread`: starts serving on the port its third argument names, and waits, without reading
 ///   the answer, until it's interrupted.
 ///
@@ -54,7 +56,7 @@ pub fn tool() -> u32 {
     }
     // Long enough, for `end`, that a post is still waiting when the tool ends.
     let post_timeout = if what.as_str() == "end" { 600.0 } else { 0.3 }
-    let s = serve::start(root.as_str(), u16(port), post_timeout)
+    let s = serve::start(root.as_str(), u16(port), post_timeout, lan: what.as_str() == "lan")
     if what.as_str() == "unread" {
         let _ = time::after(600.0).wait()
         return 0
@@ -69,7 +71,13 @@ pub fn tool() -> u32 {
         },
     }
     print(f"serving {started.origin.as_str()}")
-    if what.as_str() == "end" {
+    for url in started.lan {
+        print(f"lan {url.as_str()}")
+    }
+    if what.as_str() == "lan" {
+        print("lan done")
+    }
+    if what.as_str() == "end" || what.as_str() == "lan" {
         let _ = time::after(600.0).wait()
         return 0
     }
@@ -441,4 +449,57 @@ fn a_post_whose_body_comes_past_its_deadline_fails_then_and_reaches_no_one() {
     assert_eq!(tool.join().expect("the tool's thread").end, End::Exit(0));
     let said: Vec<String> = lines.try_iter().collect();
     assert!(said.is_empty(), "the late post reached the tool: {said:?}");
+}
+
+/// A server on the LAN (`lan: true`) answers a device there at this machine's own address: a GET
+/// of its page, and a PUT of a result, which lands in `results/`; a request naming another
+/// host is refused, as on the loopback.
+#[test]
+fn a_server_on_the_lan_answers_this_machines_address_and_takes_results() {
+    let addresses = wrela_host::loopback::lan_urls(&["x".into()], 1);
+    assert_eq!(addresses, ["http://x:1/"]);
+    let root = scratch("serve-lan");
+    std::fs::write(root.join("index.html"), "the page").expect("a page");
+    let grants = Grants::default().root("site", &root, true);
+    let interrupt = Arc::new(AtomicBool::new(false));
+    let args = ["lan".into(), "site".into()];
+    let (lines, tool) =
+        serving_with("lan", grants, &args, None, Testing::default(), Some(interrupt.clone()));
+    let port = port_of(&lines);
+    let mut urls = Vec::new();
+    loop {
+        let line = lines.recv_timeout(Duration::from_secs(20)).expect("the tool's lines");
+        match line.strip_prefix("lan ") {
+            Some("done") => break,
+            Some(url) => urls.push(url.to_string()),
+            None => panic!("{line}"),
+        }
+    }
+    if urls.is_empty() {
+        // A machine on no network has no address to serve the LAN at.
+        interrupt.store(true, Ordering::Release);
+        let _ = tool.join();
+        eprintln!("this machine has no LAN address: nothing to test");
+        return;
+    }
+    let host = urls[0].trim_start_matches("http://").trim_end_matches('/').to_string();
+    let ask = |request: String| {
+        let mut s = TcpStream::connect(host.as_str()).expect("connect at the LAN address");
+        s.set_read_timeout(Some(Duration::from_secs(10))).expect("a timeout");
+        s.write_all(request.as_bytes()).expect("the request");
+        let mut response = Vec::new();
+        let _ = s.read_to_end(&mut response);
+        String::from_utf8_lossy(&response).into_owned()
+    };
+    let got = ask(format!("GET /index.html HTTP/1.1\r\nHost: {host}\r\n\r\n"));
+    assert!(got.starts_with("HTTP/1.1 200") && got.ends_with("the page"), "{got}");
+    let put =
+        ask(format!("PUT /results/DONE HTTP/1.1\r\nHost: {host}\r\nContent-Length: 2\r\n\r\nok"));
+    assert!(put.starts_with("HTTP/1.1 201"), "{put}");
+    assert_eq!(std::fs::read_to_string(root.join("results/DONE")).expect("the result"), "ok");
+    let other = ask("GET /index.html HTTP/1.1\r\nHost: example.com\r\n\r\n".to_string());
+    assert!(other.starts_with("HTTP/1.1 403"), "{other}");
+    let _ = port;
+    interrupt.store(true, Ordering::Release);
+    assert_eq!(tool.join().expect("the tool's thread").end, End::Interrupted);
 }

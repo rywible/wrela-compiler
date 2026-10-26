@@ -214,6 +214,7 @@ macro_rules! lang_items {
                         | Lang::CopyBufferToTextureCommand
                         | Lang::ScissorCommand
                         | Lang::ViewportCommand
+                        | Lang::ScreenCommand
                         | Lang::LabelCommand
                         | Lang::ReadBufferCommand
                         | Lang::TimedCommand
@@ -463,6 +464,7 @@ lang_items! {
     CopyTextureToBufferCommand = "std::gpu::copy_texture_to_buffer_command",
     CopyBufferToTextureCommand = "std::gpu::copy_buffer_to_texture_command",
     ScissorCommand = "std::gpu::scissor_command",
+    ScreenCommand = "std::gpu::screen_command",
     ViewportCommand = "std::gpu::viewport_command",
     LabelCommand = "std::gpu::label_command",
     EndPass = "std::gpu::end_pass_command",
@@ -487,6 +489,12 @@ lang_items! {
     TextureLayers = "std::gpu::texture_layers",
     TextureSampleCompare = "std::gpu::texture_sample_compare",
     TextureSampleCompareLevel = "std::gpu::texture_sample_compare_level",
+    TextureGather = "std::gpu::texture_gather",
+    ArrayGather = "std::gpu::array_gather",
+    DepthGather = "std::gpu::depth_gather",
+    DepthGatherCompare = "std::gpu::depth_gather_compare",
+    DepthArrayGather = "std::gpu::depth_array_gather",
+    DepthArrayGatherCompare = "std::gpu::depth_array_gather_compare",
     TextureLoad = "std::gpu::texture_load",
     DepthLoad = "std::gpu::depth_load",
     Texture3dSampleLevel = "std::gpu::texture3d_sample_level",
@@ -583,7 +591,21 @@ lang_items! {
     ValueAndGradient = "std::derive::value_and_gradient",
     ValueGradientWith = "std::derive::value_gradient_with",
     IntervalOf = "std::derive::interval",
+    Precision = "std::derive::precision",
+    PrecisionNote = "std::derive::precision_note",
     Filtered = "std::derive::filtered",
+    TapeOf = "std::derive::tape",
+    TapeWith = "std::derive::tape_with",
+    TapeSized = "std::derive::tape_sized",
+    Building = "std::stage::Building",
+    PushOne = "std::stage::push_one",
+    PushTwo = "std::stage::push_two",
+    PushNew = "std::stage::push_new",
+    TapeFinish = "std::stage::finish",
+    Smin = "std::field::smin",
+    ValueNoise = "std::field::value_noise",
+    LatticeCoord = "std::field::lattice_coord",
+    Pcg = "std::hash::pcg",
     LiftGradient = "std::lift::gradient",
     LiftReads = "std::lift::reads",
     LiftCount = "std::lift::literal_count",
@@ -817,6 +839,9 @@ pub struct ParamSig {
     pub span: Span,
     /// The receiver, `self`.
     pub is_self: bool,
+    /// `name: const T`: a GPU entry point's build-time constant, a pipeline-overridable
+    /// constant of its pipeline (§18.1).
+    pub is_const: bool,
 }
 
 /// Which host runs a build (language.md §15.3): a client's (the browser's, with a screen), a

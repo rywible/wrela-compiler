@@ -10,13 +10,14 @@ import { type Command, onePass, StreamError } from "../src/stream.ts";
 import { Lines, locate, wasmOffsets } from "../src/lines.ts";
 import { Net } from "../src/net.ts";
 import { Encoder } from "./encoder.ts";
+import { abiOf, loadProgram } from "./wasm-abi.ts";
 import { checker, Recorder, readFixture, readFixtureText, shapes } from "./fixtures.ts";
 import { batchProgram, buildModule, FRAME_TYPE, type Import, op, SUBMIT } from "./wasm-builder.ts";
 
 const U16 = new Uint8Array(16);
 
 async function load(wasm: Uint8Array<ArrayBuffer>): Promise<Program> {
-  return Program.load(wasm, checker(), new Recorder(), { hash: true });
+  return loadProgram(wasm, checker(), new Recorder(), { hash: true });
 }
 
 /** Runs every frame of a batch program; returns the program and the first error. */
@@ -153,9 +154,32 @@ describe("the ABI check", () => {
     await expect(load(wasm)).rejects.toThrow(ProgramError);
   });
 
-  test("accepts the first-light fixture", async () => {
+  test("accepts the first-light fixture, whose manifest states what its bytes say", async () => {
     const wasm = readFixture("game.wasm");
-    checkAbi(await WebAssembly.compile(wasm), wasm);
+    const abi = parseManifest(new TextDecoder().decode(readFixture("manifest.json"))).wasm_abi;
+    expect(abi).toEqual(abiOf(wasm));
+    expect(checkAbi(await WebAssembly.compile(wasm), abi)).toEqual({ initial: 1, maximum: 16384, shared: true });
+  });
+
+  test("refuses a manifest whose wasm_abi isn't the module's, or that has none", async () => {
+    const wasm = readFixture("game.wasm");
+    const module = await WebAssembly.compile(wasm);
+    const abi = abiOf(wasm);
+    expect(() => checkAbi(module, null)).toThrow("doesn't state its WASM's interface");
+    const renamed = { ...abi, imports: abi.imports.map(([m, n, t]) => [m, n === "submit" ? "print" : n, t] as [string, string, string]) };
+    expect(() => checkAbi(module, renamed)).toThrow("doesn't describe its WASM");
+  });
+
+  test("compiles a WASM response as it streams, and a mislabelled one from its bytes", async () => {
+    const wasm = readFixture("game.wasm");
+    const abi = abiOf(wasm);
+    const streamed = await Program.compile(new Response(wasm, { headers: { "Content-Type": "application/wasm" } }), abi, true);
+    expect(streamed.streamed).toBe(true);
+    const fallback = await Program.compile(new Response(wasm, { headers: { "Content-Type": "text/plain" } }), abi, true);
+    expect(fallback.streamed).toBe(false);
+    expect(fallback.hash).toBe(streamed.hash);
+    expect(fallback.hash).not.toBeNull();
+    expect((await Program.compile(wasm, abi)).hash).toBeNull();
   });
 });
 
@@ -214,7 +238,7 @@ test("initialization and other exports flush their completed command work", asyn
   const written = new Encoder().writeBuffer(1, 0, new Uint8Array(4)).finish();
   const submit = (offset: number, length: number) => [...op.i32(offset), ...op.i32(length), ...op.call(0)];
   const executor = new Recorder();
-  const program = await Program.load(buildModule({
+  const program = await loadProgram(buildModule({
     imports: [SUBMIT], memory: 1,
     funcs: [frameOnly,
       { type: { params: [], results: [] }, body: submit(16, created.length), export: "init" },
@@ -260,7 +284,7 @@ test("a program without helper control memory reports no helper work", async () 
 
 test("requesting tick hashes accepts programs without ticker control memory", async () => {
   for (const memory of [0, 1]) {
-    const program = await Program.load(buildModule({ memory, funcs: [frameOnly] }), checker(), new Recorder(), { tickHashes: true });
+    const program = await loadProgram(buildModule({ memory, funcs: [frameOnly] }), checker(), new Recorder(), { tickHashes: true });
     expect(() => program.frame(0, 1, 1)).not.toThrow();
     expect(program.ticker).toBeNull();
   }
@@ -271,7 +295,7 @@ test("a helper export needs control memory before any helper is started", async 
   const wasm = buildModule({ memory: 0, funcs: [frameOnly,
     { type: { params: ["i32"], results: [] }, body: [], export: "__worker" },
   ] });
-  await expect(Program.load(wasm, checker(), new Recorder(), {
+  await expect(loadProgram(wasm, checker(), new Recorder(), {
     workers: 3, spawnWorker: () => { spawned++; },
   })).rejects.toThrow("it exports `__worker` but its memory is 0 bytes; the helpers need at least 276");
   expect(spawned).toBe(0);
@@ -294,7 +318,7 @@ test("a rejected command leaves no trace", async () => {
   // the same way, not as a second pass.)
   const nan = new Encoder().beginScreenPass([NaN, 0, 0, 1]).finish();
   const executor = new Recorder();
-  const program = await Program.load(batchProgram([[nan]]), checker(), executor);
+  const program = await loadProgram(batchProgram([[nan]]), checker(), executor);
   expect(() => program.frame(0, 64, 64)).toThrow(CommandError);
   expect(() => program.frame(1 / 60, 64, 64)).toThrow("the clear colour's r isn't a finite number");
   expect(executor.log).toEqual([]);
@@ -314,7 +338,7 @@ test("nothing runs after the host fails a command", async () => {
   }
   const pass = new Encoder().beginScreenPass([0, 0, 0, 0]).present().finish();
   const executor = new FailsOnce();
-  const program = await Program.load(batchProgram([[pass], [pass]]), checker(), executor);
+  const program = await loadProgram(batchProgram([[pass], [pass]]), checker(), executor);
   expect(() => program.frame(0, 64, 64)).toThrow("lost");
   expect(() => program.frame(1 / 60, 64, 64)).toThrow("the host failed to carry out an earlier command (lost)");
   expect(executor.log).toEqual(["BeginScreenPass"]);
@@ -324,7 +348,7 @@ test("a synchronous capability failure during commit prevents later commands", a
   const bad = new Encoder().unprepare("floor").createBuffer(1, 4).finish();
   const next = new Encoder().writeBuffer(1, 0, new Uint8Array(4)).finish();
   const executor = new Recorder();
-  const program = await Program.load(batchProgram([[bad], [next]]), checker(), executor, { builds: {
+  const program = await loadProgram(batchProgram([[bad], [next]]), checker(), executor, { builds: {
     prepare: async () => {}, handOver: async () => {}, unprepare: () => { throw new Error("capability lost"); },
   } });
   expect(() => program.frame(0, 1, 1)).toThrow("capability lost");
@@ -337,7 +361,7 @@ test("a failure while flushing committed work prevents later commands", async ()
     override flush(): void { throw new Error("flush lost"); }
   }
   const executor = new FailedFlush();
-  const program = await Program.load(batchProgram([
+  const program = await loadProgram(batchProgram([
     [new Encoder().createBuffer(1, 4).finish()],
     [new Encoder().writeBuffer(1, 0, new Uint8Array(4)).finish()],
   ]), checker(), executor);
@@ -375,7 +399,7 @@ test("a failed audio or ticker start fails the call even if the module catches i
   ];
   for (const { host, args, message } of cases) {
     const body = [0x06, 0x40, ...args.flatMap(op.i32), ...op.call(0), 0x19, 0x0b];
-    const program = await Program.load(
+    const program = await loadProgram(
       buildModule({ imports: [host], memory: 1, funcs: [{ type: FRAME_TYPE, body, export: "frame" }] }),
       checker(),
       new Recorder(),
@@ -404,7 +428,7 @@ test("invalid memory and request imports fail the call even if the module catche
   for (const { name, args, result, message } of cases) {
     const host: FuncImport = { module: "wrela", name, kind: "func", type: { params: args.map(() => "i32"), results: result ? ["i32"] : [] } };
     const body = [0x06, 0x40, ...args.flatMap(op.i32), ...op.call(0), ...(result ? [0x1a] : []), 0x19, 0x0b];
-    const program = await Program.load(
+    const program = await loadProgram(
       buildModule({ imports: [host], memory: 1, funcs: [{ type: FRAME_TYPE, body, export: "frame" }] }),
       checker(), new Recorder(), { kept: Uint8Array.of(1) },
     );
@@ -457,7 +481,7 @@ test("a trapping export commits none of its submitted commands", async () => {
   const batch = new Encoder().createBuffer(1, 16).finish();
   for (const name of ["init", "frame", "other"]) {
     const executor = new Recorder();
-    const loading = Program.load(buildModule({
+    const loading = loadProgram(buildModule({
       imports: [SUBMIT], memory: 1,
       funcs: [...(name === "frame" ? [] : [frameOnly]), {
         type: name === "frame" ? FRAME_TYPE : { params: [], results: [] },
@@ -498,7 +522,7 @@ test("a trapped call restores replaced resources and its open pass", async () =>
     return { type: { params: [], results: [] }, body, export: ["init", "bad", "recover"][i]! };
   });
   const executor = new Recorder();
-  const program = await Program.load(buildModule({ imports: [SUBMIT], memory: 1, funcs: [frameOnly, ...funcs], data }), checker(), executor);
+  const program = await loadProgram(buildModule({ imports: [SUBMIT], memory: 1, funcs: [frameOnly, ...funcs], data }), checker(), executor);
   const initialized = executor.log.slice();
   expect(() => program.call("bad")).toThrow(TrapError);
   expect(executor.log).toEqual(initialized);
@@ -515,7 +539,7 @@ test("submitted bytes survive reuse of the program's command memory before retur
       super.execute(cmd);
     }
   }
-  const program = await Program.load(buildModule({ imports: [SUBMIT], memory: 1, funcs: [{
+  const program = await loadProgram(buildModule({ imports: [SUBMIT], memory: 1, funcs: [{
     type: FRAME_TYPE, export: "frame", body: [
       ...op.i32(16), ...op.i32(batch.length), ...op.call(0),
       ...op.i32(16 + batch.length - 4), ...op.i32(0x08070605), 0x36, 0x02, 0x00,
@@ -530,7 +554,7 @@ test("a trapped call prints immediately while its command work is discarded", as
   const batch = new Encoder().createBuffer(1, 4).finish();
   const line = new TextEncoder().encode("before trap");
   const executor = new Recorder();
-  const program = await Program.load(buildModule({ imports: [SUBMIT, PRINT], memory: 1, funcs: [{
+  const program = await loadProgram(buildModule({ imports: [SUBMIT, PRINT], memory: 1, funcs: [{
     type: FRAME_TYPE, export: "frame", body: [
       ...op.i32(16), ...op.i32(batch.length), ...op.call(0),
       ...op.i32(16 + batch.length), ...op.i32(line.length), ...op.call(1), ...op.unreachable,
@@ -570,7 +594,7 @@ test("a host TrapError has one prefix and still yields to the program's panic me
   const panic = new Uint8Array(8);
   new DataView(panic.buffer).setUint32(0, 4, true);
   panic.set(new TextEncoder().encode("oops"), 4);
-  const program = await Program.load(
+  const program = await loadProgram(
     buildModule({
       imports: [KEEP],
       memory: 20,
@@ -665,7 +689,7 @@ test("writable aliases and clear colours", async () => {
     ];
   }
   const why = async (manifest: typeof m, batch: Uint8Array) => {
-    const program = await Program.load(batchProgram([[batch]]), checker(manifest), new Recorder());
+    const program = await loadProgram(batchProgram([[batch]]), checker(manifest), new Recorder());
     try {
       program.frame(0, 64, 64);
     } catch (e) {
@@ -705,17 +729,17 @@ test("first-light's CPU side gives the native host's state hash", async () => {
   // runtime/native/tests/suite/gpu.rs derives this hash independently (with the Rust reference
   // encoder) and checks the native host computes it; suite/agreement.rs checks Chrome does.
   const manifest = parseManifest(readFixtureText("manifest.json"));
-  const program = await Program.load(readFixture("game.wasm"), checker(manifest), new Recorder(), { hash: true });
+  const program = await loadProgram(readFixture("game.wasm"), checker(manifest), new Recorder(), { hash: true });
   for (let i = 0; i < 60; i++) program.frame(i / 60, 640, 360);
   // Stream v11 changes the batch headers; the native reference encoder checks the same bytes.
-  expect(program.hash!.hex()).toBe("987ca2ba293937b5");
+  expect(program.hash!.hex()).toBe("7351032fefe87fcc");
   const log = (program.executor as Recorder).log;
   expect(log.slice(0, 7)).toEqual(["CreateBuffer", "WriteBuffer", "Dispatch", "BeginScreenPass", "Draw", "Present", "end"]);
   expect(log.length).toBe(3 + 60 * 4);
 });
 
 test("runs without the state hash unless asked", async () => {
-  const program = await Program.load(readFixture("game.wasm"), checker(), new Recorder());
+  const program = await loadProgram(readFixture("game.wasm"), checker(), new Recorder());
   expect(program.hash).toBeNull();
 });
 
@@ -742,8 +766,8 @@ describe("requests", () => {
 
   /** A program whose `ask` submits `batch`, `status` is request 4's status, and `take` takes
    * its answer into memory and returns the answer's first word. */
-  const program = (batch: Uint8Array, io?: Parameters<typeof Program.load>[3]) =>
-    Program.load(
+  const program = (batch: Uint8Array, io?: ProgramOptions) =>
+    loadProgram(
       buildModule({
         imports: [SUBMIT, STATUS, TAKE],
         memory: 1,
@@ -767,7 +791,7 @@ describe("requests", () => {
     const good = new Encoder().createBuffer(1, 4).fetch(4, "level").finish();
     let fetched = 0;
     const executor = new Recorder();
-    const p = await Program.load(buildModule({
+    const p = await loadProgram(buildModule({
       imports: [SUBMIT], memory: 1, funcs: [frameOnly,
         { type: NONE_TYPE, export: "bad", body: [0x06, 0x40, ...op.i32(16), ...op.i32(bad.length), ...op.call(0), 0x19, 0x0b] },
         { type: NONE_TYPE, export: "good", body: [...op.i32(16 + bad.length), ...op.i32(good.length), ...op.call(0)] },
@@ -789,7 +813,7 @@ describe("requests", () => {
     const later = new Encoder().writeBuffer(1, 4, new Uint8Array(4)).finish();
     const executor = new Recorder();
     let fetched = 0;
-    const p = await Program.load(buildModule({ imports: [SUBMIT], memory: 1, funcs: [{
+    const p = await loadProgram(buildModule({ imports: [SUBMIT], memory: 1, funcs: [{
       type: FRAME_TYPE, export: "frame", body: [
         ...op.i32(16), ...op.i32(earlier.length), ...op.call(0),
         ...op.i32(16 + earlier.length), ...op.i32(later.length), ...op.call(0),
@@ -955,7 +979,7 @@ describe("requests", () => {
     const fetched = spyOn(globalThis, "fetch").mockImplementation((() => new Promise<Response>(() => {})) as unknown as typeof fetch);
     const log = spyOn(console, "log").mockImplementation(() => {});
     try {
-      const p = await Program.load(paired, checker(), executor, { net });
+      const p = await loadProgram(paired, checker(), executor, { net });
       expect(() => p.frame(0, 1, 1)).toThrow("connection 7 is open");
       expect(executor.log).toEqual([]);
       expect(fetched).not.toHaveBeenCalled();
@@ -1017,7 +1041,7 @@ describe("the voice", () => {
 
   test("is handed to the audio thread once", async () => {
     const voices: { task: number; context: number }[] = [];
-    const p = await Program.load(wasm, checker(), new Recorder(), {
+    const p = await loadProgram(wasm, checker(), new Recorder(), {
       startVoice: (v) => voices.push({ task: v.task, context: v.context }),
     });
     expect(voices).toEqual([{ task: 3, context: 100 }]);
@@ -1038,7 +1062,7 @@ describe("the voice", () => {
     });
     let started = false;
     await expect(
-      Program.load(tooSmall, checker(), new Recorder(), { startVoice: () => (started = true) }),
+      loadProgram(tooSmall, checker(), new Recorder(), { startVoice: () => (started = true) }),
     ).rejects.toThrow(`it starts a voice but its memory is ${19 * 65536} bytes; the audio thread needs at least ${need}`);
     expect(started).toBe(false);
   });
@@ -1063,7 +1087,7 @@ test("a ticker needs its record region before it starts", async () => {
   });
   let started = false;
   await expect(
-    Program.load(wasm, checker(), new Recorder(), { startTicker: () => (started = true) }),
+    loadProgram(wasm, checker(), new Recorder(), { startTicker: () => (started = true) }),
   ).rejects.toThrow(`it starts a ticker but its memory is ${18 * 65536} bytes; the ticker needs at least ${need}`);
   expect(started).toBe(false);
 });
@@ -1087,7 +1111,7 @@ test("a ticker's rate is nonzero at the host boundary", async () => {
   let started = false;
   let error: unknown = null;
   try {
-    await Program.load(wasm, checker(), new Recorder(), { startTicker: () => (started = true) });
+    await loadProgram(wasm, checker(), new Recorder(), { startTicker: () => (started = true) });
   } catch (e) {
     error = e;
   }
@@ -1136,7 +1160,7 @@ test("a rejected init starts no voice or ticker and tells spawned helpers to sto
   let voices = 0;
   let tickers = 0;
   await expect(
-    Program.load(wasm, checker(), new Recorder(), {
+    loadProgram(wasm, checker(), new Recorder(), {
       workers: 3,
       spawnWorker: (_module, shared) => {
         memory = shared;
@@ -1161,7 +1185,7 @@ test("rejecting an empty-memory program preserves its initialization trap", asyn
   });
   let error: unknown = null;
   try {
-    await Program.load(wasm, checker(), new Recorder());
+    await loadProgram(wasm, checker(), new Recorder());
   } catch (e) {
     error = e;
   }
@@ -1211,7 +1235,7 @@ test("catch_all cannot hide a start function's host call", async () => {
       funcs: [frameOnly, { type: { params: [], results: [] }, body: caught }],
       start: 2,
     });
-    await expect(Program.load(wasm, checker(), new Recorder())).rejects.toThrow(
+    await expect(loadProgram(wasm, checker(), new Recorder())).rejects.toThrow(
       "its start function called the host",
     );
 
@@ -1232,7 +1256,7 @@ test("a printed line goes to the console as it's made, prefixed, and a phase is 
   const printedLines: string[] = [];
   const log = spyOn(console, "log").mockImplementation(() => {});
   try {
-    const program = await Program.load(
+    const program = await loadProgram(
       buildModule({
         imports: [PRINT, PHASE],
         memory: 1,
@@ -1255,7 +1279,7 @@ test("printed lines are strict UTF-8 and keep a byte-order mark", async () => {
   const PRINT: Import = { module: "wrela", name: "print", kind: "func", type: { params: ["i32", "i32"], results: [] } };
   const program = async (bytes: Uint8Array) => {
     const lines: string[] = [];
-    const p = await Program.load(
+    const p = await loadProgram(
       buildModule({
         imports: [PRINT],
         memory: 1,
@@ -1286,7 +1310,7 @@ test("printed lines are strict UTF-8 and keep a byte-order mark", async () => {
 test("a phase validates its memory range and UTF-8 name, and is timed only when the options ask", async () => {
   const PHASE: Import = { module: "wrela", name: "phase", kind: "func", type: { params: ["i32", "i32"], results: [] } };
   const program = (ptr: number, len: number, data: Uint8Array[] = [], options: ProgramOptions = {}) =>
-    Program.load(
+    loadProgram(
       buildModule({
         imports: [PHASE],
         memory: 1,
@@ -1334,7 +1358,7 @@ test("another thread's printed line is relayed to its program", async () => {
     thread: number;
     onPrint: (line: string) => void;
   } | null = null;
-  await Program.load(wasm, checker(), new Recorder(), {
+  await loadProgram(wasm, checker(), new Recorder(), {
     workers: 2,
     spawnWorker: (module, memory, thread, onPrint) => {
       helper = { module, memory, thread, onPrint };
@@ -1358,8 +1382,8 @@ describe("posts", () => {
   const STATUS = { module: "wrela", name: "request_status", kind: "func" as const, type: { params: ["i32" as const], results: ["i32" as const] } };
   const TAKE = { module: "wrela", name: "request_take", kind: "func" as const, type: { params: ["i32" as const, "i32" as const], results: [] } };
   const I32 = { params: [], results: ["i32" as const] };
-  const program = (batch: Uint8Array, io?: Parameters<typeof Program.load>[3]) =>
-    Program.load(
+  const program = (batch: Uint8Array, io?: ProgramOptions) =>
+    loadProgram(
       buildModule({
         imports: [SUBMIT, STATUS, TAKE],
         memory: 1,
@@ -1419,7 +1443,7 @@ describe("input", () => {
 
   test("is read oldest first, and what isn't read waits", async () => {
     const { pointerEvent, textEvent, keyEvent, bits } = await import("../src/input.ts");
-    const p = await Program.load(wasm, checker(), new Recorder());
+    const p = await loadProgram(wasm, checker(), new Recorder());
     p.queueInput(new Uint8Array([...pointerEvent(2, 3.5, 4, 2, 1), ...textEvent(0xe9), ...keyEvent(true, 40, false, 0)]));
     expect(p.call("take", 2)).toBe(2);
     expect(p.call("word", 1024)).toBe(2);
@@ -1449,7 +1473,7 @@ describe("input", () => {
   });
 
   test("a message's bytes are read in the call given it, and no later", async () => {
-    const p = await Program.load(messages, checker(), new Recorder());
+    const p = await loadProgram(messages, checker(), new Recorder());
     p.inbox.pushMessage(3, Uint8Array.of(9, 8, 7, 6, 5));
     // Its length, whatever it copied.
     expect(p.call("read", 2)).toBe(5);
@@ -1486,7 +1510,7 @@ describe("the checker in release and in test mode", () => {
 
   test("unchecked, as a release build plays, the command goes to WebGPU, whose error is fatal", async () => {
     const executor = new Recorder();
-    const program = await Program.load(batchProgram([[wrong]]), checker(), executor, { checking: false });
+    const program = await loadProgram(batchProgram([[wrong]]), checker(), executor, { checking: false });
     expect(() => program.frame(0, 64, 64)).not.toThrow();
     expect(executor.log).toEqual(["WriteBuffer", "end"]);
     const { openDevice, GpuError } = await import("../src/device.ts");
@@ -1521,14 +1545,14 @@ describe("the checker in release and in test mode", () => {
     ] as const;
     for (const [batch, message] of cases) {
       const executor = new Recorder();
-      const program = await Program.load(batchProgram([[batch]]), checker(), executor, { checking: false });
+      const program = await loadProgram(batchProgram([[batch]]), checker(), executor, { checking: false });
       expect(() => program.frame(0, 64, 64)).toThrow(message);
       expect(executor.log).toEqual([]);
     }
   });
 
   test("the sequencer checks either way", async () => {
-    const program = await Program.load(batchProgram([[new Encoder().draw(0, 3, 1, [], U16).finish()]]), checker(), new Recorder(), { checking: false });
+    const program = await loadProgram(batchProgram([[new Encoder().draw(0, 3, 1, [], U16).finish()]]), checker(), new Recorder(), { checking: false });
     expect(() => program.frame(0, 64, 64)).toThrow("out of sequence");
   });
 });
@@ -1549,7 +1573,7 @@ test("several uploads in one call each reach their buffer, though the program ov
     .writeBuffer(1, 0, want[0]!).writeBuffer(2, 0, want[1]!).writeBuffer(3, 0, want[2]!).finish();
   // submit(16, len), then memory.fill(16, 0, len): the command memory zeroed before return.
   const fill = [...op.i32(16), ...op.i32(0), ...op.i32(batch.length), 0xfc, 0x0b, 0x00];
-  const program = await Program.load(buildModule({ imports: [SUBMIT], memory: 1, funcs: [{
+  const program = await loadProgram(buildModule({ imports: [SUBMIT], memory: 1, funcs: [{
     type: FRAME_TYPE, export: "frame", body: [...op.i32(16), ...op.i32(batch.length), ...op.call(0), ...fill],
   }], data: [{ offset: 16, bytes: batch }] }), checker(), executor);
   program.frame(0, 64, 64);

@@ -14,6 +14,9 @@ pub enum Error {
     NotDerivable(String, Option<Span>),
     /// An interval of a function with a loop whose exit depends on the input.
     ActiveLoopExit(String, Option<Span>),
+    /// A tape (`std::derive::tape`) of a function that uses what a tape can't hold, and the
+    /// calls it was reached through, innermost first.
+    NotTapeable(String, Option<Span>, Vec<Span>),
     /// A bug: the IR breaks a rule the pass relies on.
     Internal(String),
 }
@@ -23,20 +26,40 @@ impl Error {
         Error::NotDerivable(message.into(), None)
     }
 
+    pub fn not_tapeable(message: impl Into<String>) -> Error {
+        Error::NotTapeable(message.into(), None, Vec::new())
+    }
+
     pub fn internal(message: impl Into<String>) -> Error {
         Error::Internal(message.into())
     }
 
     pub fn message(&self) -> &str {
         match self {
-            Error::NotDerivable(m, _) | Error::ActiveLoopExit(m, _) | Error::Internal(m) => m,
+            Error::NotDerivable(m, _)
+            | Error::ActiveLoopExit(m, _)
+            | Error::NotTapeable(m, ..)
+            | Error::Internal(m) => m,
+        }
+    }
+
+    /// The error, reached through a call at `at` (a tape's: [`Error::NotTapeable`]).
+    pub fn through(self, at: Option<Span>) -> Error {
+        match self {
+            Error::NotTapeable(m, s, mut calls) => {
+                calls.extend(at);
+                Error::NotTapeable(m, s, calls)
+            }
+            e => e,
         }
     }
 
     /// Where in the source the program's error is, if known.
     pub fn span(&self) -> Option<Span> {
         match self {
-            Error::NotDerivable(_, s) | Error::ActiveLoopExit(_, s) => *s,
+            Error::NotDerivable(_, s)
+            | Error::ActiveLoopExit(_, s)
+            | Error::NotTapeable(_, s, _) => *s,
             Error::Internal(_) => None,
         }
     }
@@ -46,6 +69,7 @@ impl Error {
         match self {
             Error::NotDerivable(m, None) => Error::NotDerivable(m, at),
             Error::ActiveLoopExit(m, None) => Error::ActiveLoopExit(m, at),
+            Error::NotTapeable(m, None, calls) => Error::NotTapeable(m, at, calls),
             e => e,
         }
     }

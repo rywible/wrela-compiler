@@ -774,6 +774,81 @@ fn std_counts_the_gpu_memory_a_program_holds() {
     assert_eq!(crate::tests_pass(&dir), 1);
 }
 
+/// A constant that is mostly zeros (compiler/tests/zero_runs, language.md §13): its 64 KiB
+/// table costs the WASM's data segments under a quarter of that, and both hosts read it back
+/// whole (the test runs `hosts: both`).
+#[test]
+#[ignore = "needs a GPU"]
+fn a_mostly_zero_constant_costs_its_bytes_only() {
+    let dir = wrela_tests::repo_root().join("compiler/tests/zero_runs");
+    assert_eq!(crate::tests_pass(&dir), 1);
+    let wasm = std::fs::read(crate::built("zero_runs").join("game.wasm")).expect("game.wasm");
+    let (segments, bytes) = wrela_wasm::data_segments(&wasm).expect("reads");
+    eprintln!("the 65,536-byte table: {segments} data segments of {bytes} bytes in all");
+    assert!(bytes < 65_536 / 4, "{bytes} bytes of data");
+}
+
+/// `const` parameters (compiler/tests/overrides, language.md §18.1): a kernel dispatched with
+/// two sets of constants is two pipelines, each made with its own, and both hosts compute what
+/// each set says; the microbench (compiler/tests/override_bench) times the `const` form and a
+/// uniform-branch twin. And pipeline tiers (compiler/tests/tiers): a tier-1 pipeline a frame
+/// needs first is made at once, on both hosts.
+#[test]
+#[ignore = "needs a GPU"]
+fn const_parameters_and_tiers_run_on_both_hosts() {
+    for (pkg, n) in [("overrides", 1), ("override_bench", 1), ("tiers", 1)] {
+        let dir = wrela_tests::repo_root().join("compiler/tests").join(pkg);
+        assert_eq!(crate::tests_pass(&dir), n, "{pkg}");
+    }
+}
+
+/// Tapes that can hold a creature (language.md §14.4): each new operation against its std
+/// twin at 10⁶ points on the CPU and the GPU (compiler/tests/tape_ops), and a full 4,096-op
+/// tape bound as storage, run on both hosts and timed (compiler/tests/tape_long).
+#[test]
+#[ignore = "needs a GPU"]
+fn tape_operations_match_their_twins_and_a_full_tape_runs() {
+    for (pkg, n) in [("tape_ops", 2), ("tape_long", 1)] {
+        let dir = wrela_tests::repo_root().join("compiler/tests").join(pkg);
+        assert_eq!(crate::tests_pass(&dir), n, "{pkg}");
+    }
+}
+
+/// What a tape must take as compiled code does (compiler/tests/tape_cases): a branch's writes
+/// through a call, a value only part of which depends on the point, an integer table past 2²⁴,
+/// `lattice` and `lattice_coord` past `i32`'s range, one function taped at two sizes, and a
+/// pruned tape of `tape_with`.
+#[test]
+fn tapes_take_what_compiled_code_does() {
+    let dir = wrela_tests::repo_root().join("compiler/tests/tape_cases");
+    assert_eq!(crate::tests_pass(&dir), 6);
+}
+
+/// `gather` (language.md §18.8): a 2 × 2 colour texture's texels, one component of each, and a
+/// 2 × 2 depth texture's depths and their comparisons, each in one fetch and in WGSL's order, on
+/// both hosts (compiler/tests/gather).
+#[test]
+#[ignore = "needs a GPU"]
+fn gathers_read_four_texels_in_wgsls_order() {
+    let dir = wrela_tests::repo_root().join("compiler/tests/gather");
+    assert_eq!(crate::tests_pass(&dir), 1);
+}
+
+/// A gather is one WGSL fetch: `textureGather`, and `textureGatherCompare` of a depth texture.
+#[test]
+fn a_gather_is_one_fetch_in_the_wgsl() {
+    let dir = wrela_tests::repo_root().join("compiler/tests/gather");
+    let built = wrela_tests::build(&dir).unwrap_or_else(|e| panic!("doesn't build:\n{e}"));
+    let wgsl: String = built
+        .files
+        .iter()
+        .filter(|(n, _)| n.ends_with(".wgsl"))
+        .map(|(_, bytes)| String::from_utf8_lossy(bytes).into_owned())
+        .collect();
+    assert_eq!(wgsl.matches("textureGather(").count(), 3, "two of colour, one of depth");
+    assert_eq!(wgsl.matches("textureGatherCompare(").count(), 1);
+}
+
 /// Constants that hold `Text`, read by GPU code (M6, AC15): compiler/tests/gpu-constants has a
 /// kernel read a table of sites, each a place, a height and a name, written as a literal and
 /// computed by the build; it reads back what the CPU computes from the same tables. Spike 17

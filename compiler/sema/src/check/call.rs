@@ -11,6 +11,9 @@ use crate::ty::*;
 use wrela_diag::{Diagnostic, Edit, Span, codes};
 use wrela_syntax::ast;
 
+/// Arguments by their parameters' positions.
+type Positional<T> = Vec<(usize, T)>;
+
 /// A parameter as call checking sees it.
 #[derive(Clone, Copy)]
 pub(crate) struct CallParam<'p> {
@@ -2823,6 +2826,18 @@ impl<'p> Checker<'p> {
             .map(|(_, c)| c.ty);
         let bound = Bound { func, gen_args: gen_args.clone(), args: Some(args), span };
         let xs = self.bind_args(&bound, skip);
+        if let Some(ps) = self.p.func(func).params.iter().find(|ps| ps.is_const) {
+            let (name, fname) = (ps.name.clone(), self.p.func(func).name.clone());
+            self.err(
+                Diagnostic::new(
+                    codes::E0603,
+                    span,
+                    format!("`{fname}` takes `const` `{name}`, so it's bound where it's dispatched or drawn"),
+                )
+                .with_note("a `const` parameter's value makes a pipeline of its own, which the command that records it names (§18.1)")
+                .with_help(format!("write `{fname}.bind(...)` in the `dispatch` or `draw`")),
+            );
+        }
         let fields = crate::gpu::bound_fields(self.p, func);
         let subst = Subst::from_pairs(&self.p.fn_all_generics(func), &gen_args);
         let mut held: Vec<Option<Expr>> = vec![None; fields.len()];
@@ -2925,10 +2940,103 @@ impl<'p> Checker<'p> {
     fn record(&mut self, r: Recorded, skip: Option<TyId>) -> (Shader, Vec<(usize, Expr)>) {
         match r {
             Recorded::Named(b) => {
-                let args = self.bind_args(&b, skip);
-                (Shader::Named(b.func, b.gen_args), args)
+                let all = self.bind_args(&b, skip);
+                let (args, consts) = self.const_args(b.func, all);
+                (Shader::Named(b.func, b.gen_args, consts), args)
             }
             Recorded::Value(x, _) => (Shader::Value(Box::new(x)), Vec::new()),
+        }
+    }
+
+    /// `args` (a bound entry point's, `bind_args`') split into its ordinary arguments and its
+    /// `const` parameters' values (§18.1): each a literal, a negated literal or a `const` item
+    /// holding one, else E0603 naming the parameter.
+    fn const_args(
+        &mut self,
+        func: FnId,
+        args: Vec<(usize, Expr)>,
+    ) -> (Positional<Expr>, Positional<ConstArg>) {
+        let mut plain = Vec::new();
+        let mut consts = Vec::new();
+        for (i, x) in args {
+            let ps = &self.p.func(func).params[i];
+            if !ps.is_const {
+                plain.push((i, x));
+                continue;
+            }
+            let ty = self.infer.resolve(&self.p.types, x.ty);
+            match self.const_arg(&x, ty) {
+                Some(c) => consts.push((i, c)),
+                None if matches!(self.kind(ty), TyKind::Error) => {}
+                None => {
+                    let (name, fname) = (ps.name.clone(), self.p.func(func).name.clone());
+                    self.err(
+                        Diagnostic::new(
+                            codes::E0603,
+                            x.span,
+                            format!("`{fname}`'s `{name}` is `const`: its argument is a build-time constant, written where it's bound"),
+                        )
+                        .with_note("it's a constant of the pipeline, which the host makes when the program loads; each value is a pipeline of its own")
+                        .with_help(format!("write a literal or a `const` item, e.g. `{name}: true`; pass a value that changes as an ordinary parameter")),
+                    );
+                }
+            }
+        }
+        (plain, consts)
+    }
+
+    /// The value of a `const` parameter's argument `x` of type `ty`, if it's a literal, a
+    /// negated literal or a `const` item that is one.
+    fn const_arg(&self, x: &Expr, ty: TyId) -> Option<ConstArg> {
+        let make = |v: f64, int: Option<i128>| -> Option<ConstArg> {
+            Some(match self.kind(ty) {
+                TyKind::Bool => return None,
+                TyKind::Int(IntTy::U32) => ConstArg::U32(u32::try_from(int?).ok()?),
+                TyKind::Int(IntTy::I32) => ConstArg::I32(i32::try_from(int?).ok()?),
+                TyKind::Float(FloatTy::F32) => ConstArg::F32((v as f32).to_bits()),
+                _ => return None,
+            })
+        };
+        match &x.kind {
+            ExprKind::Lit(Lit::Bool(b)) if matches!(self.kind(ty), TyKind::Bool) => {
+                Some(ConstArg::Bool(*b))
+            }
+            ExprKind::Lit(Lit::Int(n)) => make(*n as f64, Some(*n)),
+            ExprKind::Lit(Lit::Float(v, _)) => make(*v, None),
+            ExprKind::Unary(ast::UnOp::Neg, inner) => match &inner.kind {
+                ExprKind::Lit(Lit::Int(n)) => make(-(*n as f64), Some(-*n)),
+                ExprKind::Lit(Lit::Float(v, _)) => make(-*v, None),
+                _ => None,
+            },
+            &ExprKind::Const(c) => {
+                fn literal(e: &ast::Expr) -> Option<(f64, Option<i128>, Option<bool>)> {
+                    match &e.kind {
+                        ast::ExprKind::Lit(ast::Lit {
+                            kind: ast::LitKind::Int(ast::IntValue::Ok(v)),
+                            ..
+                        }) => Some((*v as f64, Some(i128::from(*v)), None)),
+                        ast::ExprKind::Lit(ast::Lit { kind: ast::LitKind::Float(x), .. }) => {
+                            Some((*x, None, None))
+                        }
+                        ast::ExprKind::Lit(ast::Lit { kind: ast::LitKind::Bool(b), .. }) => {
+                            Some((0.0, None, Some(*b)))
+                        }
+                        ast::ExprKind::Unary(ast::UnOp::Neg, inner) => {
+                            let (v, n, b) = literal(inner)?;
+                            b.is_none().then(|| (-v, n.map(|n| -n), None))
+                        }
+                        _ => None,
+                    }
+                }
+                match literal(&self.p.const_(c).value)? {
+                    (_, _, Some(b)) if matches!(self.kind(ty), TyKind::Bool) => {
+                        Some(ConstArg::Bool(b))
+                    }
+                    (_, _, Some(_)) => None,
+                    (v, n, None) => make(v, n),
+                }
+            }
+            _ => None,
         }
     }
 

@@ -1,10 +1,13 @@
 //! The little HTTP the toolchain's local servers speak: `wrela run`'s (the driver's `live.rs`),
 //! and a tool's (`std::tool::serve`, language.md §15.5). One request per connection, on
-//! 127.0.0.1 only. A request must name this machine as its host (so a
-//! page elsewhere can't reach a server through DNS rebinding), and a post must come from the
-//! server's own pages (their `Origin`), so another site open in the browser can't change files. A
-//! put (test mode's results) isn't checked for its origin: a browser asks a server before another
-//! site's page may put, and these servers answer no such question.
+//! 127.0.0.1, or on every interface when it's asked to serve the LAN (`--lan`, `lan: true`). A
+//! request must name this machine as its host: a loopback name, or on the LAN one of this
+//! machine's own addresses, never a name (so a page elsewhere can't reach a server through DNS
+//! rebinding). A post must come from the server's own pages (their `Origin`), so another site
+//! open in the browser can't change files. A put (test mode's results) isn't checked for its
+//! origin: a browser asks a server before another site's page may put, and these servers answer
+//! no such question; on the LAN any device can put, which is what serving the LAN is for (a
+//! phone's bench run reporting back).
 //!
 //! Every answer is cross-origin isolated (COOP and COEP, which `SharedArrayBuffer` needs, and
 //! CORP), and keeps nothing cached. Files are reached through a
@@ -71,6 +74,10 @@ pub struct Head {
     pub query: String,
     pub length: usize,
     pub session: Option<String>,
+    /// The request's `If-None-Match`: the tag of the copy the browser holds.
+    pub if_none_match: Option<String>,
+    /// Whether the request's `Accept-Encoding` lists `gzip`.
+    pub gzip: bool,
 }
 
 impl Head {
@@ -80,22 +87,36 @@ impl Head {
     }
 }
 
-/// Listens on 127.0.0.1:`port` (0: a free port): the listener, and its port.
-pub fn listen(port: u16) -> Result<(TcpListener, u16), String> {
-    let listener = TcpListener::bind(("127.0.0.1", port))
-        .map_err(|e| format!("can't listen on 127.0.0.1:{port}: {e}"))?;
+/// Listens on 127.0.0.1:`port` (0: a free port), or with `lan` on every interface: the
+/// listener, its port, and the hosts a request may name besides the loopback names (with `lan`,
+/// this machine's addresses on its networks; else none).
+pub fn listen(port: u16, lan: bool) -> Result<(TcpListener, u16, Vec<String>), String> {
+    let at = if lan { "0.0.0.0" } else { "127.0.0.1" };
+    let listener =
+        TcpListener::bind((at, port)).map_err(|e| format!("can't listen on {at}:{port}: {e}"))?;
     let port = listener.local_addr().map_err(|e| e.to_string())?.port();
-    Ok((listener, port))
+    let hosts = if lan {
+        crate::interfaces::lan_addresses().iter().map(|a| a.to_string()).collect()
+    } else {
+        Vec::new()
+    };
+    Ok((listener, port, hosts))
 }
 
-/// Reads a request's head from `reader`, for a server on `port`: `None` if it was refused (the
-/// refusal is answered on `out`): one for another host, a post from another origin, a body past
-/// [`MAX_BODY`] ([`MAX_RESULT`] for a put), a body framed other than by its length, or a head
-/// past 64 KiB.
+/// The URLs a LAN device opens a server on `port` at: one an address in `hosts`.
+pub fn lan_urls(hosts: &[String], port: u16) -> Vec<String> {
+    hosts.iter().map(|h| format!("http://{h}:{port}/")).collect()
+}
+
+/// Reads a request's head from `reader`, for a server on `port` that also answers for `hosts`
+/// (its LAN addresses, from [`listen`]): `None` if it was refused (the refusal is answered on
+/// `out`): one for another host, a post from another origin, a body past [`MAX_BODY`]
+/// ([`MAX_RESULT`] for a put), a body framed other than by its length, or a head past 64 KiB.
 pub fn read_head(
     reader: &mut impl BufRead,
     out: &mut impl Write,
     port: u16,
+    hosts: &[String],
 ) -> std::io::Result<Option<Head>> {
     let mut left = MAX_HEAD;
     let mut line = |reader: &mut dyn BufRead| -> std::io::Result<Option<String>> {
@@ -120,6 +141,8 @@ pub fn read_head(
     let mut length = Some(0usize);
     let (mut host, mut origin, mut framed) = (String::new(), None::<String>, false);
     let mut session = None;
+    let mut if_none_match = None;
+    let mut gzip = false;
     loop {
         let Some(h) = line(reader)? else {
             too_long(out)?;
@@ -140,11 +163,16 @@ pub fn read_head(
                 framed = true;
             } else if k.eq_ignore_ascii_case(wrela_chrome::proxy::SESSION_HEADER) {
                 session = Some(v.to_string());
+            } else if k.eq_ignore_ascii_case("if-none-match") {
+                if_none_match = Some(v.to_string());
+            } else if k.eq_ignore_ascii_case("accept-encoding") {
+                gzip = accepts_gzip(v);
             }
         }
     }
     let local = ["127.0.0.1", "localhost", "[::1]"];
-    if !local.iter().any(|h| host == *h || host == format!("{h}:{port}")) {
+    let named = |h: &str| host == h || host == format!("{h}:{port}");
+    if !local.iter().any(|h| named(h)) && !hosts.iter().any(|h| named(h)) {
         respond(out, 403, "text/plain", b"this server answers only requests for this machine")?;
         return Ok(None);
     }
@@ -165,7 +193,15 @@ pub fn read_head(
         return Ok(None);
     }
     let (path, query) = target.split_once('?').unwrap_or((target, ""));
-    Ok(Some(Head { method, path: path.to_string(), query: query.to_string(), length, session }))
+    Ok(Some(Head {
+        method,
+        path: path.to_string(),
+        query: query.to_string(),
+        length,
+        session,
+        if_none_match,
+        gzip,
+    }))
 }
 
 /// `path` with its URL escapes decoded, once: `None` if an escape is malformed, names a `/` or a
@@ -213,12 +249,33 @@ pub fn mime(path: &str) -> &'static str {
     }
 }
 
+/// Whether a browser may keep a file it was sent.
+#[derive(Clone, Copy, Debug)]
+pub enum Caching<'a> {
+    /// Never: each request reads the file again (a hot-reloading server's, whose files change
+    /// under the same names).
+    NoStore,
+    /// It may keep the file and must ask again before it uses it (`no-cache`), naming the copy
+    /// it has (`if_none_match`, the request's), which is answered with 304 while it's current.
+    /// A kept copy is what lets the browser keep a WASM module's compiled code between opens.
+    Revalidate { if_none_match: Option<&'a str> },
+}
+
 /// Writes a response's head: its status, its body's kind and length, and the headers every
-/// answer has.
-fn head(out: &mut dyn Write, status: u16, kind: &str, len: u64) -> std::io::Result<()> {
+/// answer has: `Cache-Control: no-store`, unless `tag` names the file's version, which the
+/// browser may keep (`no-cache`, with the tag).
+fn head_with(
+    out: &mut dyn Write,
+    status: u16,
+    kind: &str,
+    len: u64,
+    tag: Option<&str>,
+    gzipped: bool,
+) -> std::io::Result<()> {
     let reason = match status {
         200 => "OK",
         201 => "Created",
+        304 => "Not Modified",
         400 => "Bad Request",
         403 => "Forbidden",
         404 => "Not Found",
@@ -230,10 +287,160 @@ fn head(out: &mut dyn Write, status: u16, kind: &str, len: u64) -> std::io::Resu
         504 => "Gateway Timeout",
         _ => "Error",
     };
+    let mut cache = match tag {
+        Some(tag) => format!("Cache-Control: no-cache\r\nETag: {tag}"),
+        None => "Cache-Control: no-store".to_string(),
+    };
+    if gzipped {
+        cache.push_str("\r\nContent-Encoding: gzip\r\nVary: Accept-Encoding");
+    }
     write!(
         out,
-        "HTTP/1.1 {status} {reason}\r\nContent-Type: {kind}\r\nContent-Length: {len}\r\nCache-Control: no-store\r\nCross-Origin-Opener-Policy: same-origin\r\nCross-Origin-Embedder-Policy: require-corp\r\nCross-Origin-Resource-Policy: same-origin\r\nConnection: close\r\n\r\n",
+        "HTTP/1.1 {status} {reason}\r\nContent-Type: {kind}\r\nContent-Length: {len}\r\n{cache}\r\nCross-Origin-Opener-Policy: same-origin\r\nCross-Origin-Embedder-Policy: require-corp\r\nCross-Origin-Resource-Policy: same-origin\r\nConnection: close\r\n\r\n",
     )
+}
+
+fn head(out: &mut dyn Write, status: u16, kind: &str, len: u64) -> std::io::Result<()> {
+    head_with(out, status, kind, len, None, false)
+}
+
+/// Whether an `Accept-Encoding` value lists gzip (and doesn't refuse it with `q=0`).
+fn accepts_gzip(value: &str) -> bool {
+    value.split(',').any(|coding| {
+        let mut parts = coding.split(';').map(str::trim);
+        let named = parts.next().is_some_and(|c| c.eq_ignore_ascii_case("gzip") || c == "*");
+        let refused = parts.any(|p| {
+            p.strip_prefix("q=").is_some_and(|q| q.parse::<f32>().is_ok_and(|q| q == 0.0))
+        });
+        named && !refused
+    })
+}
+
+/// Whether a response of this media type is worth compressing: the build's code, shaders and
+/// data (WASM, text, JSON, scripts), not images, which are compressed already.
+fn compressible(kind: &str) -> bool {
+    kind == "application/wasm" || kind == "application/json" || kind.starts_with("text/")
+}
+
+/// The most bytes of compressed files [`gzipped`] keeps, across every server in the process.
+const MAX_COMPRESSED: usize = 256 << 20;
+
+/// A file's identity and version: its device, its inode, its length and when it changed.
+type Version = (u64, u64, u64, u128);
+
+/// The compressed files kept, by the file's identity and version, oldest first; their bytes.
+#[derive(Default)]
+struct Compressed {
+    files: std::collections::VecDeque<(Version, std::sync::Arc<Vec<u8>>)>,
+    bytes: usize,
+}
+
+static COMPRESSED: std::sync::Mutex<Compressed> =
+    std::sync::Mutex::new(Compressed { files: std::collections::VecDeque::new(), bytes: 0 });
+
+/// How many times a server has compressed a file (a test's counter).
+static COMPRESSIONS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// How many times the process's servers have compressed a file.
+pub fn compressions() -> u64 {
+    COMPRESSIONS.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// `bytes` compressed with gzip at level 6.
+fn gzip(bytes: &[u8]) -> std::io::Result<Vec<u8>> {
+    COMPRESSIONS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let mut encoder = flate2::write::GzEncoder::new(
+        Vec::with_capacity(bytes.len() / 3),
+        flate2::Compression::new(6),
+    );
+    encoder.write_all(bytes)?;
+    encoder.finish()
+}
+
+/// The largest file a server gzips; a larger one is sent as it is.
+const MOST_GZIPPED: u64 = 64 << 20;
+
+/// The most bytes the process's servers compress at once (the plain bytes read for it); past
+/// it, a file is sent as it is rather than wait.
+const MOST_COMPRESSING: usize = 256 << 20;
+
+/// The plain bytes being compressed now.
+static COMPRESSING: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+/// `n` bytes of [`MOST_COMPRESSING`], taken until it's dropped; none if they aren't free.
+struct Compressing(usize);
+
+impl Compressing {
+    fn take(n: usize) -> Option<Compressing> {
+        use std::sync::atomic::Ordering;
+        COMPRESSING
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |held| {
+                held.checked_add(n).filter(|&total| total <= MOST_COMPRESSING)
+            })
+            .ok()
+            .map(|_| Compressing(n))
+    }
+}
+
+impl Drop for Compressing {
+    fn drop(&mut self) {
+        COMPRESSING.fetch_sub(self.0, std::sync::atomic::Ordering::AcqRel);
+    }
+}
+
+/// The file `file` (whose metadata is `meta`, at most `len` bytes of it read), gzipped: from
+/// the process's cache when the same file at the same version was compressed before, so a
+/// second load costs no compression. Nothing is written to disk. `None`, with nothing read,
+/// when the file is over [`MOST_GZIPPED`] or compressing it now would pass
+/// [`MOST_COMPRESSING`]: a LAN server's peer can't make it hold more than that.
+fn gzipped(
+    file: &mut dyn Read,
+    meta: &std::fs::Metadata,
+    len: u64,
+) -> std::io::Result<Option<std::sync::Arc<Vec<u8>>>> {
+    use std::os::unix::fs::MetadataExt;
+    let key = (meta.dev(), meta.ino(), len, written(meta));
+    let lock = || COMPRESSED.lock().unwrap_or_else(|p| p.into_inner());
+    if let Some((_, bytes)) = lock().files.iter().find(|(k, _)| *k == key) {
+        return Ok(Some(bytes.clone()));
+    }
+    if len > MOST_GZIPPED {
+        return Ok(None);
+    }
+    let Some(_held) = Compressing::take(len as usize) else { return Ok(None) };
+    let mut plain = Vec::with_capacity(len as usize);
+    file.take(len).read_to_end(&mut plain)?;
+    if (plain.len() as u64) < len {
+        return Err(std::io::Error::other("the file was cut short as it was read"));
+    }
+    let bytes = std::sync::Arc::new(gzip(&plain)?);
+    let mut kept = lock();
+    if bytes.len() <= MAX_COMPRESSED {
+        kept.bytes += bytes.len();
+        kept.files.push_back((key, bytes.clone()));
+        while kept.bytes > MAX_COMPRESSED {
+            let Some((_, old)) = kept.files.pop_front() else { break };
+            kept.bytes -= old.len();
+        }
+    }
+    Ok(Some(bytes))
+}
+
+/// A file's version, as an entity tag: which file it is (its device and inode), its length and
+/// when it was last written, as the gzip cache keys it: a file replaced by another of the same
+/// length and time is another file.
+fn tag_of(meta: &std::fs::Metadata) -> String {
+    use std::os::unix::fs::MetadataExt;
+    format!("\"{:x}-{:x}-{:x}-{:x}\"", meta.dev(), meta.ino(), meta.len(), written(meta))
+}
+
+/// When a file was last written, in nanoseconds since 1970 (0 if the system can't say): its
+/// version, with its length, for the gzip cache and the entity tag alike.
+fn written(meta: &std::fs::Metadata) -> u128 {
+    meta.modified()
+        .ok()
+        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+        .map_or(0, |d| d.as_nanos())
 }
 
 /// An HTTP response of `body`.
@@ -253,6 +460,8 @@ pub fn get_file(
     dir: &Dir,
     rel: &str,
     page: Option<&dyn Fn(&str) -> String>,
+    caching: Caching,
+    gzip_ok: bool,
 ) -> std::io::Result<()> {
     let not_found = |out: &mut dyn Write| respond(out, 404, "text/plain", b"not found");
     // Decoded once before it's checked or opened: checking the encoded spelling would let
@@ -265,19 +474,54 @@ pub fn get_file(
     let (name, above) = parts.split_last().expect("a path has a part");
     let file = crate::confined::open_dir(dir, above, false)
         .and_then(|at| crate::confined::open_file(&at, name, false));
-    let Ok(file) = file else { return not_found(out) };
+    let Ok(mut file) = file else { return not_found(out) };
     if let (Some(page), "index.html") = (page, rel.as_str()) {
         let mut bytes = Vec::new();
         file.take(MAX_BODY as u64).read_to_end(&mut bytes)?;
-        return respond(out, 200, mime(&rel), page(&String::from_utf8_lossy(&bytes)).as_bytes());
+        let body = page(&String::from_utf8_lossy(&bytes)).into_bytes();
+        if gzip_ok {
+            return send_gzipped(out, mime(&rel), &gzip(&body)?, None);
+        }
+        return respond(out, 200, mime(&rel), &body);
     }
-    let len = file.metadata()?.len();
-    head(out, 200, mime(&rel), len)?;
+    let meta = file.metadata()?;
+    let len = meta.len();
+    let tag = match caching {
+        Caching::NoStore => None,
+        Caching::Revalidate { if_none_match } => {
+            let tag = tag_of(&meta);
+            if if_none_match.is_some_and(|held| held.split(',').any(|t| t.trim() == tag)) {
+                head_with(out, 304, mime(&rel), 0, Some(&tag), false)?;
+                return out.flush();
+            }
+            Some(tag)
+        }
+    };
+    // Compressed as it's served, never as a file: the release's edge compresses the same types.
+    if gzip_ok
+        && compressible(mime(&rel))
+        && let Some(body) = gzipped(&mut file, &meta, len)?
+    {
+        return send_gzipped(out, mime(&rel), &body, tag.as_deref());
+    }
+    head_with(out, 200, mime(&rel), len, tag.as_deref(), false)?;
     // At most the length the head gave, though the file grows meanwhile.
     let sent = std::io::copy(&mut file.take(len), out)?;
     if sent < len {
         return Err(std::io::Error::other("the file was cut short as it was sent"));
     }
+    out.flush()
+}
+
+/// A 200 of `body`, gzipped, of type `kind`, with its entity tag if it has one.
+fn send_gzipped(
+    out: &mut dyn Write,
+    kind: &str,
+    body: &[u8],
+    tag: Option<&str>,
+) -> std::io::Result<()> {
+    head_with(out, 200, kind, body.len() as u64, tag, true)?;
+    out.write_all(body)?;
     out.flush()
 }
 
@@ -347,7 +591,7 @@ mod tests {
 
     fn head_of(text: &str) -> (Option<Head>, String) {
         let mut out = Vec::new();
-        let head = read_head(&mut text.as_bytes(), &mut out, 8000).expect("read");
+        let head = read_head(&mut text.as_bytes(), &mut out, 8000, &[]).expect("read");
         (head, String::from_utf8_lossy(&out).into_owned())
     }
 
@@ -380,5 +624,94 @@ mod tests {
         assert_eq!(sized("PUT", MAX_BODY + 1).0.map(|h| h.length), Some(MAX_BODY + 1));
         assert!(sized("PUT", MAX_RESULT + 1).1.starts_with("HTTP/1.1 413"));
         assert!(sized("POST", MAX_BODY + 1).1.starts_with("HTTP/1.1 413"));
+    }
+
+    /// A served file in `dir` named `name` holding `bytes`, and the directory's handle.
+    pub(crate) fn served(tag: &str, name: &str, bytes: &[u8]) -> (std::path::PathBuf, Dir) {
+        let root =
+            std::env::temp_dir().join(format!("wrela-loopback-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).expect("directory");
+        std::fs::write(root.join(name), bytes).expect("file");
+        let dir = Dir::open_ambient_dir(&root, cap_std::ambient_authority()).expect("open");
+        (root, dir)
+    }
+
+    fn get(dir: &Dir, rel: &str, caching: Caching) -> String {
+        String::from_utf8_lossy(&get_bytes(dir, rel, caching, false)).into_owned()
+    }
+
+    fn get_bytes(dir: &Dir, rel: &str, caching: Caching, gzip: bool) -> Vec<u8> {
+        let mut out = Vec::new();
+        get_file(&mut out, dir, rel, None, caching, gzip).expect("answered");
+        out
+    }
+
+    /// A response's head and body.
+    fn split(response: &[u8]) -> (String, &[u8]) {
+        let at = response.windows(4).position(|w| w == b"\r\n\r\n").expect("a head") + 4;
+        (String::from_utf8_lossy(&response[..at]).into_owned(), &response[at..])
+    }
+
+    /// A request that accepts gzip gets the file gzipped, with its inner type, `Vary` and the
+    /// compressed length; one that doesn't gets the plain bytes; an image is never compressed;
+    /// and a second load of the same file at the same version compresses nothing.
+    #[test]
+    fn files_are_gzipped_at_serve_time_where_the_request_accepts_it() {
+        use std::io::Read;
+        let wasm: Vec<u8> = (0..200_000u32).flat_map(|i| (i % 251).to_le_bytes()).collect();
+        let (root, dir) = served("gzip", "game.wasm", &wasm);
+        std::fs::write(root.join("a.png"), b"not really a png").expect("png");
+        let before = compressions();
+        let caching = Caching::Revalidate { if_none_match: None };
+        let response = get_bytes(&dir, "game.wasm", caching, true);
+        let (head, body) = split(&response);
+        assert!(head.contains("Content-Encoding: gzip\r\n"), "{head}");
+        assert!(head.contains("Vary: Accept-Encoding\r\n"), "{head}");
+        assert!(head.contains("Content-Type: application/wasm\r\n"), "{head}");
+        assert!(head.contains(&format!("Content-Length: {}\r\n", body.len())), "{head}");
+        assert!(body.len() < wasm.len() / 3, "{} of {} bytes", body.len(), wasm.len());
+        let mut plain = Vec::new();
+        flate2::read::GzDecoder::new(body).read_to_end(&mut plain).expect("gunzips");
+        assert_eq!(plain, wasm);
+        let again = get_bytes(&dir, "game.wasm", caching, true);
+        assert_eq!(split(&again).1, body);
+        assert_eq!(compressions() - before, 1, "the second load is compressed from the cache");
+        let unasked = get_bytes(&dir, "game.wasm", caching, false);
+        let (head, body) = split(&unasked);
+        assert!(!head.contains("Content-Encoding"), "{head}");
+        assert_eq!(body, wasm);
+        let image = get_bytes(&dir, "a.png", caching, true);
+        assert!(!split(&image).0.contains("Content-Encoding"));
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn accept_encoding_is_read_with_its_weights() {
+        assert!(accepts_gzip("gzip, deflate, br, zstd"));
+        assert!(accepts_gzip("br;q=1.0, gzip;q=0.8"));
+        assert!(accepts_gzip("*"));
+        assert!(!accepts_gzip("gzip;q=0, br"));
+        assert!(!accepts_gzip("br, identity"));
+    }
+
+    /// A file the browser may keep is sent with its tag, and asked for again with that tag it's
+    /// answered 304 with no body; a hot-reloading server's never is.
+    #[test]
+    fn a_kept_file_is_revalidated_by_its_tag() {
+        let (root, dir) = served("tag", "game.wasm", b"\0asm");
+        let first = get(&dir, "game.wasm", Caching::Revalidate { if_none_match: None });
+        assert!(
+            first.starts_with("HTTP/1.1 200") && first.contains("Cache-Control: no-cache"),
+            "{first}"
+        );
+        let tag = first.lines().find_map(|l| l.strip_prefix("ETag: ")).expect("a tag").to_string();
+        let again = get(&dir, "game.wasm", Caching::Revalidate { if_none_match: Some(&tag) });
+        assert!(again.starts_with("HTTP/1.1 304") && again.ends_with("\r\n\r\n"), "{again}");
+        let stale = get(&dir, "game.wasm", Caching::Revalidate { if_none_match: Some("\"0-0\"") });
+        assert!(stale.starts_with("HTTP/1.1 200") && stale.ends_with("\0asm"), "{stale}");
+        let live = get(&dir, "game.wasm", Caching::NoStore);
+        assert!(live.contains("Cache-Control: no-store") && !live.contains("ETag"), "{live}");
+        let _ = std::fs::remove_dir_all(root);
     }
 }

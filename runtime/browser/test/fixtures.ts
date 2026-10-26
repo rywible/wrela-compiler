@@ -61,6 +61,9 @@ export function shapes(): Manifest {
     manifest_version: MANIFEST_VERSION,
     stream_version: STREAM_VERSION,
     wasm: "game.wasm",
+    wasm_abi: null,
+    wasm_relaxed: null,
+    wasm_relaxed_abi: null,
     pipelines: [
       {
         kind: "render",
@@ -82,6 +85,8 @@ export function shapes(): Manifest {
         ],
         debug_flag: null,
         requires: [],
+        conditional: false,
+        constants: [],
       },
       {
         kind: "compute",
@@ -96,6 +101,8 @@ export function shapes(): Manifest {
         ],
         debug_flag: null,
         requires: [],
+        conditional: false,
+        constants: [],
       },
     ],
   };

@@ -90,6 +90,8 @@ export const COMMAND_HEADER_LEN = {command_header_len};
 /** A pass's attachment that isn't there, and a pass's colour attachment that is the screen. */
 export const NONE = 0x{none:08x};
 export const SCREEN = 0x{screen:08x};
+/** `wrela.limit`'s index of how the host shows the screen (`std::gpu::screen_is`). */
+export const SCREEN_LIMIT = {screen_limit};
 /** The upload ring's starting size, and the largest write it takes: a bigger one goes through
  * the queue, between submissions. */
 export const UPLOAD_START = {upload_start};
@@ -289,6 +291,7 @@ export const PANIC_CAP = {panic_cap};
         command_header_len = stream::COMMAND_HEADER_LEN,
         none = stream::NONE,
         screen = stream::SCREEN,
+        screen_limit = crate::SCREEN_LIMIT,
         upload_start = stream::UPLOAD_START,
         upload_max = stream::UPLOAD_MAX,
         import_module = crate::IMPORT_MODULE,

@@ -100,8 +100,19 @@ pub struct GenericParam {
 
 #[derive(Clone, Debug, PartialEq)]
 pub enum Param {
-    SelfParam { mode: Mode, span: Span },
-    Named { name: Ident, mode: Mode, ty: TypeExpr, default: Option<Expr>, span: Span },
+    SelfParam {
+        mode: Mode,
+        span: Span,
+    },
+    /// `konst`: `name: const T`, a GPU entry point's build-time constant (language.md §18.1).
+    Named {
+        name: Ident,
+        mode: Mode,
+        konst: bool,
+        ty: TypeExpr,
+        default: Option<Expr>,
+        span: Span,
+    },
 }
 
 impl Param {

@@ -886,8 +886,9 @@ impl<'a> Builder<'a> {
     fn param(&mut self, p: &Param) -> Doc {
         match p {
             Param::SelfParam { mode, .. } => concat([self.mode(*mode), self.tok("self")]),
-            Param::Named { name, mode, ty, default, .. } => {
-                let name = self.tok(&format!("{}: ", name.name));
+            Param::Named { name, mode, konst, ty, default, .. } => {
+                let name =
+                    self.tok(&format!("{}: {}", name.name, if *konst { "const " } else { "" }));
                 let mode = self.mode(*mode);
                 let ty = self.ty(ty);
                 let default = match default {

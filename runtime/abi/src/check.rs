@@ -604,6 +604,8 @@ impl Checker {
                 self.pass_size = self.screen_size;
             }
             Command::BeginPass(pass) => self.begin_pass(op, pass)?,
+            // How the screen is shown: outside a pass (the sequence's rule), and no resource's.
+            Command::ConfigureScreen { .. } => {}
             Command::SetScissor { x, y, width, height } => {
                 if let Some((w, h)) = self.pass_size
                     && (u64::from(*x) + u64::from(*width) > u64::from(w)
@@ -1168,7 +1170,9 @@ impl Checker {
                     }
                     Self::used(&mut self.scope, op, "buffer", b.handle, u)?;
                 }
-                BindingKind::Sampler | BindingKind::ComparisonSampler => {
+                BindingKind::Sampler
+                | BindingKind::ComparisonSampler
+                | BindingKind::NonFilteringSampler => {
                     if b.offset != 0 || b.size != 0 {
                         return err(format!(
                             "a sampler binding has offset {} and size {}: both must be 0",

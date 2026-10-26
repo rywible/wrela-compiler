@@ -184,6 +184,16 @@ pub(crate) fn route(s: &Services, name: &str, b: &mut Body) -> Work {
                     }))
                 }))
             }
+            "navigate" => {
+                let handle = b.u32()?;
+                let url = b.str()?;
+                let due = entered + deadline(b)?;
+                Work::Long(Box::new(move |s, _| {
+                    super::services::answer(using(s, handle, due, |_, tab| {
+                        navigate(s, handle, tab, &url, due)
+                    }))
+                }))
+            }
             "observe" => {
                 let handle = b.u32()?;
                 let kind = b.u8()?;
@@ -306,6 +316,50 @@ impl Spawner for Owned<'_> {
     }
 }
 
+/// The page's result, for browser `handle` on `url`: what its server keeps for the browser's
+/// session from now on, if `url` is a server's (`forget`: the server's last one dropped first).
+fn result_of(s: &Services, handle: u32, url: &str, forget: bool) -> Option<wrela_chrome::Done> {
+    let server = served_port(url).and_then(|port| s.servers().on_port(port))?;
+    let session = format!("browser-{handle}");
+    if forget {
+        server.forget_done(&session);
+    }
+    Some(Arc::new(move || server.done(&session)))
+}
+
+/// Takes browser `handle`'s tab to `url` (a page the tool may open), by `due`, and waits until
+/// the page has a context to ask.
+fn navigate(
+    s: &Services,
+    handle: u32,
+    tab: &wrela_chrome::Tab,
+    url: &str,
+    due: Instant,
+) -> Result<Vec<u8>, String> {
+    if !may_open(s, url) {
+        return Err(format!(
+            "`{url}` isn't one of the tool's servers' origins or an `https://` host it's granted"
+        ));
+    }
+    tab.navigate(url, result_of(s, handle, url, true), due)?;
+    page_ready(tab, due)?;
+    Ok(Vec::new())
+}
+
+/// Waits until `tab`'s page has a context to ask (one between documents hasn't), by `due`: the
+/// hardware adapter it offers.
+fn page_ready(tab: &wrela_chrome::Tab, due: Instant) -> Result<(), String> {
+    loop {
+        match tab.hardware_adapter(due) {
+            Ok(()) => return Ok(()),
+            Err(why) if why.contains("xecution context") && Instant::now() < due => {
+                std::thread::sleep(Duration::from_millis(20));
+            }
+            Err(why) => return Err(why),
+        }
+    }
+}
+
 /// Opens `url` in a browser of its own for `request`, by `due`: its handle.
 fn open(
     s: &Arc<Services>,
@@ -356,23 +410,10 @@ fn open(
         return Err("the tool ended before the browser opened".into());
     }
     // The page's result: what its server keeps from now on.
-    let done = served_port(url).and_then(|port| s.servers().on_port(port)).map(|server| {
-        let session = session.clone();
-        let d: wrela_chrome::Done = Arc::new(move || server.done(&session));
-        d
-    });
-    let options = TabOptions { size: Some(size), console: None, done };
+    let options =
+        TabOptions { size: Some(size), console: None, done: result_of(s, handle, url, false) };
     let tab = held.browser.open(url, options, due)?;
-    // A page between documents has no context to ask yet: until it has one.
-    loop {
-        match tab.hardware_adapter(due) {
-            Ok(()) => break,
-            Err(why) if why.contains("xecution context") && Instant::now() < due => {
-                std::thread::sleep(Duration::from_millis(20));
-            }
-            Err(why) => return Err(why),
-        }
-    }
+    page_ready(&tab, due)?;
     *locked(&held.tab) = Some(tab);
     held.busy.store(false, Ordering::Release);
     s.signal("browser");

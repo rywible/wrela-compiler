@@ -170,22 +170,8 @@ fn solve(
     exact: bool,
     write: bool,
 ) -> Result<serde_json::Value, String> {
-    let package = wrela_driver::manifest::name_in(dir)
-        .ok_or_else(|| format!("`{}` has no wrela.toml with a package name", dir.display()))?;
-    let glue_dir = dir.join("build").join("solve");
-    crate::generated_path(dir, &glue_dir)?;
-    wrela_driver::ensure_no_symlinks(&glue_dir, ["wrela.toml", "main.wrela"])
-        .map_err(|e| e.to_string())?;
-    std::fs::create_dir_all(&glue_dir).map_err(|e| e.to_string())?;
-    std::fs::write(
-        glue_dir.join("wrela.toml"),
-        format!(
-            "[package]\nname = \"solve\"\n\n[dependencies]\n{package} = {{ path = \"../..\" }}\n"
-        ),
-    )
-    .map_err(|e| e.to_string())?;
-    std::fs::write(glue_dir.join("main.wrela"), glue(&package, module, function, spec))
-        .map_err(|e| e.to_string())?;
+    let (glue_dir, package) =
+        crate::glue_package(dir, "solve", |package| glue(package, module, function, spec))?;
     let out =
         wrela_driver::build_lifted(&glue_dir, std::slice::from_ref(&package), Default::default())?;
     let built = glue_dir.join("out");

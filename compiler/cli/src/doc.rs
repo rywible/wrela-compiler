@@ -61,6 +61,18 @@ pub fn run(args: &[String]) -> ExitCode {
     let q: Vec<String> = query.split("::").map(String::from).collect();
     let exact: Vec<usize> =
         (0..index.entries.len()).filter(|&i| index.entries[i].path == q).collect();
+    // A built-in function's name alone is the built-in, before any method of std's it ends.
+    let builtins = wrela_driver::builtins();
+    if exact.is_empty()
+        && q.len() == 1
+        && let Some((name, arity, _)) = builtins.iter().find(|b| b.0 == q[0])
+    {
+        println!(
+            "{name}: a built-in function of {arity} argument{} (language.md §4; `wrela doc builtins` lists them all)",
+            wrela_diag::plural(*arity)
+        );
+        return ExitCode::SUCCESS;
+    }
     let matches: Vec<usize> = if exact.is_empty() {
         (0..index.entries.len()).filter(|&i| index.entries[i].path.ends_with(&q)).collect()
     } else {
@@ -84,8 +96,7 @@ pub fn run(args: &[String]) -> ExitCode {
             return ExitCode::SUCCESS;
         }
     }
-    // The built-in functions: all of them, or one.
-    let builtins = wrela_driver::builtins();
+    // The built-in functions, all of them.
     if q == ["builtins"] {
         println!("the built-in functions (no import; most work on scalars and vectors alike):");
         for &(name, arity, method) in &builtins {
@@ -95,15 +106,6 @@ pub fn run(args: &[String]) -> ExitCode {
         for (name, summary) in crate::builtin_types::summaries() {
             println!("  {name:<10} {summary}");
         }
-        return ExitCode::SUCCESS;
-    }
-    if q.len() == 1
-        && let Some((name, arity, _)) = builtins.iter().find(|b| b.0 == q[0])
-    {
-        println!(
-            "{name}: a built-in function of {arity} argument{} (language.md §4; `wrela doc builtins` lists them all)",
-            wrela_diag::plural(*arity)
-        );
         return ExitCode::SUCCESS;
     }
     // A module, or std's list of them.

@@ -531,6 +531,14 @@ pub enum TextureOp {
     SampleCompare,
     /// As `SampleCompare`, at level 0: any stage.
     SampleCompareLevel,
+    /// The four texels a bilinear sample at the coordinates would read, one component of each
+    /// (0 to 3; a depth texture's depth): a `vec4`, in WGSL's order (`textureGather`). Args: the
+    /// coordinates. Any stage.
+    Gather(u8),
+    /// Of a depth texture, with a comparison sampler: the four texels' comparisons with the
+    /// reference depth, each 1 or 0 (`textureGatherCompare`). Args: the coordinates and the
+    /// reference. Any stage.
+    GatherCompare,
     /// Args: the texel, and its level. A `vec4`, or an `f32` of a depth texture.
     Load,
     /// The width, height or depth (of a 3D texture), a `u32`.
@@ -659,6 +667,9 @@ pub enum Expr {
     /// A GPU builtin input of the entry point (`@builtin(...)`), by index into the entry's
     /// inputs, as the std struct that holds it (`GlobalId`, `FragCoord`, ...).
     EntryInput(u32),
+    /// A pipeline-overridable constant of the module (GPU only), by index into
+    /// [`Module::overrides`]: an entry point's `const` parameter, whose value the pipeline sets.
+    Override(u32),
     /// A by-value parameter.
     Param(u32),
 }
@@ -740,6 +751,25 @@ pub struct Function {
     /// rather than inline it (`opt::outlined`), since nested derivations call the same ones
     /// from many places.
     pub interval: bool,
+    /// One of std's functions that a derivation knows by what it computes (`derive::tape`).
+    pub known: Option<Known>,
+    /// CPU code outside what deterministic code reaches (lowering's `mark_relaxable`): with
+    /// `--relaxed-simd`, its vector arithmetic may use relaxed SIMD (a fused multiply-add),
+    /// which can differ from engine to engine in its last bit.
+    pub relaxable: bool,
+}
+
+/// A function of std's that a tape holds as one of its operations rather than as its body.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Known {
+    /// `std::field::smin(a, b, k)`: `SMIN`.
+    Smin,
+    /// `std::field::value_noise(p)`: `NOISE3`.
+    ValueNoise,
+    /// `std::field::lattice_coord(x)`: `F2I`, `x` toward zero, wrapped past `i32`'s range.
+    LatticeCoord,
+    /// `std::hash::pcg(h)`: `PCG`.
+    Pcg,
 }
 
 impl Function {
@@ -780,6 +810,8 @@ impl Function {
             body: Vec::new(),
             counted: self.counted,
             interval: false,
+            known: None,
+            relaxable: false,
         }
     }
 
@@ -935,6 +967,9 @@ pub struct Module {
     pub types: Types,
     pub functions: Vec<Function>,
     pub resources: Vec<Resource>,
+    /// GPU only: the pipeline-overridable constants (WGSL's `override`), each its name and
+    /// scalar type, which the pipeline sets by name.
+    pub overrides: Vec<(String, Scalar)>,
     pub entry_points: Vec<EntryPoint>,
     /// CPU only: functions exported from the WASM, by name.
     pub exports: Vec<(String, FuncId)>,

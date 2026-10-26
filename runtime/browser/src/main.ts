@@ -10,7 +10,7 @@ import { Semantics } from "./semantics.ts";
 import { listen, pollPads } from "./listen.ts";
 import { type FromVoice, type FromWorker, type ToWorker, VOICE_PROCESSOR, type VoiceOptions } from "./messages.ts";
 import { BrowserPlatform } from "./platform.ts";
-import { asksForTest, isLoopback, loaded, parseTestParams, putResult, sleepUntil, type TestParams } from "./testmode.ts";
+import { asksForTest, loaded, mayTest, parseTestParams, putResult, sleepUntil, type TestParams } from "./testmode.ts";
 
 let shown = false;
 
@@ -284,8 +284,38 @@ class Clip {
   }
 }
 
+/** Test mode, `show=1`: the run's summary, white on black, over the canvas's top left, left
+ * there: a device that can't put its results shows them. */
+function showSummary(canvas: HTMLCanvasElement, lines: string[]): void {
+  const over = document.createElement("canvas");
+  const box = canvas.getBoundingClientRect();
+  const ratio = window.devicePixelRatio || 1;
+  over.width = Math.round(box.width * ratio);
+  over.height = Math.round(box.height * ratio);
+  Object.assign(over.style, {
+    position: "fixed",
+    left: `${box.left}px`,
+    top: `${box.top}px`,
+    width: `${box.width}px`,
+    height: `${box.height}px`,
+    pointerEvents: "none",
+    // Over the screen, which stacks above the page.
+    zIndex: "2",
+  });
+  const g = over.getContext("2d");
+  if (g === null) return;
+  const size = Math.max(12, Math.round(14 * ratio));
+  g.font = `${size}px monospace`;
+  const width = Math.max(...lines.map((l) => g.measureText(l).width)) + size;
+  g.fillStyle = "rgba(0, 0, 0, 0.85)";
+  g.fillRect(0, 0, Math.min(width, over.width), (lines.length + 0.6) * size * 1.3);
+  g.fillStyle = "#fff";
+  lines.forEach((l, i) => g.fillText(l, size / 2, (i + 1) * size * 1.3));
+  document.body.appendChild(over);
+}
+
 function start(): void {
-  const testing = isLoopback(location.hostname) && asksForTest(location.hash);
+  const testing = mayTest(location.hostname) && asksForTest(location.hash);
   try {
     const test = testing ? parseTestParams(location.hash) : null;
     const canvas = document.querySelector<HTMLCanvasElement>("canvas#screen");
@@ -360,6 +390,9 @@ function start(): void {
         stopVoice();
       } else if (msg.type === "reload") {
         location.reload();
+      } else if (msg.type === "summary") {
+        showSummary(canvas, msg.lines);
+        worker.postMessage({ type: "summary-shown" } satisfies ToWorker);
       } else if (msg.type === "clip-start") {
         try {
           clip.start(canvas);

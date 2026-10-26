@@ -48,6 +48,7 @@ mod requests;
 mod roles;
 mod rooms;
 mod run_pass;
+mod screen;
 mod semantics;
 mod server_services;
 mod simd;

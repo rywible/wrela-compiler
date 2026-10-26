@@ -150,6 +150,11 @@ export type Pipeline = Stage & {
   debug_flag: number | null;
   /** The device features its shader needs (WebGPU's names). */
   requires: string[];
+  /** Reached only under runtime conditions: tier 1, built once tier 0 is (or when a command
+   * needs it first). */
+  conditional: boolean;
+  /** Its shaders' pipeline-overridable constants, each by its name in the WGSL, in order. */
+  constants: [string, boolean | number][];
 };
 
 export interface Manifest {
@@ -157,6 +162,28 @@ export interface Manifest {
   stream_version: number;
   wasm: string;
   pipelines: Pipeline[];
+  /** The WASM's interface, as the build made it (null where the manifest doesn't state it). */
+  wasm_abi: WasmAbi | null;
+  /** A relaxed-SIMD build's second module, and its interface (`wrela build --relaxed-simd`):
+   * what a browser that runs relaxed SIMD loads instead (`loadBuild`). */
+  wasm_relaxed: string | null;
+  wasm_relaxed_abi: WasmAbi | null;
+}
+
+/** A memory's limits, in 64 KiB pages. */
+export interface MemoryLimits {
+  initial: number;
+  maximum: number | null;
+  shared: boolean;
+}
+
+/** A module's interface (the ABI's `WasmAbi`): its imported memory's limits, each import as
+ * `[module, name, type]` and each exported function as `[name, type]`, in the module's order. A
+ * function's type is written `(i32, i32) -> ()`; another import's is its kind (`memory`). */
+export interface WasmAbi {
+  memory: MemoryLimits | null;
+  imports: [string, string, string][];
+  exports: [string, string][];
 }
 
 export class ManifestError extends Error {
@@ -338,7 +365,52 @@ function pipeline(v: unknown, i: number): Pipeline {
   const debug_flag = d === null ? null : asU32(d, `${where}.debug_flag`);
   // Missing `requires` is none.
   const requires: string[] = names(o, "requires", where, FEATURES, "a feature this host knows", true);
-  return { ...stage, name, shader, uniform, bindings, debug_flag, requires };
+  // A missing `conditional` is tier 0.
+  const conditional = flag(o, "conditional", where, false);
+  // Missing `constants` are none.
+  const constants: [string, boolean | number][] = [];
+  if (o["constants"] !== undefined) {
+    const co = object(o["constants"], `${where}.constants`);
+    for (const [k, v] of Object.entries(co)) {
+      if (typeof v !== "boolean" && !(typeof v === "number" && Number.isFinite(v))) {
+        throw new ManifestError(`${where}.constants.${k} must be true, false or a number`);
+      }
+      constants.push([k, v]);
+    }
+  }
+  return { ...stage, name, shader, uniform, bindings, debug_flag, requires, conditional, constants };
+}
+
+/** The manifest's `wasm_abi`. */
+function wasmAbi(v: unknown): WasmAbi {
+  const where = "wasm_abi";
+  const o = object(v, where);
+  const strings = <N extends number>(item: unknown, at: string, n: N): string[] => {
+    if (!Array.isArray(item) || item.length !== n || !item.every((x) => typeof x === "string")) {
+      throw new ManifestError(`${at} must be an array of ${n} strings`);
+    }
+    return item as string[];
+  };
+  const rows = (key: string, n: number): string[][] => {
+    const list = field(o, key, where);
+    if (!Array.isArray(list)) throw new ManifestError(`${where}.${key} must be an array`);
+    return list.map((item, k) => strings(item, `${where}.${key}[${k}]`, n));
+  };
+  let memory: MemoryLimits | null = null;
+  if (o["memory"] !== undefined) {
+    const mw = `${where}.memory`;
+    const mo = object(o["memory"], mw);
+    memory = {
+      initial: u32(mo, "initial", mw),
+      maximum: mo["maximum"] === undefined ? null : u32(mo, "maximum", mw),
+      shared: flag(mo, "shared", mw, false),
+    };
+  }
+  return {
+    memory,
+    imports: rows("imports", 3) as [string, string, string][],
+    exports: rows("exports", 2) as [string, string][],
+  };
 }
 
 /** Parses and validates a manifest; any other version is rejected. */
@@ -366,6 +438,9 @@ export function parseManifest(json: string): Manifest {
     stream_version: u32(o, "stream_version", "the manifest"),
     wasm: str(o, "wasm", "the manifest"),
     pipelines: pipelines.map(pipeline),
+    wasm_abi: o["wasm_abi"] === undefined ? null : wasmAbi(o["wasm_abi"]),
+    wasm_relaxed: o["wasm_relaxed"] === undefined ? null : str(o, "wasm_relaxed", "the manifest"),
+    wasm_relaxed_abi: o["wasm_relaxed_abi"] === undefined ? null : wasmAbi(o["wasm_relaxed_abi"]),
   };
   validateManifest(m);
   return m;

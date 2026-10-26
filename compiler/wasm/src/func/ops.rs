@@ -440,6 +440,23 @@ fn dims(fe: &Fe, t: ir::TypeId) -> Option<Dims> {
 // Each lane is computed by the instruction the scalar code uses for that component, and sums
 // of lanes are added one lane at a time in the scalar code's order: the bits are the same.
 
+/// `v = a * b + c` (`c - a * b` with `negate`) as one relaxed fused multiply-add: relaxed SIMD
+/// in a relaxable function (`Fused`).
+pub(in crate::func) fn fused_madd(
+    fe: &mut Fe,
+    v: ir::ValueId,
+    a: ir::ValueId,
+    b: ir::ValueId,
+    c: ir::ValueId,
+    negate: bool,
+) {
+    vec_operand(fe, a);
+    vec_operand(fe, b);
+    vec_operand(fe, c);
+    fe.ins.push(if negate { I::F32x4RelaxedNmadd } else { I::F32x4RelaxedMadd });
+    fe.ins.push(I::LocalSet(fe.v(v)));
+}
+
 /// Pushes `x` as a `v128`: a vector, or a scalar in every lane.
 fn vec_operand(fe: &mut Fe, x: ir::ValueId) {
     fe.ins.push(I::LocalGet(fe.v(x)));
@@ -629,7 +646,13 @@ pub(super) fn lanes_builtin(
         B::Min | B::Max => {
             arg(fe, 0);
             arg(fe, 1);
-            fe.ins.push(if b == B::Min { I::F32x4Min } else { I::F32x4Max });
+            fe.ins.push(match (b == B::Min, fe.relaxed) {
+                (true, false) => I::F32x4Min,
+                (false, false) => I::F32x4Max,
+                // Relaxed: a NaN or a signed zero may come out either way.
+                (true, true) => I::F32x4RelaxedMin,
+                (false, true) => I::F32x4RelaxedMax,
+            });
         }
         B::Clamp => {
             arg(fe, 0);

@@ -226,10 +226,44 @@ pub enum ExprKind {
 
 /// What a command records (§18): an entry point named where it's recorded, or a bound entry
 /// point's value.
+/// A `const` parameter's argument (§18.1): a pipeline-overridable constant's value. A float
+/// is held as its bits, so a pipeline's key compares and hashes it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum ConstArg {
+    Bool(bool),
+    U32(u32),
+    I32(i32),
+    F32(u32),
+}
+
+impl ConstArg {
+    /// Its value as WebGPU's `constants` take it, a number (a bool is 0 or 1).
+    pub fn number(self) -> f64 {
+        match self {
+            ConstArg::Bool(b) => f64::from(u8::from(b)),
+            ConstArg::U32(x) => f64::from(x),
+            ConstArg::I32(x) => f64::from(x),
+            ConstArg::F32(bits) => f64::from(f32::from_bits(bits)),
+        }
+    }
+}
+
+impl std::fmt::Display for ConstArg {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match *self {
+            ConstArg::Bool(b) => write!(f, "{b}"),
+            ConstArg::U32(x) => write!(f, "{x}"),
+            ConstArg::I32(x) => write!(f, "{x}"),
+            ConstArg::F32(bits) => write!(f, "{:?}", f32::from_bits(bits)),
+        }
+    }
+}
+
 #[derive(Clone, Debug)]
 pub enum Shader {
-    /// `k` or `k.bind(...)`, with its generic arguments: its arguments are the command's.
-    Named(FnId, Vec<TyId>),
+    /// `k` or `k.bind(...)`, with its generic arguments: its arguments are the command's, but
+    /// its `const` parameters' (§18.1), whose values are here, by parameter index.
+    Named(FnId, Vec<TyId>, Vec<(usize, ConstArg)>),
     /// A value of a bound entry point's type (`let k = k.bind(...)`, or a parameter bounded by
     /// `Kernel`): the type names the entry point once it's known, and its fields hold the
     /// arguments.

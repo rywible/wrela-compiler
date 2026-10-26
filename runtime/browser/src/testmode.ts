@@ -100,6 +100,13 @@ export interface TestParams {
   /** 0: the checker off, as a release build plays (a profile's runs); 1, the default: on, so a
    * test names the program's mistake. */
   checks: number;
+  /** 1: at the end, draw the run's summary over the canvas and leave it there, for a device
+   * that can't put its results (a phone on the LAN). */
+  show: number;
+  /** 1: the program may show the screen another way (`std::gpu::screen`): HDR, or Display P3.
+   * Otherwise test mode keeps it `SCREEN_FORMAT`, so goldens and hashes don't change; with it the
+   * run writes `screen.json` (the canvas's configuration, the screen's middle texel). */
+  hdr: number;
 }
 
 export const TEST_DEFAULTS: TestParams = {
@@ -128,6 +135,8 @@ export const TEST_DEFAULTS: TestParams = {
   clip: 0,
   clipfrom: 0,
   checks: 1,
+  show: 0,
+  hdr: 0,
 };
 /** Every parameter's name, in order. */
 const NAMES = Object.keys(TEST_DEFAULTS) as (keyof TestParams)[];
@@ -138,6 +147,48 @@ const KEYS = NAMES.filter((k): k is Count => typeof TEST_DEFAULTS[k] === "number
 /** Whether a page's host is this machine, where test mode may run. */
 export function isLoopback(hostname: string): boolean {
   return hostname === "localhost" || hostname === "127.0.0.1" || hostname === "[::1]" || hostname === "::1";
+}
+
+/** Whether test mode may run on a page from `hostname`: this machine, or an address on a private
+ * network (10/8, 172.16/12, 192.168/16, as `wrela run --lan` serves a device there), never a
+ * name or a public address, so a shipped page doesn't enter it. */
+export function mayTest(hostname: string): boolean {
+  if (isLoopback(hostname)) return true;
+  const m = /^(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})$/.exec(hostname);
+  if (m === null || m.slice(1).some((x) => Number(x) > 255)) return false;
+  const [a, b] = [Number(m[1]), Number(m[2])];
+  // As a LAN server's own addresses are (runtime/native `interfaces::private`): RFC 1918's, the
+  // shared 100.64/10 (an overlay's, Tailscale's), and link-local.
+  return a === 10 || (a === 172 && b >= 16 && b < 32) || (a === 192 && b === 168) || (a === 100 && b >= 64 && b < 128) || (a === 169 && b === 254);
+}
+
+/** The nearest-rank `p`th percentile of `xs`. */
+function percentile(xs: number[], p: number): number {
+  const sorted = [...xs].sort((a, b) => a - b);
+  return sorted[Math.max(Math.ceil((sorted.length * p) / 100), 1) - 1] ?? 0;
+}
+
+/** A run's summary, as `show=1` draws it: the frames' intervals (their 50th, 95th and 99th
+ * percentiles, and how many were over 33 ms), when the page was first playable (its program's
+ * first line that says `playable`) and its first frame, how long its pipelines took, and the
+ * adapter. */
+export function summaryLines(
+  run: { began_ms: number[]; printed: string[]; printed_in: number[]; opened_ms: number; pipelines_ms: number | null },
+  adapter: string,
+): string[] {
+  const intervals = run.began_ms.slice(1).map((t, i) => t - run.began_ms[i]!);
+  const ms = (x: number) => `${x.toFixed(1)} ms`;
+  const lines = [
+    `${intervals.length + 1} frames; intervals p50 ${ms(percentile(intervals, 50))}, p95 ${ms(percentile(intervals, 95))}, p99 ${ms(percentile(intervals, 99))}; over 33 ms: ${intervals.filter((x) => x > 33).length}`,
+  ];
+  const first = run.began_ms[0];
+  if (first !== undefined) lines.push(`first frame ${ms(first - run.opened_ms)} after the page opened`);
+  const said = run.printed.findIndex((l) => l.includes("playable"));
+  const at = said < 0 ? undefined : run.began_ms[run.printed_in[said]!];
+  lines.push(at === undefined ? "playable: not said" : `playable ${ms(at - run.opened_ms)}`);
+  if (run.pipelines_ms !== null) lines.push(`pipelines ${ms(run.pipelines_ms)}`);
+  lines.push(adapter || "an unnamed adapter");
+  return lines;
 }
 
 /** Whether a URL fragment asks for test mode, whether or not its parameters are valid. */

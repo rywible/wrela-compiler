@@ -9,6 +9,7 @@
 //! the deepest tree the parser accepts (`wrela_syntax::MAX_NESTING`, `MAX_EXPR_DEPTH`).
 
 pub mod build;
+pub use wrela_wasm::DataReport;
 pub mod const_cache;
 pub mod consts;
 pub mod edit;
@@ -60,6 +61,9 @@ pub struct Output {
     pub program_files: ProgramFiles,
     /// How many constants the build computed, and how many it read from the cache (§13).
     pub consts: consts::ConstStats,
+    /// What the client build's constant data holds (`wrela build --report data`), when it was
+    /// built.
+    pub data: Option<wrela_wasm::DataReport>,
 }
 
 /// One pipeline: an instantiation of its entry points, and why it exists.
@@ -77,6 +81,14 @@ pub struct PipelineSummary {
     /// (`wrela_sema::mir::control`): its pipeline is in the build however rarely it holds.
     /// Empty unless the compile was [`check_pipelines`].
     pub conditional: Vec<bool>,
+}
+
+impl PipelineSummary {
+    /// Its tier (§18.9): 1 when every site of it is under a runtime condition (a host builds it
+    /// once tier 0 is built), else 0. A summary without its sites' conditions is tier 0.
+    pub fn tier(&self) -> u8 {
+        u8::from(!self.conditional.is_empty() && self.conditional.iter().all(|&c| c))
+    }
 }
 
 impl Output {
@@ -176,6 +188,15 @@ pub fn check_with(root: &Path, overlay: &Overlay) -> Output {
 /// Builds the package at `root`: its diagnostics, and its files when there are no errors.
 pub fn build(root: &Path) -> Output {
     on_compiler_thread(|| compile(root, Mode::RELEASE, wrela_lower::Roots::of, &[]))
+}
+
+/// [`build`], with a second module beside `game.wasm` whose presentation code uses relaxed SIMD
+/// (`game.relaxed.wasm`, `Manifest::wasm_relaxed`): the code deterministic code reaches is the
+/// same in both.
+pub fn build_relaxed(root: &Path) -> Output {
+    on_compiler_thread(|| {
+        compile(root, Mode { relaxed_simd: true, ..Mode::RELEASE }, wrela_lower::Roots::of, &[])
+    })
 }
 
 /// [`build`] in debug mode: the build pays for checks a release build doesn't make, such as a
@@ -782,11 +803,19 @@ struct Mode {
     testing: bool,
     /// Each pipeline site's [`PipelineSummary::conditional`] worked out.
     conditions: bool,
+    /// A second module, with relaxed SIMD outside deterministic code ([`build_relaxed`]).
+    relaxed_simd: bool,
 }
 
 impl Mode {
-    const CHECK: Mode =
-        Mode { emit: false, debug: false, no_simd: false, testing: false, conditions: false };
+    const CHECK: Mode = Mode {
+        emit: false,
+        debug: false,
+        no_simd: false,
+        testing: false,
+        conditions: false,
+        relaxed_simd: false,
+    };
     const RELEASE: Mode = Mode { emit: true, ..Mode::CHECK };
 }
 
@@ -845,6 +874,7 @@ fn compile_loaded_in(
             pipelines: Vec::new(),
             program_files: Vec::new(),
             consts: consts::ConstStats::default(),
+            data: None,
         });
     };
     // The program package's own files: package 1's (std is 0).
@@ -869,10 +899,12 @@ fn compile_loaded_in(
     scope.stop()?;
     let mut files = Vec::new();
     let mut pipelines = Vec::new();
+    let mut data_report = None;
     let mut data = wrela_lower::BuildData {
         debug: mode.debug,
         no_simd: mode.no_simd,
         testing: mode.testing,
+        relaxed_simd: mode.relaxed_simd,
         ..Default::default()
     };
     let cache = scope.cache_of(root);
@@ -895,12 +927,19 @@ fn compile_loaded_in(
         for role in roles(&checked) {
             scope.stop()?;
             data.role = role;
-            let (lowered, d) = wrela_lower::lower(&checked, &roots, &data, mode.emit);
+            // The pipeline-count query lowers as a build does, inlining and all, so it lists the
+            // pipelines a build makes (a constant branch's are gone): only the back ends are
+            // skipped.
+            let (lowered, d) =
+                wrela_lower::lower(&checked, &roots, &data, mode.emit || mode.conditions);
             scope.stop()?;
             let ok = !has_errors(&d);
             diagnostics.extend(d);
             if role == wrela_sema::defs::Role::Client {
-                pipelines = summarize(&checked, &sources, &lowered, mode.conditions);
+                // A build works out which pipelines are reached only under a condition: the
+                // manifest's tiers (§18.9).
+                pipelines = summarize(&checked, &sources, &lowered, mode.conditions || mode.emit);
+                data_report = wrela_wasm::data_report(&lowered.cpu).ok();
             }
             if !ok || !mode.emit {
                 continue;
@@ -914,7 +953,9 @@ fn compile_loaded_in(
             // A shipped build keeps its budgets; a test's, a debug, a lifted or a SIMD-less
             // one may go over.
             let budgets = !(mode.debug || mode.no_simd || mode.testing) && lift.is_empty();
-            let out = build::emit(&lowered, &sources, !data.no_simd, budgets);
+            let tier1: Vec<bool> = pipelines.iter().map(|p| p.tier() == 1).collect();
+            let relaxed = mode.relaxed_simd && !data.no_simd;
+            let out = build::emit(&lowered, &sources, !data.no_simd, budgets, &tier1, relaxed);
             diagnostics.extend(out.diagnostics);
             files.extend(out.files);
             files.append(&mut shipped_files);
@@ -924,15 +965,17 @@ fn compile_loaded_in(
         }
         let mut client = None;
         let mut server = None;
+        let mut relaxed = None;
         for (path, bytes) in &mut files {
             match path.as_str() {
                 "game.wasm" => client = Some(bytes),
+                build::RELAXED_WASM => relaxed = Some(bytes),
                 build::SERVER_WASM => server = Some(bytes),
                 _ => {}
             }
         }
         if client.is_some() || server.is_some() {
-            build::pair(client, server);
+            build::pair(client, server, relaxed);
         }
     }
     sort_and_dedup(&mut diagnostics);
@@ -948,6 +991,7 @@ fn compile_loaded_in(
         pipelines,
         program_files,
         consts: stats,
+        data: data_report,
     })
 }
 
@@ -1066,15 +1110,23 @@ fn summarize(
     conditions: bool,
 ) -> Vec<PipelineSummary> {
     let p = &checked.program;
-    let entry = |f: wrela_sema::ty::FnId, substs: &[wrela_sema::ty::TyId]| {
+    // An instantiation: its type arguments, then its `const` parameters' values (§18.1).
+    let entry = |f: wrela_sema::ty::FnId,
+                 substs: &[wrela_sema::ty::TyId],
+                 consts: Vec<(usize, wrela_sema::thir::ConstArg)>| {
         let name = p.fn_display_name(f);
-        if substs.is_empty() {
+        let mut args: Vec<String> = substs.iter().map(|&t| p.display_ty(t)).collect();
+        args.extend(consts.iter().map(|(i, c)| format!("{} = {c}", p.func(f).params[*i].name)));
+        if args.is_empty() {
             (name.clone(), name)
         } else {
-            let args: Vec<String> = substs.iter().map(|&t| p.display_ty(t)).collect();
             (format!("{name}::<{}>", args.join(", ")), name)
         }
     };
+    let consts_of =
+        |key: &wrela_lower::PipelineKey, e: usize| -> Vec<(usize, wrela_sema::thir::ConstArg)> {
+            key.consts().iter().filter(|c| c.0 == e).map(|&(_, i, c)| (i, c)).collect()
+        };
     let commands = conditions.then(|| {
         let sites: Vec<Span> =
             lowered.pipelines.iter().flat_map(|p| p.sites.iter().copied()).collect();
@@ -1091,11 +1143,15 @@ fn summarize(
         .map(|out| {
             let (kind, parts) = match &out.key {
                 wrela_lower::PipelineKey::Compute { kernel, substs, .. } => {
-                    ("compute", vec![entry(*kernel, substs)])
+                    ("compute", vec![entry(*kernel, substs, consts_of(&out.key, 0))])
                 }
-                wrela_lower::PipelineKey::Render { vertex, fragment, .. } => {
-                    ("render", vec![entry(vertex.0, &vertex.1), entry(fragment.0, &fragment.1)])
-                }
+                wrela_lower::PipelineKey::Render { vertex, fragment, .. } => (
+                    "render",
+                    vec![
+                        entry(vertex.0, &vertex.1, consts_of(&out.key, 0)),
+                        entry(fragment.0, &fragment.1, consts_of(&out.key, 1)),
+                    ],
+                ),
             };
             let sites = out.sites.iter().map(|s| sources.file(s.file).location(s.start)).collect();
             PipelineSummary {

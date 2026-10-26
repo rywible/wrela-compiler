@@ -31,10 +31,17 @@ pub fn run(args: &[String]) -> ExitCode {
         wrela_driver::build_for_tests(dir, args.debug)
     } else if args.debug {
         wrela_driver::build_debug(dir)
+    } else if args.relaxed_simd {
+        wrela_driver::build_relaxed(dir)
     } else {
         wrela_driver::build(dir)
     };
     let failed = crate::report(&output, args.json);
+    if args.report_data
+        && let Some(data) = &output.data
+    {
+        print!("{}", if args.json { data_json(data) } else { data_table(data) });
+    }
     if let Some(level) = args.optimize
         && !failed
         && let Err(e) = optimized(&mut output.files, level)
@@ -96,31 +103,90 @@ pub fn run(args: &[String]) -> ExitCode {
     }
 }
 
+/// How many of the largest constants `--report data` lists.
+const LARGEST: usize = 20;
+
+/// `--report data`'s table: the largest constants, the section's total and its zero share.
+fn data_table(d: &wrela_driver::DataReport) -> String {
+    let share =
+        |zeros: u32, of: u32| if of == 0 { 0.0 } else { 100.0 * f64::from(zeros) / f64::from(of) };
+    let mut s = format!("{:<40} {:<32} {:>12} {:>7}\n", "constant", "type", "bytes", "zeros");
+    for (name, ty, bytes, zeros) in d.constants.iter().take(LARGEST) {
+        let ty = if ty.len() > 32 {
+            format!("{}…", &ty[..ty.floor_char_boundary(31)])
+        } else {
+            ty.clone()
+        };
+        s.push_str(&format!("{name:<40} {ty:<32} {bytes:>12} {:>6.1}%\n", share(*zeros, *bytes)));
+    }
+    s.push_str(&format!(
+        "data: {} bytes in {} constants, {:.1}% zero; the segments hold {} bytes\n",
+        d.total,
+        d.constants.len(),
+        share(d.zeros, d.total),
+        d.segments
+    ));
+    s
+}
+
+/// `--report data --json`.
+fn data_json(d: &wrela_driver::DataReport) -> String {
+    let constants: Vec<_> = d
+        .constants
+        .iter()
+        .take(LARGEST)
+        .map(|(name, ty, bytes, zeros)| {
+            serde_json::json!({ "name": name, "type": ty, "bytes": bytes, "zero_bytes": zeros })
+        })
+        .collect();
+    let all = serde_json::json!({
+        "data": {
+            "bytes": d.total,
+            "zero_bytes": d.zeros,
+            "segment_bytes": d.segments,
+            "constants": d.constants.len(),
+            "largest": constants,
+        }
+    });
+    format!("{all}\n")
+}
+
 /// The build's files with `game.wasm` optimized, and its trap locations beside it.
 pub(crate) fn optimized(
     files: &mut Vec<(String, Vec<u8>)>,
     level: wrela_driver::optimize::Level,
 ) -> Result<(), String> {
-    optimized_with(files, |wasm| wrela_driver::optimize::optimize(wasm, level))
+    optimized_with(files, |wasm, relaxed| wrela_driver::optimize::optimize(wasm, level, relaxed))
 }
 
 /// [`optimized`], with `optimize` making the optimized code and its table.
 pub(crate) fn optimized_with(
     files: &mut Vec<(String, Vec<u8>)>,
-    optimize: impl FnOnce(&[u8]) -> Result<(Vec<u8>, Vec<u8>), String>,
+    mut optimize: impl FnMut(&[u8], bool) -> Result<(Vec<u8>, Vec<u8>), String>,
 ) -> Result<(), String> {
     let wasm =
         files.iter_mut().find(|(f, _)| f == "game.wasm").ok_or("the build has no game.wasm")?;
-    let (code, lines) = optimize(&wasm.1)?;
+    let (code, lines) = optimize(&wasm.1, false)?;
     wasm.1 = code;
     files.push((LINES.to_string(), lines));
-    Ok(())
+    // A relaxed module, through `wasm-opt` with relaxed SIMD allowed (its own trap lines: the
+    // relaxed module's offsets are its own).
+    if let Some(relaxed) = files.iter_mut().find(|(f, _)| f == wrela_driver::build::RELAXED_WASM) {
+        let (code, lines) = optimize(&relaxed.1, true)?;
+        relaxed.1 = code;
+        files.push((RELAXED_LINES.to_string(), lines));
+    }
+    wrela_driver::build::restate_abi(files)
 }
+
+/// An optimized relaxed module's trap locations, beside it.
+const RELAXED_LINES: &str = "game.relaxed.lines";
 
 /// An optimized build's trap locations, beside `game.wasm` (`wrela_abi::lines::SIDECAR`).
 const LINES: &str = "game.lines";
 
-/// Whether a build writes a file with this name: `game.wasm`, `manifest.json`, a pipeline's
+/// Whether a build writes a file with this name: `game.wasm` (and a relaxed-SIMD build's
+/// `game.relaxed.wasm`), their trap locations, `manifest.json`, a pipeline's
 /// `pipeline_<n>.wgsl`, a file of the runtime, a server build's `server/game.wasm` or a tool
 /// build's `tool/tool.wasm`.
 pub(crate) fn written_by_build(name: &str) -> bool {
@@ -137,6 +203,8 @@ pub(crate) fn written_by_build(name: &str) -> bool {
         || shipped
         || name == "game.wasm"
         || name == LINES
+        || name == wrela_driver::build::RELAXED_WASM
+        || name == RELAXED_LINES
         || name == "manifest.json"
         || name == "lift.json"
         || name == wrela_driver::build::SERVER_WASM
