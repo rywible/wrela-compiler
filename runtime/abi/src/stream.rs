@@ -1192,7 +1192,7 @@ impl Command<'_> {
         }
     }
 
-    /// The pipeline and bindings of a command that dispatches or draws.
+    /// The pipeline and bindings of a command that dispatches or draws: `None` for the others.
     pub fn pipeline(&self) -> Option<(u32, &[Binding])> {
         match self {
             Command::Dispatch { pipeline, bindings, .. }
@@ -1202,7 +1202,37 @@ impl Command<'_> {
             | Command::DrawIndirect { pipeline, bindings, .. }
             | Command::DrawIndexedIndirect { pipeline, bindings, .. }
             | Command::MultiDrawIndirect { pipeline, bindings, .. } => Some((*pipeline, bindings)),
-            _ => None,
+            // Each by name, so a command added later is placed here on purpose.
+            Command::CreateBuffer { .. }
+            | Command::WriteBuffer { .. }
+            | Command::BeginScreenPass { .. }
+            | Command::Present
+            | Command::DestroyBuffer { .. }
+            | Command::CopyBuffer { .. }
+            | Command::CreateTexture { .. }
+            | Command::WriteTexture { .. }
+            | Command::DestroyTexture { .. }
+            | Command::CreateSampler { .. }
+            | Command::DestroySampler { .. }
+            | Command::BeginPass(_)
+            | Command::EndPass
+            | Command::ReadBuffer { .. }
+            | Command::StorageRead { .. }
+            | Command::StorageWrite { .. }
+            | Command::Fetch { .. }
+            | Command::Label { .. }
+            | Command::Post { .. }
+            | Command::Prepare { .. }
+            | Command::Unprepare { .. }
+            | Command::HandOver { .. }
+            | Command::HostRequest { .. }
+            | Command::Timed { .. }
+            | Command::CopyTexture { .. }
+            | Command::CopyTextureToBuffer { .. }
+            | Command::CopyBufferToTexture { .. }
+            | Command::SetScissor { .. }
+            | Command::ConfigureScreen { .. }
+            | Command::SetViewport { .. } => None,
         }
     }
 }

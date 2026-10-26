@@ -999,7 +999,8 @@ mod tests {
     use super::Recorded;
     use wrela_abi::stream::{Binding, Command};
 
-    /// Every draw names its pipeline, indexed and multi-draws too: the pass viewer lists them.
+    /// Every draw names its pipeline, indexed and multi-draws too, and a dispatch its pipeline
+    /// and groups: the pass viewer lists them. What neither draws nor dispatches names none.
     #[test]
     fn every_draw_names_its_pipeline() {
         let names = [String::from("a"), String::from("b")];
@@ -1025,12 +1026,22 @@ mod tests {
             count: 8,
             count_buffer: 5,
             count_offset: 0,
-            bindings: bound,
+            bindings: bound.clone(),
             uniforms: &[],
         };
-        for c in [indexed, multi] {
+        let dispatch = Command::Dispatch {
+            pipeline: 1,
+            groups: [2, 3, 4],
+            bindings: bound.clone(),
+            uniforms: &[],
+        };
+        for c in [indexed, multi, dispatch] {
             let r = Recorded::of(&c, &names);
             assert_eq!((r.pipeline.as_str(), r.bindings.as_slice()), ("b", &[[7, 0, 0]][..]));
         }
+        let groups =
+            Command::Dispatch { pipeline: 0, groups: [2, 3, 4], bindings: bound, uniforms: &[] };
+        assert_eq!(Recorded::of(&groups, &names).groups, [2, 3, 4]);
+        assert!(Command::Present.pipeline().is_none());
     }
 }

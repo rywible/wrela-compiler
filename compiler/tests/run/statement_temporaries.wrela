@@ -26,6 +26,7 @@
 // expect: loop_ends_with_a_call(2048) = 2048
 // expect: while_ends_with_a_call(2048) = 2048
 // expect: each_ends_with_a_call(2048) = 2048
+// expect: continued_or_broken(2048) = 1025
 
 fn made(s: str) -> String {
     var out = String::new()
@@ -251,6 +252,24 @@ pub fn each_ends_with_a_call(n: u32) -> u32 {
         passes.push(1)
     }
     for _ in passes {
+        add_first(mut count, large())
+    }
+    count
+}
+
+/// Every other pass leaves by `continue` before its last call, and the last by `break`: the
+/// passes that reach the call free its temporary, those that don't have nothing to free.
+pub fn continued_or_broken(n: u32) -> u32 {
+    var count = 0
+    var i = 0
+    loop {
+        i += 1
+        if i > n + 1 {
+            break
+        }
+        if i % 2 == 0 {
+            continue
+        }
         add_first(mut count, large())
     }
     count
