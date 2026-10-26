@@ -15,9 +15,14 @@ import { parseScript, type Scripted } from "./input.ts";
 
 export interface Build {
   manifest: Manifest;
-  wasm: Bytes;
+  /** The WASM: its response, not yet read (it compiles as it streams in), or its bytes. Once
+   * compiled, `compiled` holds the module and this isn't read again. */
+  wasm: Response | Bytes;
   /** Each pipeline's WGSL, in manifest order. */
   shaders: string[];
+  /** The WASM, compiled: set by the first start (`startProgram`) or a hand-over's getting ready,
+   * so a build started again reuses it. */
+  compiled?: Compiled;
 }
 
 export type Fetch = (url: URL, init?: RequestInit) => Promise<Response>;
@@ -96,8 +101,9 @@ export class Handed {
 /** Fetches and validates a build; its files resolve against `base`. */
 export async function loadBuild(base: string, fetchFn: Fetch = networkFetch): Promise<Build> {
   const manifest = parseManifest(await getText(fetchFn, new URL("manifest.json", base)));
+  // The WASM's response stays unread: `Program.compile` compiles it as it streams in.
   const [wasm, shaders] = await Promise.all([
-    get(fetchFn, new URL(manifest.wasm, base)).then(async (r) => new Uint8Array(await r.arrayBuffer())),
+    get(fetchFn, new URL(manifest.wasm, base)),
     Promise.all(manifest.pipelines.map((p) => getText(fetchFn, new URL(p.shader, base)))),
   ]);
   return { manifest, wasm, shaders };
@@ -186,24 +192,26 @@ export interface GpuOptions {
   /** Hot reload: the pipelines built so far, which the build keeps where they're the same
    * (`buildPipelines`). */
   cache?: PipelineCache | undefined;
+  /** Whether the WASM's bytes are hashed as it compiles (the tick log's header). */
+  hashWasm?: boolean;
 }
 
 /** Starts building every pipeline, compiles the WASM meanwhile (unless the build comes compiled:
- * one got ready for a hand-over), then instantiates the program with the decoder behind its
+ * one got ready for a hand-over, or one started before), then instantiates the program with the decoder behind its
  * import. A program whose `init` fails leaves nothing on the GPU. The program starts while its pipelines build: a command
  * that needs one waits for it (`GpuExecutor`), and the frames wait for the commands
  * (`GpuExecutor.caughtUp`). A pipeline that can't be built fails the program, through the
  * executor's `built`. */
 export async function startProgram(
   device: GPUDevice,
-  build: Build & { compiled?: Compiled },
+  build: Build,
   screen: ScreenTarget,
   options: ProgramOptions = {},
   gpu: GpuOptions = {},
 ): Promise<Program> {
   const started = performance.now();
   const pipelines = buildPipelines(device, build.manifest, build.shaders, screen.format, gpu.cache);
-  const compiled = build.compiled ?? (await Program.compile(build.wasm));
+  const compiled = (build.compiled ??= await Program.compile(build.wasm, build.manifest.wasm_abi, gpu.hashWasm ?? false));
   const debug = build.manifest.pipelines.some((p) => p.debug_flag !== null);
   const executor = new GpuExecutor(device, pipelines, screen, gpu.timing, debug);
   executor.built.then(() => gpu.onPipelines?.(performance.now() - started), () => {});

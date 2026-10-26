@@ -93,6 +93,7 @@ fn emit_in(
     let mut diagnostics = Vec::new();
     let mut files = Vec::new();
     let mut code_lines = Vec::new();
+    let mut wasm_abi = None;
     match wrela_wasm::emit_with(&l.cpu, options) {
         Ok(out) => {
             // Where each part of the code came from, as `file:line:column`, for trap messages.
@@ -106,11 +107,18 @@ fn emit_in(
             let lines = wrela_abi::lines::Lines::new(entries).encode();
             let wasm = wrela_wasm::with_custom_section(out.wasm, wrela_abi::lines::SECTION, &lines);
             code_lines = out.lines;
+            match wrela_wasm::interface(&wasm) {
+                Ok(abi) => wasm_abi = Some(abi),
+                Err(e) => diagnostics.push(Diagnostic::internal(format!(
+                    "the WASM back end's module doesn't read: {e}"
+                ))),
+            }
             files.push(("game.wasm".to_string(), wasm));
         }
         Err(e) => diagnostics.push(Diagnostic::internal(format!("the WASM back end failed: {e}"))),
     }
     let mut manifest = wrela_abi::Manifest::new("game.wasm");
+    manifest.wasm_abi = wasm_abi;
     for (i, p) in l.pipelines.iter().enumerate() {
         let shader = format!("pipeline_{i}.wgsl");
         let wgsl = if shaders {
@@ -227,6 +235,21 @@ fn emit_in(
         }
     }
     BuildOutput { files, diagnostics, lines: code_lines }
+}
+
+/// States `game.wasm`'s interface in `manifest.json` again, after something rewrote the module
+/// (`wasm-opt` may drop an import nothing calls).
+pub fn restate_abi(files: &mut [(String, Vec<u8>)]) -> Result<(), String> {
+    let wasm = files.iter().find(|(f, _)| f == "game.wasm").ok_or("the build has no game.wasm")?;
+    let abi = wrela_wasm::interface(&wasm.1)?;
+    let Some(manifest) = files.iter_mut().find(|(f, _)| f == "manifest.json") else {
+        return Ok(());
+    };
+    let text = std::str::from_utf8(&manifest.1).map_err(|_| "manifest.json isn't UTF-8")?;
+    let mut m = wrela_abi::Manifest::parse(text).map_err(|e| e.to_string())?;
+    m.wasm_abi = Some(abi);
+    manifest.1 = m.to_json().into_bytes();
+    Ok(())
 }
 
 /// The runtime's page for a build: it preloads the build's manifest, WASM and shaders as soon as

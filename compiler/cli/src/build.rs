@@ -114,7 +114,7 @@ pub(crate) fn optimized_with(
     let (code, lines) = optimize(&wasm.1)?;
     wasm.1 = code;
     files.push((LINES.to_string(), lines));
-    Ok(())
+    wrela_driver::build::restate_abi(files)
 }
 
 /// An optimized build's trap locations, beside `game.wasm` (`wrela_abi::lines::SIDECAR`).

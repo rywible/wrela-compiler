@@ -20,7 +20,6 @@ import { encodePng } from "./png.ts";
 import { Resampler } from "./resample.ts";
 import { frameTime, holdFor, inputUrl, loaded, putResult, sleepUntil, type TestParams } from "./testmode.ts";
 import { lockstepTicks, runTicker, TickerControl, TickerMode } from "./ticker.ts";
-import { wasmHash } from "./ticks.ts";
 import { failAudioRender } from "./worker-audio.ts";
 
 declare const self: DedicatedWorkerGlobalScope;
@@ -185,11 +184,12 @@ type TickSettings = Pick<TickerStart, "script" | "hashes" | "timing" | "delay" |
 const NORMAL_TICKS: TickSettings = { script: [], hashes: false, timing: false, delay: 0, replayable: false };
 
 /** What starts the program's ticker on its own thread, with `settings`: this script again, told
- * to run it. `wasm` is the build's, whose hash heads the tick log when hashes are kept. With
+ * to run it. `build` is the program's, whose WASM's hash (taken as it compiled) heads the tick
+ * log when hashes are kept. With
  * `replay`, a hot reload's: the ticker runs the replaced build's ticks again first, and reads
  * the input ring on from where the replaced one stopped. */
 function tickerStarter(
-  wasm: Uint8Array,
+  build: Build,
   settings: TickSettings,
   replay: Replay | null = null,
 ): (options: TickerOptions, onPrint: PrintSink) => void {
@@ -215,7 +215,7 @@ function tickerStarter(
       control: ticker.control.buffer,
       clock: clock.buffer,
       input: ring!.buffer,
-      wasmHash: settings.hashes ? wasmHash(wasm) : 0n,
+      wasmHash: settings.hashes ? (build.compiled?.hash ?? 0n) : 0n,
       replay,
       framesBeforeStart,
     } satisfies ToWorker);
@@ -250,7 +250,7 @@ function programOptions(b: Build, ticks: TickSettings, carried: Carried | null):
     builds: handOvers ?? undefined,
     spawnWorker,
     startVoice,
-    startTicker: tickerStarter(b.wasm, ticks, carried?.replay ?? null),
+    startTicker: tickerStarter(b, ticks, carried?.replay ?? null),
     kept: carried?.kept,
     inbox: carried?.inbox,
     net,
@@ -657,6 +657,7 @@ async function runTest(canvas: OffscreenCanvas, device: GPUDevice, build: Build,
           record.pipelinesMs = ms;
         },
         cache: pipelineCache,
+        hashWasm: tickHashes,
       },
     );
   running = salted;
@@ -759,7 +760,7 @@ async function runTest(canvas: OffscreenCanvas, device: GPUDevice, build: Build,
   }
   await draining;
   if (failed) return;
-  await saveResults(device, build, params, r, screen, timing, record);
+  await saveResults(device, salted, params, r, screen, timing, record);
 }
 
 /** A test's results, once its frames have run (`results/`), then `DONE`. */
@@ -817,7 +818,10 @@ async function saveResults(
   self.postMessage({ type: "load-query" } satisfies FromWorker);
   const page = await pageLoaded.promise;
   const resources = [...page.resources, ...loaded(["resource"])];
-  const load = { opened_ms: page.opened_ms, first_frame_ms: began_ms[0] ?? null, resources };
+  // How the WASM compiled: a second open of the same build streams it from the code cache.
+  const compiled = build.compiled;
+  const wasm = compiled ? { compile_ms: compiled.compile_ms, streamed: compiled.streamed } : null;
+  const load = { opened_ms: page.opened_ms, first_frame_ms: began_ms[0] ?? null, wasm, resources };
   await putResult(base, "load.json", JSON.stringify(load));
   // An asynchronous device or voice failure may arrive while results are being saved. Its
   // DONE report is final; a later successful write must not replace it.
@@ -905,7 +909,7 @@ function receive(msg: ToWorker, reply: (message: FromTicker | FromHelper) => voi
       Promise.all([openDevice(fatal, test?.features ?? null), loadBuild(base, handed.fetch(networkFetch))])
         .then(([device, build]) => {
           const format = screenFormat(test !== null);
-          handOvers = new HandOvers(device, format, () => buildBase, () => [pipelineCache, leftovers]);
+          handOvers = new HandOvers(device, format, () => buildBase, () => [pipelineCache, leftovers], undefined, test !== null);
           return test ? runTest(msg.canvas, device, build, test, live) : run(msg.canvas, device, format, build, live);
         })
         .catch(fatal);

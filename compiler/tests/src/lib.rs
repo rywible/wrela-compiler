@@ -491,6 +491,19 @@ pub fn run_page(
     })
 }
 
+/// [`run_page`] twice in one browser profile (`wrela_host::pages::run_twice`): the first open's
+/// results are in `results-first/`.
+pub fn run_page_twice(rel: &str, fragment: &str, timeout: u32) -> Result<(), String> {
+    let root = repo_root();
+    wrela_host::pages::run_twice(wrela_host::pages::Page {
+        root: &root,
+        page: rel,
+        fragment,
+        timeout: std::time::Duration::from_secs(u64::from(timeout)),
+        script: None,
+    })
+}
+
 /// Runs the page at `rel` (from [`page`]) in headless Chrome with URL fragment `fragment`,
 /// giving it `script`'s trusted input while it runs (a `std::tool::browser::Script`, which
 /// [`browser_script`] reads). Whether the run passed; its printed lines are in

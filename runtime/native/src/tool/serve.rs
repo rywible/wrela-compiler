@@ -438,7 +438,15 @@ fn connection(
             } else {
                 path.to_string()
             };
-            crate::loopback::get_file(&mut out, &server.dir, &rel, None)
+            crate::loopback::get_file(
+                &mut out,
+                &server.dir,
+                &rel,
+                None,
+                crate::loopback::Caching::Revalidate {
+                    if_none_match: head.if_none_match.as_deref(),
+                },
+            )
         }
         "PUT" => match head.path.strip_prefix("/results/") {
             Some(_) if !server.writable => respond(

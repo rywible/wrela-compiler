@@ -1564,6 +1564,8 @@ Exports other than `frame` serve tests and tools, and take scalar and vector par
 - A returned value crosses as its numbers in order (fields, then elements, then components), at most 64. `wrela trace` names them `.x` to `.w`, or `.0` and on for more than four.
 - Other types cannot cross, and the host cannot choose a generic function's types (E0703).
 
+**What a build states about its module.** A client build's `manifest.json` carries `wasm_abi`: the module's imported memory's limits, each import as `[module, name, type]` and each exported function as `[name, type]`, in the module's order (a function's type is written `(i32, i32) -> ()`, another import's is its kind, `memory`). The browser host checks the module against it rather than reading the module's bytes, so it compiles the WASM as it streams in (`WebAssembly.compileStreaming`, which needs the server to send it as `application/wasm`; any other type is read whole, then compiled), and a second open of the same build finds the compiled code in the browser's code cache. A build that `wasm-opt` rewrote (`--optimize`) states the rewritten module's interface.
+
 ### 15.3 Client, server and tool roles
 
 A program has a role for each host that runs it: a client build that a browser host runs, a server build that a server host runs, and a tool build that the native host's tool profile runs.

@@ -53,6 +53,8 @@ export class HandOvers implements Builds {
     readonly base: () => string,
     readonly held: () => readonly PipelineCache[],
     readonly fetchFn?: Fetch,
+    /** Whether a build's WASM is hashed as it compiles (the tick log's header). */
+    readonly hashWasm = false,
   ) {}
 
   /** The base of the build at `path`, from the running build's. */
@@ -117,7 +119,7 @@ export class HandOvers implements Builds {
       const others = [...this.#prepared.values()].map((p) => p.pipelines).filter((c) => c !== null);
       const pipelines = preparePipelines(this.device, build.manifest, build.shaders, this.screenFormat, [...this.held(), ...others]);
       started(pipelines);
-      const [compiled] = await Promise.all([Program.compile(build.wasm), Promise.all(pipelines.values())]);
+      const [compiled] = await Promise.all([Program.compile(build.wasm, build.manifest.wasm_abi, this.hashWasm), Promise.all(pipelines.values())]);
       return { ...build, compiled, pipelines };
     } catch (e) {
       throw new Error(`the build at ${base} isn't ready: ${errorMessage(e)}`);

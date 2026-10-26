@@ -600,6 +600,93 @@ pub fn without_custom_section(
     Ok((out, payload))
 }
 
+/// A module's interface as a manifest states it ([`wrela_abi::manifest::WasmAbi`]): its imported
+/// memory's limits, and each import's and exported function's type, in the module's order.
+pub fn interface(bytes: &[u8]) -> Result<wrela_abi::manifest::WasmAbi, String> {
+    use wasmparser::{ExternalKind, Payload, TypeRef, ValType};
+    fn val(t: ValType) -> &'static str {
+        match t {
+            ValType::I32 => "i32",
+            ValType::I64 => "i64",
+            ValType::F32 => "f32",
+            ValType::F64 => "f64",
+            ValType::V128 => "v128",
+            ValType::Ref(r) if r.is_func_ref() && r.is_nullable() && !r.is_concrete_type_ref() => {
+                "funcref"
+            }
+            ValType::Ref(r) if r.is_extern_ref() && r.is_nullable() => "externref",
+            ValType::Ref(_) => "ref",
+        }
+    }
+    let mut types: Vec<String> = Vec::new();
+    let mut funcs: Vec<String> = Vec::new(); // each function index's type: imports first
+    let mut abi =
+        wrela_abi::manifest::WasmAbi { memory: None, imports: Vec::new(), exports: Vec::new() };
+    for payload in wasmparser::Parser::new(0).parse_all(bytes) {
+        match payload.map_err(|e| e.to_string())? {
+            Payload::TypeSection(reader) => {
+                for ty in reader.into_iter_err_on_gc_types() {
+                    let f = ty.map_err(|e| e.to_string())?;
+                    let list =
+                        |ts: &[ValType]| ts.iter().map(|&t| val(t)).collect::<Vec<_>>().join(", ");
+                    types.push(format!("({}) -> ({})", list(f.params()), list(f.results())));
+                }
+            }
+            Payload::ImportSection(reader) => {
+                for import in reader.into_imports() {
+                    let import = import.map_err(|e| e.to_string())?;
+                    let ty = match import.ty {
+                        TypeRef::Func(t) => {
+                            let ty = types.get(t as usize).cloned().unwrap_or_else(|| "(?)".into());
+                            funcs.push(ty.clone());
+                            ty
+                        }
+                        TypeRef::Memory(m) => {
+                            if import.module == wrela_abi::IMPORT_MODULE
+                                && import.name == wrela_abi::IMPORT_MEMORY
+                            {
+                                abi.memory = Some(wrela_abi::manifest::MemoryLimits {
+                                    initial: m.initial,
+                                    maximum: m.maximum,
+                                    shared: m.shared,
+                                });
+                            }
+                            "memory".into()
+                        }
+                        TypeRef::Table(_) => "table".into(),
+                        TypeRef::Global(_) => "global".into(),
+                        TypeRef::Tag(_) => "tag".into(),
+                        TypeRef::FuncExact(t) => {
+                            types.get(t as usize).cloned().unwrap_or_else(|| "(?)".into())
+                        }
+                    };
+                    abi.imports.push([import.module.to_string(), import.name.to_string(), ty]);
+                }
+            }
+            Payload::FunctionSection(reader) => {
+                for t in reader {
+                    let t = t.map_err(|e| e.to_string())?;
+                    funcs.push(types.get(t as usize).cloned().unwrap_or_else(|| "(?)".into()));
+                }
+            }
+            Payload::ExportSection(reader) => {
+                for export in reader {
+                    let export = export.map_err(|e| e.to_string())?;
+                    if export.kind == ExternalKind::Func {
+                        let ty = funcs
+                            .get(export.index as usize)
+                            .cloned()
+                            .unwrap_or_else(|| "(?)".into());
+                        abi.exports.push([export.name.to_string(), ty]);
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    Ok(abi)
+}
+
 /// Fails if a WASM module uses any relaxed-SIMD instruction (AC7): those are the only WASM
 /// instructions whose results may differ between engines, including fused multiply-add.
 pub fn check_no_relaxed_simd(bytes: &[u8]) -> Result<(), String> {
@@ -671,6 +758,50 @@ mod tests {
     fn module(body: &str) -> Vec<u8> {
         wat::parse_str(format!("(module (func (param v128 v128 v128) (result v128) {body}))"))
             .expect("valid WAT")
+    }
+
+    #[test]
+    fn the_interface_names_imports_exports_and_the_memory() {
+        let wasm = wat::parse_str(
+            r#"(module
+                (import "wrela" "memory" (memory 17 16384 shared))
+                (import "wrela" "submit" (func (param i32 i32)))
+                (import "wrela" "limit" (func (param i32) (result i32)))
+                (func (export "frame") (param f32 i32 i32))
+                (func $hidden)
+                (export "memory" (memory 0)))"#,
+        )
+        .expect("valid WAT");
+        let abi = interface(&wasm).expect("reads");
+        let m = abi.memory.expect("imported memory");
+        assert_eq!((m.initial, m.maximum, m.shared), (17, Some(16384), true));
+        let row = |a: &str, b: &str, c: &str| [a.to_string(), b.to_string(), c.to_string()];
+        assert_eq!(
+            abi.imports,
+            [
+                row("wrela", "memory", "memory"),
+                row("wrela", "submit", "(i32, i32) -> ()"),
+                row("wrela", "limit", "(i32) -> (i32)")
+            ]
+        );
+        assert_eq!(abi.exports, [["frame".to_string(), "(f32, i32, i32) -> ()".to_string()]]);
+    }
+
+    /// The hand-written first-light fixture's manifest states its module's interface.
+    #[test]
+    fn first_lights_manifest_states_its_interface() {
+        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../runtime/fixtures/first-light");
+        let wasm = std::fs::read(dir.join("game.wasm")).expect("game.wasm");
+        let json = std::fs::read_to_string(dir.join("manifest.json")).expect("manifest.json");
+        let stated = wrela_abi::Manifest::parse(&json).expect("valid").wasm_abi;
+        let read = interface(&wasm).expect("reads");
+        if std::env::var_os("WRELA_BLESS").is_some() {
+            let mut m = wrela_abi::Manifest::parse(&json).expect("valid");
+            m.wasm_abi = Some(read.clone());
+            std::fs::write(dir.join("manifest.json"), m.to_json()).expect("write");
+        }
+        assert_eq!(stated, Some(read));
     }
 
     #[test]

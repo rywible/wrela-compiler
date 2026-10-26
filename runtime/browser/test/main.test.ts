@@ -131,11 +131,12 @@ test("a public page ignores #test", async () => {
   expect(page.posted.map((m) => m.type)).toEqual(["start", "visibility"]);
 });
 
-test("the page names the build's files it preloads to the worker, and fetches them for it", async () => {
+test("the page names the build's files it preloads to the worker, and fetches all but the WASM for it", async () => {
   const page = await load("https://example.com/game/", { preload: ["https://example.com/game/manifest.json", "https://example.com/game/game.wasm"] });
   const start = page.posted.find((msg) => msg.type === "start");
   expect(start?.type === "start" && start.given).toEqual(["https://example.com/game/manifest.json", "https://example.com/game/game.wasm"]);
-  expect(page.puts).toEqual(["undefined https://example.com/game/manifest.json", "undefined https://example.com/game/game.wasm"]);
+  // The WASM is handed over as its URL: the worker fetches it and compiles it as it streams.
+  expect(page.puts).toEqual(["undefined https://example.com/game/manifest.json"]);
 });
 
 test("a browser without WebGPU is told what a program needs, not that it failed", async () => {

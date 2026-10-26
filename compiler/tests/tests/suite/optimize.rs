@@ -17,7 +17,13 @@ fn optimize_in_place(dir: &Path) {
         wrela_driver::optimize::optimize(&wasm, wrela_driver::optimize::Level::Size)
             .expect("optimizes");
     assert!(code.len() < wasm.len(), "optimized {} bytes into {}", wasm.len(), code.len());
-    std::fs::write(dir.join("game.wasm"), code).expect("write game.wasm");
+    // As `wrela build --optimize` does: the manifest states the rewritten module's interface.
+    let manifest = std::fs::read(dir.join("manifest.json")).expect("manifest.json");
+    let mut files = vec![("game.wasm".to_string(), code), ("manifest.json".to_string(), manifest)];
+    wrela_driver::build::restate_abi(&mut files).expect("restates the interface");
+    for (name, bytes) in files {
+        std::fs::write(dir.join(&name), bytes).expect(&name);
+    }
     std::fs::write(dir.join("game.lines"), lines).expect("write game.lines");
 }
 
@@ -114,4 +120,49 @@ fn chrome_gives_the_code_offset_when_the_lines_do_not_arrive() {
     let failure = chrome_failure(&rel, ChromeRun::new(2, 4, 4, 60.0));
     let offset = failure.trim_end().rsplit_once(" at code offset 0x").map(|(_, o)| o);
     assert!(offset.is_some_and(|o| u32::from_str_radix(o, 16).is_ok()), "{failure}");
+}
+
+/// Every frozen program's manifest states its WASM's interface (`wasm_abi`) as its bytes give
+/// it, every import the host's with the host's type (what the browser once read from the bytes),
+/// and an optimized build's manifest states the optimized module's.
+#[test]
+fn each_frozen_programs_manifest_states_its_wasm_interface() {
+    let host: std::collections::HashMap<&str, String> =
+        wrela_abi::HOST_FUNCTIONS.iter().map(|f| (f.name, f.signature())).collect();
+    for name in ["hello-field", "grazer", "herd", "wolf"] {
+        let dir = built(&format!("frozen/{name}"));
+        let read = |dir: &Path| {
+            let wasm = std::fs::read(dir.join("game.wasm")).expect("game.wasm");
+            let json = std::fs::read_to_string(dir.join("manifest.json")).expect("manifest");
+            let stated = wrela_abi::Manifest::parse(&json).expect("valid").wasm_abi;
+            (stated, wrela_wasm::interface(&wasm).expect("reads"))
+        };
+        let (stated, abi) = read(&dir);
+        assert_eq!(stated.as_ref(), Some(&abi), "{name}");
+        assert!(abi.memory.is_some_and(|m| m.shared), "{name} imports its memory, shared");
+        for [module, import, ty] in &abi.imports {
+            assert_eq!(module, wrela_abi::IMPORT_MODULE, "{name}");
+            if import != wrela_abi::IMPORT_MEMORY {
+                assert_eq!(host.get(import.as_str()), Some(ty), "{name}'s `{import}`");
+            }
+        }
+        assert!(abi.exports.contains(&["frame".into(), "(f32, i32, i32) -> ()".into()]), "{name}");
+        // The optimized build's manifest is restated from its module.
+        let small = scratch(&format!("abi-{name}"));
+        wrela_tests::copy_dir(&dir, &small);
+        let mut files: Vec<(String, Vec<u8>)> = ["game.wasm", "manifest.json"]
+            .iter()
+            .map(|f| (f.to_string(), std::fs::read(small.join(f)).expect("file")))
+            .collect();
+        let (code, _) =
+            wrela_driver::optimize::optimize(&files[0].1, wrela_driver::optimize::Level::Size)
+                .expect("optimizes");
+        files[0].1 = code;
+        wrela_driver::build::restate_abi(&mut files).expect("restated");
+        for (f, bytes) in &files {
+            std::fs::write(small.join(f), bytes).expect("write");
+        }
+        let (stated, abi) = read(&small);
+        assert_eq!(stated, Some(abi), "{name}, optimized");
+    }
 }

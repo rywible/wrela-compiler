@@ -71,6 +71,8 @@ pub struct Head {
     pub query: String,
     pub length: usize,
     pub session: Option<String>,
+    /// The request's `If-None-Match`: the tag of the copy the browser holds.
+    pub if_none_match: Option<String>,
 }
 
 impl Head {
@@ -120,6 +122,7 @@ pub fn read_head(
     let mut length = Some(0usize);
     let (mut host, mut origin, mut framed) = (String::new(), None::<String>, false);
     let mut session = None;
+    let mut if_none_match = None;
     loop {
         let Some(h) = line(reader)? else {
             too_long(out)?;
@@ -140,6 +143,8 @@ pub fn read_head(
                 framed = true;
             } else if k.eq_ignore_ascii_case(wrela_chrome::proxy::SESSION_HEADER) {
                 session = Some(v.to_string());
+            } else if k.eq_ignore_ascii_case("if-none-match") {
+                if_none_match = Some(v.to_string());
             }
         }
     }
@@ -165,7 +170,14 @@ pub fn read_head(
         return Ok(None);
     }
     let (path, query) = target.split_once('?').unwrap_or((target, ""));
-    Ok(Some(Head { method, path: path.to_string(), query: query.to_string(), length, session }))
+    Ok(Some(Head {
+        method,
+        path: path.to_string(),
+        query: query.to_string(),
+        length,
+        session,
+        if_none_match,
+    }))
 }
 
 /// `path` with its URL escapes decoded, once: `None` if an escape is malformed, names a `/` or a
@@ -213,12 +225,32 @@ pub fn mime(path: &str) -> &'static str {
     }
 }
 
+/// Whether a browser may keep a file it was sent.
+#[derive(Clone, Copy, Debug)]
+pub enum Caching<'a> {
+    /// Never: each request reads the file again (a hot-reloading server's, whose files change
+    /// under the same names).
+    NoStore,
+    /// It may keep the file and must ask again before it uses it (`no-cache`), naming the copy
+    /// it has (`if_none_match`, the request's), which is answered with 304 while it's current.
+    /// A kept copy is what lets the browser keep a WASM module's compiled code between opens.
+    Revalidate { if_none_match: Option<&'a str> },
+}
+
 /// Writes a response's head: its status, its body's kind and length, and the headers every
-/// answer has.
-fn head(out: &mut dyn Write, status: u16, kind: &str, len: u64) -> std::io::Result<()> {
+/// answer has: `Cache-Control: no-store`, unless `tag` names the file's version, which the
+/// browser may keep (`no-cache`, with the tag).
+fn head_with(
+    out: &mut dyn Write,
+    status: u16,
+    kind: &str,
+    len: u64,
+    tag: Option<&str>,
+) -> std::io::Result<()> {
     let reason = match status {
         200 => "OK",
         201 => "Created",
+        304 => "Not Modified",
         400 => "Bad Request",
         403 => "Forbidden",
         404 => "Not Found",
@@ -230,10 +262,28 @@ fn head(out: &mut dyn Write, status: u16, kind: &str, len: u64) -> std::io::Resu
         504 => "Gateway Timeout",
         _ => "Error",
     };
+    let cache = match tag {
+        Some(tag) => format!("Cache-Control: no-cache\r\nETag: {tag}"),
+        None => "Cache-Control: no-store".to_string(),
+    };
     write!(
         out,
-        "HTTP/1.1 {status} {reason}\r\nContent-Type: {kind}\r\nContent-Length: {len}\r\nCache-Control: no-store\r\nCross-Origin-Opener-Policy: same-origin\r\nCross-Origin-Embedder-Policy: require-corp\r\nCross-Origin-Resource-Policy: same-origin\r\nConnection: close\r\n\r\n",
+        "HTTP/1.1 {status} {reason}\r\nContent-Type: {kind}\r\nContent-Length: {len}\r\n{cache}\r\nCross-Origin-Opener-Policy: same-origin\r\nCross-Origin-Embedder-Policy: require-corp\r\nCross-Origin-Resource-Policy: same-origin\r\nConnection: close\r\n\r\n",
     )
+}
+
+fn head(out: &mut dyn Write, status: u16, kind: &str, len: u64) -> std::io::Result<()> {
+    head_with(out, status, kind, len, None)
+}
+
+/// A file's version, as an entity tag: its length and when it was last written.
+fn tag_of(meta: &std::fs::Metadata) -> String {
+    let written = meta
+        .modified()
+        .ok()
+        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+        .map_or(0, |d| d.as_nanos());
+    format!("\"{:x}-{written:x}\"", meta.len())
 }
 
 /// An HTTP response of `body`.
@@ -253,6 +303,7 @@ pub fn get_file(
     dir: &Dir,
     rel: &str,
     page: Option<&dyn Fn(&str) -> String>,
+    caching: Caching,
 ) -> std::io::Result<()> {
     let not_found = |out: &mut dyn Write| respond(out, 404, "text/plain", b"not found");
     // Decoded once before it's checked or opened: checking the encoded spelling would let
@@ -271,8 +322,20 @@ pub fn get_file(
         file.take(MAX_BODY as u64).read_to_end(&mut bytes)?;
         return respond(out, 200, mime(&rel), page(&String::from_utf8_lossy(&bytes)).as_bytes());
     }
-    let len = file.metadata()?.len();
-    head(out, 200, mime(&rel), len)?;
+    let meta = file.metadata()?;
+    let len = meta.len();
+    let tag = match caching {
+        Caching::NoStore => None,
+        Caching::Revalidate { if_none_match } => {
+            let tag = tag_of(&meta);
+            if if_none_match.is_some_and(|held| held.split(',').any(|t| t.trim() == tag)) {
+                head_with(out, 304, mime(&rel), 0, Some(&tag))?;
+                return out.flush();
+            }
+            Some(tag)
+        }
+    };
+    head_with(out, 200, mime(&rel), len, tag.as_deref())?;
     // At most the length the head gave, though the file grows meanwhile.
     let sent = std::io::copy(&mut file.take(len), out)?;
     if sent < len {
@@ -380,5 +443,42 @@ mod tests {
         assert_eq!(sized("PUT", MAX_BODY + 1).0.map(|h| h.length), Some(MAX_BODY + 1));
         assert!(sized("PUT", MAX_RESULT + 1).1.starts_with("HTTP/1.1 413"));
         assert!(sized("POST", MAX_BODY + 1).1.starts_with("HTTP/1.1 413"));
+    }
+
+    /// A served file in `dir` named `name` holding `bytes`, and the directory's handle.
+    pub(crate) fn served(tag: &str, name: &str, bytes: &[u8]) -> (std::path::PathBuf, Dir) {
+        let root =
+            std::env::temp_dir().join(format!("wrela-loopback-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).expect("directory");
+        std::fs::write(root.join(name), bytes).expect("file");
+        let dir = Dir::open_ambient_dir(&root, cap_std::ambient_authority()).expect("open");
+        (root, dir)
+    }
+
+    fn get(dir: &Dir, rel: &str, caching: Caching) -> String {
+        let mut out = Vec::new();
+        get_file(&mut out, dir, rel, None, caching).expect("answered");
+        String::from_utf8_lossy(&out).into_owned()
+    }
+
+    /// A file the browser may keep is sent with its tag, and asked for again with that tag it's
+    /// answered 304 with no body; a hot-reloading server's never is.
+    #[test]
+    fn a_kept_file_is_revalidated_by_its_tag() {
+        let (root, dir) = served("tag", "game.wasm", b"\0asm");
+        let first = get(&dir, "game.wasm", Caching::Revalidate { if_none_match: None });
+        assert!(
+            first.starts_with("HTTP/1.1 200") && first.contains("Cache-Control: no-cache"),
+            "{first}"
+        );
+        let tag = first.lines().find_map(|l| l.strip_prefix("ETag: ")).expect("a tag").to_string();
+        let again = get(&dir, "game.wasm", Caching::Revalidate { if_none_match: Some(&tag) });
+        assert!(again.starts_with("HTTP/1.1 304") && again.ends_with("\r\n\r\n"), "{again}");
+        let stale = get(&dir, "game.wasm", Caching::Revalidate { if_none_match: Some("\"0-0\"") });
+        assert!(stale.starts_with("HTTP/1.1 200") && stale.ends_with("\0asm"), "{stale}");
+        let live = get(&dir, "game.wasm", Caching::NoStore);
+        assert!(live.contains("Cache-Control: no-store") && !live.contains("ETag"), "{live}");
+        let _ = std::fs::remove_dir_all(root);
     }
 }

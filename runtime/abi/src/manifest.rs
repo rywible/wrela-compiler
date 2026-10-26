@@ -131,6 +131,35 @@ pub struct Manifest {
     /// The program's WASM file, relative to the manifest.
     pub wasm: String,
     pub pipelines: Vec<Pipeline>,
+    /// The WASM's interface, as the build made it: what a host checks the module against
+    /// without reading its bytes (a browser compiles it as it streams in).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub wasm_abi: Option<WasmAbi>,
+}
+
+/// A module's interface (language.md §15): its imported memory's limits, and the type of each
+/// import and each exported function, in the module's order. JavaScript sees an import's or an
+/// export's name and kind but not a function's type, nor a memory's limits, so the build states
+/// them. A function's type is written `(i32, i32) -> ()`; any other import's is its kind
+/// (`memory`, `table`, `global`, `tag`).
+#[derive(Clone, Debug, PartialEq, Serialize)]
+pub struct WasmAbi {
+    /// The imported memory's limits, if the module imports one.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub memory: Option<MemoryLimits>,
+    /// Each import as `[module, name, type]`.
+    pub imports: Vec<[String; 3]>,
+    /// Each exported function as `[name, type]`.
+    pub exports: Vec<[String; 2]>,
+}
+
+/// A memory's limits, in 64 KiB pages.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+pub struct MemoryLimits {
+    pub initial: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub maximum: Option<u64>,
+    pub shared: bool,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize)]
@@ -627,6 +656,7 @@ impl Manifest {
             stream_version: crate::stream::VERSION,
             wasm: wasm.into(),
             pipelines: Vec::new(),
+            wasm_abi: None,
         }
     }
 
@@ -1227,6 +1257,57 @@ mod read {
                 .enumerate()
                 .map(|(i, p)| pipeline(p, i))
                 .collect::<Result<_>>()?,
+            wasm_abi: match o.get("wasm_abi") {
+                None => None,
+                Some(v) => Some(wasm_abi(v)?),
+            },
+        })
+    }
+
+    /// The manifest's `wasm_abi`: absent in a manifest that doesn't state it.
+    fn wasm_abi(v: &Value) -> Result<WasmAbi> {
+        let place = "wasm_abi";
+        let o = object(v, place)?;
+        let strings = |p: &str, v: &Value, n: usize| -> Result<Vec<String>> {
+            match v {
+                Value::Array(items) if items.len() == n && items.iter().all(|i| i.is_string()) => {
+                    Ok(items.iter().map(|i| i.as_str().unwrap_or_default().to_string()).collect())
+                }
+                _ => fail(format!("{p} must be an array of {n} strings")),
+            }
+        };
+        let memory = match o.get("memory") {
+            None => None,
+            Some(m) => {
+                let mp = format!("{place}.memory");
+                let mo = object(m, &mp)?;
+                let pages = |key: &str| -> Result<u64> {
+                    match field(mo, key, &mp)?.as_u64() {
+                        Some(n) => Ok(n),
+                        None => fail(format!("{mp}.{key} must be a count of pages")),
+                    }
+                };
+                Some(MemoryLimits {
+                    initial: pages("initial")?,
+                    maximum: if mo.contains_key("maximum") {
+                        Some(pages("maximum")?)
+                    } else {
+                        None
+                    },
+                    shared: flag(mo, "shared", &mp, false)?,
+                })
+            }
+        };
+        Ok(WasmAbi {
+            memory,
+            imports: list(o, "imports", place, |p, v| {
+                let s = strings(p, v, 3)?;
+                Ok([s[0].clone(), s[1].clone(), s[2].clone()])
+            })?,
+            exports: list(o, "exports", place, |p, v| {
+                let s = strings(p, v, 2)?;
+                Ok([s[0].clone(), s[1].clone()])
+            })?,
         })
     }
 }
@@ -1303,6 +1384,26 @@ mod tests {
 "#;
         assert_eq!(json, expected);
         assert_eq!(Manifest::parse(&json).expect("valid"), sample());
+    }
+
+    /// `wasm_abi` is optional: a manifest without it has none, and one with it round-trips.
+    #[test]
+    fn the_wasm_abi_is_read_where_given() {
+        assert_eq!(Manifest::parse(&sample().to_json()).expect("valid").wasm_abi, None);
+        let mut m = sample();
+        m.wasm_abi = Some(WasmAbi {
+            memory: Some(MemoryLimits { initial: 17, maximum: Some(16384), shared: true }),
+            imports: vec![
+                ["wrela".into(), "memory".into(), "memory".into()],
+                ["wrela".into(), "submit".into(), "(i32, i32) -> ()".into()],
+            ],
+            exports: vec![["frame".into(), "(f32, i32, i32) -> ()".into()]],
+        });
+        let json = m.to_json();
+        assert!(json.contains("\"wasm_abi\""), "{json}");
+        assert_eq!(Manifest::parse(&json).expect("valid"), m);
+        let bad = json.replace("\"(i32, i32) -> ()\"", "7");
+        assert!(Manifest::parse(&bad).unwrap_err().to_string().contains("wasm_abi.imports[1]"));
     }
 
     #[test]

@@ -71,7 +71,9 @@ import { Inbox, type Net } from "./net.ts";
 import type { Scripted } from "./input.ts";
 import { type Bytes, type Command, decode, type OpcodeName, Sequencer } from "./stream.ts";
 import type { TickerOptions, VoiceOptions } from "./messages.ts";
-import { functionTypes, type MemoryLimits, UTF8 } from "./wasm.ts";
+import type { MemoryLimits, WasmAbi } from "./manifest.ts";
+import { wasmHash } from "./ticks.ts";
+import { UTF8 } from "./wasm.ts";
 
 /** The WASM module is invalid or breaks the program ABI. */
 export class ProgramError extends Error {
@@ -192,16 +194,32 @@ const IMPORTS = new Map<string, string>(HOST_FUNCTIONS);
  * Checks a module against the program ABI before instantiating it: it imports its memory,
  * shared, as `wrela.memory`, may import only the host's functions (`IMPORTS`) besides, must
  * export `memory` and `frame(f32, i32, i32)`. (It may have a start function, which may not call
- * the host: `#starting`.) `bytes` is the module's binary, for what JavaScript can't otherwise
- * see. The memory's limits.
+ * the host: `#starting`.) What JavaScript can't see of the module, its functions' types and its
+ * memory's limits, comes from `abi`, its build's manifest's: whose names and kinds must be the
+ * module's own. The memory's limits.
  */
-export function checkAbi(module: WebAssembly.Module, bytes: Uint8Array): MemoryLimits {
-  let types: ReturnType<typeof functionTypes>;
-  try {
-    types = functionTypes(bytes);
-  } catch (e) {
-    throw new ProgramError(`can't read its function types: ${errorMessage(e)}`);
-  }
+export function checkAbi(module: WebAssembly.Module, abi: WasmAbi | null): MemoryLimits {
+  if (abi === null) throw new ProgramError("its manifest doesn't state its WASM's interface (`wasm_abi`)");
+  const imported = WebAssembly.Module.imports(module);
+  const exported = WebAssembly.Module.exports(module).filter((e) => e.kind === "function");
+  const kindOf = (ty: string) => (ty.startsWith("(") ? "function" : ty);
+  const same =
+    imported.length === abi.imports.length &&
+    imported.every((imp, i) => {
+      const [m, n, ty] = abi.imports[i]!;
+      return imp.module === m && imp.name === n && imp.kind === kindOf(ty);
+    }) &&
+    exported.length === abi.exports.length &&
+    exported.every((e, i) => e.name === abi.exports[i]![0]);
+  if (!same) throw new ProgramError("its manifest's `wasm_abi` doesn't describe its WASM");
+  const types = {
+    imports: abi.imports.map(([, , ty]) => (ty.startsWith("(") ? ty : null)),
+    exports: new Map(abi.exports.map(([name, ty]) => [name, ty])),
+    memories: new Map<number, MemoryLimits>(),
+  };
+  imported.forEach((imp, i) => {
+    if (imp.module === IMPORT_MODULE && imp.name === IMPORT_MEMORY && abi.memory !== null) types.memories.set(i, abi.memory);
+  });
   let memory: MemoryLimits | null = null;
   WebAssembly.Module.imports(module).forEach((imp, i) => {
     const name = `${imp.module}.${imp.name}`;
@@ -251,10 +269,15 @@ export function checkAbi(module: WebAssembly.Module, bytes: Uint8Array): MemoryL
   return memory;
 }
 
-/** A program's module, checked, and its memory's limits. */
+/** A program's module, checked, its memory's limits, and how it was compiled. */
 export interface Compiled {
   module: WebAssembly.Module;
   memory: MemoryLimits;
+  /** The module's bytes' hash (`ticks.ts`), when it was asked for. */
+  hash: bigint | null;
+  /** How long the compile took (ms), and whether it streamed. */
+  compile_ms: number;
+  streamed: boolean;
 }
 
 /** A line printed by any of a program's threads, after that thread has shown it on its console. */
@@ -466,19 +489,33 @@ export class Program {
     this.#net = options.net ?? null;
   }
 
-  static async load(wasm: Bytes, checker: Checker, executor: Executor, options: ProgramOptions = {}): Promise<Program> {
-    return Program.instantiate(await Program.compile(wasm), checker, executor, options);
+  static async load(wasm: Bytes, abi: WasmAbi | null, checker: Checker, executor: Executor, options: ProgramOptions = {}): Promise<Program> {
+    return Program.instantiate(await Program.compile(wasm, abi), checker, executor, options);
   }
 
-  /** Compiles a program's WASM and checks it against the program ABI. */
-  static async compile(wasm: Bytes): Promise<Compiled> {
+  /** Compiles a program's WASM and checks it against the program ABI, which its build's
+   * manifest states (`abi`). A response the server says is WASM compiles as it streams in (which
+   * the browser's code cache can serve on a later open); anything else is read whole first.
+   * With `hash`, the module's bytes are hashed too (the tick log's header). */
+  static async compile(wasm: Response | Bytes, abi: WasmAbi | null, hash = false): Promise<Compiled> {
     let module: WebAssembly.Module;
+    let hashed: Promise<bigint | null> = Promise.resolve(null);
+    const started = performance.now();
+    let streamed = false;
     try {
-      module = await WebAssembly.compile(wasm);
+      if (wasm instanceof Response) {
+        if (hash) hashed = wasm.clone().arrayBuffer().then((b) => wasmHash(new Uint8Array(b)));
+        streamed = (wasm.headers.get("Content-Type") ?? "").split(";")[0]!.trim() === "application/wasm";
+        module = streamed ? await WebAssembly.compileStreaming(wasm) : await WebAssembly.compile(await wasm.arrayBuffer());
+      } else {
+        if (hash) hashed = Promise.resolve(wasmHash(wasm));
+        module = await WebAssembly.compile(wasm);
+      }
     } catch (e) {
       throw new ProgramError(errorMessage(e));
     }
-    return { module, memory: checkAbi(module, wasm) };
+    const compile_ms = performance.now() - started;
+    return { module, memory: checkAbi(module, abi), hash: await hashed, compile_ms, streamed };
   }
 
   /** Instantiates a compiled program against the decoder, with its memory and its workers. */

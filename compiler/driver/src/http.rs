@@ -170,7 +170,7 @@ pub(crate) fn get_file(
     rel: &str,
     page: impl Fn(&str) -> String,
 ) -> std::io::Result<()> {
-    loopback::get_file(out, dir, rel, Some(&page))
+    loopback::get_file(out, dir, rel, Some(&page), loopback::Caching::NoStore)
 }
 
 #[cfg(test)]

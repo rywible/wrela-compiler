@@ -151,6 +151,18 @@ fn fresh_results(dir: &Path, opened: &Dir) -> Result<PathBuf, String> {
 /// Runs `page` in Chrome: `Ok` if it put `ok` in `results/DONE` (and its script finished), else
 /// why not.
 pub fn run(page: Page) -> Result<(), String> {
+    run_opens(page, 1)
+}
+
+/// Runs `page` in Chrome twice, as a player opens a game a second time: the same browser
+/// profile, the same server and port, so the second open finds what the first left in the
+/// browser's caches. The first open's results are kept in `results-first/`; the second's are in
+/// `results/`.
+pub fn run_twice(page: Page) -> Result<(), String> {
+    run_opens(page, 2)
+}
+
+fn run_opens(page: Page, opens: usize) -> Result<(), String> {
     let root = Dir::open_ambient_dir(page.root, cap_std::ambient_authority())
         .map_err(|e| format!("{}: {e}", page.root.display()))?;
     let (dir, opened, path) = if page.page.is_empty() {
@@ -169,11 +181,24 @@ pub fn run(page: Page) -> Result<(), String> {
             .map_err(|e| format!("no plain page directory at {}: {e}", dir.display()))?;
         (dir, opened, format!("{}/", page.page))
     };
-    let results = fresh_results(&dir, &opened)?;
+    let mut results = fresh_results(&dir, &opened)?;
     let server = Server::start(root, page.page)?;
     let url = format!("http://127.0.0.1:{}/{path}{}", server.port, page.fragment);
     let done = server.done.clone();
-    drive(&url, &results, page.timeout, page.script, &|| locked(&done).clone())
+    // Held across the opens: the browser, and its profile, last until the last one ends.
+    let _browser = Lease::take()?;
+    for open in 0..opens {
+        if open > 0 {
+            let first = dir.join("results-first");
+            let _ = std::fs::remove_dir_all(&first);
+            std::fs::rename(&results, &first)
+                .map_err(|e| format!("can't keep the first open's results: {e}"))?;
+            results = fresh_results(&dir, &opened)?;
+            *locked(&done) = None;
+        }
+        drive(&url, &results, page.timeout, page.script, &|| locked(&done).clone())?;
+    }
+    Ok(())
 }
 
 /// Runs the page another server serves at `url` (`wrela run`'s) in Chrome, its results going to
@@ -434,7 +459,13 @@ fn connection(
             } else {
                 path.to_string()
             };
-            loopback::get_file(&mut out, dir, &rel, None)
+            loopback::get_file(
+                &mut out,
+                dir,
+                &rel,
+                None,
+                loopback::Caching::Revalidate { if_none_match: head.if_none_match.as_deref() },
+            )
         }
         "PUT" => {
             let parts: Vec<&str> = decoded.split('/').collect();

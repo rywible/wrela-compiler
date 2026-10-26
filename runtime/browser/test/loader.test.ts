@@ -27,7 +27,9 @@ test("loads a build's manifest, WASM and shaders", async () => {
   const { fetch, requested } = server();
   const build = await loadBuild(BASE, fetch);
   expect(build.manifest.pipelines.length).toBe(2);
-  expect(build.wasm).toEqual(readFixture("game.wasm"));
+  // The WASM's response, unread: it compiles as it streams in.
+  expect(build.wasm).toBeInstanceOf(Response);
+  expect(new Uint8Array(await (build.wasm as Response).arrayBuffer())).toEqual(readFixture("game.wasm"));
   expect(build.shaders).toEqual(
     ["first-light.wgsl", "fill.wgsl"].map(readFixtureText),
   );
