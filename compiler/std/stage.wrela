@@ -208,9 +208,15 @@ fn pair_op(code: u32) -> bool {
     (code >= IADD && code < F2I) || code == PCG || code == IMAD
 }
 
+/// Whether an operation is an integer one (`IADD` to `IMAD`): its registers are integers' halves
+/// or comparisons, and a box noise past them is a float's.
+fn integer_op(code: u32) -> bool {
+    code >= IADD && code <= IMAD
+}
+
 /// Whether an operation writes half an integer (`c` says which).
 fn half_op(code: u32) -> bool {
-    (code >= IADD && code < ULT) || code >= F2I
+    (code >= IADD && code < ULT) || (code >= F2I && code <= IMAD)
 }
 
 /// Whether an operation reads its registers three in a row: `a..a+3` (and `b..b+3`).
@@ -667,6 +673,15 @@ impl<const N: u32, const K: u32> Surface for Taped<N, K> {
         interpret(self, p)
     }
 
+    /// The tape's own interval (`Taped::interval`), not one derived through `interpret`: a box
+    /// noise's loops run as often as its box is wide, which no derivation follows.
+    fn interval(self, over: Box3) -> Interval {
+        if self.len == 0 {
+            return Interval { lo: 0.0, hi: 0.0 }
+        }
+        self.register_intervals(over)[self.len - 1]
+    }
+
     /// Itself, as a `Tape`.
     fn to_tape(self) -> Tape {
         match self.resized() {
@@ -1050,7 +1065,7 @@ impl<const N: u32, const K: u32> Taped<N, K> {
             if n == 3 {
                 known = known && finite[op.third()]
             }
-            r[i] = if code >= IADD {
+            r[i] = if integer_op(code) {
                 // An integer's halves are whole numbers to 65535; a comparison 0 or 1.
                 let hi = if half_op(code) { 65535.0 } else if code == I2F {
                     2147483647.0
