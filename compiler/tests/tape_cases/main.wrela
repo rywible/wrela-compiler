@@ -1,0 +1,108 @@
+// What a tape must take as compiled code does (language.md §14.4), each found by the 0.8.0
+// council: a branch on the point whose sides write through a call's `mut` argument; a value
+// only part of which depends on the point; an integer table with values past 2²⁴; `lattice`
+// and `lattice_coord` past `i32`'s range; one function taped at two sizes in one program; and a
+// pruned tape of `tape_with`, which keeps its channels.
+// Each tape is interpreted at points on both sides of what it branches on, against the field.
+use std::derive::{Box3, tape, tape_sized, tape_with}
+use std::field::{lattice, lattice_coord}
+use std::stage::{Taped, interpret, interpret_with}
+
+pub fn frame(time: f32, width: u32, height: u32) {}
+
+fn set(d: mut f32, x: f32) {
+    d = x
+}
+
+/// Each side of a branch on the point writes `d` through a call.
+fn through_a_call(p: vec3) -> f32 {
+    var d = 0.0
+    if p.x > 0.0 {
+        set(mut d, p.y + 1.0)
+    } else {
+        set(mut d, p.z - 1.0)
+    }
+    d
+}
+
+/// The point's x, and 3, which doesn't depend on it.
+fn pair(p: vec3) -> (f32, u32) {
+    (p.x, 3)
+}
+
+fn partly(p: vec3) -> f32 {
+    let r = pair(p)
+    r.0 + f32(r.1)
+}
+
+/// Integers a float can't hold exactly.
+const BIG: [u32; 4] = [16777217, 4294967295, 7, 2147483649]
+
+fn big(p: vec3) -> f32 {
+    let i = u32(clamp(p.x, 0.0, 3.0))
+    f32(BIG[i] & 1) + 2.0 * f32(BIG[i] >> 31)
+}
+
+/// `lattice_coord` past `i32`'s range wraps; `lattice` hashes its integers exactly.
+fn lattices(p: vec3) -> f32 {
+    f32((lattice_coord(p.x) >> 8) & 255) + lattice(2147483647, lattice_coord(p.y), 16777217)
+}
+
+fn sphere(p: vec3) -> f32 {
+    length(p) - 1.0
+}
+
+/// The worst difference of `t` from `f` over points around the origin, past the branches, and
+/// at `far` along x.
+fn worst<const N: u32, const K: u32>(t: Taped<N, K>, f: fn(vec3) -> f32, far: f32) -> f32 {
+    var w = 0.0
+    for i in 0..64 {
+        let p = vec3(f32(i % 4) - 1.5, f32((i / 4) % 4) - 1.5, f32(i / 16) - 1.5) * 1.3
+        w = max(w, abs(interpret(t, p) - f(p)))
+    }
+    let q = vec3(far, -far, 0.25)
+    max(w, abs(interpret(t, q) - f(q)))
+}
+
+@test
+fn a_branchs_writes_through_a_call_are_selected() {
+    assert(worst(tape(through_a_call), through_a_call, 2.0) == 0.0)
+}
+
+@test
+fn what_doesnt_depend_on_the_point_keeps_its_value() {
+    assert(worst(tape(partly), partly, 2.0) == 0.0)
+}
+
+@test
+fn an_integer_table_holds_every_bit() {
+    assert(worst(tape(big), big, 3.0) == 0.0)
+}
+
+@test
+fn lattices_past_an_i32_are_the_compiled_codes() {
+    assert(worst(tape(lattices), lattices, 3.0e9) == 0.0)
+}
+
+@test
+fn one_function_tapes_at_two_sizes() {
+    let small: Taped<64, 64> = tape_sized(sphere)
+    assert(worst(tape(sphere), sphere, 2.0) < 1.0e-6 && worst(small, sphere, 2.0) < 1.0e-6)
+}
+
+/// A distance and a channel beside it.
+fn with_channel(p: vec3) -> (f32, f32) {
+    (p.x - 0.25, 0.5 + 0.25 * p.y)
+}
+
+@test
+fn a_pruned_tape_keeps_its_channels() {
+    let box = Box3 { lo: vec3(-1.0), hi: vec3(1.0) }
+    let t = tape_with(with_channel).prune(box)
+    for i in 0..8 {
+        let p = vec3(f32(i) * 0.25 - 1.0, 0.5 - f32(i) * 0.125, 0.0)
+        let (d, rest): (f32, [f32; 1]) = interpret_with(t, p)
+        let (want_d, want_c) = with_channel(p)
+        assert(d == want_d && rest[0] == want_c)
+    }
+}

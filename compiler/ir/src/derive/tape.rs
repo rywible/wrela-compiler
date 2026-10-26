@@ -41,7 +41,6 @@ const POW: u32 = 24;
 const LOG: u32 = 25;
 const LOAD: u32 = 27;
 const NOISE3: u32 = 29;
-const HASH: u32 = 31;
 const DOT3: u32 = 32;
 const LEN3: u32 = 33;
 const NORM3: u32 = 34;
@@ -162,7 +161,7 @@ pub(super) fn tape(
     }
     let mut mask = vec![0; func.params.len()];
     mask[xi] = all_bits(&m.types, x_ty);
-    let d = derive(m, cache, f, mask.clone(), lay)?;
+    let d = derive(m, cache, f, mask.clone(), lay, false)?;
     let returns = returns_active(m, cache, f, mask, Mode::Interval) != 0;
     let mut params = func.params.clone();
     params.truncate(xi);
@@ -506,8 +505,20 @@ pub(super) fn derive(
     f: FuncId,
     mask: Vec<Bits>,
     lay: Layout,
+    speculative: bool,
 ) -> Result<FuncId> {
-    if let Some(&d) = cache.tape.get(&(f, mask.clone())) {
+    if let Some(&d) = cache.tape.get(&(f, mask.clone(), lay.building)) {
+        // A call back into one being built recurses: under a branch on the point, both of
+        // whose sides a tape runs, it might never end (as an interval's, `interval::derive`).
+        let open = cache.building.iter().position(|(g, mk, _)| *g == f && *mk == mask);
+        if let Some(i) = open
+            && (speculative || cache.building[i + 1..].iter().any(|b| b.2))
+        {
+            return Err(cant(
+                "a tape can't hold a recursion under a branch on what depends on the point: it \
+                 runs both sides of the branch, so the recursion might not end",
+            ));
+        }
         return Ok(d);
     }
     let orig = m.functions[f.index()].clone();
@@ -554,8 +565,9 @@ pub(super) fn derive(
         }));
     }
     let id = m.add_function(Function::new(nf.name.clone(), nf.params.clone(), nf.ret));
-    let key = (f, mask);
+    let key = (f, mask, lay.building);
     cache.tape.insert(key.clone(), id);
+    cache.building.push((f, key.1.clone(), speculative));
     let mut b = Tp {
         m,
         cache,
@@ -571,8 +583,11 @@ pub(super) fn derive(
         tape,
         returns,
         track: Track::default(),
+        branching: 0,
     };
-    let body = match b.block(&func.body) {
+    let built = b.block(&func.body);
+    b.cache.building.pop();
+    let body = match built {
         Ok(body) => body,
         Err(e) => {
             b.cache.tape.remove(&key);
@@ -605,6 +620,8 @@ struct Tp<'a> {
     tape: u32,
     returns: bool,
     track: Track,
+    /// How many branches on the point the code being built is under: both sides run.
+    branching: u32,
 }
 
 /// `Error::not_tapeable` placed nowhere yet: a statement's `Track` places it.
@@ -891,10 +908,24 @@ impl Tp<'_> {
                     return Ok(());
                 }
                 // What depends on the point is computed by the tape, not here: its value is
-                // left zero, so a side of a branch that the point would skip runs safely.
+                // left zero, so a side of a branch that the point would skip runs safely. Where
+                // only part of it depends on the point, an expression that can't trap is kept:
+                // its other parts are what they are (their active parts read zeros).
                 let ty = self.f.value_ty(*v);
                 let r = self.reg_expr(*v, e, out)?;
-                out.push(Stmt::Let(*v, Expr::Zero(ty)));
+                let partly = self.act.values[v.index()] != all_bits(&self.m.types, ty);
+                let safe = matches!(
+                    e,
+                    Expr::Construct(..)
+                        | Expr::Variant(..)
+                        | Expr::Extract(..)
+                        | Expr::Swizzle(..)
+                        | Expr::Splat(..)
+                        | Expr::Load(_)
+                        | Expr::Param(_)
+                );
+                let kept = if partly && safe { e.clone() } else { Expr::Zero(ty) };
+                out.push(Stmt::Let(*v, kept));
                 self.rv.insert(*v, r);
                 Ok(())
             }
@@ -952,7 +983,8 @@ impl Tp<'_> {
         out: &mut Block,
     ) -> Result<()> {
         // `depth`: how many loops in the branch `b` is in; a `break` of one of them stays in it.
-        fn check(b: &Block, depth: u32, written: &mut Vec<LocalId>) -> Result<()> {
+        // A local written through a call's `mut` argument is written too.
+        fn check(m: &Module, b: &Block, depth: u32, written: &mut Vec<LocalId>) -> Result<()> {
             for s in b {
                 match s {
                     Stmt::Break | Stmt::Continue if depth > 0 => {}
@@ -961,26 +993,39 @@ impl Tp<'_> {
                             "a tape can't hold a branch on what depends on the point that leaves early",
                         ));
                     }
-                    Stmt::Store(p, _) => match p.root {
-                        PlaceRoot::Local(l) => written.push(l),
-                        _ => {
-                            return Err(cant(
-                                "a tape can't hold a branch on what depends on the point that writes through a reference",
-                            ));
+                    Stmt::Store(p, _) => written_local(p, written)?,
+                    Stmt::Let(_, Expr::Call(g, args)) | Stmt::Eval(Expr::Call(g, args)) => {
+                        let params = &m.functions[g.index()].params;
+                        for (a, p) in args.iter().zip(params) {
+                            if let (Arg::Place(place), true) = (a, p.mutable) {
+                                written_local(place, written)?;
+                            }
                         }
-                    },
+                    }
+                    Stmt::Let(_, Expr::Addr(place)) => written_local(place, written)?,
                     _ => {}
                 }
                 let deeper = depth + u32::from(matches!(s, Stmt::Loop { .. }));
                 for inner in s.blocks() {
-                    check(inner, deeper, written)?;
+                    check(m, inner, deeper, written)?;
                 }
             }
             Ok(())
         }
+        fn written_local(p: &Place, written: &mut Vec<LocalId>) -> Result<()> {
+            match p.root {
+                PlaceRoot::Local(l) => {
+                    written.push(l);
+                    Ok(())
+                }
+                _ => Err(cant(
+                    "a tape can't hold a branch on what depends on the point that writes through a reference",
+                )),
+            }
+        }
         let mut written = Vec::new();
-        check(then, 0, &mut written)?;
-        check(else_, 0, &mut written)?;
+        check(self.m, then, 0, &mut written)?;
+        check(self.m, else_, 0, &mut written)?;
         let mut seen = HashSet::new();
         written.retain(|l| seen.insert(*l) && self.rlocal[l.index()].is_some());
         let c = self.regs(out, cond)?;
@@ -994,8 +1039,10 @@ impl Tp<'_> {
             out.push(Stmt::Store(Place::local(keep), v));
             before.push((rl, keep, ty));
         }
-        let t = self.block(then)?;
-        out.extend(t);
+        self.branching += 1;
+        let t = self.block(then);
+        self.branching -= 1;
+        out.extend(t?);
         let mut after_then = Vec::new();
         for &(rl, keep, ty) in &before {
             let mine = self.nf.new_local("then", ty);
@@ -1005,8 +1052,10 @@ impl Tp<'_> {
             out.push(Stmt::Store(Place::local(rl), k));
             after_then.push(mine);
         }
-        let e = self.block(else_)?;
-        out.extend(e);
+        self.branching += 1;
+        let e = self.block(else_);
+        self.branching -= 1;
+        out.extend(e?);
         for (&(rl, _, ty), mine) in before.iter().zip(after_then) {
             let a = self.val(out, ty, Expr::Load(Place::local(mine)));
             let b = self.val(out, ty, Expr::Load(Place::local(rl)));
@@ -1063,7 +1112,9 @@ impl Tp<'_> {
             out.push(let_or_eval(v, Expr::Call(g, args.to_vec())));
             return Ok(());
         }
-        // std's own functions that are one operation of the tape.
+        // std's own functions that are one operation of the tape. (`lattice` isn't: its
+        // coordinates are integers, which `HASH`'s floats hold exactly only to 2²⁴, so its body
+        // is taped, hashing the pairs as compiled code does.)
         if let (Some(v), Some(known)) = (v, self.m.functions[g.index()].known) {
             let ty = self.f.value_ty(v);
             out.push(Stmt::Let(v, Expr::Zero(ty)));
@@ -1091,17 +1142,10 @@ impl Tp<'_> {
                     let one = self.fconst(out, 1.0);
                     self.op(out, NOISE3, &[x, y, z], Some(one))?
                 }
-                // An `i32` toward zero; `HASH` floors its operands' values and takes their
-                // `lattice_coord`, which gives each one back.
+                // `F2I` is `lattice_coord`: toward zero, wrapped to the low 32 bits past `i32`'s
+                // range, 0 for an infinity or NaN.
                 Known::LatticeCoord => self.int_op(out, F2I, &[regs[0], regs[0]])?,
                 Known::Pcg => self.int_op(out, PCG, &[regs[0], regs[0]])?,
-                Known::Lattice => {
-                    let mut coords = Vec::new();
-                    for &r in &regs[..3] {
-                        coords.push(self.as_float(out, r, true)?);
-                    }
-                    self.op(out, HASH, &coords, None)?
-                }
             };
             self.rv.insert(v, r);
             return Ok(());
@@ -1114,8 +1158,8 @@ impl Tp<'_> {
             return Ok(());
         }
         let at = self.track.at;
-        let dg =
-            derive(self.m, self.cache, g, mask.clone(), self.lay).map_err(|e| e.through(at))?;
+        let dg = derive(self.m, self.cache, g, mask.clone(), self.lay, self.branching > 0)
+            .map_err(|e| e.through(at))?;
         let mut new_args = args.to_vec();
         for (i, a) in args.iter().enumerate() {
             if mask[i] == 0 {
@@ -1370,60 +1414,65 @@ impl Tp<'_> {
         let signed_index =
             self.m.types.element_scalar(self.f.value_ty(i)).is_some_and(Scalar::signed);
         let i = self.regs(out, i)?;
-        let n = elems.len() as u32;
         let width = match self.m.types.get(ty) {
             TypeDef::Scalar(_) => 1,
             TypeDef::Vector(_, w) => *w as u32,
             _ => return Err(cant("a tape's table holds numbers and vectors of them")),
         };
         let from = self.m.types.element_scalar(ty).unwrap_or(Scalar::F32);
+        let index = self.as_float(out, i, signed_index)?;
+        let index = self.as_u32(out, index);
         let mut comps = Vec::new();
         for c in 0..width {
-            let base = self.table_base(out, n)?;
-            for (k, &e) in elems.iter().enumerate() {
-                let x = if width == 1 {
+            let mut xs = Vec::new();
+            for &e in elems {
+                xs.push(if width == 1 {
                     e
                 } else {
                     let et = self.m.types.scalar(from);
                     self.val(out, et, Expr::Extract(e, c))
-                };
-                let x = match from {
-                    Scalar::F32 => x,
-                    Scalar::Bool => {
-                        let one = self.fconst(out, 1.0);
-                        let zero = self.fconst(out, 0.0);
-                        self.val(out, f, Expr::Select { cond: x, if_true: one, if_false: zero })
-                    }
-                    _ => self.val(out, f, Expr::Convert(x, Scalar::F32)),
-                };
-                let u = self.u32();
-                let kv = self.val(out, u, Expr::Const(Const::U32(k as u32)));
-                let at = self.val(out, u, Expr::Binary(BinOp::Add, base, kv));
-                let tape = self.table_place();
-                let slot = slot(
-                    &mut self.nf,
-                    &self.m.types,
-                    out,
-                    &tape,
-                    self.lay.consts,
-                    at,
-                    self.lay.kcap,
-                )?;
-                out.push(Stmt::Store(slot, x));
+                });
             }
-            let bf = self.val(out, f, Expr::Convert(base, Scalar::F32));
-            let ut = self.u32();
-            let count = self.val(out, ut, Expr::Const(Const::U32(n)));
-            let index = self.as_float(out, i, signed_index)?;
-            let ia = self.as_u32(out, index);
-            let args = OpArgs { code: LOAD, a: Some(ia), b: Some(ia), t: Some(count), c: Some(bf) };
-            let read = self.push(out, Push::One(args))?;
-            // An integer's table holds its values, exact below 2²⁴: back to a pair.
             comps.push(if from.is_int() {
-                let code = if from.signed() { F2I } else { F2U };
-                self.int_op(out, code, &[read, read])?
+                // An integer's table is two, its high and its low 16 bits, each exact as a
+                // float; what's read is a pair again: `hi × 65536 + lo`.
+                let u = self.u32();
+                let bits: Vec<ValueId> = (xs.iter())
+                    .map(|&x| match from {
+                        Scalar::U32 => x,
+                        _ => self.val(out, u, Expr::Bitcast(x, Scalar::U32)),
+                    })
+                    .collect();
+                let (sixteen, mask) = (
+                    self.val(out, u, Expr::Const(Const::U32(16))),
+                    self.val(out, u, Expr::Const(Const::U32(65535))),
+                );
+                let mut halves = [Vec::new(), Vec::new()];
+                for &b in &bits {
+                    let hi = self.val(out, u, Expr::Binary(BinOp::Shr, b, sixteen));
+                    let lo = self.val(out, u, Expr::Binary(BinOp::BitAnd, b, mask));
+                    halves[0].push(self.val(out, f, Expr::Convert(hi, Scalar::F32)));
+                    halves[1].push(self.val(out, f, Expr::Convert(lo, Scalar::F32)));
+                }
+                let hi = self.table_read(out, &halves[0], index)?;
+                let lo = self.table_read(out, &halves[1], index)?;
+                let (hi, lo) =
+                    (self.int_op(out, F2U, &[hi, hi])?, self.int_op(out, F2U, &[lo, lo])?);
+                let shift = self.int_const(out, 65536)?;
+                self.int_op(out, IMAD, &[hi, shift, lo])?
             } else {
-                read
+                let xs: Vec<ValueId> = (xs.iter())
+                    .map(|&x| match from {
+                        Scalar::F32 => x,
+                        Scalar::Bool => {
+                            let one = self.fconst(out, 1.0);
+                            let zero = self.fconst(out, 0.0);
+                            self.val(out, f, Expr::Select { cond: x, if_true: one, if_false: zero })
+                        }
+                        _ => self.val(out, f, Expr::Convert(x, Scalar::F32)),
+                    })
+                    .collect();
+                self.table_read(out, &xs, index)?
             });
         }
         if width == 1 {
@@ -1431,6 +1480,27 @@ impl Tp<'_> {
         }
         let rt = reg_ty(&mut self.m.types, ty)?;
         Ok(self.val(out, rt, Expr::Construct(rt, comps)))
+    }
+
+    /// `xs` (floats) put in the tape's table, and the operation that reads the one at `index`
+    /// (a `u32` register value): its register.
+    fn table_read(&mut self, out: &mut Block, xs: &[ValueId], index: ValueId) -> Result<ValueId> {
+        let (f, u) = (self.f32(), self.u32());
+        let n = xs.len() as u32;
+        let base = self.table_base(out, n)?;
+        for (k, &x) in xs.iter().enumerate() {
+            let kv = self.val(out, u, Expr::Const(Const::U32(k as u32)));
+            let at = self.val(out, u, Expr::Binary(BinOp::Add, base, kv));
+            let tape = self.table_place();
+            let slot =
+                slot(&mut self.nf, &self.m.types, out, &tape, self.lay.consts, at, self.lay.kcap)?;
+            out.push(Stmt::Store(slot, x));
+        }
+        let bf = self.val(out, f, Expr::Convert(base, Scalar::F32));
+        let count = self.val(out, u, Expr::Const(Const::U32(n)));
+        let args =
+            OpArgs { code: LOAD, a: Some(index), b: Some(index), t: Some(count), c: Some(bf) };
+        self.push(out, Push::One(args))
     }
 
     /// Room for `n` more constants in the tape's table: where they start (a `u32`).
@@ -1698,14 +1768,11 @@ impl Tp<'_> {
             }
             B::Pow => {
                 if self.act.value(args[1]) {
-                    // exp(b log a).
-                    let rs: Vec<ValueId> =
-                        args.iter().map(|&x| self.regs(out, x)).collect::<Result<_>>()?;
-                    self.each(out, ty, &rs, |s, out, p| {
-                        let l = s.op(out, LOG, &[p[0]], None)?;
-                        let m = s.op(out, MUL, &[p[1], l], None)?;
-                        s.op(out, EXP, &[m], None)
-                    })?
+                    // `exp(b log a)` isn't `pow` where `a` is negative or 0, and a tape's `POW`
+                    // takes its exponent as a constant.
+                    return Err(cant(
+                        "a tape can't hold a power whose exponent depends on the point",
+                    ));
                 } else {
                     let a = self.regs(out, args[0])?;
                     let e = args[1];

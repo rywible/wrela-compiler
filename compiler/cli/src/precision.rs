@@ -8,7 +8,9 @@
 //! It writes a program around the function (`<package>/build/precision/`) that calls
 //! `std::derive::precision` on each box and runs it on the CPU. That walks the function's
 //! interval twice: widened as an `f32` rounds, and as a half float rounds (`2⁻¹¹` an ulp,
-//! `2⁻¹⁴` near zero), noting each operation's range. Per operation, in source order: where it
+//! `2⁻¹⁴` near zero; the box itself rounded outward to the half floats first), noting each
+//! operation's range. Constants are exact in both walks: one a half float can't hold is the
+//! reader's to see. Per operation, in source order: where it
 //! is, the operation, its range's width in each walk, their ratio, and a verdict on the half
 //! walk's extra width `e` beside the value's magnitude `|v|`: `safe` if `e ≤ tol × max(|v|, 1)`
 //! (`--tol`, default `1e-3`) in every box, `watch` within ten times that, else `unsafe`. A value
@@ -339,6 +341,11 @@ pub fn shell(p: vec3) -> f32 {
     length(p) - 1000.0
 }
 
+/// Its input's floor: a half float rounds 0.9999 to 1.
+pub fn floored(x: f32) -> f32 {
+    floor(x)
+}
+
 /// Two of value noise's corners, mixed by a weight from the input.
 pub fn corners(t: f32) -> f32 {
     mix(lattice(1, 2, 3), lattice(4, 5, 6), t)
@@ -423,6 +430,12 @@ pub fn corners(t: f32) -> f32 {
         assert_eq!(verdicts(&r), [("mix".to_string(), "watch".to_string())]);
         let r = report_at("corners-5e-3", "shapes::corners", &["0..1"], 5e-3);
         assert_eq!(verdicts(&r), [("mix".to_string(), "safe".to_string())]);
+    }
+
+    #[test]
+    fn a_half_floats_input_is_rounded_too() {
+        let r = report("floored", "shapes::floored", &["0.9999..0.9999"]);
+        assert_eq!(verdicts(&r), [("floor".to_string(), "unsafe".to_string())], "{r:#}");
     }
 
     #[test]

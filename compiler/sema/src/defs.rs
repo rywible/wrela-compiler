@@ -604,7 +604,6 @@ lang_items! {
     TapeFinish = "std::stage::finish",
     Smin = "std::field::smin",
     ValueNoise = "std::field::value_noise",
-    Lattice = "std::field::lattice",
     LatticeCoord = "std::field::lattice_coord",
     Pcg = "std::hash::pcg",
     LiftGradient = "std::lift::gradient",

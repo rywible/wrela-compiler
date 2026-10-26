@@ -27,7 +27,9 @@ pub struct DeriveCache {
     interval: HashMap<(FuncId, Vec<Bits>), FuncId>,
     /// A precision report's walks' ([`Report`]): the `f32` walk's, then the half walk's.
     report: [HashMap<(FuncId, Vec<Bits>), FuncId>; 2],
-    tape: HashMap<(FuncId, Vec<Bits>), FuncId>,
+    /// By the function, its active parameters and the `Building` type it pushes onto (a tape of
+    /// another size takes another).
+    tape: HashMap<(FuncId, Vec<Bits>, TypeId), FuncId>,
     /// What a call does with active arguments, by derivation and active parameters: `None`
     /// while the callee is still being analyzed.
     effects: HashMap<(Mode, FuncId, Vec<Bits>), Option<Effect>>,
@@ -128,12 +130,73 @@ pub fn precision(
     let mut g = Function::new(name, params.clone(), None);
     let mut body = Vec::new();
     for w in [w32, w16] {
-        let args: Vec<Arg> = (0..params.len() as u32).map(|i| g.param_arg(i, &mut body)).collect();
+        let mut args: Vec<Arg> =
+            (0..params.len() as u32).map(|i| g.param_arg(i, &mut body)).collect();
+        if w == w16
+            && let Some(Arg::Value(over)) = args.last().cloned()
+        {
+            // A half float's input is the box rounded to it: each end out to the half floats'.
+            let rounded = half_box(&mut m.types, &mut g, &mut body, box_ty, over)?;
+            *args.last_mut().expect("the box") = Arg::Value(rounded);
+        }
         body.push(Stmt::Eval(Expr::Call(w, args)));
     }
     body.push(Stmt::Return(None));
     g.body = body;
     Ok(m.add_function(g))
+}
+
+/// The box `over` (of type `box_ty`: `lo` and `hi`, an `f32` or a float vector each) as a half
+/// float holds it: each end rounded outward to the half floats' grid there (its spacing
+/// `2^(e - 10)` for an end of exponent `e`, at least `2⁻²⁴`, found from the end's bits), so an
+/// end a half float holds stays where it is, and one between two goes to the outer.
+fn half_box(
+    types: &mut Types,
+    g: &mut Function,
+    body: &mut Block,
+    box_ty: TypeId,
+    over: ValueId,
+) -> Result<ValueId> {
+    let TypeDef::Struct { fields, .. } = types.get(box_ty).clone() else {
+        return Err(Error::internal("a box that isn't a struct"));
+    };
+    let x_ty = fields.first().map(|f| f.1).ok_or_else(|| Error::internal("an empty box"))?;
+    let n = match *types.get(x_ty) {
+        TypeDef::Vector(_, n) => Some(n as u32),
+        _ => None,
+    };
+    let (f32, u32) = (types.f32(), types.u32());
+    let u =
+        |g: &mut Function, body: &mut Block, x: u32| g.let_(body, u32, Expr::Const(Const::U32(x)));
+    let mut ends = Vec::new();
+    for (k, outward) in [(0, Builtin::Floor), (1, Builtin::Ceil)] {
+        let end = g.let_(body, x_ty, Expr::Extract(over, k));
+        let mut comps = Vec::new();
+        for c in 0..n.unwrap_or(1) {
+            let x = match n {
+                Some(_) => g.let_(body, f32, Expr::Extract(end, c)),
+                None => end,
+            };
+            // The biased exponent, at least 2⁻¹⁴'s (113): the spacing's is 10 less.
+            let bits = g.let_(body, u32, Expr::Bitcast(x, Scalar::U32));
+            let (shift, mask, least, ten) =
+                (u(g, body, 23), u(g, body, 255), u(g, body, 113), u(g, body, 10));
+            let e = g.let_(body, u32, Expr::Binary(BinOp::Shr, bits, shift));
+            let e = g.let_(body, u32, Expr::Binary(BinOp::BitAnd, e, mask));
+            let e = g.let_(body, u32, Expr::Builtin(Builtin::Max, vec![e, least]));
+            let e = g.let_(body, u32, Expr::Binary(BinOp::Sub, e, ten));
+            let e = g.let_(body, u32, Expr::Binary(BinOp::Shl, e, shift));
+            let step = g.let_(body, f32, Expr::Bitcast(e, Scalar::F32));
+            let q = g.let_(body, f32, Expr::Binary(BinOp::Div, x, step));
+            let q = g.let_(body, f32, Expr::Builtin(outward, vec![q]));
+            comps.push(g.let_(body, f32, Expr::Binary(BinOp::Mul, q, step)));
+        }
+        ends.push(match n {
+            Some(_) => g.let_(body, x_ty, Expr::Construct(x_ty, comps)),
+            None => comps[0],
+        });
+    }
+    Ok(g.let_(body, box_ty, Expr::Construct(box_ty, ends)))
 }
 
 /// A function of `f`'s captures that builds the tape (`of.tape`, a `std::stage::Taped`) of `f`,

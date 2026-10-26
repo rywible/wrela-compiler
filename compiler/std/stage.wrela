@@ -111,7 +111,8 @@ pub const ATAN2: u32 = 35
 // amount mod 32; `ISHR` keeps an `i32`'s sign), `/ %` (0 where they'd trap: a tape runs both
 // sides of a branch on the point), `min` and `max` (`IMIN`, `IMAX` of `i32`s). `ULT` and `ILT`
 // (`<` of `u32`s and `i32`s) and `IEQ` give 1 or 0; `I2F` and `U2F` an integer's value as an
-// `f32`; `F2I` and `F2U` the half `c` of a float register `a` toward zero (0 out of range).
+// `f32`; `F2I` and `F2U` the half `c` of a float register `a` toward zero (`F2I` wrapped to the
+// low 32 bits past `i32`'s range, as `std::field::lattice_coord` wraps; `F2U` 0 out of range).
 // How a field hashes the lattice cells its point is in, exactly, on both targets.
 /// `a + b`, wrapping.
 pub const IADD: u32 = 36
@@ -250,6 +251,9 @@ pub struct Taped<const N: u32, const K: u32>: Copy + GpuData {
     len: u32,
     consts: [f32; K],
     nconsts: u32,
+    /// How many of its last registers are what it gives: 1, its value; or for a tape of
+    /// `tape_with`, its value and the floats beside it, which `prune` keeps too.
+    keep: u32,
 }
 
 /// A tape of up to `TAPE_LEN` operations and `TAPE_CONSTS` constants: 72 KiB, which a kernel
@@ -477,6 +481,17 @@ pub fn interpret_with<const N: u32, const K: u32, const M: u32>(
     (r[base - 1], rest)
 }
 
+/// `a` toward zero as an `i32`'s bits, wrapped to its low 32 bits past `i32`'s range, 0 for an
+/// infinity or NaN: `std::field::lattice_coord`'s, which `F2I` stands for in a tape.
+fn wrapped(a: f32) -> u32 {
+    if abs(a) < 2147483648.0 {
+        return u32(i32(a))
+    }
+    // Exact: at |a| >= 2^31 an f32 is a multiple of 2^8, and so is this, below 2^32.
+    let low = a - 4294967296.0 * floor(a / 4294967296.0)
+    if low == low { u32(low) } else { 0 }
+}
+
 /// Component `c` (0, 1 or 2) of `v`.
 fn vector_component(v: vec3, c: f32) -> f32 {
     if c < 0.5 { v.x } else if c < 1.5 { v.y } else { v.z }
@@ -546,7 +561,7 @@ fn apply(op: Op, p: vec3, a: f32, b: f32, t: f32) -> f32 {
         NOISE3 => value_noise(vec3(a, b, t) * op.c),
         HASH => lattice(lattice_coord(floor(a)), lattice_coord(floor(b)), lattice_coord(floor(t))),
         ATAN2 => atan2(a, b),
-        F2I => half(op, if abs(a) < 2147483648.0 { u32(i32(a)) } else { 0 }),
+        F2I => half(op, wrapped(a)),
         F2U => half(op, if a > -1.0 && a < 4294967296.0 { u32(a) } else { 0 }),
         _ => a,
     }
@@ -623,6 +638,7 @@ impl<const N: u32, const K: u32> Taped<N, K> {
             len: 0,
             consts: [0.0; K],
             nconsts: 0,
+            keep: 1,
         }
     }
 
@@ -656,6 +672,7 @@ impl<const N: u32, const K: u32> Taped<N, K> {
         }
         out.len = self.len
         out.nconsts = self.nconsts
+        out.keep = self.keep
         Some(out)
     }
 
@@ -1056,7 +1073,7 @@ impl<const N: u32, const K: u32> Taped<N, K> {
                 }
             }
         }
-        self.drop_unused(ops, 1)
+        self.drop_unused(ops, self.keep)
     }
 
     /// The tape with operations `ops`: the ones its last `keep` registers use (its value, and
@@ -1128,6 +1145,7 @@ impl<const N: u32, const K: u32> Taped<N, K> {
                 }
             }
         }
+        out.keep = keep
         out
     }
 }
