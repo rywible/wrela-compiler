@@ -646,7 +646,7 @@ fn handle(
             let Ok(dir) = state.out.open_dir(version_dir.to_string()) else {
                 return http::respond(&mut out, 404, "text/plain", b"not found");
             };
-            http::get_file(&mut out, &dir, rel, req.gzip, |html| {
+            http::get_file(&mut out, &dir, rel, req.gzip, req.if_none_match.as_deref(), |html| {
                 html.replacen("<head>", &format!("<head>{}", mark(seq, version)), 1)
             })
         }

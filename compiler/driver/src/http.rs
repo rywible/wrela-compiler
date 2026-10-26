@@ -27,6 +27,8 @@ pub(crate) struct Request {
     pub query: String,
     /// Whether the request accepts a gzipped answer.
     pub gzip: bool,
+    /// The entity tags of what the browser holds (`If-None-Match`).
+    pub if_none_match: Option<String>,
     body: Option<(BufReader<DeadlineIo>, usize)>,
 }
 
@@ -148,6 +150,7 @@ fn read_with_timeout(
         path: head.path,
         query: head.query,
         gzip: head.gzip,
+        if_none_match: head.if_none_match,
         body,
     }))
 }
@@ -180,15 +183,20 @@ fn put_result_from(
 /// Answers a GET of the file at `rel` in `dir`, an `index.html` as `page` makes it of the
 /// file's text: not found if there's none, or `rel` isn't a plain path in `dir`.
 /// Gzipped as it's sent when `gzip` (the request accepts it, and the file's type is worth it).
-/// Never kept by the browser: a hot reload writes new files under the same names.
+/// Kept by the browser and checked again on each use (its entity tag, `if_none_match` the one the
+/// browser holds): a hot reload that writes a file again under its name changes its tag, and a
+/// page's preload of a build's WASM is what its worker's fetch then finds. The page itself is
+/// never kept.
 pub(crate) fn get_file(
     out: &mut TcpStream,
     dir: &cap_std::fs::Dir,
     rel: &str,
     gzip: bool,
+    if_none_match: Option<&str>,
     page: impl Fn(&str) -> String,
 ) -> std::io::Result<()> {
-    loopback::get_file(out, dir, rel, Some(&page), loopback::Caching::NoStore, gzip)
+    let caching = loopback::Caching::Revalidate { if_none_match };
+    loopback::get_file(out, dir, rel, Some(&page), caching, gzip)
 }
 
 #[cfg(test)]
@@ -351,6 +359,7 @@ mod tests {
                 &build_dir,
                 request.path.trim_start_matches('/'),
                 false,
+                None,
                 str::to_string,
             )
             .expect("answer GET");
@@ -406,7 +415,8 @@ mod tests {
             client.join().expect("response")
         };
         let served = answer(&|stream| {
-            get_file(stream, &held, "visible.txt", false, str::to_string).expect("answer GET");
+            get_file(stream, &held, "visible.txt", false, None, str::to_string)
+                .expect("answer GET");
         });
         assert!(served.starts_with("HTTP/1.1 404"), "{served}");
         assert!(!served.contains("private"));
@@ -452,8 +462,9 @@ mod tests {
             drop(stream);
             client.join().expect("client")
         };
-        let served =
-            answer(&|out| get_file(out, &held, "index.html", false, str::to_string).expect("GET"));
+        let served = answer(&|out| {
+            get_file(out, &held, "index.html", false, None, str::to_string).expect("GET")
+        });
         assert!(served.ends_with("original"), "{served}");
         assert!(!served.contains("private"));
         let written = answer(&|out| {
