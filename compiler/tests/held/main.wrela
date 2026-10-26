@@ -5,7 +5,10 @@
 use std::io::{Pending, Shipped, fetch, load, ship, store}
 
 /// A file the build ships (`files/data/three.bin`).
-pub const SHIPPED: Shipped = ship("data", Vec::from([(String::from("three.bin"), Vec::from([1, 2, 3]))]))
+pub const SHIPPED: Shipped = ship(
+    "data",
+    Vec::from([(String::from("three.bin"), Vec::from([1, 2, 3]))]),
+)
 
 /// Not arrived yet.
 pub const NEVER: u32 = 0xFFFFFFFF
