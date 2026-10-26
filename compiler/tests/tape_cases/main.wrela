@@ -162,8 +162,8 @@ fn bounds<S: Surface>(s: S, over: Box3) -> std::derive::Interval {
     s.interval(over)
 }
 
-/// A tape as a `Surface` gives its own interval (no derivation through the interpreter, whose
-/// box noise no interval follows): every value it takes over a box within it.
+/// A tape as a `Surface` has an interval though its box noise's loops have no derivation: every
+/// value it takes over a box lies within it.
 @test
 fn a_tape_as_a_surface_has_its_interval() {
     let t = tape(filtered)
