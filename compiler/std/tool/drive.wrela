@@ -218,7 +218,10 @@ pub struct Bound: Copy {
 /// (its manifest's); a dispatch's workgroups; the resources it binds, in order; what a
 /// host-facing command names (a storage path, a fetch's or a post's URL, a host request's
 /// service, a build's path); and the bytes a storage write, a post or a host request carries.
-/// What a command doesn't have is empty or 0. Each batch begins with a `Batch` of its own.
+/// A `BeginPass`'s `groups` are 1 if it may join the pass before it (`std::gpu`'s `join`), then
+/// its colour targets' count; its `bindings` its targets (each colour target's texture, level
+/// and layer, then the depth texture or `u32::MAX`, 0 and its layer). What a command doesn't have
+/// is empty or 0. Each batch begins with a `Batch` of its own.
 pub struct Recorded: Clone {
     pub kind: String,
     pub label: String,

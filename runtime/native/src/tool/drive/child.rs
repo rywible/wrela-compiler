@@ -376,6 +376,16 @@ impl Recorded {
         match c {
             C::Label { name } => r.label = bounded(name),
             C::Dispatch { groups, .. } => r.groups = *groups,
+            // A pass's begin: whether it may join the pass before it, and its targets (each
+            // colour target's texture, then the depth or `NONE`) as its bindings.
+            C::BeginPass(p) => {
+                r.groups = [u32::from(p.join), p.count, 0];
+                r.bindings = p.colors[..p.count as usize]
+                    .iter()
+                    .map(|t| [t.texture, t.level, t.layer])
+                    .chain([[p.depth, 0, p.depth_layer]])
+                    .collect();
+            }
             C::StorageRead { path, .. }
             | C::Fetch { url: path, .. }
             | C::Prepare { path, .. }
