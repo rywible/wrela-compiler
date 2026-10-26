@@ -591,6 +591,8 @@ lang_items! {
     ValueAndGradient = "std::derive::value_and_gradient",
     ValueGradientWith = "std::derive::value_gradient_with",
     IntervalOf = "std::derive::interval",
+    Precision = "std::derive::precision",
+    PrecisionNote = "std::derive::precision_note",
     Filtered = "std::derive::filtered",
     TapeOf = "std::derive::tape",
     TapeWith = "std::derive::tape_with",

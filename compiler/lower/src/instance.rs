@@ -36,6 +36,8 @@ pub enum DeriveKind {
     ValueAndGradient,
     /// The interval over a box.
     Interval,
+    /// A precision report over a box (`std::derive::precision`, `wrela precision`): nothing.
+    Precision,
     /// The value box-filtered over a footprint (`filtered`): `f32`.
     Filtered,
     /// A parameter gradient (§23): the value and its derivative by each of some lifted

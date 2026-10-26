@@ -2,6 +2,7 @@
 // body (language.md §14), and the ranges and boxes they work over. Any function that qualifies
 // has them; nothing here is specific to fields.
 
+use std::io::print
 use std::stage::{Tape, Taped}
 
 /// A closed range `[lo, hi]` of `f32` values.
@@ -247,6 +248,33 @@ pub fn value_gradient_with<X: Domain, T>(f: fn(X) -> (f32, T), at: X) -> (f32, X
 /// derived function. On the GPU each operation widens its result outward by its error bound.
 @intrinsic
 pub fn interval<X: Domain, Y: Domain>(f: fn(X) -> Y, over: X::Box) -> Y::Box {}
+
+/// For `wrela precision`: `interval(f, over)` twice, once widened as an `f32` rounds and once as
+/// a half float rounds, each noting every operation's range (`precision_note`). It returns
+/// nothing; `wrela precision` reads the notes and says where an `f16` twin would be safe. The
+/// half walk isn't an interval in `f16`: it's the `f32` walk, widened by a half float's rounding
+/// at each operation, so what it says is advice, not a bound. A measured twin is the proof.
+@intrinsic
+pub fn precision<X: Domain, Y: Domain>(f: fn(X) -> Y, over: X::Box) {}
+
+/// One of `precision`'s notes, printed as a line: `precision`, then the walk (1 for the half
+/// walk), the source file and byte where the operation is, whether its value is an integer, its
+/// name in three little-endian words, and its range's ends as their bits.
+pub fn precision_note(
+    half: u32,
+    file: u32,
+    at: u32,
+    int: u32,
+    op0: u32,
+    op1: u32,
+    op2: u32,
+    lo: f32,
+    hi: f32,
+) {
+    print(
+        f"precision {half} {file} {at} {int} {op0} {op1} {op2} {bitcast_u32(lo)} {bitcast_u32(hi)}",
+    )
+}
 
 /// `f(at)` box-filtered over a footprint `width` wide along each of `at`'s components (a pixel's
 /// spread in `f`'s input, say): each `fract`, `floor`, `ceil`, `round`, `trunc`, `step`, `sign`,

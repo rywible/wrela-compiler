@@ -40,6 +40,9 @@
 //! wrela solve <package-dir> (--minimize <fn> | --spec) --free <file>:<lines>...
 //!                                         choose literals that minimize a function, or that
 //!                                         make the package's spec hold (§23)
+//! wrela precision <package-dir> <fn> --box <lo>..<hi>,...
+//!                                         where a half-float twin of a function would be
+//!                                         safe, operation by operation, from its interval
 //! wrela same <package-dir> --against <build-dir> [--frames n] [--within x] [--no-gpu] [--json]
 //!                                         whether the package built now behaves as a saved
 //!                                         build does: the same commands each frame, the
@@ -100,6 +103,7 @@ mod fmt;
 mod migrate;
 mod pin;
 mod pipelines;
+mod precision;
 mod primer;
 mod profile;
 mod query;
@@ -131,6 +135,7 @@ pub(crate) fn usage() -> ExitCode {
         "wrela script <package-dir> <module>::<NAME> [-o <file>]",
         "wrela primer [area]",
         "wrela solve <package-dir> (--minimize <module>::<function> | --spec) --free <file>[:<lines>]... [--steps n] [--exact] [--write] [--json]",
+        "wrela precision <package-dir> <module>::<function> --box <lo>..<hi>[,<lo>..<hi>]... [--box ...] [--tol t] [--json]",
         "wrela query <package-dir> [<query>...] [--json]",
         "wrela context <item> [<package-dir>] [--budget n]",
         "wrela refactor <package-dir> (rename <item> <new-name> | move <item> <module> | add-param <fn> \"<name>: <type>\" (--value <expr> | --default <expr>) | change-mode <fn> <param> <borrow|mut|take> | extract-const <file>:<line>:<col> <NAME> | inline <fn> | extract-fn <file>:<first>-<last> <name> | apply <plan.json>) [--dry-run] [--json]",
@@ -204,6 +209,7 @@ fn main() -> ExitCode {
         "same" => same::run(rest),
         "tool" => tool::run(rest),
         "solve" => solve::run(rest),
+        "precision" => precision::run(rest),
         "script" => script::run(rest),
         "primer" => primer::run(rest),
         "query" => query::query(rest),

@@ -21,6 +21,7 @@ pub(crate) fn call(
 ) -> Option<ir::ValueId> {
     let kind = match lang {
         Lang::IntervalOf => DeriveKind::Interval,
+        Lang::Precision => DeriveKind::Precision,
         Lang::Filtered => DeriveKind::Filtered,
         Lang::LiftGradient => DeriveKind::Literals,
         Lang::LiftReads => DeriveKind::Reads,
@@ -36,7 +37,7 @@ pub(crate) fn call(
         return None;
     };
     let (input, output) = match kind {
-        DeriveKind::Interval => (substs[0], substs.get(1).copied()),
+        DeriveKind::Interval | DeriveKind::Precision => (substs[0], substs.get(1).copied()),
         DeriveKind::Filtered => (substs[0], None),
         // `gradient<const N>`: the literals' type and the result's are the call's.
         DeriveKind::Literals => {
@@ -62,7 +63,11 @@ pub(crate) fn call(
         let width = fl.arg_value(&c.args[2])?;
         args.push(ir::Arg::Value(width));
     }
-    let ret = fl.mb.m.functions[callee.index()].ret?;
+    let Some(ret) = fl.mb.m.functions[callee.index()].ret else {
+        // `precision`: a report, which returns nothing.
+        fl.emit(ir::Stmt::Eval(ir::Expr::Call(callee, args)));
+        return None;
+    };
     let v = fl.value(ret, ir::Expr::Call(callee, args));
     match lang {
         Lang::Gradient => {
@@ -172,25 +177,39 @@ pub(crate) fn signature(cx: &mut Cx, mb: &mut ModuleBuilder, key: &InstanceKey) 
         }
         // `input` is the tape's type.
         DeriveKind::Tape => ir::Function::new("tape", params, x),
-        DeriveKind::Interval => {
-            // The range of the result: an `Interval` for an `f32`, a box for a vector.
-            let interval = match output {
-                Some(y) => box_type(cx, *y),
-                None => cx
-                    .checked
-                    .program
-                    .lang_adt(Lang::Interval)
-                    .map(|a| cx.checked.program.types.adt(a, Vec::new())),
-            };
-            let box_ty = box_type(cx, *input);
-            let bt = box_ty.and_then(|b| cx.lower_ty(mb, b, span));
-            let it = interval.and_then(|i| cx.lower_ty(mb, i, span));
+        DeriveKind::Interval | DeriveKind::Precision => {
+            let (bt, it) = box_types(cx, mb, *input, *output, span);
             if let Some(bt) = bt {
                 params.push(ir::Param::value("over", bt));
+            }
+            if *kind == DeriveKind::Precision {
+                return ir::Function::new("precision", params, None);
             }
             ir::Function::new("interval", params, it)
         }
     }
+}
+
+/// An interval's box over `input`, and the range of its result (`output`'s box, or an
+/// `Interval` for an `f32`), lowered.
+fn box_types(
+    cx: &mut Cx,
+    mb: &mut ModuleBuilder,
+    input: TyId,
+    output: Option<TyId>,
+    span: Span,
+) -> (Option<ir::TypeId>, Option<ir::TypeId>) {
+    let interval = match output {
+        Some(y) => box_type(cx, y),
+        None => cx
+            .checked
+            .program
+            .lang_adt(Lang::Interval)
+            .map(|a| cx.checked.program.types.adt(a, Vec::new())),
+    };
+    let box_ty = box_type(cx, input);
+    let bt = box_ty.and_then(|b| cx.lower_ty(mb, b, span));
+    (bt, interval.and_then(|i| cx.lower_ty(mb, i, span)))
 }
 
 /// `X::Box` for a domain type `X`.
@@ -364,7 +383,7 @@ fn build(
     id: ir::FuncId,
     inner: ir::FuncId,
 ) {
-    let InstanceKey::Derived { kind, input, output, .. } = key else { return };
+    let InstanceKey::Derived { of, kind, input, output } = key else { return };
     let target = mb.target();
     let result = match kind {
         DeriveKind::Reads => return build_reads(mb, id, inner),
@@ -418,6 +437,30 @@ fn build(
                 ),
                 _ => Err(ir::Error::internal(
                     "a tape's signature returns no tape, or std has no `Building`",
+                )),
+            }
+        }
+        DeriveKind::Precision => {
+            let sig = &mb.m.functions[id.index()];
+            let ncap = (sig.params.len() as u32).saturating_sub(1);
+            let span = callable_span(cx, of);
+            let bt = sig.params.last().map(|p| p.ty);
+            let (_, it) = box_types(cx, mb, *input, *output, span);
+            let note = cx.checked.program.lang_fn(Lang::PrecisionNote);
+            let at = mb.callers.get(&id).map(|c| (id, c.1));
+            let note = note.map(|n| cx.instance(mb, InstanceKey::plain(n, Vec::new()), at));
+            match (bt, it, note) {
+                (Some(box_ty), Some(interval_ty), Some(note)) => ir::derive::precision(
+                    &mut mb.m,
+                    &mut mb.derived,
+                    inner,
+                    ncap,
+                    box_ty,
+                    interval_ty,
+                    note,
+                ),
+                _ => Err(ir::Error::internal(
+                    "a precision report's signature has no box, or std has no `precision_note`",
                 )),
             }
         }
@@ -476,7 +519,10 @@ fn build(
                     body.push(ir::Stmt::Let(v, ir::Expr::Call(derived, args)));
                     body.push(ir::Stmt::Return(Some(v)));
                 }
-                None => body.push(ir::Stmt::Return(None)),
+                None => {
+                    body.push(ir::Stmt::Eval(ir::Expr::Call(derived, args)));
+                    body.push(ir::Stmt::Return(None));
+                }
             }
             f.body.extend(body);
         }

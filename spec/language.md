@@ -1517,6 +1517,12 @@ The compiler derives them from the function's body, and from every function it c
 - A branch run speculatively can still trap on the CPU (an integer overflow, for example), even if no point in the box would take it.
 - std's `ellipsoid` bound divides by a length that is 0 at its centre. So a box that holds the centre gets an interval that reaches 0, deep inside the body.
 
+**Where a half float would do (`std::derive::precision`, `wrela precision`).** An interval can't be derived in `f16` (E0700): its widening is `f32`'s, which a half float rounds away. `precision(f, over)` doesn't derive one either. It runs `f`'s interval over the box twice on the CPU. The first walk widens each operation as an `f32` rounds. The second widens it as a half float rounds: by `max(|x| k 2⁻¹¹, 2⁻¹⁴)` for an operation of `k` ulps in std's table, `2⁻¹⁴` being the smallest normal, below which a GPU may flush. Each walk notes every operation's range through `precision_note`.
+
+- `wrela precision` reads the notes. For each operation, it compares the half walk's extra width `e` with the value's magnitude `|v|`. The operation is `safe` where `e ≤ tol × max(|v|, 1)`, `watch` within ten times that, and `unsafe` past it. A value past 65504 is `unsafe` by range, and so is an integer past 2048, the last integer a half float holds exactly.
+- **The extra width accumulates.** An operation's verdict counts what the operations before it rounded too. So a subtraction that cancels two large values is `unsafe` even where its own rounding is small.
+- **Its verdicts are advice.** The half walk is a model of the rounding, not a bound. A twin written in `f16` where the report says `safe` is proven by measuring it.
+
 ### 14.4 Fields built at run time
 
 A field built while the program runs is a tape: `std::stage::Tape` holds up to 4,096 operations over the point and a table of up to 2,048 constants (`TAPE_LEN`, `TAPE_CONSTS`); `ShortTape` holds 256 of each, for a pruned tape. Both are `Taped<N, K>` of their sizes, so code written for one takes the other. Each operation writes its own register, and the last register is the field's value.
@@ -2567,7 +2573,7 @@ The compiler knows the language, a closed list of std items and its targets; the
   - `std::input`: `Script`
   - `std::tool::browser`: `Script`
   - `std::mem`: `take_answer`, `take_input`, `take_payload`, `keep_bytes`, `kept_bytes`, `read_clock`, `Drop`, `size_of`, `align_of`, `needs_drop`, `is_copy`, `read`, `zeroed`, `write`, `drop_at`, `at`, `at_mut`, `at_mut_pair`, `heap_base`, `memory_pages`, `memory_grow`, `load_u32`, `store_u32`, `load_u8`, `store_u8`, `copy`, `fill`, `compare_swap`, `atomic_add`, `atomic_load`, `atomic_store`, `wait`, `notify`, `run_task`, `task`, `thread_block`, `wait_for`, `abort`, `debug_build`, `test_build`, `tool_request`, `tool_wait`, `tool_any`, `tool_take`, `tool_idle`, `tool_active`, `tool_join`, `tool_done`
-  - `std::derive`: `Interval`, `Domain`, `gradient`, `value_and_gradient`, `value_gradient_with`, `interval`, `filtered`, `tape`, `tape_with`, `tape_sized`
+  - `std::derive`: `Interval`, `Domain`, `gradient`, `value_and_gradient`, `value_gradient_with`, `interval`, `precision`, `precision_note`, `filtered`, `tape`, `tape_with`, `tape_sized`
   - `std::field`: `smin`, `value_noise`, `lattice`, `lattice_coord`, `pcg`
   - `std::stage`: `Building`, `push_one`, `push_two`, `push_new`, `finish`
   - `std::math`: `sin`, `cos`, `tan`, `asin`, `acos`, `atan`, `atan2`, `sinh`, `cosh`, `tanh`, `exp`, `exp2`, `log`, `log2`, `pow`
@@ -3007,6 +3013,7 @@ These commands let an agent read what the compiler knows about a package, instea
 | `wrela fix <package-dir> [--dry-run] [--json]` | Makes every fix a tool can make, and reports each one; a fix that is the author's choice is listed, not made (§6.13). `--dry-run` prints the diff and writes nothing |
 | `wrela migrate <package-dir> [--dry-run] [--json]` | Makes every migration's fix and nothing else (§10.2): after a workspace moves its toolchain pin, one command brings each member to the new forms |
 | `wrela solve <package> --minimize <fn> --free <file>:<lines>` | Minimizes a function of no arguments over the literals on those lines, and rounds them to their decimals. It builds a program around the function that uses `std::lift::Minimize` (BFGS on `std::lift::gradient`). `--write` writes the literals through `wrela edit` |
+| `wrela precision <package> <fn> --box <lo>..<hi>,...` | Says, operation by operation, where a half-float twin of a function of a point would be safe, from `std::derive::precision` over each box (§14.3), and names the first operation that isn't. `<fn>` is `<module>::<name>` in the package, or a path in std |
 | `wrela run <package> [--port N]` | Serves the program lifted on 127.0.0.1 with hot reload (§23.2): a saved literal reaches the running program at its next frame, and any other edit swaps in a new build, in the same page |
 | `wrela trace <package> --watch <exports>` | Runs frames, in lockstep with the program's ticker if it has one (as `wrela-host` does), and prints what the exports say after each frame (`--csv`) |
 | `wrela bisect <package> --until "<export> <op> <number>"` | Finds the first frame at which a condition holds (`nan <export>` too) |

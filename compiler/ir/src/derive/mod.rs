@@ -13,6 +13,7 @@ pub mod interval;
 pub mod literal;
 pub mod tape;
 
+pub use interval::Report;
 pub use literal::literal_gradient;
 pub use tape::{TapeFns, TapeOf};
 
@@ -24,6 +25,8 @@ use std::collections::HashMap;
 pub struct DeriveCache {
     ad: HashMap<(FuncId, Vec<Bits>, u8), FuncId>,
     interval: HashMap<(FuncId, Vec<Bits>), FuncId>,
+    /// A precision report's walks' ([`Report`]): the `f32` walk's, then the half walk's.
+    report: [HashMap<(FuncId, Vec<Bits>), FuncId>; 2],
     tape: HashMap<(FuncId, Vec<Bits>), FuncId>,
     /// What a call does with active arguments, by derivation and active parameters: `None`
     /// while the callee is still being analyzed.
@@ -75,6 +78,16 @@ pub fn value_gradient_ty(types: &mut Types, x: TypeId, with: Option<TypeId>) -> 
     types.intern(TypeDef::Struct { name: format!("({})", names.join(", ")), fields })
 }
 
+impl DeriveCache {
+    /// The interval derivations for `report`'s walk, or the plain ones.
+    fn intervals(&mut self, report: Option<Report>) -> &mut HashMap<(FuncId, Vec<Bits>), FuncId> {
+        match report {
+            Some(r) => &mut self.report[r.half as usize],
+            None => &mut self.interval,
+        }
+    }
+}
+
 /// A function of `f`'s captures and a box (`box_ty`, with fields `lo` and `hi`) returning an
 /// interval (`interval_ty`, likewise) that contains `f(x)`, as the target computes it, for every
 /// `x` in the box. On the GPU each operation's result is widened by its WGSL error bound
@@ -88,7 +101,39 @@ pub fn interval(
     box_ty: TypeId,
     interval_ty: TypeId,
 ) -> Result<FuncId> {
-    interval::interval(m, cache, f, ncap, target, box_ty, interval_ty)
+    interval::interval(m, cache, f, ncap, target, (box_ty, interval_ty), None)
+}
+
+/// A function of `f`'s captures and a box (as [`interval`]'s) that returns nothing: it runs the
+/// interval of `f` over the box twice for `wrela precision`, once widened as the CPU rounds an
+/// `f32` and once as a half float rounds, and each walk notes each operation's range through
+/// `note`, std's `precision_note` ([`Report`]).
+pub fn precision(
+    m: &mut Module,
+    cache: &mut DeriveCache,
+    f: FuncId,
+    ncap: u32,
+    box_ty: TypeId,
+    interval_ty: TypeId,
+    note: FuncId,
+) -> Result<FuncId> {
+    let walks = [false, true].map(|half| {
+        let report = Some(Report { half, note });
+        interval::interval(m, cache, f, ncap, Target::Cpu, (box_ty, interval_ty), report)
+    });
+    let [w32, w16] = walks;
+    let (w32, w16) = (w32?, w16?);
+    let params = m.functions[w32.index()].params.clone();
+    let name = format!("{}_precision", m.functions[f.index()].name);
+    let mut g = Function::new(name, params.clone(), None);
+    let mut body = Vec::new();
+    for w in [w32, w16] {
+        let args: Vec<Arg> = (0..params.len() as u32).map(|i| g.param_arg(i, &mut body)).collect();
+        body.push(Stmt::Eval(Expr::Call(w, args)));
+    }
+    body.push(Stmt::Return(None));
+    g.body = body;
+    Ok(m.add_function(g))
 }
 
 /// A function of `f`'s captures that builds the tape (`of.tape`, a `std::stage::Taped`) of `f`,
