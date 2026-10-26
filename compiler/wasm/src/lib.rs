@@ -368,9 +368,11 @@ pub fn emit_with(m: &ir::Module, options: Options) -> Result<Emitted, String> {
     // A shared memory's constants are copied once, by a start function, not by each instance
     // as it starts: a worker's instance starts while the program runs, and would overwrite
     // what's changed since (the program's state among it).
-    let passive = shared_memory && !data_bytes.is_empty();
+    // One segment per run of bytes that aren't zero: memory is zero where none lands.
+    let segments = nonzero_runs(&data_bytes);
+    let passive = shared_memory && !segments.is_empty();
     let start = passive.then(|| {
-        let body = func::init_data(data_base, data_bytes.len() as u32);
+        let body = func::init_data(data_base, &segments);
         let ty = types.get(vec![], vec![]);
         functions.function(ty);
         code.function(&body);
@@ -430,15 +432,18 @@ pub fn emit_with(m: &ir::Module, options: Options) -> Result<Emitted, String> {
         module.section(&elements);
     }
     if passive {
-        module.section(&DataCountSection { count: 1 });
+        module.section(&DataCountSection { count: segments.len() as u32 });
     }
     module.section(&code);
-    if !data_bytes.is_empty() {
+    if !segments.is_empty() {
         let mut data = DataSection::new();
-        if passive {
-            data.passive(data_bytes);
-        } else {
-            data.active(0, &ConstExpr::i32_const(data_base as i32), data_bytes);
+        for &(at, len) in &segments {
+            let bytes = data_bytes[at as usize..(at + len) as usize].iter().copied();
+            if passive {
+                data.passive(bytes);
+            } else {
+                data.active(0, &ConstExpr::i32_const((data_base + at) as i32), bytes);
+            }
         }
         module.section(&data);
     }
@@ -459,6 +464,74 @@ pub fn emit_with(m: &ir::Module, options: Options) -> Result<Emitted, String> {
         }
     }
     Ok(Emitted { wasm, lines })
+}
+
+/// What a program's constant data holds (`wrela build --report data`): each constant's
+/// laid-out size and how many of its bytes are zero, the largest first; the section's total,
+/// and its zero bytes.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct DataReport {
+    /// `(name, type, bytes, zero bytes)`, the largest first.
+    pub constants: Vec<(String, String, u32, u32)>,
+    pub total: u32,
+    pub zeros: u32,
+    /// The bytes the module's data segments hold, once the zero runs are left out.
+    pub segments: u32,
+}
+
+/// The program's constant data, as [`DataReport`] reports it.
+pub fn data_report(m: &ir::Module) -> Result<DataReport, String> {
+    let (addrs, base, bytes, _) = data(m)?;
+    let mut constants: Vec<(String, String, u32, u32)> = m
+        .data
+        .iter()
+        .zip(&addrs)
+        .map(|(d, &at)| {
+            let size = ir::layout::layout(&m.types, d.ty).size;
+            let from = (at - base) as usize;
+            let zeros = bytes[from..from + size as usize].iter().filter(|&&b| b == 0).count();
+            (d.name.clone(), m.types.display(d.ty), size, zeros as u32)
+        })
+        .collect();
+    constants.sort_by(|a, b| b.2.cmp(&a.2).then_with(|| a.0.cmp(&b.0)));
+    let segments = nonzero_runs(&bytes).iter().map(|&(_, len)| len).sum();
+    let zeros = bytes.iter().filter(|&&b| b == 0).count() as u32;
+    Ok(DataReport { constants, total: bytes.len() as u32, zeros, segments })
+}
+
+/// The shortest run of zero bytes that splits the data into two segments: a segment's header
+/// costs a few bytes, so shorter runs stay in their segment.
+const ZERO_RUN: usize = 256;
+
+/// The most segments a module's data is split into (engines take up to 100,000).
+const MOST_SEGMENTS: usize = 10_000;
+
+/// The runs of `bytes` that hold anything but zeros, as `(offset, length)`: split wherever
+/// [`ZERO_RUN`] zero bytes or more lie between two, with the zeros at either end left out.
+/// Memory is zero where no segment lands, so the module's data is the same.
+fn nonzero_runs(bytes: &[u8]) -> Vec<(u32, u32)> {
+    let zeros_at = |i: usize| bytes[i..].iter().take_while(|&&b| b == 0).count();
+    let mut gap = ZERO_RUN;
+    loop {
+        let mut runs: Vec<(u32, u32)> = Vec::new();
+        let mut i = zeros_at(0);
+        while i < bytes.len() {
+            let start = i;
+            let end = loop {
+                i += bytes[i..].iter().take_while(|&&b| b != 0).count();
+                let (end, zeros) = (i, zeros_at(i));
+                i += zeros;
+                if i == bytes.len() || zeros >= gap {
+                    break end;
+                }
+            };
+            runs.push((start as u32, (end - start) as u32));
+        }
+        if runs.len() <= MOST_SEGMENTS {
+            return runs;
+        }
+        gap *= 4;
+    }
 }
 
 /// Where the module's constant data goes: each one's address, where the data starts (above the
@@ -687,6 +760,20 @@ pub fn interface(bytes: &[u8]) -> Result<wrela_abi::manifest::WasmAbi, String> {
     Ok(abi)
 }
 
+/// How many data segments a module has, and the bytes they hold.
+pub fn data_segments(bytes: &[u8]) -> Result<(usize, usize), String> {
+    let (mut n, mut total) = (0, 0);
+    for payload in wasmparser::Parser::new(0).parse_all(bytes) {
+        if let wasmparser::Payload::DataSection(reader) = payload.map_err(|e| e.to_string())? {
+            for d in reader {
+                total += d.map_err(|e| e.to_string())?.data.len();
+                n += 1;
+            }
+        }
+    }
+    Ok((n, total))
+}
+
 /// Fails if a WASM module uses any relaxed-SIMD instruction (AC7): those are the only WASM
 /// instructions whose results may differ between engines, including fused multiply-add.
 pub fn check_no_relaxed_simd(bytes: &[u8]) -> Result<(), String> {
@@ -802,6 +889,19 @@ mod tests {
             std::fs::write(dir.join("manifest.json"), m.to_json()).expect("write");
         }
         assert_eq!(stated, Some(read));
+    }
+
+    #[test]
+    fn data_splits_at_long_zero_runs() {
+        let mut bytes = vec![0u8; 4096];
+        bytes[10] = 1;
+        bytes[11] = 2;
+        bytes[100] = 3; // a short gap: the same segment
+        bytes[2000] = 4; // a long one: another
+        bytes[4095] = 5;
+        assert_eq!(nonzero_runs(&bytes), [(10, 91), (2000, 1), (4095, 1)]);
+        assert_eq!(nonzero_runs(&[0; 600]), []);
+        assert_eq!(nonzero_runs(&[7, 0, 7]), [(0, 3)]);
     }
 
     #[test]

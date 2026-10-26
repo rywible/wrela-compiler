@@ -774,6 +774,20 @@ fn std_counts_the_gpu_memory_a_program_holds() {
     assert_eq!(crate::tests_pass(&dir), 1);
 }
 
+/// A constant that is mostly zeros (compiler/tests/zero_runs, language.md §13): its 64 KiB
+/// table costs the WASM's data segments under a quarter of that, and both hosts read it back
+/// whole (the test runs `hosts: both`).
+#[test]
+#[ignore = "needs a GPU"]
+fn a_mostly_zero_constant_costs_its_bytes_only() {
+    let dir = wrela_tests::repo_root().join("compiler/tests/zero_runs");
+    assert_eq!(crate::tests_pass(&dir), 1);
+    let wasm = std::fs::read(crate::built("zero_runs").join("game.wasm")).expect("game.wasm");
+    let (segments, bytes) = wrela_wasm::data_segments(&wasm).expect("reads");
+    eprintln!("the 65,536-byte table: {segments} data segments of {bytes} bytes in all");
+    assert!(bytes < 65_536 / 4, "{bytes} bytes of data");
+}
+
 /// Constants that hold `Text`, read by GPU code (M6, AC15): compiler/tests/gpu-constants has a
 /// kernel read a table of sites, each a place, a height and a name, written as a literal and
 /// computed by the build; it reads back what the CPU computes from the same tables. Spike 17

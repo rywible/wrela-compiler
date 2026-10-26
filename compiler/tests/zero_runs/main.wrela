@@ -1,0 +1,51 @@
+// A constant that is mostly zeros (language.md §13: zero runs cost nothing): 64 KiB of `u32`s,
+// one in every 1,024 set. The build's WASM leaves the zeros out of its data segments; the
+// program reads the table back whole, on both hosts, and writes what it read into a buffer, so
+// the hosts' state hashes compare it.
+use std::gpu::{GpuBuffer, buffer, write}
+
+const TABLE: [u32; 16384] = table()
+
+fn table() -> [u32; 16384] {
+    var t: [u32; 16384] = [0; 16384]
+    var i: u32 = 0
+    while i < 16384 {
+        t[i] = i * 7 + 1
+        i += 1024
+    }
+    t
+}
+
+pub struct State {
+    sum: u32,
+    set: u32,
+    out: GpuBuffer<u32>,
+}
+
+pub fn init() -> State {
+    State { sum: 0, set: 0, out: buffer(16) }
+}
+
+pub fn frame(s: mut State, time: f32, width: u32, height: u32) {
+    var sum: u32 = 0
+    var set: u32 = 0
+    var seen: [u32; 16] = [0; 16]
+    for i in 0..16384 {
+        let x = TABLE[i]
+        sum += x
+        if x != 0 {
+            seen[set % 16] = x
+            set += 1
+        }
+    }
+    s.sum = sum
+    s.set = set
+    write(mut s.out, 0, seen)
+}
+
+@test(frames: 2, gpu: true, hosts: both)
+fn the_table_reads_back_whole(s: State) {
+    // Sixteen entries set, at 0, 1024, ..., 15360: each i * 7 + 1.
+    assert(s.set == 16)
+    assert(s.sum == 7 * 1024 * 120 + 16)
+}

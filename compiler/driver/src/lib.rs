@@ -9,6 +9,7 @@
 //! the deepest tree the parser accepts (`wrela_syntax::MAX_NESTING`, `MAX_EXPR_DEPTH`).
 
 pub mod build;
+pub use wrela_wasm::DataReport;
 pub mod const_cache;
 pub mod consts;
 pub mod edit;
@@ -60,6 +61,9 @@ pub struct Output {
     pub program_files: ProgramFiles,
     /// How many constants the build computed, and how many it read from the cache (§13).
     pub consts: consts::ConstStats,
+    /// What the client build's constant data holds (`wrela build --report data`), when it was
+    /// built.
+    pub data: Option<wrela_wasm::DataReport>,
 }
 
 /// One pipeline: an instantiation of its entry points, and why it exists.
@@ -845,6 +849,7 @@ fn compile_loaded_in(
             pipelines: Vec::new(),
             program_files: Vec::new(),
             consts: consts::ConstStats::default(),
+            data: None,
         });
     };
     // The program package's own files: package 1's (std is 0).
@@ -869,6 +874,7 @@ fn compile_loaded_in(
     scope.stop()?;
     let mut files = Vec::new();
     let mut pipelines = Vec::new();
+    let mut data_report = None;
     let mut data = wrela_lower::BuildData {
         debug: mode.debug,
         no_simd: mode.no_simd,
@@ -901,6 +907,7 @@ fn compile_loaded_in(
             diagnostics.extend(d);
             if role == wrela_sema::defs::Role::Client {
                 pipelines = summarize(&checked, &sources, &lowered, mode.conditions);
+                data_report = wrela_wasm::data_report(&lowered.cpu).ok();
             }
             if !ok || !mode.emit {
                 continue;
@@ -948,6 +955,7 @@ fn compile_loaded_in(
         pipelines,
         program_files,
         consts: stats,
+        data: data_report,
     })
 }
 

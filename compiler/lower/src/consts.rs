@@ -15,8 +15,16 @@ impl<'a> Cx<'a> {
         if let Some(&d) = mb.data.get(&c) {
             return d;
         }
+        let before = mb.m.data.len();
         let d = self.const_value(mb, c).map(|(ty, value)| {
             let name = self.checked.program.const_(c).name.clone();
+            // What its value owns (a `Vec`'s items, a box's value) is data of its own: named for
+            // the constant, so a report of the program's data says whose it is.
+            for owned in &mut mb.m.data[before..] {
+                if owned.name == "const" {
+                    owned.name = format!("{name}'s items");
+                }
+            }
             mb.m.add_data(ir::Data { name, ty, value })
         });
         mb.data.insert(c, d);

@@ -1628,13 +1628,13 @@ mod ops;
 mod vloop;
 pub(crate) use ops::helper_bodies;
 
-/// The start function of a module whose memory is shared: copies the constants (passive data
-/// segment 0, `len` bytes) to `base` once, however many instances share the memory. The first
-/// instance claims [`memory::DATA_READY`] and copies; any other waits until it reads 2. Each
-/// then drops its segment.
-pub(crate) fn init_data(base: u32, len: u32) -> Function {
+/// The start function of a module whose memory is shared: copies the constants (the passive
+/// data segments, each `(offset, length)` from `base`, in order) into place once, however many
+/// instances share the memory. The first instance claims [`memory::DATA_READY`] and copies; any
+/// other waits until it reads 2. Each then drops its segments.
+pub(crate) fn init_data(base: u32, segments: &[(u32, u32)]) -> Function {
     let flag = memory::DATA_READY as i32;
-    let ins = [
+    let mut ins = vec![
         I::I32Const(flag),
         I::I32Const(0),
         I::I32Const(1),
@@ -1657,10 +1657,17 @@ pub(crate) fn init_data(base: u32, len: u32) -> Function {
         I::End,
         I::End,
         I::Else,
-        I::I32Const(base as i32),
-        I::I32Const(0),
-        I::I32Const(len as i32),
-        I::MemoryInit { mem: 0, data_index: 0 },
+    ];
+    // Each segment where it goes; memory between them is zero already.
+    for (i, &(at, len)) in segments.iter().enumerate() {
+        ins.extend([
+            I::I32Const((base + at) as i32),
+            I::I32Const(0),
+            I::I32Const(len as i32),
+            I::MemoryInit { mem: 0, data_index: i as u32 },
+        ]);
+    }
+    ins.extend([
         I::I32Const(flag),
         I::I32Const(2),
         I::I32AtomicStore(mem(0, 2)),
@@ -1669,9 +1676,9 @@ pub(crate) fn init_data(base: u32, len: u32) -> Function {
         I::MemoryAtomicNotify(mem(0, 2)),
         I::Drop,
         I::End,
-        I::DataDrop(0),
-        I::End,
-    ];
+    ]);
+    ins.extend((0..segments.len() as u32).map(I::DataDrop));
+    ins.push(I::End);
     function([], &ins)
 }
 

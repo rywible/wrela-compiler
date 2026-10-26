@@ -1231,6 +1231,8 @@ It runs tests the way that it computes constants (§13.2).
 
 **A `const` bakes its result into the build, so it costs bytes; computing a value at load costs time on every start.** Choose for each value: an eigenvalue solve's result is tiny, so it belongs in a `const`. There are no procedural macros.
 
+**What a `const` costs in bytes.** The program's constants are laid out together, as memory holds them, and the WASM carries that layout in data segments. Zero runs cost nothing: wherever 256 zero bytes or more lie together, the segment ends and the next starts past them, since memory is zero where no segment lands. Zeros scattered among other bytes (the high bytes of small integers, a struct's zero fields) stay in their segment; a server's compression takes most of them on the wire. `wrela build <pkg> --report data` lists the twenty largest constants by their laid-out size, with each one's share of zero bytes, and the section's total; a constant a program reads only at load, and that is large, is better shipped as a file (`std::io::Shipped`, below).
+
 ### 13.1 Computing constants
 
 The compiler compiles a `const`'s initializer, and every function it calls, to WASM, and runs it in wasmtime during the build.

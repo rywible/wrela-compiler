@@ -35,6 +35,11 @@ pub fn run(args: &[String]) -> ExitCode {
         wrela_driver::build(dir)
     };
     let failed = crate::report(&output, args.json);
+    if args.report_data
+        && let Some(data) = &output.data
+    {
+        print!("{}", if args.json { data_json(data) } else { data_table(data) });
+    }
     if let Some(level) = args.optimize
         && !failed
         && let Err(e) = optimized(&mut output.files, level)
@@ -94,6 +99,54 @@ pub fn run(args: &[String]) -> ExitCode {
             ExitCode::from(2)
         }
     }
+}
+
+/// How many of the largest constants `--report data` lists.
+const LARGEST: usize = 20;
+
+/// `--report data`'s table: the largest constants, the section's total and its zero share.
+fn data_table(d: &wrela_driver::DataReport) -> String {
+    let share =
+        |zeros: u32, of: u32| if of == 0 { 0.0 } else { 100.0 * f64::from(zeros) / f64::from(of) };
+    let mut s = format!("{:<40} {:<32} {:>12} {:>7}\n", "constant", "type", "bytes", "zeros");
+    for (name, ty, bytes, zeros) in d.constants.iter().take(LARGEST) {
+        let ty = if ty.len() > 32 {
+            format!("{}…", &ty[..ty.floor_char_boundary(31)])
+        } else {
+            ty.clone()
+        };
+        s.push_str(&format!("{name:<40} {ty:<32} {bytes:>12} {:>6.1}%\n", share(*zeros, *bytes)));
+    }
+    s.push_str(&format!(
+        "data: {} bytes in {} constants, {:.1}% zero; the segments hold {} bytes\n",
+        d.total,
+        d.constants.len(),
+        share(d.zeros, d.total),
+        d.segments
+    ));
+    s
+}
+
+/// `--report data --json`.
+fn data_json(d: &wrela_driver::DataReport) -> String {
+    let constants: Vec<_> = d
+        .constants
+        .iter()
+        .take(LARGEST)
+        .map(|(name, ty, bytes, zeros)| {
+            serde_json::json!({ "name": name, "type": ty, "bytes": bytes, "zero_bytes": zeros })
+        })
+        .collect();
+    let all = serde_json::json!({
+        "data": {
+            "bytes": d.total,
+            "zero_bytes": d.zeros,
+            "segment_bytes": d.segments,
+            "constants": d.constants.len(),
+            "largest": constants,
+        }
+    });
+    format!("{all}\n")
 }
 
 /// The build's files with `game.wasm` optimized, and its trap locations beside it.

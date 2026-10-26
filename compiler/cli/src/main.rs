@@ -2,7 +2,7 @@
 //!
 //! ```text
 //! wrela check <package-dir> [--json]      check a package; exit 1 if it has errors
-//! wrela build <package-dir> [-o <dir>] [--debug] [--testing] [--optimize] [--lift <package>]...
+//! wrela build <package-dir> [-o <dir>] [--debug] [--testing] [--optimize] [--lift <package>]... [--report data]
 //!                                         check and build; writes <dir> (default
 //!                                         <package>/build); --debug adds checks (§11);
 //!                                         --testing keeps the `@testing` exports (§9);
@@ -117,7 +117,7 @@ mod trace;
 pub(crate) fn usage() -> ExitCode {
     let lines = [
         "wrela check <package-dir> [--json]",
-        "wrela build <package-dir> [-o <out-dir>] [--debug] [--testing] [--optimize [size|speed]] [--lift <package>]... [--json]",
+        "wrela build <package-dir> [-o <out-dir>] [--debug] [--testing] [--optimize [size|speed]] [--lift <package>]... [--report data] [--json]",
         "wrela fmt <file-or-dir>... [--check]",
         "wrela fix <package-dir> [--dry-run] [--json]",
         "wrela migrate <package-dir> [--dry-run] [--json]",
@@ -252,6 +252,8 @@ pub(crate) struct PackageArgs {
     /// `--optimize [size|speed]`, which only `build` takes: the WASM through `wasm-opt`
     /// (`wrela_driver::optimize`), for size or speed (alone, `Level::DEFAULT`).
     pub optimize: Option<wrela_driver::optimize::Level>,
+    /// `--report data`, which only `build` takes: what the build's constant data holds.
+    pub report_data: bool,
 }
 
 /// Reads the arguments of `check`, or of `build` (`takes_out`), and checks that the package is
@@ -260,6 +262,7 @@ pub(crate) struct PackageArgs {
 pub(crate) fn package_args(args: &[String], takes_out: bool) -> Result<PackageArgs, ExitCode> {
     let (mut dir, mut out, mut json, mut debug, mut testing) = (None, None, false, false, false);
     let mut optimize = None;
+    let mut report_data = false;
     let mut lift = Vec::new();
     let mut it = args.iter().peekable();
     while let Some(a) = it.next() {
@@ -281,6 +284,10 @@ pub(crate) fn package_args(args: &[String], takes_out: bool) -> Result<PackageAr
                     None => Level::DEFAULT,
                 });
             }
+            "--report" if takes_out => match it.next().map(String::as_str) {
+                Some("data") => report_data = true,
+                _ => return Err(usage()),
+            },
             "--lift" if takes_out => match it.next() {
                 Some(p) => lift.extend(p.split(',').map(String::from)),
                 None => return Err(usage()),
@@ -306,7 +313,7 @@ pub(crate) fn package_args(args: &[String], takes_out: bool) -> Result<PackageAr
         );
         return Err(ExitCode::from(2));
     }
-    Ok(PackageArgs { dir, json, out, debug, testing, lift, optimize })
+    Ok(PackageArgs { dir, json, out, debug, testing, lift, optimize, report_data })
 }
 
 /// Checks that the package `dir` is a directory. If it isn't, the message is printed and the
