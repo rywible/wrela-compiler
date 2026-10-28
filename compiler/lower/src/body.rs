@@ -970,6 +970,19 @@ impl<'c, 'a> Fl<'c, 'a> {
             self.locals[l.index()] = g;
             return;
         }
+        // A texture's handle copied in GPU code (`let t = field.texels`): the texture the shader
+        // received, by another name.
+        if place.proj.is_empty()
+            && self.is_gpu()
+            && let Rvalue::Use(mir::Operand {
+                kind: mir::OperandKind::Copy(from) | mir::OperandKind::Move(from, _),
+                ..
+            }) = r
+            && crate::gpu::is_resource_ty(&self.cx.checked.program, self.place_src_ty(from))
+        {
+            self.locals[l.index()] = self.alias_of(from);
+            return;
+        }
         if place.proj.is_empty() {
             // A callable normally has no IR value; a job stores an owned environment below.
             if let Some(c) = self.callable_rvalue(r) {
@@ -1599,7 +1612,7 @@ impl<'c, 'a> Fl<'c, 'a> {
                     }
                     _ => return None,
                 }
-            } else if wrela_sema::gpu::is_group(p, ft) {
+            } else if wrela_sema::gpu::is_gpu_group(p, ft) {
                 let Repr::Group(sub) = r else { return None };
                 bs.push(Some(self.pass_group(sub, ft, out, span)?));
             } else {
@@ -2457,7 +2470,7 @@ impl<'c, 'a> Fl<'c, 'a> {
                 continue;
             }
             callables.push(None);
-            if self.is_gpu() && wrela_sema::gpu::is_group(&self.cx.checked.program, pt) {
+            if self.is_gpu() && wrela_sema::gpu::is_gpu_group(&self.cx.checked.program, pt) {
                 let fields = a.place().and_then(|pl| self.group_of(pl));
                 let bound = fields.and_then(|f| self.pass_group(&f, pt, &mut out, a.span()));
                 if bound.is_none() {

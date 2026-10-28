@@ -297,6 +297,7 @@ macro_rules! lang_items {
                     Lang::Texture
                         | Lang::DepthTexture
                         | Lang::Texture3d
+                        | Lang::Texture3dHandle
                         | Lang::TextureArray
                         | Lang::Cubemap
                         | Lang::DepthTextureArray
@@ -527,6 +528,8 @@ lang_items! {
     DepthLoad = "std::gpu::depth_load",
     Texture3dSampleLevel = "std::gpu::texture3d_sample_level",
     Texture3dLoad = "std::gpu::texture3d_load",
+    Texture3dHandle = "std::gpu::Texture3dHandle",
+    Texture3dHandleLoad = "std::gpu::texture3d_handle_load",
     TextureWidth = "std::gpu::texture_width",
     TextureHeight = "std::gpu::texture_height",
     TextureDepth = "std::gpu::texture_depth",

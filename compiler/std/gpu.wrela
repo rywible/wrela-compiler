@@ -1844,6 +1844,54 @@ impl<F: Storage + Filtered> Texture3d<F> {
     }
 }
 
+impl<F: Storage> Texture3d<F> {
+    /// Its handle, as data a field may hold: a `Texture3dHandle`, which names this texture while
+    /// it lives.
+    pub fn to_handle(self) -> Texture3dHandle<F> {
+        Texture3dHandle {
+            handle: self.handle,
+            width: self.width,
+            height: self.height,
+            depth: self.depth,
+        }
+    }
+}
+
+/// A 3D texture's handle as data (language.md §20.3): `Copy` and `GpuData`, so a value, a
+/// field's among them, can hold the texture whose texels are its data. Where a value that holds
+/// one, at any depth of its fields, is an entry point's argument, the compiler binds the texture
+/// beside it as it binds a group's (§18): its other fields are the entry point's uniforms, and
+/// GPU code reads its texels (`load`). CPU code knows its size. It names its texture while the
+/// texture lives; the texture's owner keeps it.
+pub struct Texture3dHandle<F: Storage>: Copy + GpuData {
+    handle: u32,
+    width: u32,
+    height: u32,
+    depth: u32,
+}
+
+impl<F: Storage> Texture3dHandle<F> {
+    /// Its width in texels. In GPU code too.
+    pub fn width(self) -> u32 {
+        texture_width(self)
+    }
+
+    /// Its height in texels. In GPU code too.
+    pub fn height(self) -> u32 {
+        texture_height(self)
+    }
+
+    /// Its depth in texels. In GPU code too.
+    pub fn depth(self) -> u32 {
+        texture_depth(self)
+    }
+
+    /// The texel at (`x`, `y`, `z`), unfiltered: any GPU code.
+    pub fn load(self, x: u32, y: u32, z: u32) -> F::Texel {
+        texture3d_handle_load(self, x, y, z, 0)
+    }
+}
+
 // ---- copies and readback (§18.8) ---------------------------------------------------------------
 
 /// Copies a `width` × `height` rectangle at (`x`, `y`) of `from` into `to` at (`to_x`, `to_y`),
@@ -4280,6 +4328,15 @@ fn texture3d_sample_level<F: Storage + Filtered>(
 
 @intrinsic
 fn texture3d_load<F: Storage>(t: Texture3d<F>, x: u32, y: u32, z: u32, level: u32) -> F::Texel {}
+
+@intrinsic
+fn texture3d_handle_load<F: Storage>(
+    t: Texture3dHandle<F>,
+    x: u32,
+    y: u32,
+    z: u32,
+    level: u32,
+) -> F::Texel {}
 
 @intrinsic
 fn mip_step_load<F: Storage>(m: MipStep<F>, x: u32, y: u32) -> F::Texel {}

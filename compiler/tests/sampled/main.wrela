@@ -1,0 +1,112 @@
+// A texture as a field's data (language.md §20.3): a sphere's distances cooked into a 3D
+// texture, held by a `Sampled3d` (a `Surface` whose texture travels beside it, bound where the
+// kernel takes it), and marched by `std::field::hit`, which is generic over `Surface`: the
+// cooked sphere's hits are its radius's within a voxel; the analytic sphere's, through the same
+// code, are exact; and a `Sampled3d` in a `Union` with an analytic field composes. Frame 0 cooks
+// and marches; the tests read the hits back, on both hosts.
+use std::field::{Sampled3d, Surface, Union, hit, sampled3d, sphere}
+use std::gpu::{
+    GlobalId, GpuBuffer, R32Float, Slots, Texels3d, Texture3d, buffer, dispatch, read, texture3d,
+}
+use std::io::Pending
+
+/// The grid: 32 texels a side over a 2 m cube centred at the origin.
+const SIDE: u32 = 32
+const VOXEL: f32 = 2.0 / 32.0
+const ORIGIN: vec3 = vec3(-1.0, -1.0, -1.0)
+const RADIUS: f32 = 0.6
+/// The rays: 64, from z = -2 along +z, at x from 0 to 0.5 across them.
+const RAYS: u32 = 64
+
+pub struct State {
+    frame: u32,
+    volume: Texture3d<R32Float>,
+    cooked: GpuBuffer<f32>,
+    exact: GpuBuffer<f32>,
+    joined: GpuBuffer<f32>,
+    pending: Vec<Pending<f32>>,
+    seen: Vec<Vec<f32>>,
+}
+
+pub fn init() -> State {
+    State {
+        frame: 0,
+        volume: texture3d(width: SIDE, height: SIDE, depth: SIDE),
+        cooked: buffer(RAYS),
+        exact: buffer(RAYS),
+        joined: buffer(RAYS),
+        pending: Vec::new(),
+        seen: Vec::new(),
+    }
+}
+
+/// Each texel's distance to the sphere, at its centre.
+@compute(4, 4, 4)
+fn cook(out: mut Texels3d<R32Float>, id: GlobalId) {
+    let p = ORIGIN + (vec3(f32(id.x), f32(id.y), f32(id.z)) + vec3(0.5)) * VOXEL
+    out.store(id, length(p) - RADIUS)
+}
+
+/// Ray `i`'s offset across the sphere.
+fn across(i: u32) -> f32 {
+    0.5 * f32(i) / f32(RAYS)
+}
+
+/// Where ray `id.x` meets `field`: the march is the same code for every surface.
+@compute(64)
+fn march<S: Surface>(field: S, out: mut Slots<f32>, id: GlobalId) {
+    out[id] = hit(field, vec3(across(id.x), 0.0, -2.0), vec3(0.0, 0.0, 1.0), far: 4.0)
+}
+
+pub fn frame(s: mut State, time: f32, width: u32, height: u32) {
+    if s.frame == 0 {
+        dispatch(cook.bind(mut s.volume), groups: (SIDE / 4, SIDE / 4, SIDE / 4))
+        let cooked = sampled3d(s.volume.to_handle(), ORIGIN, VOXEL)
+        dispatch(march.bind(cooked, mut s.cooked), groups: 1)
+        dispatch(march.bind(sphere(RADIUS), mut s.exact), groups: 1)
+        // A smaller analytic sphere beside it, which the union's nearest rays meet first.
+        let joined = Union { a: cooked, b: sphere(0.2).translate(vec3(0.0, 0.0, -0.9)) }
+        dispatch(march.bind(joined, mut s.joined), groups: 1)
+        s.pending.push(read(s.cooked.items()))
+        s.pending.push(read(s.exact.items()))
+        s.pending.push(read(s.joined.items()))
+    }
+    for i in 0..s.pending.len() {
+        if s.seen.len() == i {
+            if let Some(Ok(v)) = s.pending[i].poll() {
+                s.seen.push(take v)
+            }
+        }
+    }
+    s.frame += 1
+}
+
+/// Where ray `i` meets the sphere of radius `r`: from z = -2 to z = -√(r² − x²).
+fn expected(i: u32, r: f32) -> f32 {
+    let x = across(i)
+    2.0 - sqrt(r * r - x * x)
+}
+
+@test(frames: 4, gpu: true, hosts: both)
+fn a_cooked_field_marches_as_an_analytic_one(s: State) {
+    assert(s.seen.len() == 3)
+    for i in 0..RAYS {
+        let want = expected(i, RADIUS)
+        assert(abs(s.seen[1][i] - want) < 0.0005)
+        assert(abs(s.seen[0][i] - want) < VOXEL)
+    }
+}
+
+@test(frames: 4, gpu: true, hosts: both)
+fn a_cooked_field_composes_with_an_analytic_one(s: State) {
+    // Rays within the small sphere's 0.2 m meet it, at z = -0.9 - √(0.04 − x²); the rest meet
+    // the cooked one.
+    for i in 0..RAYS {
+        let x = across(i)
+        if x < 0.2 {
+            assert(abs(s.seen[2][i] - (1.1 - sqrt(0.04 - x * x))) < 0.0005)
+        } else {
+            assert(abs(s.seen[2][i] - expected(i, RADIUS)) < VOXEL)
+        }
+    }
+}

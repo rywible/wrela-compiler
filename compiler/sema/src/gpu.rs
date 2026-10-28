@@ -404,6 +404,26 @@ pub fn is_group(p: &Program, t: TyId) -> bool {
     matches!(p.types.kind(t), TyKind::Adt(a, _) if p.adt(*a).borrow && p.adt(*a).lang.is_none() && p.adt(*a).entry.is_none())
 }
 
+/// Whether GPU code takes a value of type `t` as its fields (§18): a group, or a struct that
+/// holds a texture's handle (a `Texture3dHandle`, §20.3: a field whose data is a texture), at
+/// any depth of its fields. The texture is bound beside the value, and the value's other fields
+/// are its uniforms, as a group's are. `t` is concrete.
+pub fn is_gpu_group(p: &Program, t: TyId) -> bool {
+    is_group(p, t) || holds_texture_handle(p, t, 0)
+}
+
+/// Whether a struct of type `t`, or one of its fields', holds a `Texture3dHandle`.
+fn holds_texture_handle(p: &Program, t: TyId, depth: u32) -> bool {
+    let TyKind::Adt(a, args) = p.types.kind(t) else { return false };
+    let adt = p.adt(*a);
+    if adt.borrow || adt.lang.is_some() || adt.is_enum() || depth > 32 {
+        return false;
+    }
+    p.fields_of(*a, args, None).into_iter().any(|ft| {
+        p.lang_of_ty(ft) == Some(Lang::Texture3dHandle) || holds_texture_handle(p, ft, depth + 1)
+    })
+}
+
 /// What an entry point can't take in group `t`, reached as `path` (`lit.probes`): each field
 /// is a texture or sampler, borrowed; a `GpuSpan<T>` of `GpuData`; a `GpuData` value; or a
 /// group. A group passes what the GPU reads, so nothing in it is `mut`.
@@ -431,7 +451,8 @@ fn check_group(
                 .with_help("pass what the GPU writes as a parameter of its own"),
             );
         } else if lang.is_some_and(Lang::is_texture_or_sampler) {
-            if d.mode == RetMode::Owned {
+            // A handle is a value, and a group holds it so.
+            if d.mode == RetMode::Owned && lang != Some(Lang::Texture3dHandle) {
                 out.push(Diagnostic::new(
                     codes::E0602,
                     span,

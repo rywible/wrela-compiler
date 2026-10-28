@@ -206,6 +206,10 @@ fn classify(cx: &Cx, f: FnId, param: usize, ty: TyId, varyings: Option<TyId>) ->
     // decided from the declaration: `k<T>(x: T)` given a `LocalId` for `x` takes that value, not
     // the invocation's id.
     if let TyKind::Param(_) = p.types.kind(p.func(f).params[param].ty) {
+        // Unless it holds a texture's handle, which is bound as a group's fields are.
+        if wrela_sema::gpu::is_gpu_group(p, ty) {
+            return ParamClass::Group;
+        }
         return ParamClass::Uniform;
     }
     if let Some(b) = BuiltinInput::of(p, ty) {
@@ -268,7 +272,7 @@ fn class_of(cx: &Cx, ty: TyId, mode: Mode, varyings: Option<TyId>) -> ParamClass
         (_, TyKind::Slice(e)) => {
             ParamClass::Buffer { elem: *e, read_write: mode == Mode::Mut, atomic: false }
         }
-        _ if wrela_sema::gpu::is_group(p, ty) => ParamClass::Group,
+        _ if wrela_sema::gpu::is_gpu_group(p, ty) => ParamClass::Group,
         _ => ParamClass::Uniform,
     }
 }
@@ -293,7 +297,7 @@ fn resource_class(cx: &Cx, ty: TyId) -> Option<ParamClass> {
         (Lang::Texture, _) => colour(ir::TexDim::D2),
         (Lang::TextureArray, _) => colour(ir::TexDim::D2Array),
         (Lang::Cubemap, _) => colour(ir::TexDim::Cube),
-        (Lang::Texture3d, _) => colour(ir::TexDim::D3),
+        (Lang::Texture3d | Lang::Texture3dHandle, _) => colour(ir::TexDim::D3),
         (Lang::DepthTexture, _) => depth(ir::TexDim::D2),
         (Lang::DepthTextureArray, _) => depth(ir::TexDim::D2Array),
         (Lang::Sampler, _) => ParamClass::Sampler { comparison: false },
@@ -319,7 +323,7 @@ pub(crate) fn texture_format(cx: &Cx, ty: TyId) -> ir::TextureFormat {
 fn field_class(cx: &Cx, ty: TyId) -> ParamClass {
     match resource_class(cx, ty) {
         Some(class) => class,
-        None if wrela_sema::gpu::is_group(&cx.checked.program, ty) => ParamClass::Group,
+        None if wrela_sema::gpu::is_gpu_group(&cx.checked.program, ty) => ParamClass::Group,
         None => ParamClass::Uniform,
     }
 }
@@ -1611,6 +1615,7 @@ pub(crate) fn intrinsic(
             | Lang::DepthLoad
             | Lang::Texture3dSampleLevel
             | Lang::Texture3dLoad
+            | Lang::Texture3dHandleLoad
             | Lang::ArraySample
             | Lang::ArraySampleLevel
             | Lang::ArraySampleGrad
@@ -2018,6 +2023,7 @@ fn texture_read(
         Lang::TextureLoad
         | Lang::DepthLoad
         | Lang::Texture3dLoad
+        | Lang::Texture3dHandleLoad
         | Lang::ArrayLoad
         | Lang::DepthArrayLoad
         | Lang::MipStepLoad => T::Load,
@@ -2036,7 +2042,8 @@ fn texture_read(
             let field = match (op, lang) {
                 (T::Width, _) => 1,
                 (T::Height, _) => 2,
-                (T::Levels, Some(Lang::Texture)) | (T::Depth, Some(Lang::Texture3d)) => 3,
+                (T::Levels, Some(Lang::Texture))
+                | (T::Depth, Some(Lang::Texture3d | Lang::Texture3dHandle)) => 3,
                 (T::Layers, Some(Lang::TextureArray | Lang::DepthTextureArray)) => 3,
                 (T::Levels, Some(Lang::TextureArray)) => 4,
                 // A depth texture, and a 3D one, have one level.
@@ -3398,7 +3405,7 @@ fn stand_in(
     span: Span,
     next: &mut u32,
 ) -> Option<Bound> {
-    if wrela_sema::gpu::is_group(&cx.checked.program, t) {
+    if wrela_sema::gpu::is_gpu_group(&cx.checked.program, t) {
         let names = group_field_names(cx, t);
         let fields = group_fields(cx, t);
         let mut bs = Vec::new();
