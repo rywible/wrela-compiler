@@ -58,7 +58,7 @@ fn rejects_a_0_7_build() {
         wrela_abi::manifest::VERSION
     );
     assert!(err.to_string().contains(&want), "{err}");
-    assert_eq!((wrela_abi::manifest::VERSION, wrela_abi::stream::VERSION), (11, 13));
+    assert_eq!((wrela_abi::manifest::VERSION, wrela_abi::stream::VERSION), (12, 13));
 }
 
 #[test]

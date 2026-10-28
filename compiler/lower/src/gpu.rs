@@ -773,7 +773,8 @@ impl Recorded {
 
 /// What `s` records in this instance: a bound entry point's value is of its entry point's
 /// bound type here, whose fields hold the arguments (`gpu::bound_fields`).
-fn recorded_shader(fl: &mut Fl, s: &mir::Shader) -> Option<Recorded> {
+/// A `const` argument that doesn't fold is reported at the command, `span`.
+fn recorded_shader(fl: &mut Fl, s: &mir::Shader, span: Span) -> Option<Recorded> {
     match s {
         mir::Shader::Named(f, args, consts) => {
             let substs: Vec<TyId> = args.iter().map(|&a| fl.concrete(a)).collect();
@@ -783,7 +784,7 @@ fn recorded_shader(fl: &mut Fl, s: &mir::Shader) -> Option<Recorded> {
                 let mut src = src.clone();
                 src.for_each_ty_mut(&mut |t| *t = fl.concrete(*t));
                 let param = &fl.cx.checked.program.func(*f).params[*i];
-                let (name, span) = (param.name.clone(), param.span);
+                let name = param.name.clone();
                 values.push((*i, fl.cx.const_src(&src, tys[*i], &name, span)?));
             }
             Some(Recorded { func: *f, substs, consts: values, value: None })
@@ -810,7 +811,7 @@ fn record_dispatch(fl: &mut Fl, d: &mir::Dispatch, span: Span) -> Option<()> {
         host_effect(fl, "`dispatch`", span);
         return None;
     }
-    let kernel = recorded_shader(fl, &d.kernel)?;
+    let kernel = recorded_shader(fl, &d.kernel, span)?;
     // A kernel a generic function dispatches over a domain is known here (§18, E0603).
     if d.over
         && kernel.value.is_some()
@@ -969,7 +970,7 @@ fn record_draw(fl: &mut Fl, d: &mir::Draw, span: Span) -> Option<()> {
         host_effect(fl, "`draw`", span);
         return None;
     }
-    let shaders = [recorded_shader(fl, &d.vertex)?, recorded_shader(fl, &d.fragment)?];
+    let shaders = [recorded_shader(fl, &d.vertex, span)?, recorded_shader(fl, &d.fragment, span)?];
     let target = draw_target(fl, d, &shaders[1], span)?;
     let vs = (shaders[0].func, shaders[0].substs.clone());
     let fs = (shaders[1].func, shaders[1].substs.clone());

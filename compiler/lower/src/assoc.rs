@@ -6,7 +6,7 @@
 use crate::Cx;
 use wrela_diag::{Diagnostic, Span, codes};
 use wrela_sema::thir::{Block, ConstArg, ConstSrc, Expr, ExprKind, Lit};
-use wrela_sema::ty::{Subst, TyId, TyKind};
+use wrela_sema::ty::{IntTy, Subst, TyId, TyKind};
 use wrela_syntax::ast::{BinOp, UnOp};
 
 /// A folded value, before it takes its parameter's type.
@@ -106,14 +106,31 @@ impl<'a> Cx<'a> {
             }
             ExprKind::Block(b) => self.fold_block(b, subst, depth)?,
             ExprKind::Unary(op, x) => match (op, self.fold_expr(x, subst, depth)?) {
-                (UnOp::Neg, Folded::Int(n)) => Folded::Int(-n),
+                (UnOp::Neg, Folded::Int(n)) => fits(checked.program.types.kind(ty), -n)?,
                 (UnOp::Neg, Folded::Float(v)) => Folded::Float(-v),
                 (UnOp::Not, Folded::Bool(b)) => Folded::Bool(!b),
                 _ => return None,
             },
+            // `&&` and `||` read their right side only where the left doesn't decide.
+            ExprKind::Binary(op @ (BinOp::And | BinOp::Or), a, b) => {
+                match (op, self.fold_expr(a, subst, depth)?) {
+                    (BinOp::And, Folded::Bool(false)) => Folded::Bool(false),
+                    (BinOp::Or, Folded::Bool(true)) => Folded::Bool(true),
+                    (_, Folded::Bool(_)) => match self.fold_expr(b, subst, depth)? {
+                        Folded::Bool(r) => Folded::Bool(r),
+                        _ => return None,
+                    },
+                    _ => return None,
+                }
+            }
             ExprKind::Binary(op, a, b) => {
                 let (a, b) = (self.fold_expr(a, subst, depth)?, self.fold_expr(b, subst, depth)?);
-                binary(*op, a, b)?
+                match binary(*op, a, b)? {
+                    // Each step in its own type, as the CPU computes it: one past its range is
+                    // no value (the CPU traps), not one folded exactly and checked at the end.
+                    Folded::Int(n) => fits(checked.program.types.kind(ty), n)?,
+                    r => r,
+                }
             }
             ExprKind::If { cond, then, else_ } => match self.fold_expr(cond, subst, depth)? {
                 Folded::Bool(true) => self.fold_block(then, subst, depth)?,
@@ -143,6 +160,18 @@ impl<'a> Cx<'a> {
     }
 }
 
+/// `n`, an integer of type `kind`, if it's in that type's range.
+fn fits(kind: &TyKind, n: i128) -> Option<Folded> {
+    let ok = match kind {
+        TyKind::Int(IntTy::U32) => u32::try_from(n).is_ok(),
+        TyKind::Int(IntTy::I32) => i32::try_from(n).is_ok(),
+        // An integer literal a float takes: exact here, rounded once where it's used.
+        TyKind::Float(_) => true,
+        _ => false,
+    };
+    ok.then_some(Folded::Int(n))
+}
+
 /// A computed constant's scalar.
 fn scalar(k: &wrela_ir::Const) -> Option<Folded> {
     Some(match *k {
@@ -154,9 +183,9 @@ fn scalar(k: &wrela_ir::Const) -> Option<Folded> {
     })
 }
 
-/// `a op b`, for the operators a constant's initializer folds. Integer arithmetic is exact
-/// here, and the result must fit the parameter's type ([`Cx::const_arg_of`]); a float's is
-/// `f32`'s, as the CPU computes it (§11.1).
+/// `a op b`, for the operators a constant's initializer folds: an integer's exactly (the caller
+/// checks the result is in its type's range, as each step is on the CPU), a float's in `f32`, as
+/// the CPU computes it (§11.1).
 fn binary(op: BinOp, a: Folded, b: Folded) -> Option<Folded> {
     use Folded::*;
     Some(match (a, b) {
@@ -188,8 +217,6 @@ fn binary(op: BinOp, a: Folded, b: Folded) -> Option<Folded> {
             _ => return None,
         },
         (Bool(x), Bool(y)) => match op {
-            BinOp::And => Bool(x && y),
-            BinOp::Or => Bool(x || y),
             BinOp::Eq => Bool(x == y),
             BinOp::Ne => Bool(x != y),
             _ => return None,

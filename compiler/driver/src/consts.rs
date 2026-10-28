@@ -16,7 +16,7 @@ use std::sync::{Arc, Mutex};
 use wrela_diag::{Diagnostic, SourceMap, Span, codes};
 use wrela_lower::{BuildData, ConstLowering, Embeds, Memory};
 use wrela_sema::Checked;
-use wrela_sema::ty::ConstId;
+use wrela_sema::ty::{ConstId, TyId, TyKind};
 
 /// How much work computing one constant may do: wasmtime's fuel, about one unit per WASM
 /// instruction. A computation that goes past it is a compile error, not a hang. About 17 billion
@@ -209,6 +209,10 @@ pub fn compute(
                             .or_insert_with(|| const_cache::digest(bytes));
                         Some((path.as_ref(), d))
                     });
+                    // How its value is read back is part of what it is: an enum's variants are
+                    // cached by index, which a reordering moves (the WASM may not change).
+                    let schema = checked.consts.get(&c).map(|(t, _)| schema(checked, *t));
+                    let options = format!("{options} schema={}", schema.unwrap_or_default());
                     let inputs = const_cache::inputs(&options, embeds);
                     let key = const_cache::key(&out.wasm, fuel, &inputs);
                     match const_cache::get_in(cache, &key) {
@@ -277,6 +281,58 @@ pub fn compute(
         const_cache::clean(dir);
     }
     (diags, stats)
+}
+
+/// How a value of type `t` is laid out and read back, as text: each type's fields and, for an
+/// enum, its variants with their discriminants, at every depth (a type met again is named).
+fn schema(checked: &Checked, t: TyId) -> String {
+    fn go(p: &wrela_sema::program::Program, t: TyId, seen: &mut Vec<TyId>, out: &mut String) {
+        use std::fmt::Write;
+        let _ = write!(out, "{}", p.display_ty(t));
+        if seen.contains(&t) {
+            return;
+        }
+        seen.push(t);
+        match p.types.kind(t) {
+            TyKind::Adt(a, args) => {
+                let adt = p.adt(*a);
+                if adt.is_enum() {
+                    for (i, v) in adt.variants().iter().enumerate() {
+                        let _ = write!(out, "|{}={}(", v.name, v.discriminant);
+                        for ft in p.fields_of(*a, args, Some(i as u32)) {
+                            go(p, ft, seen, out);
+                            out.push(',');
+                        }
+                        out.push(')');
+                    }
+                } else {
+                    out.push('{');
+                    for (d, ft) in p.adt_fields(*a, None).iter().zip(p.fields_of(*a, args, None)) {
+                        let _ = write!(out, "{}:", d.name);
+                        go(p, ft, seen, out);
+                        out.push(',');
+                    }
+                    out.push('}');
+                }
+            }
+            TyKind::Tuple(ts) => {
+                for &e in ts {
+                    out.push('(');
+                    go(p, e, seen, out);
+                    out.push(')');
+                }
+            }
+            &TyKind::Array(e, _) => {
+                out.push('[');
+                go(p, e, seen, out);
+                out.push(']');
+            }
+            _ => {}
+        }
+    }
+    let mut out = String::new();
+    go(&checked.program, checked.reveal(t), &mut Vec::new(), &mut out);
+    out
 }
 
 /// The engine for the code builds run (constants and tests): the native host's that counts

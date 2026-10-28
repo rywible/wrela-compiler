@@ -443,3 +443,51 @@ fn a_match_on_a_constant_builds_only_its_arm() {
     let low = [("TIER".to_string(), "Low".to_string())];
     assert_eq!(entries(&wrela_driver::check_pipelines_set(&dir, &low)), ["low"]);
 }
+
+/// A computed constant of an enum, read back by its variant's index.
+const REORDERED: &str = r#"
+enum E {
+    Zero = 0,
+    A = 2,
+}
+
+const X: E = make()
+
+fn make() -> E {
+    var e = E::Zero
+    for _ in 0..3 {
+        e = E::A
+    }
+    e
+}
+
+pub fn frame(time: f32, width: u32, height: u32) {
+    let _ = u32(X)
+}
+
+@test
+fn x_is_a() {
+    assert(u32(X) == 2)
+}
+"#;
+
+/// How a constant's value is read back is in its key (language.md §13): a variant inserted
+/// before the one a cached enum holds moves its index, though the constant's code is the same,
+/// and the cache isn't read for it.
+#[test]
+fn an_enums_variants_are_in_its_constants_key() {
+    let dir = scratch("consts/reordered");
+    let passes = |text: &str| {
+        std::fs::write(dir.join("main.wrela"), text).expect("write");
+        let out = wrela_driver::test(&dir, None);
+        let failed: Vec<_> = out.results.iter().filter_map(|r| r.failure.clone()).collect();
+        assert!(
+            out.passed(),
+            "{}{}",
+            wrela_diag::render::render_all(&out.sources, &out.diagnostics),
+            wrela_diag::render::render_all(&out.sources, &failed)
+        );
+    };
+    passes(REORDERED);
+    passes(&REORDERED.replace("    A = 2,", "    B = 1,\n    A = 2,"));
+}

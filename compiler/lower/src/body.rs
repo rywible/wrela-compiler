@@ -991,6 +991,19 @@ impl<'c, 'a> Fl<'c, 'a> {
             }) = r
             && crate::gpu::is_resource_ty(&self.cx.checked.program, self.place_src_ty(from))
         {
+            // Bound once: which texture a second binding names would depend on the path taken,
+            // and the shader's bindings are fixed.
+            if !matches!(self.locals[l.index()], Repr::Unbound) {
+                self.cx.err(
+                    Diagnostic::new(
+                        codes::E0702,
+                        span,
+                        "GPU code binds a texture's handle to a local once: this one is bound already",
+                    )
+                    .with_help("give each texture a local of its own, or choose between them by an index into what each one reads"),
+                );
+                return;
+            }
             self.locals[l.index()] = self.alias_of(from);
             return;
         }

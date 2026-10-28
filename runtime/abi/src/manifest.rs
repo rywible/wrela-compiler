@@ -58,7 +58,9 @@ use serde_json::{Map, Value};
 use std::collections::BTreeMap;
 use std::fmt;
 
-pub const VERSION: u32 = 11;
+/// The manifest's version. 12 (toolchain 0.10.0): a pipeline has no `constants` (its `const`
+/// parameters are folded into its WGSL), and a build may record its `set`.
+pub const VERSION: u32 = 12;
 /// The screen's texture format: what a screen target's colour is, and the format of the bytes a
 /// host reads back from the screen.
 pub const SCREEN_TEXTURE: TextureFormat = TextureFormat::Rgba8;
@@ -1369,7 +1371,7 @@ mod tests {
     fn golden_json() {
         let json = sample().to_json();
         let expected = r#"{
-  "manifest_version": 11,
+  "manifest_version": 12,
   "stream_version": 13,
   "wasm": "game.wasm",
   "pipelines": [

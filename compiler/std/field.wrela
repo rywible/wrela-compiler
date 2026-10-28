@@ -654,10 +654,13 @@ impl Sampled3d {
     }
 
     /// The distance between the texels round grid point `q` (in texels, centres at `i + 0.5`),
-    /// clamped to the grid, and its gradient in texels.
+    /// clamped to the texel centres, and its gradient in texels: zero along an axis the clamp
+    /// holds, where the distance doesn't change with `q`.
     fn trilinear(self, q: vec3) -> (f32, vec3) {
         let hi = vec3(self.dims()) - vec3(1.0)
-        let c = clamp(q - vec3(0.5), vec3(0.0), hi)
+        let u = q - vec3(0.5)
+        let c = clamp(u, vec3(0.0), hi)
+        let free = vec3(f32(u.x == c.x), f32(u.y == c.y), f32(u.z == c.z))
         let lo = min(floor(c), max(hi - vec3(1.0), vec3(0.0)))
         let f = c - lo
         let i = vec3u(lo)
@@ -682,7 +685,7 @@ impl Sampled3d {
         let dx = mix(mix(d100 - d000, d110 - d010, f.y), mix(d101 - d001, d111 - d011, f.y), f.z)
         let dy = mix(x10 - x00, x11 - x01, f.z)
         let dz = y1 - y0
-        (d, vec3(dx, dy, dz))
+        (d, vec3(dx, dy, dz) * free)
     }
 
     /// `p`'s distance from the grid's box (0 inside), and the point of the box nearest it.
@@ -706,20 +709,19 @@ impl Surface for Sampled3d {
         g
     }
 
+    /// Past the grid: the box's distance's gradient, and the trilinear's along each axis that
+    /// `p` is within the box on (the point where `p` meets the box moves with `p` there).
     fn sample(self, p: vec3) -> (f32, vec3) {
         let (out, near) = self.outside(p)
         let (d, g) = self.trilinear((near - self.origin) / self.voxel)
         if out > 0.0 {
-            return (d + out, (p - near) / out)
+            let along = vec3(f32(near.x == p.x), f32(near.y == p.y), f32(near.z == p.z))
+            return (d + out, g / self.voxel * along + (p - near) / out)
         }
         (d, g / self.voxel)
     }
-
-    /// The sphere round the grid, outside which the distance grows at least as the box's.
-    fn bound(self) -> Bound {
-        let half = 0.5 * vec3(self.dims()) * self.voxel
-        Bound { centre: self.origin + half, radius: length(half), slope: 1.0 }
-    }
+    // No `bound`: the texels may hold distances below zero at the grid's edge, which reach past
+    // it, so the sphere round the grid holds nothing out (the default, unbounded).
 }
 
 /// An ellipsoid centred at the origin. No exact distance exists; this is the usual bound.

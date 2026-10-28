@@ -2,7 +2,8 @@
 // texture, held by a `Sampled3d` (a `Surface` whose texture travels beside it, bound where the
 // kernel takes it), and marched by `std::field::hit`, which is generic over `Surface`: the
 // cooked sphere's hits are its radius's within a voxel; the analytic sphere's, through the same
-// code, are exact; and a `Sampled3d` in a `Union` with an analytic field composes. Frame 0 cooks
+// code, are exact; a `Sampled3d` in a `Union` with an analytic field composes; and its gradient
+// is its distance's, through the grid's edge and past it. Frame 0 cooks
 // and marches; the tests read the hits back, on both hosts.
 use std::field::{Sampled3d, Surface, Union, hit, sampled3d, sphere}
 use std::gpu::{
@@ -24,6 +25,7 @@ pub struct State {
     cooked: GpuBuffer<f32>,
     exact: GpuBuffer<f32>,
     joined: GpuBuffer<f32>,
+    slopes: GpuBuffer<f32>,
     pending: Vec<Pending<f32>>,
     seen: Vec<Vec<f32>>,
 }
@@ -35,6 +37,7 @@ pub fn init() -> State {
         cooked: buffer(RAYS),
         exact: buffer(RAYS),
         joined: buffer(RAYS),
+        slopes: buffer(SLOPES),
         pending: Vec::new(),
         seen: Vec::new(),
     }
@@ -58,6 +61,43 @@ fn march<S: Surface>(field: S, out: mut Slots<f32>, id: GlobalId) {
     out[id] = hit(field, vec3(across(id.x), 0.0, -2.0), vec3(0.0, 0.0, 1.0), far: 4.0)
 }
 
+/// The points where `slopes` checks the gradient: inside texels' cells (away from their faces,
+/// where the trilinear's slope is its own), in the half texel at the grid's edge (where the
+/// clamp holds it), and past the grid's box (where the box's distance adds its own).
+const SLOPES: u32 = 64
+
+fn slope_point(i: u32) -> vec3 {
+    let k = i % 8
+    let t = f32(i / 8)
+    if k < 5 {
+        // A cell's inside: texel coordinates i + 0.8, i + 0.7, i + 0.6.
+        ORIGIN + vec3(f32(k * 5 + 2) + 0.8, 10.7 + t, 13.6) * VOXEL
+    } else if k < 7 {
+        // The edge's half texel: 0.25 of a texel in from the grid's corner on x.
+        ORIGIN + vec3(0.25, 12.7 + t, 14.6) * VOXEL
+    } else {
+        // Past the box on x, within it on y and z.
+        vec3(1.3 + 0.01 * t, ORIGIN.y + (14.7 + t) * VOXEL, ORIGIN.z + 15.6 * VOXEL)
+    }
+}
+
+/// How far `sample`'s gradient is from the distance's central differences at point `id.x`, the
+/// largest of its three components.
+@compute(64)
+fn slopes(field: Sampled3d, out: mut Slots<f32>, id: GlobalId) {
+    let p = slope_point(id.x)
+    let h = 0.001
+    let (_, g) = field.sample(p)
+    let fx = (field.distance(p + vec3(h, 0.0, 0.0)) - field.distance(p - vec3(h, 0.0, 0.0))) /
+        (2.0 * h)
+    let fy = (field.distance(p + vec3(0.0, h, 0.0)) - field.distance(p - vec3(0.0, h, 0.0))) /
+        (2.0 * h)
+    let fz = (field.distance(p + vec3(0.0, 0.0, h)) - field.distance(p - vec3(0.0, 0.0, h))) /
+        (2.0 * h)
+    let d = abs(g - vec3(fx, fy, fz))
+    out[id] = max(d.x, max(d.y, d.z))
+}
+
 pub fn frame(s: mut State, time: f32, width: u32, height: u32) {
     if s.frame == 0 {
         dispatch(cook.bind(mut s.volume), groups: (SIDE / 4, SIDE / 4, SIDE / 4))
@@ -67,9 +107,11 @@ pub fn frame(s: mut State, time: f32, width: u32, height: u32) {
         // A smaller analytic sphere beside it, which the union's nearest rays meet first.
         let joined = Union { a: cooked, b: sphere(0.2).translate(vec3(0.0, 0.0, -0.9)) }
         dispatch(march.bind(joined, mut s.joined), groups: 1)
+        dispatch(slopes.bind(cooked, mut s.slopes), groups: 1)
         s.pending.push(read(s.cooked.items()))
         s.pending.push(read(s.exact.items()))
         s.pending.push(read(s.joined.items()))
+        s.pending.push(read(s.slopes.items()))
     }
     for i in 0..s.pending.len() {
         if s.seen.len() == i {
@@ -89,7 +131,7 @@ fn expected(i: u32, r: f32) -> f32 {
 
 @test(frames: 4, gpu: true, hosts: both)
 fn a_cooked_field_marches_as_an_analytic_one(s: State) {
-    assert(s.seen.len() == 3)
+    assert(s.seen.len() == 4)
     for i in 0..RAYS {
         let want = expected(i, RADIUS)
         assert(abs(s.seen[1][i] - want) < 0.0005)
@@ -108,5 +150,12 @@ fn a_cooked_field_composes_with_an_analytic_one(s: State) {
         } else {
             assert(abs(s.seen[2][i] - expected(i, RADIUS)) < VOXEL)
         }
+    }
+}
+
+@test(frames: 4, gpu: true, hosts: both)
+fn a_cooked_fields_gradient_is_its_distances(s: State) {
+    for i in 0..SLOPES {
+        assert(s.seen[3][i] < 0.01)
     }
 }

@@ -1,0 +1,23 @@
+// rejects: trait.assoc-const
+// An associated constant is folded where it's read, so its initializer has no effect anyone
+// sees: not even a line printed.
+use std::io::print
+
+trait Taps {
+    const TAPS: u32
+}
+
+struct Loud {}
+
+impl Taps for Loud {
+    const TAPS: u32 = shout()
+}
+
+fn shout() -> u32 {
+    print("taps") //~ E0600
+    4
+}
+
+pub fn frame(time: f32, width: u32, height: u32) {
+    let _ = Loud::TAPS
+}
