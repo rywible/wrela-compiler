@@ -70,6 +70,8 @@ pub struct ConstModule {
     /// Each constant, and the export that computes it: it returns the address of the value in
     /// memory (0 for a value with no runtime parts).
     pub exports: Vec<(ConstId, String)>,
+    /// The files its code `embed`s, by path (`BuildData::embeds` holds their bytes).
+    pub embeds: Vec<std::sync::Arc<str>>,
 }
 
 /// What lowering the constants' module found: the module, or the constants it needs that
@@ -155,7 +157,8 @@ pub fn lower_consts(
     }
     let mut diags = cx.diags;
     wrela_diag::sort_and_dedup(&mut diags);
-    (ConstLowering::Ready(ConstModule { module: mb.m, exports }), diags)
+    let embeds = mb.embeds;
+    (ConstLowering::Ready(ConstModule { module: mb.m, exports, embeds }), diags)
 }
 
 /// A module whose exports run tests (§13): each of `tests`, a `@test` function, called with

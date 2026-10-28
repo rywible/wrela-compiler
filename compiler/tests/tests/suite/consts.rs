@@ -81,11 +81,78 @@ fn the_second_build_computes_no_constant() {
     assert_eq!(stats(&dir), (0, all), "an edit elsewhere computes none");
 
     // The cache's files are the package's build's, and a corrupt one is a miss, not an error.
-    let cache = dir.join("build/consts");
-    for e in std::fs::read_dir(&cache).expect("the cache is in build/consts") {
+    let cache = dir.join("build/consts").join(wrela_driver::const_cache::VERSION);
+    for e in std::fs::read_dir(&cache).expect("the cache is in build/consts/<version>") {
         std::fs::write(e.expect("entry").path(), b"not a value").expect("write");
     }
     assert_eq!(stats(&dir), first, "corrupt entries are computed again");
+}
+
+/// A constant whose code reads a function in another module, with a test of its value.
+const READS: &str = r#"
+use sizes::size
+
+const SIZE: u32 = size(3)
+
+pub fn frame(time: f32, width: u32, height: u32) {
+    let _ = SIZE
+}
+
+@test
+fn the_size_is_what_the_sources_say() {
+    assert(SIZE == WANT)
+}
+"#;
+
+/// The cache holds what a value depends on (language.md §13): an edit to a function a constant
+/// calls, in another module, gives the new value; the toolchain's version names the cache's
+/// directory, so another version's entries aren't read; and `--report consts` says which
+/// constants were read from the cache.
+#[test]
+fn a_constants_key_is_its_code_and_the_toolchains_version() {
+    let dir = scratch("consts/keyed");
+    let with = |n: u32, want: u32| {
+        std::fs::write(dir.join("main.wrela"), READS.replace("WANT", &want.to_string()))
+            .expect("write");
+        let sizes = format!("pub fn size(x: u32) -> u32 {{\n    x * {n}\n}}\n");
+        std::fs::write(dir.join("sizes.wrela"), sizes).expect("write");
+    };
+    let passes = |dir: &Path| {
+        let out = wrela_driver::test(dir, None);
+        let failed: Vec<_> = out.results.iter().filter_map(|r| r.failure.clone()).collect();
+        assert!(
+            out.passed(),
+            "{}{}",
+            wrela_diag::render::render_all(&out.sources, &out.diagnostics),
+            wrela_diag::render::render_all(&out.sources, &failed)
+        );
+    };
+    let runs = |dir: &Path| wrela_driver::build(dir).consts.runs;
+    with(2, 6);
+    passes(&dir);
+    let first = runs(&dir);
+    let size = first.iter().find(|r| r.name == "SIZE").expect("SIZE was computed");
+    assert!(size.bytes > 0 && size.fuel > 0, "{size:?}");
+    assert!(runs(&dir).iter().all(|r| r.cached), "a second build reads them all");
+    // The function `SIZE` calls changed: its new value, not the cached one.
+    with(5, 15);
+    passes(&dir);
+    let after = runs(&dir);
+    assert!(after.iter().any(|r| r.name == "SIZE" && !r.cached), "computed again: {after:?}");
+
+    // Another version's directory isn't read: this version's entries, moved under another
+    // version's name, are computed again.
+    let consts = dir.join("build/consts");
+    let this = consts.join(wrela_driver::const_cache::VERSION);
+    let other = consts.join("0.0.1");
+    let _ = std::fs::remove_dir_all(&other);
+    std::fs::rename(&this, &other).expect("move the cache");
+    // (Constants with the same code share an entry within the build, so only those first of
+    // their code are computed.)
+    let moved = runs(&dir);
+    assert!(moved.iter().any(|r| r.name == "SIZE" && !r.cached), "{moved:?}");
+    assert!(moved.iter().filter(|r| !r.cached).count() > moved.len() / 2, "{moved:?}");
+    assert!(other.read_dir().expect("kept").next().is_some(), "a recent version's are kept");
 }
 
 /// Waiting constants keep their round order, including a fan-in whose inputs become ready

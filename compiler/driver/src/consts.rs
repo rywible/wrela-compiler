@@ -82,6 +82,23 @@ pub struct ConstStats {
     /// What each computed constant that printed or timed a phase did (§8's `trace`), by name:
     /// its lines were shown as they were made.
     pub traced: Vec<(String, wrela_host::Traced)>,
+    /// Each computed constant, in the order the build reached it (`wrela build --report
+    /// consts`).
+    pub runs: Vec<ConstRun>,
+}
+
+/// One computed constant, as `wrela build --report consts` shows it.
+#[derive(Clone, Debug, PartialEq)]
+pub struct ConstRun {
+    pub name: String,
+    /// Its value's bytes, as the cache holds it.
+    pub bytes: u64,
+    /// The fuel computing it used (from the cache: when it was computed).
+    pub fuel: u64,
+    /// The seconds this build spent on it: computing it, or reading it from the cache.
+    pub seconds: f64,
+    /// Whether it was read from the cache.
+    pub cached: bool,
 }
 
 /// Computes the program's computed constants into `data` (whose files `embed` reads are
@@ -113,6 +130,15 @@ pub fn compute(
         .collect();
     let mut failed = BTreeSet::new();
     let simd = !data.no_simd;
+    // The build's options that change what CPU code does, in every key.
+    let options = format!(
+        "debug={} testing={} simd={simd} relaxed={} role={:?} lifted={}",
+        data.debug,
+        data.testing,
+        data.relaxed_simd,
+        data.role,
+        data.lift.is_some()
+    );
     while !pending.is_empty() && !cancelled() {
         // Each constant in a module of its own, which holds only what it reads: its key. Those
         // that need a constant still to compute wait for the next round.
@@ -157,21 +183,36 @@ pub fn compute(
                 break;
             }
             let fuel = checked.program.const_(c).fuel.unwrap_or(FUEL);
+            let started = std::time::Instant::now();
+            let name = checked.program.const_(c).name.clone();
+            let ran = |stats: &mut ConstStats, v: &wrela_lower::Value, used, cached| {
+                stats.runs.push(ConstRun {
+                    name: name.clone(),
+                    bytes: const_cache::value_bytes(v),
+                    fuel: used,
+                    seconds: started.elapsed().as_secs_f64(),
+                    cached,
+                })
+            };
             // The key is the module's WASM, so the cache is read before wasmtime compiles it:
             // a constant read from the cache isn't compiled at all.
             let result = match emit(&module.module, simd, true) {
                 Err(msg) => Err(Diagnostic::internal(msg)),
                 Ok(out) => {
-                    let key = const_cache::key(&out.wasm, fuel);
+                    let embeds = module.embeds.iter().filter_map(|path| {
+                        data.embeds.get(path).map(|b| (path.as_ref(), b.as_ref()))
+                    });
+                    let inputs = const_cache::inputs(&options, embeds);
+                    let key = const_cache::key(&out.wasm, fuel, &inputs);
                     match const_cache::get_in(cache, &key) {
-                        Some(v) => {
+                        Some(e) => {
                             stats.cached += 1;
-                            Ok(v)
+                            ran(&mut stats, &e.value, e.fuel, true);
+                            Ok(e.value)
                         }
                         None => {
                             stats.computed += 1;
                             let export = &module.exports[0].1;
-                            let name = checked.program.const_(c).name.clone();
                             let trace = wrela_host::Trace::new(Some(format!("{name}: ")));
                             let r = Compiled::of(engine(stop.is_some()), out)
                                 .map_err(|msg| Box::new(Diagnostic::internal(msg)))
@@ -187,9 +228,9 @@ pub fn compute(
                                         stop.as_ref(),
                                     )
                                 })
-                                .map(|(v, helped)| {
+                                .map(|(v, helped, used)| {
                                     stats.helped += u64::from(helped);
-                                    v
+                                    (v, used)
                                 })
                                 .map_err(|d| *d);
                             let traced = trace.take();
@@ -197,12 +238,14 @@ pub fn compute(
                                 eprintln!("{name}'s phases: {}", traced.phases_line());
                             }
                             if !traced.is_empty() {
-                                stats.traced.push((name, traced));
+                                stats.traced.push((name.clone(), traced));
                             }
-                            if let Ok(v) = &r {
-                                const_cache::put_in(cache, &key, v);
-                            }
-                            r
+                            r.map(|(value, fuel)| {
+                                ran(&mut stats, &value, fuel, false);
+                                let entry = const_cache::Entry { value, fuel };
+                                const_cache::put_in(cache, &key, &entry);
+                                entry.value
+                            })
                         }
                     }
                 }
@@ -429,7 +472,7 @@ fn run_one(
     (c, fuel): (ConstId, u64),
     trace: &wrela_host::Trace,
     stop: Option<&wrela_host::Stop>,
-) -> Result<(wrela_lower::Value, u32), Box<Diagnostic>> {
+) -> Result<(wrela_lower::Value, u32, u64), Box<Diagnostic>> {
     let mut running = compiled
         .start(engine(stop.is_some()), true, trace, stop)
         .map_err(|m| Box::new(Diagnostic::internal(m)))?;
@@ -463,7 +506,7 @@ fn run_one(
         Ok(addr) if used <= fuel => {
             return running.read(|bytes| {
                 let mem = Memory { bytes };
-                wrela_lower::read_value(checked, c, &mem, addr).map(|v| (v, helped)).map_err(|e| {
+                wrela_lower::read_value(checked, c, &mem, addr).map(|v| (v, helped, used)).map_err(|e| {
                     let def = checked.program.const_(c);
                     Box::new(match e {
                         wrela_lower::ReadError::TooDeep => Diagnostic::new(

@@ -38,10 +38,15 @@ impl crate::Cx<'_> {
     /// The constant data holding the file `embed` reads at `path`, and its length. The driver
     /// read it before lowering.
     pub fn embed_data(&mut self, mb: &mut ModuleBuilder, path: &str) -> Option<(ir::DataId, u32)> {
-        let Some(bytes) = self.data.embeds.get(path).cloned() else {
+        let Some((key, bytes)) =
+            self.data.embeds.get_key_value(path).map(|(k, b)| (k.clone(), b.clone()))
+        else {
             self.err(Diagnostic::internal(format!("the build didn't read `{path}` for `embed`")));
             return None;
         };
+        if !mb.embeds.contains(&key) {
+            mb.embeds.push(key);
+        }
         let n = bytes.len() as u32;
         // An empty file still has an address.
         let mut padded = bytes.to_vec();

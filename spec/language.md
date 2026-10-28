@@ -1299,12 +1299,12 @@ The compiler compiles a `const`'s initializer, and every function it calls, to W
 
 The build computes a constant again only when its inputs change: the code it runs, the constants it reads or the files it embeds.
 
-- The build lowers each constant into a module of its own, which holds exactly those inputs. The cache key is that module's WASM, with its fuel and a hash of the compiler's and the host's code that runs it and reads its value back. So an edit to a function that the constant doesn't call leaves its key unchanged.
-- The cache is files in the package's `build/consts`, one for each constant's value.
-- If `WRELA_CONST_CACHE` names a directory, that directory backs the package's cache. Every package and checkout that sets it shares it, since a key holds everything that a value depends on.
+- The build lowers each constant into a module of its own, which holds exactly those inputs. The cache key is a hash of: that module's WASM (the initializer and every function it reaches, after inlining, with the constants it reads); its fuel; the build's options that change what CPU code does (debug, testing, SIMD, relaxed SIMD, the role, a lifted build); each file it embeds, by its path and its bytes; the toolchain's version; and a hash of the compiler's and the host's code that runs it and reads its value back. So an edit to a function that the constant doesn't call leaves its key unchanged, and an edit to one it does call, in any module, changes it.
+- The cache is files in the package's `build/consts/<the toolchain's version>`, one for each constant's value and the fuel computing it used. A toolchain never reads another version's directory; cleaning removes another version's entries once they're a week old, and the directory with them.
+- If `WRELA_CONST_CACHE` names a directory, its `<version>` directory backs the package's cache. Every package and checkout that sets it shares it, since a key holds everything that a value depends on.
 - A build reads the package's cache first. It copies a value that it finds in the shared cache into the package's cache, and it writes new values to both.
 - The build removes a value that no build has used for a week.
-- `wrela build` reports how many constants it computed and how many it read from the cache.
+- `wrela build` reports how many constants it computed and how many it read from the cache. `wrela build --report consts` lists each: its name, its value's bytes, the fuel computing it used, the build's seconds on it, and whether it was computed or read from the cache (`--json` for tools).
 
 #### Shipped files
 

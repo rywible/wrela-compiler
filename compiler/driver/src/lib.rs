@@ -12,6 +12,7 @@ pub mod build;
 pub use wrela_wasm::DataReport;
 pub mod const_cache;
 pub mod consts;
+pub use consts::ConstRun;
 pub mod edit;
 pub mod explain;
 mod frames;
