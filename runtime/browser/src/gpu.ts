@@ -76,9 +76,9 @@ interface RenderParts {
   depthBias: { constant: number; slope_scale: number; clamp: number };
   /** The manifest's `depth`: how fragments' depths are tested, and whether they're kept. */
   depth: { compare: GPUCompareFunction; write: boolean };
-  /** By target formats: `colours|depth`, the colours joined by commas, each a format or `none`. */
   /** A legacy build's pipeline-overridable constants each stage is made with, by name. */
   constants: Record<string, number>;
+  /** By target formats: `colours|depth`, the colours joined by commas, each a format or `none`. */
   variants: Map<string, GPURenderPipeline>;
 }
 
