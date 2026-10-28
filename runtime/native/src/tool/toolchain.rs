@@ -161,6 +161,8 @@ pub struct BuildOptions {
     pub simd: bool,
     pub debug: bool,
     pub testing: bool,
+    /// The program's constants set (`wrela build --set NAME=VALUE`).
+    pub set: Vec<(String, String)>,
 }
 
 /// A diagnostic, as the compiler gives it: whether it's an error, its code, its message, where
@@ -398,7 +400,9 @@ pub(crate) fn route(s: &Services, name: &str, b: &mut Body) -> Work {
                 let testing = b.u8()? != 0;
                 let lift = strs(b)?;
                 let overrides = overrides_of(b)?;
-                Op::Build { package, out, optimize, simd, debug, testing, lift, overrides }
+                // The constants set: name and value, as `overrides` holds its pairs.
+                let set = overrides_of(b)?;
+                Op::Build { package, out, optimize, simd, debug, testing, lift, overrides, set }
             }
             "test" => {
                 let package = b.str()?;
@@ -473,6 +477,7 @@ enum Op {
         testing: bool,
         lift: Vec<String>,
         overrides: Vec<(String, String)>,
+        set: Vec<(String, String)>,
     },
     Test {
         package: String,
@@ -584,12 +589,12 @@ fn work(s: &Services, job: &Job, toolchain: &dyn Toolchain, op: Op) -> Result<Ve
     let caps = &s.caps;
     let mut out = Out::default();
     match op {
-        Op::Build { package, out: into, optimize, simd, debug, testing, lift, overrides } => {
+        Op::Build { package, out: into, optimize, simd, debug, testing, lift, overrides, set } => {
             let dir = caps.dir_path(&package, false)?;
             // The output's root is a write root, checked before any work.
             caps.writable(&into)?;
             let overrides = override_dirs(caps, overrides)?;
-            let options = BuildOptions { optimize, lift, simd, debug, testing, overrides };
+            let options = BuildOptions { optimize, lift, simd, debug, testing, overrides, set };
             let built = toolchain.build(job, &dir, &options)?;
             if job.cancelled() {
                 return Err(CANCELLED.into());

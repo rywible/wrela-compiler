@@ -55,6 +55,7 @@ pub use crate::stream::Compare;
 use crate::stream::{MAX_COLOR_ATTACHMENTS, TextureFormat, TextureKind};
 use serde::Serialize;
 use serde_json::{Map, Value};
+use std::collections::BTreeMap;
 use std::fmt;
 
 pub const VERSION: u32 = 11;
@@ -142,6 +143,11 @@ pub struct Manifest {
     pub wasm_relaxed: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub wasm_relaxed_abi: Option<WasmAbi>,
+    /// The program's constants the build set (`wrela build --set NAME=VALUE`, language.md
+    /// §13), by name: part of what the build is, so two builds of one program with different
+    /// sets are two builds.
+    #[serde(skip_serializing_if = "BTreeMap::is_empty")]
+    pub set: BTreeMap<String, String>,
 }
 
 /// A module's interface (language.md §15): its imported memory's limits, and the type of each
@@ -712,6 +718,7 @@ impl Manifest {
             wasm_abi: None,
             wasm_relaxed: None,
             wasm_relaxed_abi: None,
+            set: BTreeMap::new(),
         }
     }
 
@@ -1352,6 +1359,16 @@ mod read {
             wasm_relaxed_abi: match o.get("wasm_relaxed_abi") {
                 None => None,
                 Some(v) => Some(wasm_abi(v)?),
+            },
+            set: match o.get("set").and_then(Value::as_object) {
+                None => BTreeMap::new(),
+                Some(m) => m
+                    .iter()
+                    .map(|(k, v)| match v.as_str() {
+                        Some(s) => Ok((k.clone(), s.to_string())),
+                        None => fail(format!("the manifest's `set.{k}` isn't a string")),
+                    })
+                    .collect::<Result<_>>()?,
             },
         })
     }

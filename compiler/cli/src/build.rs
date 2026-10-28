@@ -27,6 +27,9 @@ pub fn run(args: &[String]) -> ExitCode {
                 return ExitCode::from(2);
             }
         }
+    } else if !args.set.is_empty() {
+        let kind = wrela_driver::BuildKind { debug: args.debug, testing: args.testing };
+        wrela_driver::build_set(dir, kind, args.relaxed_simd, &args.set)
     } else if args.testing {
         wrela_driver::build_for_tests(dir, args.debug)
     } else if args.debug {

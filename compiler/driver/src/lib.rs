@@ -180,6 +180,35 @@ pub fn check_pipelines(root: &Path) -> Output {
     on_compiler_thread(|| compile(root, mode, wrela_lower::Roots::of, &[]))
 }
 
+/// [`check_pipelines`], with the program's constants `set` names given its values (`wrela
+/// pipelines --set`).
+pub fn check_pipelines_set(root: &Path, set: &[(String, String)]) -> Output {
+    let mode = Mode { conditions: true, ..Mode::CHECK };
+    on_compiler_thread(|| compile_set(root, mode, set))
+}
+
+/// A build of the package at `root` ([`build`]; a debug or test build as `kind` says, or with
+/// relaxed SIMD) with the program's root-module constants `set` names given its values (`wrela
+/// build --set NAME=VALUE`, language.md §13), which its manifest records.
+pub fn build_set(
+    root: &Path,
+    kind: BuildKind,
+    relaxed_simd: bool,
+    set: &[(String, String)],
+) -> Output {
+    let mode =
+        Mode { debug: kind.debug, testing: kind.testing, relaxed_simd, ..Mode::RELEASE };
+    on_compiler_thread(|| compile_set(root, mode, set))
+}
+
+/// [`compile`] with constants set.
+fn compile_set(root: &Path, mode: Mode, set: &[(String, String)]) -> Output {
+    let loaded = load_with(root, &Overlay::new());
+    let scope = Scope { set: set.to_vec(), ..Scope::default() };
+    compile_loaded_in(root, mode, wrela_lower::Roots::of, &[], loaded, &scope)
+        .expect("an uncancelled compile")
+}
+
 /// Files' texts that stand in for what's on disk, by their canonical paths: for checking a
 /// change before it's written (`wrela refactor`).
 pub type Overlay = std::collections::HashMap<std::path::PathBuf, String>;
@@ -269,6 +298,9 @@ pub struct Scope {
     /// Set to stop the compile: it stops at its next phase (loading, checking, constants,
     /// lowering a role, emitting) with [`CANCELLED`].
     pub cancel: Option<Arc<std::sync::atomic::AtomicBool>>,
+    /// The program's root-module constants given other values, by name (`wrela build --set
+    /// NAME=VALUE`, language.md §13): the manifest records them.
+    pub set: Vec<(String, String)>,
 }
 
 /// What a cancelled compile gives ([`Scope::cancel`]).
@@ -899,7 +931,7 @@ fn compile_loaded_in(
         })
         .map(|(f, _, path)| (*f, lift::relative(path, root)))
         .collect();
-    let checked = wrela_sema::check_packages(units, &packages, &mut diagnostics);
+    let checked = wrela_sema::check_packages_set(units, &packages, &scope.set, &mut diagnostics);
     scope.stop()?;
     let mut files = Vec::new();
     let mut pipelines = Vec::new();
@@ -980,6 +1012,9 @@ fn compile_loaded_in(
         }
         if client.is_some() || server.is_some() {
             build::pair(client, server, relaxed);
+        }
+        if !scope.set.is_empty() {
+            record_set(&mut files, &scope.set, &mut diagnostics);
         }
     }
     sort_and_dedup(&mut diagnostics);
@@ -1176,6 +1211,22 @@ fn summarize(
             }
         })
         .collect()
+}
+
+/// Records the constants a build set in its manifest (`Manifest::set`).
+fn record_set(
+    files: &mut [(String, Vec<u8>)],
+    set: &[(String, String)],
+    diagnostics: &mut Vec<Diagnostic>,
+) {
+    let Some((_, bytes)) = files.iter_mut().find(|(p, _)| p == "manifest.json") else { return };
+    match wrela_abi::Manifest::parse(&String::from_utf8_lossy(bytes)) {
+        Ok(mut m) => {
+            m.set = set.iter().cloned().collect();
+            *bytes = m.to_json().into_bytes();
+        }
+        Err(e) => diagnostics.push(Diagnostic::internal(format!("recording `--set`: {e}"))),
+    }
 }
 
 /// The program package's own files, and where each is.

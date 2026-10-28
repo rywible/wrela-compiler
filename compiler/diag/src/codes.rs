@@ -150,6 +150,7 @@ codes! {
     E0221 = "E0221", "packages that depend on each other";
     E0222 = "E0222", "a `@test` that `wrela test` can't run";
     E0223 = "E0223", "a workspace that isn't valid";
+    E0224 = "E0224", "a build's `--set` of a constant it can't override";
 
     // ---- E03xx: types ----------------------------------------------------------------------
     E0300 = "E0300", "mismatched types";

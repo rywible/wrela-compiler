@@ -305,3 +305,80 @@ pub fn frame(time: f32, width: u32, height: u32) {
     let text = wrela_diag::render::render_all(&out.sources, &out.diagnostics);
     assert!(text.contains("ships more than one file named `a.bin`"), "{text}");
 }
+
+/// A program whose root module's constants a build may set (language.md §13).
+const SETTABLE: &str = r#"
+pub enum Tier {
+    Low,
+    High,
+}
+
+pub const N: u32 = 4
+pub const TIER: Tier = Tier::Low
+pub const SCALE: f32 = 1.5
+const HIDDEN: u32 = 1
+pub const AT: vec2 = vec2(1.0, 2.0)
+
+pub fn value() -> u32 {
+    N
+}
+
+pub fn length() -> u32 {
+    let a = [0.0; N]
+    a.len()
+}
+
+pub fn tier() -> u32 {
+    match TIER {
+        Tier::Low => 1,
+        Tier::High => 2,
+    }
+}
+
+pub fn frame(time: f32, width: u32, height: u32) {
+    let _ = HIDDEN + u32(SCALE) + u32(AT.x)
+}
+"#;
+
+/// `wrela build --set N=8`: the program reads 8, an array of length `N` has 8 elements, an
+/// enum's constant takes a variant by name, and the manifest records the sets; a `pub const`
+/// that isn't there, one that isn't `pub`, and one of a type a build can't set are E0224.
+#[test]
+fn a_build_sets_a_programs_pub_constants() {
+    let dir = scratch("consts/set");
+    std::fs::write(dir.join("main.wrela"), SETTABLE).expect("write");
+    let set = |pairs: &[(&str, &str)]| -> Vec<(String, String)> {
+        pairs.iter().map(|&(n, v)| (n.to_string(), v.to_string())).collect()
+    };
+    let kind = wrela_driver::BuildKind::default();
+    let sets = set(&[("N", "8"), ("TIER", "High"), ("SCALE", "-2.5")]);
+    let out = wrela_driver::build_set(&dir, kind, false, &sets);
+    assert!(
+        !out.has_errors(),
+        "{}",
+        wrela_diag::render::render_all(&out.sources, &out.diagnostics)
+    );
+    let built = dir.join("build-set");
+    let _ = std::fs::remove_dir_all(&built);
+    out.write_to(&built).expect("write the build");
+    let mut host = crate::cpu_host(&built);
+    assert_eq!(wrela_tests::one_u32(&mut host, "value", &[]), 8);
+    assert_eq!(wrela_tests::one_u32(&mut host, "length", &[]), 8, "N folds where it's a length");
+    assert_eq!(wrela_tests::one_u32(&mut host, "tier", &[]), 2);
+    let manifest = wrela_tests::manifest(&built);
+    assert_eq!(manifest.set.get("N").map(String::as_str), Some("8"));
+    assert_eq!(manifest.set.get("TIER").map(String::as_str), Some("High"));
+    // Without sets, the manifest says none and the program reads what it's written with.
+    let plain = wrela_driver::build(&dir);
+    let json = plain.files.iter().find(|(p, _)| p == "manifest.json").expect("manifest");
+    assert!(!String::from_utf8_lossy(&json.1).contains("\"set\""));
+    for (pairs, says) in [
+        (set(&[("MISSING", "1")]), "has no constant `MISSING`"),
+        (set(&[("HIDDEN", "2")]), "isn't `pub`"),
+        (set(&[("AT", "3")]), "is a `vec2`"),
+    ] {
+        let out = wrela_driver::build_set(&dir, kind, false, &pairs);
+        let e = out.diagnostics.iter().find(|d| d.code.as_str() == "E0224");
+        assert!(e.is_some_and(|d| d.message.contains(says)), "{pairs:?}: {:?}", out.diagnostics);
+    }
+}

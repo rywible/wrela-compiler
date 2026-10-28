@@ -384,6 +384,8 @@ const CHEST = GRAZER.bone("chest")                           // a misspelled nam
 
 The optimizer never decides staging: work that must happen early is written as a `const`, or done at load.
 
+**A build may set a program's `pub const`.** `wrela build <package> --set NAME=VALUE` (repeatable; `std::tool::toolchain::build`'s `BuildOptions::set` too) gives the constant `NAME` of the program's `main.wrela` the value `VALUE` in place of its initializer, before anything reads it: its uses fold with it, and a length or a `const` argument it gives takes it, as if it were written there. So one program builds at another tier or in another style without a second `main`. The constant is `pub`, its type is written, and it's a `bool`, `u32`, `i32`, `f32`, a `Text` (`--set NAME='"cel"'`) or an enum whose variants hold nothing, whose variant `VALUE` names (`--set TIER=Medium` is `Tier::Medium`); anything else is E0224. The build's manifest records its sets (`"set": {"TIER": "Medium"}`), so two builds of a program with different sets are two builds: `wrela same --against` a build whose sets differ says they differ. A type can't be a value, so a program that chooses its style names it by an enum (or a `Text`) and matches on it.
+
 ### 3.6 Modules and packages
 
 A program is one package: a directory with a `main.wrela`, in which each file is a module, and which can depend on other packages.

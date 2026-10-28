@@ -43,7 +43,7 @@
 //! wrela precision <package-dir> <fn> --box <lo>..<hi>,...
 //!                                         where a half-float twin of a function would be
 //!                                         safe, operation by operation, from its interval
-//! wrela same <package-dir> --against <build-dir> [--frames n] [--within x] [--no-gpu] [--json]
+//! wrela same <package-dir> --against <build-dir> [--set NAME=VALUE]... [--frames n] [--within x] [--no-gpu] [--json]
 //!                                         whether the package built now behaves as a saved
 //!                                         build does: the same commands each frame, the
 //!                                         same last frame within x, the same pipelines
@@ -121,7 +121,7 @@ mod trace;
 pub(crate) fn usage() -> ExitCode {
     let lines = [
         "wrela check <package-dir> [--json]",
-        "wrela build <package-dir> [-o <out-dir>] [--debug] [--testing] [--optimize [size|speed]] [--relaxed-simd] [--lift <package>]... [--report data|consts] [--json]",
+        "wrela build <package-dir> [-o <out-dir>] [--debug] [--testing] [--optimize [size|speed]] [--relaxed-simd] [--lift <package>]... [--set NAME=VALUE]... [--report data|consts] [--json]",
         "wrela fmt <file-or-dir>... [--check]",
         "wrela fix <package-dir> [--dry-run] [--json]",
         "wrela migrate <package-dir> [--dry-run] [--json]",
@@ -142,7 +142,7 @@ pub(crate) fn usage() -> ExitCode {
         "wrela trace <package-dir> --watch <export>[,<export>...] [--frames n] [--csv] [--fps f] [--size WxH] [--input <script.json>] [--release] [--no-gpu] [--workers N]",
         "wrela bisect <package-dir> --until \"<export> <op> <number>\" [--frames n] [--json] [--fps f] [--size WxH] [--input <script.json>] [--release] [--no-gpu] [--workers N]",
         "wrela run <package-dir> [--port N] [--lan] [--lift <package>]... [--debug]",
-        "wrela same <package-dir> --against <build-dir> [--frames n] [--fps f] [--size WxH] [--input <script.json>] [--within x] [--no-gpu] [--json]",
+        "wrela same <package-dir> --against <build-dir> [--set NAME=VALUE]... [--frames n] [--fps f] [--size WxH] [--input <script.json>] [--within x] [--no-gpu] [--json]",
         "wrela suite [fmt | allow | wrela::<package-path>::[<test-name>]] [--workspace <dir>]",
         "wrela tool (<package-dir> | <name>) [--read NAME=DIR]... [--write NAME=DIR]... [--secret NAME]... [--net HOST]... [--allow-run NAME[=PATH]]... [--browser] [--timeout S] [--workers N] [--blob-budget B] [-- args...]",
         "wrela toolchain",
@@ -263,6 +263,9 @@ pub(crate) struct PackageArgs {
     /// `--report consts`, which only `build` takes: each computed constant, and whether it was
     /// computed or read from the cache.
     pub report_consts: bool,
+    /// `--set NAME=VALUE`, which only `build` takes: the program's root-module constants given
+    /// other values (language.md §13).
+    pub set: Vec<(String, String)>,
     /// `--relaxed-simd`, which only `build` takes: a second module beside `game.wasm` whose
     /// presentation code uses relaxed SIMD (`wrela_driver::build_relaxed`).
     pub relaxed_simd: bool,
@@ -276,6 +279,7 @@ pub(crate) fn package_args(args: &[String], takes_out: bool) -> Result<PackageAr
     let mut optimize = None;
     let mut report_data = false;
     let mut report_consts = false;
+    let mut set = Vec::new();
     let mut relaxed_simd = false;
     let mut lift = Vec::new();
     let mut it = args.iter().peekable();
@@ -302,6 +306,13 @@ pub(crate) fn package_args(args: &[String], takes_out: bool) -> Result<PackageAr
             "--report" if takes_out => match it.next().map(String::as_str) {
                 Some("data") => report_data = true,
                 Some("consts") => report_consts = true,
+                _ => return Err(usage()),
+            },
+            "--set" if takes_out => match it.next().and_then(|s| s.split_once('=')) {
+                Some((name, value)) if !name.is_empty() => {
+                    set.retain(|(n, _): &(String, String)| n != name);
+                    set.push((name.to_string(), value.to_string()));
+                }
                 _ => return Err(usage()),
             },
             "--lift" if takes_out => match it.next() {
@@ -345,6 +356,7 @@ pub(crate) fn package_args(args: &[String], takes_out: bool) -> Result<PackageAr
         optimize,
         report_data,
         report_consts,
+        set,
         relaxed_simd,
     })
 }
@@ -424,9 +436,26 @@ pub(crate) fn build_into(
     optimize: Option<wrela_driver::optimize::Level>,
     relaxed: bool,
 ) -> Result<PathBuf, String> {
+    build_set_into(dir, name, optimize, relaxed, &[])
+}
+
+/// [`build_into`], with the program's constants `set` names given its values (`--set`).
+pub(crate) fn build_set_into(
+    dir: &Path,
+    name: &str,
+    optimize: Option<wrela_driver::optimize::Level>,
+    relaxed: bool,
+    set: &[(String, String)],
+) -> Result<PathBuf, String> {
     let built = dir.join("build").join(name);
     generated_path(dir, &built)?;
-    let mut out = if relaxed { wrela_driver::build_relaxed(dir) } else { wrela_driver::build(dir) };
+    let mut out = if !set.is_empty() {
+        wrela_driver::build_set(dir, wrela_driver::BuildKind::default(), relaxed, set)
+    } else if relaxed {
+        wrela_driver::build_relaxed(dir)
+    } else {
+        wrela_driver::build(dir)
+    };
     if let Some(level) = optimize
         && !out.has_errors()
     {

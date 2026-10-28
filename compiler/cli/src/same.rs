@@ -1,7 +1,8 @@
-//! `wrela same <package-dir> --against <build-dir> [--frames n] [--fps f] [--size WxH]
-//! [--input <script.json>] [--within x] [--no-gpu] [--json]`: whether the package, built now,
-//! behaves as a build of it saved before does (language.md §23.9). An agent runs it after a
-//! refactor, a std change, or before moving a pin.
+//! `wrela same <package-dir> --against <build-dir> [--set NAME=VALUE]... [--frames n] [--fps f]
+//! [--size WxH] [--input <script.json>] [--within x] [--no-gpu] [--json]`: whether the package,
+//! built now (with its constants set as `--set` says, §13), behaves as a build of it saved before
+//! does (language.md §23.9). An agent runs it after a refactor, a std change, or before moving a
+//! pin. Two builds whose sets differ are two builds: never the same.
 //!
 //! Two builds are the same when every command byte each submits is the same, frame by frame
 //! (the hosts' state hash after each frame, FNV-1a 64 of every byte submitted so far), their
@@ -31,6 +32,7 @@ struct Args {
     within: f64,
     no_gpu: bool,
     json: bool,
+    set: Vec<(String, String)>,
 }
 
 fn parse(args: &[String]) -> Option<Args> {
@@ -45,6 +47,7 @@ fn parse(args: &[String]) -> Option<Args> {
         within: 0.5,
         no_gpu: false,
         json: false,
+        set: Vec::new(),
     };
     let (mut dir, mut against) = (None, None);
     let mut it = args.iter();
@@ -59,6 +62,11 @@ fn parse(args: &[String]) -> Option<Args> {
                 a.within = it.next()?.parse().ok().filter(|&w: &f64| (0.0..=255.0).contains(&w))?
             }
             "--no-gpu" => a.no_gpu = true,
+            "--set" => {
+                let (name, value) = it.next()?.split_once('=')?;
+                a.set.retain(|(n, _)| n != name);
+                a.set.push((name.to_string(), value.to_string()));
+            }
             "--json" => a.json = true,
             s if !s.starts_with('-') && dir.is_none() => dir = Some(PathBuf::from(s)),
             _ => return None,
@@ -102,6 +110,8 @@ struct Report {
     within: f64,
     added: Vec<String>,
     removed: Vec<String>,
+    /// The constants each build set, where they differ (§13): the saved build's, then this one's.
+    sets: Option<(Vec<String>, Vec<String>)>,
     against: (PathBuf, String),
     candidate: (PathBuf, String),
 }
@@ -112,6 +122,7 @@ impl Report {
             && self.screen.is_none_or(|d| d.mean <= self.within)
             && self.added.is_empty()
             && self.removed.is_empty()
+            && self.sets.is_none()
     }
 
     fn json(&self) -> serde_json::Value {
@@ -124,6 +135,7 @@ impl Report {
                 "within": self.within,
             })),
             "pipelines": { "added": self.added, "removed": self.removed },
+            "sets": self.sets.as_ref().map(|(was, now)| serde_json::json!({ "against": was, "candidate": now })),
             "against": { "dir": self.against.0.display().to_string(), "hash": self.against.1 },
             "candidate": { "dir": self.candidate.0.display().to_string(), "hash": self.candidate.1 },
         })
@@ -155,7 +167,13 @@ impl Report {
             format!("pipelines: {}", parts.join(" "))
         };
         let verdict = if self.same() { "same as" } else { "differs from" };
-        format!("{verdict} {against}: {commands}; {screen}; {pipelines}")
+        let sets = match &self.sets {
+            Some((was, now)) => {
+                format!("; its sets [{}], this build's [{}]", was.join(", "), now.join(", "))
+            }
+            None => String::new(),
+        };
+        format!("{verdict} {against}: {commands}; {screen}; {pipelines}{sets}")
     }
 }
 
@@ -180,8 +198,11 @@ fn same(a: &Args) -> Result<Report, String> {
     let before = manifest(&against)?;
     let script = crate::read_script(a.input.as_deref())?;
     // The candidate, as `wrela build` builds it.
-    let built = crate::build_into(&a.dir, "same", None, false)?;
+    let built = crate::build_set_into(&a.dir, "same", None, false, &a.set)?;
     let after = manifest(&built)?;
+    let shown =
+        |m: &wrela_abi::Manifest| m.set.iter().map(|(k, v)| format!("{k}={v}")).collect::<Vec<_>>();
+    let sets = (before.set != after.set).then(|| (shown(&before), shown(&after)));
     let names = |m: &wrela_abi::Manifest| -> Vec<String> {
         let mut v: Vec<String> = m.pipelines.iter().map(|p| p.name.clone()).collect();
         v.sort();
@@ -206,6 +227,7 @@ fn same(a: &Args) -> Result<Report, String> {
         within: a.within,
         added: now.iter().filter(|p| !was.contains(p)).cloned().collect(),
         removed: was.iter().filter(|p| !now.contains(p)).cloned().collect(),
+        sets,
         against: (a.against.clone(), hash(&against)),
         candidate: (built.clone(), hash(&built)),
     })

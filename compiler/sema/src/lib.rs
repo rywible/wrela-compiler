@@ -14,6 +14,7 @@ mod lints;
 pub mod mir;
 pub mod program;
 pub mod resolve;
+pub mod set;
 pub mod thir;
 pub mod traits;
 pub mod ty;
@@ -186,7 +187,18 @@ pub fn check_packages(
     packages: &[collect::PackageInfo],
     diags: &mut Vec<Diagnostic>,
 ) -> Checked {
-    check(units, packages, diags, false)
+    check(units, packages, diags, false, &[])
+}
+
+/// [`check_packages`], with the program's root-module constants that `sets` names given its
+/// values (`wrela build --set NAME=VALUE`, [`set`]).
+pub fn check_packages_set(
+    units: Vec<SourceUnit>,
+    packages: &[collect::PackageInfo],
+    sets: &[(String, String)],
+    diags: &mut Vec<Diagnostic>,
+) -> Checked {
+    check(units, packages, diags, false, sets)
 }
 
 /// [`check_packages`], memory-checking std's bodies too: for std's own tests.
@@ -195,15 +207,17 @@ pub fn check_packages_and_std(
     packages: &[collect::PackageInfo],
     diags: &mut Vec<Diagnostic>,
 ) -> Checked {
-    check(units, packages, diags, true)
+    check(units, packages, diags, true, &[])
 }
 
 fn check(
-    units: Vec<SourceUnit>,
+    mut units: Vec<SourceUnit>,
     packages: &[collect::PackageInfo],
     diags: &mut Vec<Diagnostic>,
     memory_check_std: bool,
+    sets: &[(String, String)],
 ) -> Checked {
+    diags.extend(set::apply(&mut units, sets));
     let mut program = collect::collect(units, packages, diags);
     let consts = {
         let p = &program;
@@ -213,6 +227,7 @@ fn check(
             diags.extend(fieldwise::check_trait(p, ty::TraitId(t as u32)));
         }
         let consts = check::check_consts(p, diags);
+        diags.extend(set::check_types(p, &consts.tys, sets));
         diags.extend(collect::check_test_inputs(p, &consts.tys));
         consts
     };
