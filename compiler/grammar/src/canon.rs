@@ -258,6 +258,7 @@ impl AstWalker {
                     match &m.kind {
                         TraitMemberKind::Fn(f) => self.fn_decl(f),
                         TraitMemberKind::Type { bounds, .. } => self.types(bounds),
+                        TraitMemberKind::Const(c) => self.assoc_const(c),
                     }
                 }
             }
@@ -277,6 +278,7 @@ impl AstWalker {
                     match &m.kind {
                         ImplMemberKind::Fn(f) => self.fn_decl(f),
                         ImplMemberKind::Type { ty, .. } => self.ty(ty),
+                        ImplMemberKind::Const(c) => self.assoc_const(c),
                     }
                 }
             }
@@ -309,6 +311,15 @@ impl AstWalker {
             for t in trees {
                 self.use_tree(t);
             }
+        }
+    }
+
+    /// An associated constant's type and value; the function it's checked as is the parser's,
+    /// with no syntax of its own.
+    fn assoc_const(&mut self, c: &AssocConst) {
+        self.ty(&c.ty);
+        if let Some(v) = &c.value {
+            self.expr(v);
         }
     }
 

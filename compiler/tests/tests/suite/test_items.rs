@@ -803,6 +803,25 @@ fn const_parameters_and_tiers_run_on_both_hosts() {
     }
 }
 
+/// Associated constants as `const` arguments (compiler/tests/assoc_consts, language.md §3.4,
+/// §18.1): a generic function dispatching `blur.bind(taps: Twice::<S>::TAPS, heavy: S::HEAVY)`
+/// for two `S`s is two pipelines, each computing what its constants say on both hosts; the
+/// instantiation whose `HEAVY` is `false` has no heavy loop in its WGSL (no `sin`, and fewer
+/// bytes), and neither shader has an override: the constants are folded into each.
+#[test]
+#[ignore = "needs a GPU"]
+fn associated_constants_specialize_each_pipeline() {
+    let dir = wrela_tests::repo_root().join("compiler/tests/assoc_consts");
+    assert_eq!(crate::tests_pass(&dir), 1);
+    let build = crate::built("assoc_consts");
+    let wgsl = |i: usize| std::fs::read_to_string(build.join(format!("pipeline_{i}.wgsl")));
+    let (wide, narrow) = (wgsl(0).expect("pipeline 0"), wgsl(1).expect("pipeline 1"));
+    eprintln!("WGSL: heavy {} bytes, folded away {} bytes", wide.len(), narrow.len());
+    assert!(wide.contains("sin(") && !narrow.contains("sin("));
+    assert!(narrow.len() < wide.len());
+    assert!(!wide.contains("override") && !narrow.contains("override"));
+}
+
 /// Tapes that can hold a creature (language.md §14.4): each new operation against its std
 /// twin at 10⁶ points on the CPU and the GPU (compiler/tests/tape_ops), and a full 4,096-op
 /// tape bound as storage, run on both hosts and timed (compiler/tests/tape_long).

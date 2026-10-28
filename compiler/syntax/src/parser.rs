@@ -1287,7 +1287,7 @@ impl<'a> Parser<'a> {
         Ok(ItemKind::Trait(TraitDecl { name, generics, supertraits, members }))
     }
 
-    /// trait_member ::= attribute* (fn_sig block? | "type" IDENT (":" bounds)?)
+    /// trait_member ::= attribute* (fn_sig block? | "type" IDENT (":" bounds)? | assoc_const)
     fn parse_trait_member(&mut self) -> PResult<TraitMember> {
         let start = self.span();
         let attrs = self.parse_attrs()?;
@@ -1297,8 +1297,10 @@ impl<'a> Parser<'a> {
             TraitMemberKind::Type { name, bounds }
         } else if self.at(T::Fn) {
             TraitMemberKind::Fn(self.parse_fn(false)?)
+        } else if self.at(T::Const) {
+            TraitMemberKind::Const(self.parse_assoc_const(false)?)
         } else {
-            return Err(self.expected("`fn` or `type`"));
+            return Err(self.expected("`fn`, `type` or `const`"));
         };
         Ok(TraitMember { attrs, kind, span: start.to(self.prev_span()) })
     }
@@ -1314,7 +1316,7 @@ impl<'a> Parser<'a> {
         Ok(ImplDecl { generics, trait_, self_ty, members })
     }
 
-    /// impl_member ::= attribute* "pub"? fn_item | "type" IDENT "=" type
+    /// impl_member ::= attribute* "pub"? (fn_item | assoc_const) | "type" IDENT "=" type
     fn parse_impl_member(&mut self) -> PResult<ImplMember> {
         let start = self.span();
         if self.eat(T::Type) {
@@ -1352,8 +1354,13 @@ impl<'a> Parser<'a> {
             }
             return self.parse_impl_member();
         }
+        if self.at(T::Const) {
+            let c = self.parse_assoc_const(true)?;
+            let span = start.to(self.prev_span());
+            return Ok(ImplMember { attrs, vis, kind: ImplMemberKind::Const(c), span });
+        }
         if !self.at(T::Fn) {
-            return Err(self.expected("`fn` or `type`"));
+            return Err(self.expected("`fn`, `type` or `const`"));
         }
         let f = self.parse_fn(true)?;
         Ok(ImplMember { attrs, vis, kind: ImplMemberKind::Fn(f), span: start.to(self.prev_span()) })
@@ -1386,6 +1393,37 @@ impl<'a> Parser<'a> {
         self.closers.pop();
         self.expect(T::RBrace, "`}`")?;
         Ok(members)
+    }
+
+    /// assoc_const ::= "const" IDENT ":" type ("=" expr)?: an associated constant (§3.4), its
+    /// value required in an impl (`value_required`) and a default in a trait. It's checked as
+    /// the function `fn IDENT() -> type { expr }`, which this makes beside it.
+    fn parse_assoc_const(&mut self, value_required: bool) -> PResult<AssocConst> {
+        let start = self.expect(T::Const, "`const`")?.span;
+        let name = self.ident("a constant name")?;
+        self.expect(T::Colon, "`:` and the constant's type")?;
+        let ty = self.parse_type()?;
+        let sig_span = start.to(self.prev_span());
+        let value = if value_required || self.at(T::Eq) {
+            self.expect(T::Eq, "`=` and the constant's value")?;
+            Some(self.expr_or_error(Self::parse_expr))
+        } else {
+            None
+        };
+        let body = value.as_ref().map(|v| Block {
+            stmts: vec![Stmt { kind: StmtKind::Expr(v.clone()), span: v.span }],
+            span: v.span,
+        });
+        let func = FnDecl {
+            name: name.clone(),
+            generics: Vec::new(),
+            params: Vec::new(),
+            params_close: name.span,
+            ret: Some(RetType { mode: RetMode::Owned, ty: ty.clone() }),
+            body,
+            sig_span,
+        };
+        Ok(AssocConst { name, ty, value, func })
     }
 
     /// const_item ::= "const" IDENT (":" type)? "=" expr

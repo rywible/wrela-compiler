@@ -259,11 +259,37 @@ impl std::fmt::Display for ConstArg {
     }
 }
 
+/// A `const` parameter's argument as it's written (§18.1): its value, or an associated constant
+/// (`S::K`, §3.4), whose value is its instantiation's: lowering folds it, once the types are
+/// known.
+#[derive(Clone, Debug)]
+pub enum ConstSrc {
+    Value(ConstArg),
+    /// An inherent impl's constant, `args` its generics (the impl's).
+    Inherent { func: FnId, args: Vec<TyId> },
+    /// A trait's constant of `self_ty`.
+    Trait { method: FnId, self_ty: TyId, trait_args: Vec<TyId> },
+}
+
+impl ConstSrc {
+    /// Calls `f` on each type it names.
+    pub fn for_each_ty_mut(&mut self, f: &mut impl FnMut(&mut TyId)) {
+        match self {
+            ConstSrc::Value(_) => {}
+            ConstSrc::Inherent { args, .. } => args.iter_mut().for_each(f),
+            ConstSrc::Trait { self_ty, trait_args, .. } => {
+                f(self_ty);
+                trait_args.iter_mut().for_each(f);
+            }
+        }
+    }
+}
+
 #[derive(Clone, Debug)]
 pub enum Shader {
     /// `k` or `k.bind(...)`, with its generic arguments: its arguments are the command's, but
     /// its `const` parameters' (§18.1), whose values are here, by parameter index.
-    Named(FnId, Vec<TyId>, Vec<(usize, ConstArg)>),
+    Named(FnId, Vec<TyId>, Vec<(usize, ConstSrc)>),
     /// A value of a bound entry point's type (`let k = k.bind(...)`, or a parameter bounded by
     /// `Kernel`): the type names the entry point once it's known, and its fields hold the
     /// arguments.

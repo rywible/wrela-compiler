@@ -77,6 +77,7 @@ const CONTEXTS: &[Context] = &[
         ..NONE
     },
     Context { first: "use std::derive::Box3", ..NONE },
+    Context { first: "use std::gpu::{GlobalId, GpuBuffer, Slots, dispatch}", ..NONE },
     Context {
         first: "@compute(64)",
         items: "use std::gpu::{GlobalId, GpuBuffer, Slots, dispatch}",

@@ -698,6 +698,7 @@ impl<'a> Builder<'a> {
                                 b.tok(&format!("type {}", name.name)),
                                 b.trait_list(bounds),
                             ]),
+                            TraitMemberKind::Const(c) => b.assoc_const(c),
                         };
                         concat([attrs, kind])
                     },
@@ -730,6 +731,7 @@ impl<'a> Builder<'a> {
                             ImplMemberKind::Type { name, ty } => {
                                 concat([b.tok(&format!("type {} = ", name.name)), b.ty(ty)])
                             }
+                            ImplMemberKind::Const(c) => b.assoc_const(c),
                         };
                         concat([attrs, vis, kind])
                     },
@@ -903,6 +905,16 @@ impl<'a> Builder<'a> {
     // ---- types -------------------------------------------------------------------------------
 
     /// `: T`, if there's a type.
+    /// `const K: u32`, with ` = value` when it has one.
+    fn assoc_const(&mut self, c: &AssocConst) -> Doc {
+        let head = concat([self.tok(&format!("const {}", c.name.name)), self.opt_ty(Some(&c.ty))]);
+        let value = match &c.value {
+            Some(v) => concat([self.tok(" = "), self.expr(v)]),
+            None => nil(),
+        };
+        concat([head, value])
+    }
+
     fn opt_ty(&mut self, t: Option<&TypeExpr>) -> Doc {
         match t {
             Some(t) => concat([self.tok(": "), self.ty(t)]),

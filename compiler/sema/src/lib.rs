@@ -112,6 +112,9 @@ pub struct Checked {
     /// Each function body's MIR.
     pub mir: BTreeMap<ty::FnId, mir::Body>,
     pub consts: BTreeMap<ty::ConstId, (ty::TyId, thir::Expr)>,
+    /// Each associated constant's value as it's written (§3.4), in its function's generics:
+    /// what lowering folds where a `const` argument names it.
+    pub assoc_consts: BTreeMap<ty::FnId, thir::Expr>,
     /// The type each function that returns by naming its traits (`-> Creature<Coat>`) returns.
     pub hidden: HashMap<ty::FnId, ty::TyId>,
     /// Each body's own effects, for lowering's checks.
@@ -257,6 +260,7 @@ fn check(
         mir.insert(f, m);
     }
     let mut hidden = Vec::new();
+    let mut assoc_consts = BTreeMap::new();
     for i in 0..p.fns.len() {
         let f = ty::FnId(i as u32);
         let check::FnCheck { body, diags: d, incomplete } = check::check_fn(p, &const_tys, f);
@@ -265,6 +269,9 @@ fn check(
         if let Some(b) = body {
             if let Some(h) = b.hidden_ret {
                 hidden.push((f, h));
+            }
+            if p.func(f).attrs.assoc_const {
+                assoc_consts.insert(f, b.value.clone());
             }
             // The memory checker needs a well-typed, whole body; it would only add noise
             // otherwise. A `@fieldwise` trait's walk has no memory IR of its own: each type that
@@ -292,7 +299,7 @@ fn check(
         diags.extend(unused_items(p, &mir));
     }
     let hidden = hidden.into_iter().collect();
-    Checked { program, mir, consts, hidden, direct }
+    Checked { program, mir, consts, assoc_consts, hidden, direct }
 }
 
 /// W0008: a private function or constant that no other code uses (a function that only calls

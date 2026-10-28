@@ -11,6 +11,7 @@
 //!   CPU-only types; derivatives only exist in fragment shaders. These are found while lowering
 //!   each GPU pipeline and reported with the call chain.
 
+mod assoc;
 mod body;
 mod consts;
 mod derive;

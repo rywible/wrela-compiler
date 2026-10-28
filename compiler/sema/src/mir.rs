@@ -334,7 +334,7 @@ pub struct Call {
 #[derive(Clone, Debug)]
 pub enum Shader {
     /// Its generic arguments, and its `const` parameters' values (`thir::Shader::Named`).
-    Named(FnId, Vec<TyId>, Vec<(usize, crate::thir::ConstArg)>),
+    Named(FnId, Vec<TyId>, Vec<(usize, crate::thir::ConstSrc)>),
     Value(Place, Span),
 }
 

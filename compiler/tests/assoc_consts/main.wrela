@@ -1,0 +1,83 @@
+// Associated constants (language.md §3.4) as the `const` arguments of an entry point (§18.1):
+// `run::<S>` dispatches `blur.bind(taps: S::TAPS, heavy: S::HEAVY)`, so each `S` is a pipeline
+// of its own, its constants folded into its shader. `Wide`'s `HEAVY` is its trait's default,
+// `true`; `Narrow`'s is `false`, which leaves the heavy loop out of its pipeline's WGSL (the
+// suite's test compares the two shaders' bytes). Frame 0 dispatches both and reads both back.
+use std::gpu::{GlobalId, GpuBuffer, Slots, buffer, dispatch, read}
+use std::io::Pending
+
+trait Taps {
+    const TAPS: u32
+    const HEAVY: bool = true
+}
+
+struct Wide {}
+
+struct Narrow {}
+
+impl Taps for Wide {
+    const TAPS: u32 = 4
+}
+
+impl Taps for Narrow {
+    const TAPS: u32 = 2
+    const HEAVY: bool = false
+}
+
+/// A constant of a generic impl, read from its parameter's.
+struct Twice<S> {}
+
+impl<S: Taps> Twice<S> {
+    const TAPS: u32 = S::TAPS * 2
+}
+
+@compute(64)
+fn blur(out: mut Slots<f32>, id: GlobalId, taps: const u32, heavy: const bool) {
+    var x = f32(id.x)
+    if heavy {
+        for _ in 0..64 {
+            x = sin(x) * 1.5 + cos(x * 0.5)
+        }
+    }
+    out[id] = x * 0.0 + f32(taps)
+}
+
+fn run<S: Taps>(out: mut GpuBuffer<f32>) {
+    dispatch(blur.bind(out: mut out, taps: Twice::<S>::TAPS, heavy: S::HEAVY), groups: 1)
+}
+
+pub struct State {
+    frame: u32,
+    wide: GpuBuffer<f32>,
+    narrow: GpuBuffer<f32>,
+    pending: Vec<Pending<f32>>,
+    seen: Vec<Vec<f32>>,
+}
+
+pub fn init() -> State {
+    State { frame: 0, wide: buffer(64), narrow: buffer(64), pending: Vec::new(), seen: Vec::new() }
+}
+
+pub fn frame(s: mut State, time: f32, width: u32, height: u32) {
+    if s.frame == 0 {
+        run::<Wide>(mut s.wide)
+        run::<Narrow>(mut s.narrow)
+        s.pending.push(read(s.wide.items()))
+        s.pending.push(read(s.narrow.items()))
+    }
+    for i in 0..s.pending.len() {
+        if s.seen.len() == i {
+            if let Some(Ok(v)) = s.pending[i].poll() {
+                s.seen.push(take v)
+            }
+        }
+    }
+    s.frame += 1
+}
+
+@test(frames: 4, gpu: true, hosts: both)
+fn each_instantiation_is_a_pipeline_with_its_constants(s: State) {
+    assert(s.seen.len() == 2)
+    assert(s.seen[0][5] == 8.0 && s.seen[1][5] == 4.0)
+    assert(Twice::<Wide>::TAPS == 8 && Wide::HEAVY && !Narrow::HEAVY)
+}

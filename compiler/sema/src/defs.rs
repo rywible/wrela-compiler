@@ -989,6 +989,9 @@ pub struct FnAttrs {
     pub job: Option<Span>,
     /// `@client`, `@server` or `@tool`: only that role's build may run it (§15.3).
     pub role: Option<(Role, Span)>,
+    /// An associated constant (`const K: u32 = 4`, §3.4), checked as the function that gives
+    /// its value: named without a call (`S::K`), and folded where a `const` argument needs it.
+    pub assoc_const: bool,
 }
 
 /// What a job's value holds (§16.3): where it stopped, and each local of its memory IR that owns

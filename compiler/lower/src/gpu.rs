@@ -91,8 +91,6 @@ pub struct PipelineOut {
     pub targets: Vec<wrela_abi::manifest::RenderTarget>,
     /// The functions its module instantiates, with their type arguments (`wrela query`).
     pub instances: Vec<(FnId, Vec<TyId>)>,
-    /// The value of each of its module's overrides (`ir::Module::overrides`), from its key.
-    pub constants: Vec<ConstArg>,
 }
 
 /// What a GPU module is for, while it's lowered.
@@ -114,6 +112,10 @@ pub(crate) struct GpuCx {
     pub domain_field: Option<u32>,
     /// A lifted build's literal table (§23): the storage buffer every pipeline binds last.
     pub literals: Option<ir::ResourceId>,
+    /// A pipeline's `const` parameters' values, in the interface's order (§18.1): each folded
+    /// into its shader where it's read. `None` for a module no pipeline's key made, whose
+    /// `const` parameters are its overrides.
+    pub consts: Option<Vec<ir::Const>>,
 }
 
 impl GpuCx {
@@ -134,6 +136,7 @@ impl GpuCx {
             uniform_fields: Vec::new(),
             domain_field: None,
             literals: None,
+            consts: None,
         }
     }
 
@@ -769,8 +772,19 @@ impl Recorded {
 fn recorded_shader(fl: &mut Fl, s: &mir::Shader) -> Option<Recorded> {
     match s {
         mir::Shader::Named(f, args, consts) => {
-            let substs = args.iter().map(|&a| fl.concrete(a)).collect();
-            Some(Recorded { func: *f, substs, consts: consts.clone(), value: None })
+            let substs: Vec<TyId> = args.iter().map(|&a| fl.concrete(a)).collect();
+            let mut values = Vec::new();
+            for (i, src) in consts {
+                let mut src = src.clone();
+                src.for_each_ty_mut(&mut |t| *t = fl.concrete(*t));
+                let program = &fl.cx.checked.program;
+                let param = &program.func(*f).params[*i];
+                let all = program.fn_all_generics(*f);
+                let ty = fl.cx.concrete(param.ty, &Subst::from_pairs(&all, &substs));
+                let (name, span) = (param.name.clone(), param.span);
+                values.push((*i, fl.cx.const_src(&src, ty, &name, span)?));
+            }
+            Some(Recorded { func: *f, substs, consts: values, value: None })
         }
         mir::Shader::Value(place, at) => {
             let t = fl.place_src_ty(place);
@@ -2294,31 +2308,35 @@ pub(crate) fn lower_pipeline(
     sites: Vec<Span>,
     targets: Vec<ir::RenderTarget>,
 ) -> Option<PipelineOut> {
+    let consts = iface_consts(&iface, key);
     let mut out = match key {
-        PipelineKey::Compute { .. } => lower_compute(cx, iface.clone()),
-        PipelineKey::Render { .. } => lower_render(cx, iface.clone()),
+        PipelineKey::Compute { .. } => lower_compute(cx, iface.clone(), consts),
+        PipelineKey::Render { .. } => lower_render(cx, iface.clone(), consts),
     }?;
-    out.constants = iface_consts(&iface, key, &out.module);
     out.key = key.clone();
     out.sites = sites;
     out.targets = targets;
     Some(out)
 }
 
-/// Each of `module`'s overrides' values, from `key`'s `const` arguments (the interface's
-/// `consts` order, which the module's overrides follow).
-fn iface_consts(iface: &Interface, key: &PipelineKey, module: &ir::Module) -> Vec<ConstArg> {
+/// The value of each of `iface`'s `const` parameters, in its order, from `key`'s `const`
+/// arguments: what its shaders fold (§18.1).
+fn iface_consts(iface: &Interface, key: &PipelineKey) -> Vec<ir::Const> {
     let values = key.consts();
-    let out: Vec<ConstArg> = (iface.consts.iter())
+    (iface.consts.iter())
         .map(|l| {
-            values
+            let c = values
                 .iter()
                 .find(|&&(e, i, _)| (e, i) == (l.entry, l.param))
-                .map_or(ConstArg::U32(0), |&(_, _, c)| c)
+                .map_or(ConstArg::U32(0), |&(_, _, c)| c);
+            match c {
+                ConstArg::Bool(b) => ir::Const::Bool(b),
+                ConstArg::U32(x) => ir::Const::U32(x),
+                ConstArg::I32(x) => ir::Const::I32(x),
+                ConstArg::F32(bits) => ir::Const::F32(f32::from_bits(bits)),
+            }
         })
-        .collect();
-    debug_assert_eq!(out.len(), module.overrides.len());
-    out
+        .collect()
 }
 
 /// How diagnostics name the entry point `name` of a module: "the `@compute` kernel `fill`".
@@ -2342,11 +2360,19 @@ struct EntryModule {
 /// A GPU module for the entry points of `iface`, the first of them a `stage`: its buffers
 /// bound (bindings from 1, in the interface's order), its uniform block (binding 0) and, for a
 /// kernel, `num_workgroups`.
-fn entry_module(cx: &mut Cx, iface: Rc<Interface>, stage: Entry) -> EntryModule {
+fn entry_module(
+    cx: &mut Cx,
+    iface: Rc<Interface>,
+    stage: Entry,
+    consts: Option<Vec<ir::Const>>,
+) -> EntryModule {
     let checked = cx.checked;
     let program = &checked.program;
     let what = describe_entry(stage, &program.func(iface.entries[0].func).name);
-    let mut mb = ModuleBuilder::gpu(GpuCx::new(what.clone(), iface.clone(), Some(stage)));
+    let mut gpu = GpuCx::new(what.clone(), iface.clone(), Some(stage));
+    let folded = consts.is_some();
+    gpu.consts = consts;
+    let mut mb = ModuleBuilder::gpu(gpu);
     // What each parameter is bound to: a group's fields as they're bound below.
     let mut resources: Vec<Vec<Option<Bound>>> = Vec::new();
     for entry in &iface.entries {
@@ -2364,8 +2390,8 @@ fn entry_module(cx: &mut Cx, iface: Rc<Interface>, stage: Entry) -> EntryModule 
         }
     };
     // The `const` parameters, each an override named for its parameter (and its shader's, when
-    // both shaders have one of that name).
-    for leaf in &iface.consts {
+    // both shaders have one of that name), unless a pipeline's values fold them.
+    for leaf in iface.consts.iter().filter(|_| !folded) {
         let span = program.func(iface.entries[leaf.entry].func).params[leaf.param].span;
         let scalar = match cx.lower_ty(&mut mb, leaf.ty, span).map(|t| mb.m.types.get(t).clone()) {
             Some(ir::TypeDef::Scalar(s)) => s,
@@ -2839,13 +2865,13 @@ fn non_filtering(m: &ir::Module, bindings: &mut [ResourceBinding]) {
     }
 }
 
-fn lower_compute(cx: &mut Cx, iface: Rc<Interface>) -> Option<PipelineOut> {
+fn lower_compute(cx: &mut Cx, iface: Rc<Interface>, consts: Vec<ir::Const>) -> Option<PipelineOut> {
     let kernel = iface.entries[0].func;
     let Some(Entry::Compute(wg)) = cx.entry_of(kernel) else { return None };
     let checked = cx.checked;
     let name = &checked.program.func(kernel).name;
     let EntryModule { mut mb, keys, mut bindings, uniform } =
-        entry_module(cx, iface.clone(), Entry::Compute(wg));
+        entry_module(cx, iface.clone(), Entry::Compute(wg), Some(consts));
     let entry = entry_function(&mut mb, &keys[0], name, None, None);
     cx.drain(&mut mb);
     check_recursion(cx, &mb);
@@ -2877,18 +2903,17 @@ fn lower_compute(cx: &mut Cx, iface: Rc<Interface>) -> Option<PipelineOut> {
         debug_flag: None,
         targets: Vec::new(),
         instances,
-        constants: Vec::new(),
     })
 }
 
-fn lower_render(cx: &mut Cx, iface: Rc<Interface>) -> Option<PipelineOut> {
+fn lower_render(cx: &mut Cx, iface: Rc<Interface>, consts: Vec<ir::Const>) -> Option<PipelineOut> {
     let checked = cx.checked;
     let [vertex, fragment] = &iface.entries[..] else { return None };
     let vret = iface.vertex_ret?;
     let vdef = checked.program.func(vertex.func);
     let fdef = checked.program.func(fragment.func);
     let EntryModule { mut mb, keys, mut bindings, uniform } =
-        entry_module(cx, iface.clone(), Entry::Vertex);
+        entry_module(cx, iface.clone(), Entry::Vertex, Some(consts));
     let vret_ir = cx.lower_ty(&mut mb, vret, vdef.sig_span)?;
     let ventry = entry_function(&mut mb, &keys[0], &vdef.name, Some(vret_ir), None);
     cx.drain(&mut mb);
@@ -2961,7 +2986,6 @@ fn lower_render(cx: &mut Cx, iface: Rc<Interface>) -> Option<PipelineOut> {
         debug_flag: None,
         targets: Vec::new(),
         instances,
-        constants: Vec::new(),
     })
 }
 
@@ -3136,12 +3160,17 @@ pub(crate) fn bind_entry_params(fl: &mut Fl, func: FnId, entry: Entry) {
                 entry_group(fl, &at, &[], *t, b.as_ref())
             }
             ParamClass::Uniform => at.uniform_repr(&[]),
-            // A `const` parameter: the module's override of its index.
+            // A `const` parameter: its pipeline's value, or the module's override of its index.
             ParamClass::Const => {
                 let Some(it) = fl.cx.lower_ty(fl.mb, *t, p.span) else { continue };
                 let k = iface.consts.iter().position(|l| (l.entry, l.param) == (e, i));
                 let Some(k) = k else { continue };
-                Repr::Var(fl.bind_local(&p.name, it, ir::Expr::Override(k as u32)))
+                let folded = fl.mb.gpu.as_ref().and_then(|g| g.consts.as_ref()?.get(k).cloned());
+                let value = match folded {
+                    Some(c) => ir::Expr::Const(c),
+                    None => ir::Expr::Override(k as u32),
+                };
+                Repr::Var(fl.bind_local(&p.name, it, value))
             }
             ParamClass::Varyings if entry == Entry::Fragment => {
                 let Some(it) = fl.cx.lower_ty(fl.mb, *t, p.span) else { continue };
@@ -3423,7 +3452,7 @@ pub(crate) fn check_standalone(cx: &mut Cx, f: FnId, entry: Option<Entry>, subst
             if let Entry::Compute(wg) = stage {
                 check_subgroup_invocation(cx, &iface, wg);
             }
-            let EntryModule { mut mb, keys, .. } = entry_module(cx, iface.clone(), stage);
+            let EntryModule { mut mb, keys, .. } = entry_module(cx, iface.clone(), stage, None);
             let ret = match stage {
                 Entry::Compute(_) => None,
                 Entry::Vertex | Entry::Fragment => {

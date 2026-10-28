@@ -263,9 +263,9 @@ let e = Edit::Dig { at: vec3(), radius: 1.5 }
 
 ### 3.4 Traits and impls
 
-A trait declares methods and associated types; a type gets a trait through an `impl`, or by declaring a structural or `@fieldwise` trait that the compiler derives.
+A trait declares methods, associated types and associated constants; a type gets a trait through an `impl`, or by declaring a structural or `@fieldwise` trait that the compiler derives.
 
-- **Traits have associated types and default methods.**
+- **Traits have associated types, associated constants and default methods.**
 - **An impl gives what its trait declares, and nothing else:**
   - its methods take the trait's parameter defaults, and can't declare their own (E0405);
   - associated types belong to traits, not to inherent impls (E0402);
@@ -274,6 +274,37 @@ A trait declares methods and associated types; a type gets a trait through an `i
 - **Coherence follows Rust's orphan rule:** an `impl` lives in the package of the trait or of the type, and std is another package.
   - `Copy`, `Clone` and `GpuData` aren't implemented with an `impl`: a type opts in to them in its declaration.
   - An impl for every closure or function of one signature, `impl<F: Copy + GpuData + fn(vec3) -> f32> Shape for F`, applies to just those. A closure whose signature doesn't fit, or a struct, doesn't have the trait, so the impl doesn't conflict with one for a struct.
+- **An associated constant** is declared in a trait as `const K: u32`, with an optional default (`const ON: bool = true`), and given in an impl as `const K: u32 = 4`; an inherent impl may hold one too (`impl<S: Taps> Frame<S> { const N: u32 = S::K * 2 }`).
+  - It's read as `X::K`, `Self::K`, or under a bound `S: Taps` as `S::K`: a constant of each instantiation, since generic code is monomorphized (§7). Its value is folded where it's used, so a branch on `S::ON` costs an instantiation whose `ON` is `false` nothing.
+  - Its type is a `bool`, `u32`, `i32`, `f32`, an enum whose variants hold nothing, or a `Text` (E0420). Larger values belong in a `const` item (§3.5), which a method can name.
+  - An impl gives each constant its trait declares without a default (E0401), and no other (E0402); it isn't a function, so `S::K()` is E0420.
+  - An entry point's `const` argument may be one (`blur.bind(taps: S::K)`, §18.1): each instantiation's value is a pipeline of its own. There, its initializer must fold: literals, constants, other associated constants, `const` generic parameters, arithmetic, comparisons and `if` (E0603 otherwise).
+
+```wrela
+use std::gpu::{GlobalId, GpuBuffer, Slots, dispatch}
+
+trait Taps {
+    const TAPS: u32
+    const HEAVY: bool = true
+}
+
+struct Narrow {}
+
+impl Taps for Narrow {
+    const TAPS: u32 = 2
+    const HEAVY: bool = false
+}
+
+@compute(64)
+fn blur(out: mut Slots<f32>, id: GlobalId, taps: const u32, heavy: const bool) {
+    out[id] = if heavy { f32(taps) * 2.0 } else { f32(taps) }
+}
+
+fn run<S: Taps>(out: mut GpuBuffer<f32>) {
+    dispatch(blur.bind(out: mut out, taps: S::TAPS, heavy: S::HEAVY), groups: 1)   // a pipeline per `S`
+}
+```
+
 - **`==` and ordering come from declared traits.** A type that declares `Eq` gets `==` and `!=`, and one that declares `Ord` gets `<`, `<=`, `>` and `>=`. Both are fieldwise (below): fields compare in order, and an enum's variants compare in the order they're declared. Without `Eq`, `==` works only on numbers, `bool`, vectors and enums whose variants hold nothing, which compare by variant (E0305).
 
 #### Fieldwise traits
@@ -2136,7 +2167,7 @@ An entry point is a kernel or shader, marked `@compute(x, y, z)`, `@vertex` or `
 - a kernel's outputs (§18.4);
 - for a fragment shader, the vertex shader's output, and `mut Atomics<T>`, for example to count what it shades in a test. WebGPU gives a vertex shader no writable buffers, so a vertex shader's `mut Atomics<T>` is E0602.
 
-**`const` parameters**: an entry point's parameter may be `const`, a `bool`, `u32`, `i32` or `f32` written `taps: const u32`. Its value is the pipeline's, not the command's: each set of values an entry point is recorded with is a pipeline of its own, and its value is a WGSL pipeline-overridable constant (`override taps: u32;`, without an `@id`), which the host sets by name when it makes the pipeline (the manifest's `"constants": {"taps": 4}`). Inside the entry point it's an ordinary value, and a branch on it is a branch on a constant, which the driver's compiler drops where it makes the pipeline: a `Quality` switch that's a `const` parameter costs its shader nothing when off. The argument is a literal, a negated literal or a `const` item that holds one, written where the entry point is bound for the command, `dispatch(blur.bind(out: mut o, taps: 4), groups: n)` (E0603 for any other value, and for binding the entry point to a value of its own, `let k = blur.bind(...)`: the command names its pipeline). Only an entry point's parameter is `const`, and only of those four types (E0602). `wrela pipelines` lists each set as an instantiation, `blur::<taps = 4>`.
+**`const` parameters**: an entry point's parameter may be `const`, a `bool`, `u32`, `i32` or `f32` written `taps: const u32`. Its value is the pipeline's, not the command's: each set of values an entry point is recorded with is a pipeline of its own, and its shader is written with the value in place, so a branch on it is a branch on a constant, which the compiler folds: a `Quality` switch that's a `const` parameter leaves its shader no code when off, and the shader has no pipeline-overridable constant to set. The argument is a literal, a negated literal, a `const` item that holds one, or an associated constant (§3.4: `S::K` under a bound, folded for each instantiation), written where the entry point is bound for the command, `dispatch(blur.bind(out: mut o, taps: 4), groups: n)` (E0603 for any other value, and for binding the entry point to a value of its own, `let k = blur.bind(...)`: the command names its pipeline). Only an entry point's parameter is `const`, and only of those four types (E0602). `wrela pipelines` lists each set as an instantiation, `blur::<taps = 4>`.
 
 ```wrela
 @compute(64)
@@ -3088,6 +3119,7 @@ Each rule of the conformance suite (`compiler/tests/conformance`), with what it 
 | `enum.match` | An enum's variants hold payloads, and a `match` on it is exhaustive | §3.3 |
 | `enum.discriminants` | An enum whose variants hold nothing numbers them: `u32(e)`, `E::from_u32(n)`, `Flags<E>` | §3.3 |
 | `trait.items` | A trait has associated types and default methods, and an impl gives what its trait declares | §3.4 |
+| `trait.assoc-const` | A trait's associated constant, with an optional default, is given by each impl, read as `S::K`, and folded per instantiation | §3.4 |
 | `trait.orphan` | An impl lives in the package of its trait or of its type | §3.4 |
 | `trait.eq-ord` | `==` and `<` come from a declared `Eq` and `Ord` | §3.4 |
 | `trait.fieldwise` | A `@fieldwise` trait is derived field by field for each type that declares it | §3.4 |

@@ -394,7 +394,7 @@ fn add_item(index: &mut Index, s: &Source, item: &ast::Item) {
                 .iter()
                 .filter_map(|m| match &m.kind {
                     TraitMemberKind::Fn(f) => f.body.as_ref().map(|b| b.span),
-                    TraitMemberKind::Type { .. } => None,
+                    TraitMemberKind::Type { .. } | TraitMemberKind::Const(_) => None,
                 })
                 .collect();
             ("trait", elide(s, item.span, &holes))
