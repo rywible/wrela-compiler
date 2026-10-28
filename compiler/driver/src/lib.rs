@@ -12,6 +12,7 @@ pub mod build;
 pub use wrela_wasm::DataReport;
 pub mod const_cache;
 pub mod consts;
+pub use consts::ConstRun;
 pub mod edit;
 pub mod explain;
 mod frames;
@@ -81,6 +82,9 @@ pub struct PipelineSummary {
     /// (`wrela_sema::mir::control`): its pipeline is in the build however rarely it holds.
     /// Empty unless the compile was [`check_pipelines`].
     pub conditional: Vec<bool>,
+    /// A render pipeline's colour attachments' bytes a sample, the most of its targets'
+    /// (WebGPU's count, within its 32: §18); `None` for a compute pipeline.
+    pub attachment_bytes: Option<u32>,
 }
 
 impl PipelineSummary {
@@ -176,6 +180,32 @@ pub fn check_pipelines(root: &Path) -> Output {
     on_compiler_thread(|| compile(root, mode, wrela_lower::Roots::of, &[]))
 }
 
+/// [`check_pipelines`], with the program's constants `set` names given its values (`wrela
+/// pipelines --set`).
+pub fn check_pipelines_set(root: &Path, set: &[(String, String)]) -> Output {
+    let mode = Mode { conditions: true, ..Mode::CHECK };
+    on_compiler_thread(|| compile_set(root, mode, set))
+}
+
+/// A build of the package at `root` ([`build`]; a debug or test build as `kind` says, or with
+/// relaxed SIMD) with the program's root-module constants `set` names given its values (`wrela
+/// build --set NAME=VALUE`, language.md §13), which its manifest records.
+pub fn build_set(
+    root: &Path,
+    kind: BuildKind,
+    relaxed_simd: bool,
+    set: &[(String, String)],
+) -> Output {
+    let mode = Mode { debug: kind.debug, testing: kind.testing, relaxed_simd, ..Mode::RELEASE };
+    on_compiler_thread(|| compile_set(root, mode, set))
+}
+
+/// [`compile`] with constants set.
+fn compile_set(root: &Path, mode: Mode, set: &[(String, String)]) -> Output {
+    let scope = Scope { set: set.to_vec(), ..Scope::default() };
+    compile_scoped(root, mode, wrela_lower::Roots::of, &[], &Overlay::new(), &scope)
+}
+
 /// Files' texts that stand in for what's on disk, by their canonical paths: for checking a
 /// change before it's written (`wrela refactor`).
 pub type Overlay = std::collections::HashMap<std::path::PathBuf, String>;
@@ -242,10 +272,16 @@ pub struct BuildKind {
 /// which says where each literal is and why any float literal of those packages isn't lifted.
 /// `kind` makes it a debug build, a test build, or both. An error if a name isn't one of the
 /// program's packages.
-pub fn build_lifted(root: &Path, lift: &[String], kind: BuildKind) -> Result<Output, String> {
-    // Unscoped, [`build_in`]'s only error is its `lift:` one, which the command line names
-    // `--lift`.
-    build_in(root, kind, true, lift, &Scope::default()).map_err(|e| format!("--{e}"))
+pub fn build_lifted(
+    root: &Path,
+    lift: &[String],
+    kind: BuildKind,
+    set: &[(String, String)],
+) -> Result<Output, String> {
+    // Never cancelled, [`build_in`]'s only error is its `lift:` one, which the command line
+    // names `--lift`.
+    let scope = Scope { set: set.to_vec(), ..Scope::default() };
+    build_in(root, kind, true, lift, &scope).map_err(|e| format!("--{e}"))
 }
 
 /// What a compile reaches beyond its package, and what stops it: where it may read, where it
@@ -265,6 +301,9 @@ pub struct Scope {
     /// Set to stop the compile: it stops at its next phase (loading, checking, constants,
     /// lowering a role, emitting) with [`CANCELLED`].
     pub cancel: Option<Arc<std::sync::atomic::AtomicBool>>,
+    /// The program's root-module constants given other values, by name (`wrela build --set
+    /// NAME=VALUE`, language.md §13): the manifest records them.
+    pub set: Vec<(String, String)>,
 }
 
 /// What a cancelled compile gives ([`Scope::cancel`]).
@@ -848,9 +887,21 @@ fn compile_with(
     lift: &[String],
     overlay: &Overlay,
 ) -> Output {
+    compile_scoped(root, mode, roots, lift, overlay, &Scope::default())
+}
+
+/// [`compile_with`] within `scope`, which never cancels it (its sets, say).
+fn compile_scoped(
+    root: &Path,
+    mode: Mode,
+    roots: fn(&wrela_sema::Checked) -> wrela_lower::Roots,
+    lift: &[String],
+    overlay: &Overlay,
+    scope: &Scope,
+) -> Output {
     let loaded = load_with(root, overlay);
-    compile_loaded_in(root, mode, roots, lift, loaded, &Scope::default())
-        .expect("an unscoped compile isn't cancelled")
+    compile_loaded_in(root, mode, roots, lift, loaded, scope)
+        .expect("a compile with no cancel isn't cancelled")
 }
 
 /// A compile of the program [`load_scoped`] read, within `scope`, which may cancel it between
@@ -895,7 +946,7 @@ fn compile_loaded_in(
         })
         .map(|(f, _, path)| (*f, lift::relative(path, root)))
         .collect();
-    let checked = wrela_sema::check_packages(units, &packages, &mut diagnostics);
+    let checked = wrela_sema::check_packages_set(units, &packages, &scope.set, &mut diagnostics);
     scope.stop()?;
     let mut files = Vec::new();
     let mut pipelines = Vec::new();
@@ -955,7 +1006,15 @@ fn compile_loaded_in(
             let budgets = !(mode.debug || mode.no_simd || mode.testing) && lift.is_empty();
             let tier1: Vec<bool> = pipelines.iter().map(|p| p.tier() == 1).collect();
             let relaxed = mode.relaxed_simd && !data.no_simd;
-            let out = build::emit(&lowered, &sources, !data.no_simd, budgets, &tier1, relaxed);
+            let out = build::emit(
+                &lowered,
+                &sources,
+                !data.no_simd,
+                budgets,
+                &tier1,
+                relaxed,
+                &scope.set,
+            );
             diagnostics.extend(out.diagnostics);
             files.extend(out.files);
             files.append(&mut shipped_files);
@@ -1161,6 +1220,13 @@ fn summarize(
                 sites,
                 conditional: commands.as_ref().map_or_else(Vec::new, |c| {
                     out.sites.iter().map(|s| conditional(c, s)).collect()
+                }),
+                attachment_bytes: (kind == "render").then(|| {
+                    let bytes = |t: &wrela_abi::manifest::RenderTarget| {
+                        let colors: Vec<_> = t.colors().collect();
+                        wrela_abi::stream::color_attachment_bytes(&colors)
+                    };
+                    out.targets.iter().map(bytes).max().unwrap_or(0)
                 }),
             }
         })

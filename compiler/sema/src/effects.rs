@@ -164,6 +164,14 @@ pub fn check(p: &Program, mir: &BTreeMap<FnId, Body>) -> (Vec<Diagnostic>, Direc
                 format!("`{}` is a constant, which the build computes", def.name),
             ));
         }
+        // An associated constant is folded where it's read, so it reads the same each time
+        // (§3.4): nothing it does may be seen, not even a line printed.
+        if def.attrs.assoc_const {
+            contexts.push((
+                ASSOC_CONST,
+                format!("`{}` is an associated constant, the same wherever it's read", def.name),
+            ));
+        }
         // A tool test runs on the tool host, which has its services (§13.2).
         if def.attrs.test.is_some() && def.attrs.test_tool.is_none() {
             contexts
@@ -537,6 +545,11 @@ const AUDIO: &[Effect] =
 /// `@deterministic` code, a constant, and what runs on several workers at once. A replayed tick
 /// mustn't touch storage either: requests are `io` (§17.1).
 pub const DETERMINISTIC: &[Effect] = &[Effect::Io, Effect::Nondet, Effect::Host];
+/// An associated constant (§3.4), read wherever it's used rather than computed by the build:
+/// what a constant can't do, nor print or time a phase, nor recurse (a cycle of constants)
+/// nor panic (which a constant's build would report).
+const ASSOC_CONST: &[Effect] =
+    &[Effect::Io, Effect::Nondet, Effect::Host, Effect::Trace, Effect::Recursion, Effect::Panic];
 /// What's derived can't allocate, do IO, be non-deterministic or call the host (§14).
 const DERIVED: &[Effect] =
     &[Effect::Alloc, Effect::Io, Effect::Trace, Effect::Nondet, Effect::Host];

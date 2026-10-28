@@ -334,7 +334,7 @@ pub struct Call {
 #[derive(Clone, Debug)]
 pub enum Shader {
     /// Its generic arguments, and its `const` parameters' values (`thir::Shader::Named`).
-    Named(FnId, Vec<TyId>, Vec<(usize, crate::thir::ConstArg)>),
+    Named(FnId, Vec<TyId>, Vec<(usize, crate::thir::ConstSrc)>),
     Value(Place, Span),
 }
 
@@ -534,6 +534,9 @@ pub enum TerminatorKind {
     Match {
         arms: Vec<BlockId>,
         merge: BlockId,
+        /// The one arm a `match` on a constant takes, where its value says which (`build::
+        /// arm_of_const`): lowering builds that arm alone (§13).
+        taken: Option<u32>,
     },
     /// Names the `Match` block.
     ArmMatched(BlockId),
@@ -587,7 +590,7 @@ impl FnBody {
                 TerminatorKind::Loop { continuing, .. } => one(*continuing),
                 _ => [None, None],
             },
-            TerminatorKind::Match { arms, merge } => one(*arms.first().unwrap_or(merge)),
+            TerminatorKind::Match { arms, merge, .. } => one(*arms.first().unwrap_or(merge)),
             TerminatorKind::ArmMatched(m) => match &self.block(*m).term.kind {
                 TerminatorKind::Match { merge, .. } => one(*merge),
                 _ => [None, None],

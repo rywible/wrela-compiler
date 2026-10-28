@@ -509,6 +509,21 @@ impl Program {
     }
 
     /// The package module `m` is in.
+    /// Whether `t` is a type a build folds as a constant: an associated constant's (§3.4) and a
+    /// `--set` constant's (§3.5): a `const` parameter's scalar, an enum whose variants hold
+    /// nothing, or a `Text`. An error type is, so it isn't reported again.
+    pub fn is_build_constant_ty(&self, t: TyId) -> bool {
+        match self.types.kind(t) {
+            TyKind::Error => true,
+            &TyKind::Adt(a, _) => {
+                let adt = self.adt(a);
+                (adt.is_enum() && adt.variants().iter().all(|v| v.fields.is_empty()))
+                    || Some(a) == self.lang_adt(Lang::Text)
+            }
+            _ => crate::gpu::is_const_param_ty(self, t),
+        }
+    }
+
     pub fn package_of(&self, m: ModuleId) -> &PackageDef {
         &self.packages[self.modules[m.index()].package.index()]
     }

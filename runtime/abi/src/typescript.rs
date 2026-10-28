@@ -83,6 +83,8 @@ pub fn typescript() -> String {
 
 export const STREAM_VERSION = {stream_version};
 export const MANIFEST_VERSION = {manifest_version};
+/** The version before, which this host reads too: its pipelines may name `constants`. */
+export const LEGACY_MANIFEST_VERSION = {legacy_manifest_version};
 /** The bytes `WRCS`, read as a little-endian u32. */
 export const STREAM_MAGIC = 0x{magic:08x};
 export const HEADER_LEN = {header_len};
@@ -286,6 +288,7 @@ export const PANIC_CAP = {panic_cap};
             .collect::<String>(),
         max_color_attachments = stream::MAX_COLOR_ATTACHMENTS,
         manifest_version = manifest::VERSION,
+        legacy_manifest_version = manifest::LEGACY_VERSION,
         magic = u32::from_le_bytes(stream::MAGIC),
         header_len = stream::HEADER_LEN,
         command_header_len = stream::COMMAND_HEADER_LEN,

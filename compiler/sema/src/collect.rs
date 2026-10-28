@@ -466,7 +466,12 @@ impl<'d, 'u> Collector<'d, 'u> {
                     if let ast::TraitMemberKind::Type { .. } = &member.kind {
                         self.attrs_not_on_fn(&member.attrs);
                     }
-                    if let ast::TraitMemberKind::Fn(f) = &member.kind {
+                    let (f, konst) = match &member.kind {
+                        ast::TraitMemberKind::Fn(f) => (Some(f), false),
+                        ast::TraitMemberKind::Const(c) => (Some(&c.func), true),
+                        ast::TraitMemberKind::Type { .. } => (None, false),
+                    };
+                    if let Some(f) = f {
                         if let Some(prev) = methods
                             .iter()
                             .find(|(_, g): &&(FnId, &ast::FnDecl)| g.name.name == f.name.name)
@@ -484,6 +489,7 @@ impl<'d, 'u> Collector<'d, 'u> {
                         }
                         let vis = Vis { public: true, ..vis };
                         let fid = self.new_fn(m, FnOwner::Trait(id), f, vis, &member.attrs, is_std);
+                        self.p.fns[fid.index()].attrs.assoc_const = konst;
                         methods.push((fid, f));
                     }
                 }
@@ -506,14 +512,18 @@ impl<'d, 'u> Collector<'d, 'u> {
                 });
                 let mut methods = Vec::new();
                 for member in &i.members {
-                    if let ast::ImplMemberKind::Fn(f) = &member.kind {
-                        let vis = Vis {
-                            public: member.vis.is_some() || i.trait_.is_some(),
-                            ..Vis::of(&member.vis)
-                        };
-                        let fid = self.new_fn(m, FnOwner::Impl(id), f, vis, &member.attrs, is_std);
-                        methods.push((fid, f));
-                    }
+                    let (f, konst) = match &member.kind {
+                        ast::ImplMemberKind::Fn(f) => (f, false),
+                        ast::ImplMemberKind::Const(c) => (&c.func, true),
+                        ast::ImplMemberKind::Type { .. } => continue,
+                    };
+                    let vis = Vis {
+                        public: member.vis.is_some() || i.trait_.is_some(),
+                        ..Vis::of(&member.vis)
+                    };
+                    let fid = self.new_fn(m, FnOwner::Impl(id), f, vis, &member.attrs, is_std);
+                    self.p.fns[fid.index()].attrs.assoc_const = konst;
+                    methods.push((fid, f));
                 }
                 self.p.impls[id.index()].methods = methods.iter().map(|(f, _)| *f).collect();
                 self.pending.push((m, PendingItem::Impl(id, i, methods)));
@@ -2874,6 +2884,18 @@ impl<'d, 'u> Collector<'d, 'u> {
         } else {
             ret
         };
+        if self.p.func(id).attrs.assoc_const && !self.p.is_build_constant_ty(ret) {
+            let shown = self.p.display_ty(ret);
+            self.diags.push(
+                Diagnostic::new(
+                    codes::E0420,
+                    f.sig_span,
+                    format!("the associated constant `{}` is a `{shown}`", f.name.name),
+                )
+                .with_note("an associated constant is a `bool`, `u32`, `i32`, `f32`, an enum whose variants hold nothing, or a `Text`: a value folded where it's used")
+                .with_help("keep a larger value in a `const` item, and name it from a method"),
+            );
+        }
         let def = &mut self.p.fns[id.index()];
         def.generics.extend(implicit);
         def.params = params;
@@ -3586,6 +3608,23 @@ fn check_members(
                     .with_help(format!("add `fn {}` to the impl, or remove the impl and declare the trait on the type", tdef.name)),
                 );
             }
+            None if tdef.body.is_none() && !imp.from_opt_in && tdef.attrs.assoc_const => {
+                diags.push(
+                    Diagnostic::new(
+                        codes::E0401,
+                        imp.span,
+                        format!(
+                            "this impl of `{}` is missing `const {}`, which `{}` declares without a default",
+                            tr.name, tdef.name, tr.name
+                        ),
+                    )
+                    .with_secondary(tdef.sig_span, "declared here")
+                    .with_help(match p.text(tdef.sig_span) {
+                        Some(sig) => format!("add it to the impl: `{sig} = ...`"),
+                        None => format!("add `const {}` to the impl", tdef.name),
+                    }),
+                );
+            }
             None if tdef.body.is_none() && !imp.from_opt_in => {
                 diags.push(
                     Diagnostic::new(
@@ -3601,6 +3640,24 @@ fn check_members(
                 );
             }
             None => {}
+            Some(f) if p.func(f).attrs.assoc_const != tdef.attrs.assoc_const => {
+                let (is, declared) = if tdef.attrs.assoc_const {
+                    ("a function", "a constant")
+                } else {
+                    ("a constant", "a function")
+                };
+                diags.push(
+                    Diagnostic::new(
+                        codes::E0405,
+                        p.func(f).sig_span,
+                        format!(
+                            "`{}` is {is} here, and `{}` declares {declared}",
+                            tdef.name, tr.name
+                        ),
+                    )
+                    .with_secondary(tdef.sig_span, "the trait declares it here"),
+                );
+            }
             Some(f) => compare_signatures(p, diags, f, tm, &trait_subst, imp),
         }
     }
@@ -3611,7 +3668,12 @@ fn check_members(
                 Diagnostic::new(
                     codes::E0402,
                     def.name_span,
-                    format!("`{}` has no method `{}`", tr.name, def.name),
+                    format!(
+                        "`{}` has no {} `{}`",
+                        tr.name,
+                        if def.attrs.assoc_const { "constant" } else { "method" },
+                        def.name
+                    ),
                 )
                 .with_help("move it to an inherent `impl` block"),
             );

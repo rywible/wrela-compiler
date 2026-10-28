@@ -16,7 +16,7 @@ use std::sync::{Arc, Mutex};
 use wrela_diag::{Diagnostic, SourceMap, Span, codes};
 use wrela_lower::{BuildData, ConstLowering, Embeds, Memory};
 use wrela_sema::Checked;
-use wrela_sema::ty::ConstId;
+use wrela_sema::ty::{ConstId, TyId, TyKind};
 
 /// How much work computing one constant may do: wasmtime's fuel, about one unit per WASM
 /// instruction. A computation that goes past it is a compile error, not a hang. About 17 billion
@@ -82,6 +82,23 @@ pub struct ConstStats {
     /// What each computed constant that printed or timed a phase did (§8's `trace`), by name:
     /// its lines were shown as they were made.
     pub traced: Vec<(String, wrela_host::Traced)>,
+    /// Each computed constant, in the order the build reached it (`wrela build --report
+    /// consts`).
+    pub runs: Vec<ConstRun>,
+}
+
+/// One computed constant, as `wrela build --report consts` shows it.
+#[derive(Clone, Debug, PartialEq)]
+pub struct ConstRun {
+    pub name: String,
+    /// Its entry's bytes in the cache.
+    pub bytes: u64,
+    /// The fuel computing it used (from the cache: when it was computed).
+    pub fuel: u64,
+    /// The seconds this build spent on it: computing it, or reading it from the cache.
+    pub seconds: f64,
+    /// Whether it was read from the cache.
+    pub cached: bool,
 }
 
 /// Computes the program's computed constants into `data` (whose files `embed` reads are
@@ -112,7 +129,19 @@ pub fn compute(
         .map(|c| (c, BTreeSet::new()))
         .collect();
     let mut failed = BTreeSet::new();
+    // Each embedded file's digest for the keys, once a build.
+    let mut digests: std::collections::HashMap<std::sync::Arc<str>, [u8; 32]> =
+        std::collections::HashMap::new();
     let simd = !data.no_simd;
+    // The build's options that change what CPU code does, in every key.
+    let options = format!(
+        "debug={} testing={} simd={simd} relaxed={} role={:?} lifted={}",
+        data.debug,
+        data.testing,
+        data.relaxed_simd,
+        data.role,
+        data.lift.is_some()
+    );
     while !pending.is_empty() && !cancelled() {
         // Each constant in a module of its own, which holds only what it reads: its key. Those
         // that need a constant still to compute wait for the next round.
@@ -157,21 +186,44 @@ pub fn compute(
                 break;
             }
             let fuel = checked.program.const_(c).fuel.unwrap_or(FUEL);
+            let started = std::time::Instant::now();
+            let name = checked.program.const_(c).name.clone();
+            let ran = |stats: &mut ConstStats, bytes, used, cached| {
+                stats.runs.push(ConstRun {
+                    name: name.clone(),
+                    bytes,
+                    fuel: used,
+                    seconds: started.elapsed().as_secs_f64(),
+                    cached,
+                })
+            };
             // The key is the module's WASM, so the cache is read before wasmtime compiles it:
             // a constant read from the cache isn't compiled at all.
             let result = match emit(&module.module, simd, true) {
                 Err(msg) => Err(Diagnostic::internal(msg)),
                 Ok(out) => {
-                    let key = const_cache::key(&out.wasm, fuel);
+                    let embeds = module.embeds.iter().filter_map(|path| {
+                        let bytes = data.embeds.get(path)?;
+                        let d = *digests
+                            .entry(path.clone())
+                            .or_insert_with(|| const_cache::digest(bytes));
+                        Some((path.as_ref(), d))
+                    });
+                    // How its value is read back is part of what it is: an enum's variants are
+                    // cached by index, which a reordering moves (the WASM may not change).
+                    let schema = checked.consts.get(&c).map(|(t, _)| schema(checked, *t));
+                    let options = format!("{options} schema={}", schema.unwrap_or_default());
+                    let inputs = const_cache::inputs(&options, embeds);
+                    let key = const_cache::key(&out.wasm, fuel, &inputs);
                     match const_cache::get_in(cache, &key) {
-                        Some(v) => {
+                        Some((e, bytes)) => {
                             stats.cached += 1;
-                            Ok(v)
+                            ran(&mut stats, bytes, e.fuel, true);
+                            Ok(e.value)
                         }
                         None => {
                             stats.computed += 1;
                             let export = &module.exports[0].1;
-                            let name = checked.program.const_(c).name.clone();
                             let trace = wrela_host::Trace::new(Some(format!("{name}: ")));
                             let r = Compiled::of(engine(stop.is_some()), out)
                                 .map_err(|msg| Box::new(Diagnostic::internal(msg)))
@@ -187,9 +239,9 @@ pub fn compute(
                                         stop.as_ref(),
                                     )
                                 })
-                                .map(|(v, helped)| {
+                                .map(|(v, helped, used)| {
                                     stats.helped += u64::from(helped);
-                                    v
+                                    (v, used)
                                 })
                                 .map_err(|d| *d);
                             let traced = trace.take();
@@ -197,12 +249,14 @@ pub fn compute(
                                 eprintln!("{name}'s phases: {}", traced.phases_line());
                             }
                             if !traced.is_empty() {
-                                stats.traced.push((name, traced));
+                                stats.traced.push((name.clone(), traced));
                             }
-                            if let Ok(v) = &r {
-                                const_cache::put_in(cache, &key, v);
-                            }
-                            r
+                            r.map(|(value, fuel)| {
+                                let entry = const_cache::Entry { value, fuel };
+                                let bytes = const_cache::put_in(cache, &key, &entry);
+                                ran(&mut stats, bytes, fuel, false);
+                                entry.value
+                            })
                         }
                     }
                 }
@@ -227,6 +281,58 @@ pub fn compute(
         const_cache::clean(dir);
     }
     (diags, stats)
+}
+
+/// How a value of type `t` is laid out and read back, as text: each type's fields and, for an
+/// enum, its variants with their discriminants, at every depth (a type met again is named).
+fn schema(checked: &Checked, t: TyId) -> String {
+    fn go(p: &wrela_sema::program::Program, t: TyId, seen: &mut Vec<TyId>, out: &mut String) {
+        use std::fmt::Write;
+        let _ = write!(out, "{}", p.display_ty(t));
+        if seen.contains(&t) {
+            return;
+        }
+        seen.push(t);
+        match p.types.kind(t) {
+            TyKind::Adt(a, args) => {
+                let adt = p.adt(*a);
+                if adt.is_enum() {
+                    for (i, v) in adt.variants().iter().enumerate() {
+                        let _ = write!(out, "|{}={}(", v.name, v.discriminant);
+                        for ft in p.fields_of(*a, args, Some(i as u32)) {
+                            go(p, ft, seen, out);
+                            out.push(',');
+                        }
+                        out.push(')');
+                    }
+                } else {
+                    out.push('{');
+                    for (d, ft) in p.adt_fields(*a, None).iter().zip(p.fields_of(*a, args, None)) {
+                        let _ = write!(out, "{}:", d.name);
+                        go(p, ft, seen, out);
+                        out.push(',');
+                    }
+                    out.push('}');
+                }
+            }
+            TyKind::Tuple(ts) => {
+                for &e in ts {
+                    out.push('(');
+                    go(p, e, seen, out);
+                    out.push(')');
+                }
+            }
+            &TyKind::Array(e, _) => {
+                out.push('[');
+                go(p, e, seen, out);
+                out.push(']');
+            }
+            _ => {}
+        }
+    }
+    let mut out = String::new();
+    go(&checked.program, checked.reveal(t), &mut Vec::new(), &mut out);
+    out
 }
 
 /// The engine for the code builds run (constants and tests): the native host's that counts
@@ -429,7 +535,7 @@ fn run_one(
     (c, fuel): (ConstId, u64),
     trace: &wrela_host::Trace,
     stop: Option<&wrela_host::Stop>,
-) -> Result<(wrela_lower::Value, u32), Box<Diagnostic>> {
+) -> Result<(wrela_lower::Value, u32, u64), Box<Diagnostic>> {
     let mut running = compiled
         .start(engine(stop.is_some()), true, trace, stop)
         .map_err(|m| Box::new(Diagnostic::internal(m)))?;
@@ -463,20 +569,22 @@ fn run_one(
         Ok(addr) if used <= fuel => {
             return running.read(|bytes| {
                 let mem = Memory { bytes };
-                wrela_lower::read_value(checked, c, &mem, addr).map(|v| (v, helped)).map_err(|e| {
-                    let def = checked.program.const_(c);
-                    Box::new(match e {
-                        wrela_lower::ReadError::TooDeep => Diagnostic::new(
-                            codes::E0704,
-                            def.span,
-                            format!("computing {} failed: {e}", def.shown()),
-                        ),
-                        _ => Diagnostic::internal(format!(
-                            "reading the value of `{}`: {e}",
-                            def.name
-                        )),
-                    })
-                })
+                wrela_lower::read_value(checked, c, &mem, addr).map(|v| (v, helped, used)).map_err(
+                    |e| {
+                        let def = checked.program.const_(c);
+                        Box::new(match e {
+                            wrela_lower::ReadError::TooDeep => Diagnostic::new(
+                                codes::E0704,
+                                def.span,
+                                format!("computing {} failed: {e}", def.shown()),
+                            ),
+                            _ => Diagnostic::internal(format!(
+                                "reading the value of `{}`: {e}",
+                                def.name
+                            )),
+                        })
+                    },
+                )
             });
         }
         // Its threads' work together was past its fuel.

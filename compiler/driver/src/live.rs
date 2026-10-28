@@ -248,7 +248,7 @@ impl Watcher {
             self.workspaces = inputs.workspaces;
             self.seen = self.look(&self.seen);
         }
-        let out = match crate::build_lifted(&self.pkg, &self.lift, self.kind) {
+        let out = match crate::build_lifted(&self.pkg, &self.lift, self.kind, &[]) {
             Ok(out) => out,
             Err(why) => return Change::Failed(why),
         };

@@ -60,6 +60,10 @@ pub const RULES: &[(&str, &str)] = &[
         "trait.items",
         "a trait has associated types and default methods, and an impl gives what its trait declares",
     ),
+    (
+        "trait.assoc-const",
+        "a trait's associated constant, with an optional default, is given by each impl, read as `S::K`, and folded per instantiation",
+    ),
     ("trait.orphan", "an impl lives in the package of its trait or of its type"),
     ("trait.eq-ord", "`==` and `<` come from a declared `Eq` and `Ord`"),
     (

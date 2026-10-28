@@ -208,6 +208,10 @@ macro_rules! lang_items {
                         | Lang::BeginPass2
                         | Lang::BeginPass3
                         | Lang::BeginPass4
+                        | Lang::BeginPass5
+                        | Lang::BeginPass6
+                        | Lang::BeginPass7
+                        | Lang::BeginPass8
                         | Lang::EndPass
                         | Lang::CopyTextureCommand
                         | Lang::CopyTextureToBufferCommand
@@ -293,6 +297,7 @@ macro_rules! lang_items {
                     Lang::Texture
                         | Lang::DepthTexture
                         | Lang::Texture3d
+                        | Lang::Texture3dHandle
                         | Lang::TextureArray
                         | Lang::Cubemap
                         | Lang::DepthTextureArray
@@ -316,23 +321,56 @@ macro_rules! lang_items {
 
             /// Whether it's an open pass's type: what a draw draws into.
             pub fn is_pass(self) -> bool {
-                matches!(
-                    self,
+                self.textures_pass().is_some()
+                    || matches!(
+                        self,
+                        Lang::DepthOnlyPass
+                            | Lang::ScreenPass
+                            | Lang::ScreenDepthPass
+                            | Lang::DepthLayerPass
+                    )
+            }
+
+            /// For an open pass into textures' colours (`Pass`, `LayerPass`, `Pass2` to `Pass8`
+            /// and their depth forms): whether it has a depth target.
+            pub fn textures_pass(self) -> Option<bool> {
+                match self {
                     Lang::Pass
-                        | Lang::DepthPass
-                        | Lang::DepthOnlyPass
-                        | Lang::ScreenPass
-                        | Lang::ScreenDepthPass
-                        | Lang::LayerPass
-                        | Lang::LayerDepthPass
-                        | Lang::DepthLayerPass
-                        | Lang::Pass2
-                        | Lang::Pass3
-                        | Lang::Pass4
-                        | Lang::DepthPass2
-                        | Lang::DepthPass3
-                        | Lang::DepthPass4
-                )
+                    | Lang::LayerPass
+                    | Lang::Pass2
+                    | Lang::Pass3
+                    | Lang::Pass4
+                    | Lang::Pass5
+                    | Lang::Pass6
+                    | Lang::Pass7
+                    | Lang::Pass8 => Some(false),
+                    Lang::DepthPass
+                    | Lang::LayerDepthPass
+                    | Lang::DepthPass2
+                    | Lang::DepthPass3
+                    | Lang::DepthPass4
+                    | Lang::DepthPass5
+                    | Lang::DepthPass6
+                    | Lang::DepthPass7
+                    | Lang::DepthPass8 => Some(true),
+                    _ => None,
+                }
+            }
+
+            /// For `begin_pass0_command` to `begin_pass8_command`: its colour targets.
+            pub fn begin_pass_targets(self) -> Option<u32> {
+                Some(match self {
+                    Lang::BeginPass0 => 0,
+                    Lang::BeginPass1 => 1,
+                    Lang::BeginPass2 => 2,
+                    Lang::BeginPass3 => 3,
+                    Lang::BeginPass4 => 4,
+                    Lang::BeginPass5 => 5,
+                    Lang::BeginPass6 => 6,
+                    Lang::BeginPass7 => 7,
+                    Lang::BeginPass8 => 8,
+                    _ => return None,
+                })
             }
 
             /// Whether it's workgroup memory: what the invocations of a kernel's workgroup share
@@ -409,12 +447,24 @@ lang_items! {
     Pass2 = "std::gpu::Pass2",
     Pass3 = "std::gpu::Pass3",
     Pass4 = "std::gpu::Pass4",
+    Pass5 = "std::gpu::Pass5",
+    Pass6 = "std::gpu::Pass6",
+    Pass7 = "std::gpu::Pass7",
+    Pass8 = "std::gpu::Pass8",
     DepthPass2 = "std::gpu::DepthPass2",
     DepthPass3 = "std::gpu::DepthPass3",
     DepthPass4 = "std::gpu::DepthPass4",
+    DepthPass5 = "std::gpu::DepthPass5",
+    DepthPass6 = "std::gpu::DepthPass6",
+    DepthPass7 = "std::gpu::DepthPass7",
+    DepthPass8 = "std::gpu::DepthPass8",
     Targets2 = "std::gpu::Targets2",
     Targets3 = "std::gpu::Targets3",
     Targets4 = "std::gpu::Targets4",
+    Targets5 = "std::gpu::Targets5",
+    Targets6 = "std::gpu::Targets6",
+    Targets7 = "std::gpu::Targets7",
+    Targets8 = "std::gpu::Targets8",
     Blend = "std::gpu::Blend",
     DrawMulti = "std::gpu::draw_multi",
     Present = "std::gpu::present",
@@ -460,6 +510,10 @@ lang_items! {
     BeginPass2 = "std::gpu::begin_pass2_command",
     BeginPass3 = "std::gpu::begin_pass3_command",
     BeginPass4 = "std::gpu::begin_pass4_command",
+    BeginPass5 = "std::gpu::begin_pass5_command",
+    BeginPass6 = "std::gpu::begin_pass6_command",
+    BeginPass7 = "std::gpu::begin_pass7_command",
+    BeginPass8 = "std::gpu::begin_pass8_command",
     CopyTextureCommand = "std::gpu::copy_texture_command",
     CopyTextureToBufferCommand = "std::gpu::copy_texture_to_buffer_command",
     CopyBufferToTextureCommand = "std::gpu::copy_buffer_to_texture_command",
@@ -499,6 +553,8 @@ lang_items! {
     DepthLoad = "std::gpu::depth_load",
     Texture3dSampleLevel = "std::gpu::texture3d_sample_level",
     Texture3dLoad = "std::gpu::texture3d_load",
+    Texture3dHandle = "std::gpu::Texture3dHandle",
+    Texture3dHandleLoad = "std::gpu::texture3d_handle_load",
     TextureWidth = "std::gpu::texture_width",
     TextureHeight = "std::gpu::texture_height",
     TextureDepth = "std::gpu::texture_depth",
@@ -989,6 +1045,9 @@ pub struct FnAttrs {
     pub job: Option<Span>,
     /// `@client`, `@server` or `@tool`: only that role's build may run it (§15.3).
     pub role: Option<(Role, Span)>,
+    /// An associated constant (`const K: u32 = 4`, §3.4), checked as the function that gives
+    /// its value: named without a call (`S::K`), and folded where a `const` argument needs it.
+    pub assoc_const: bool,
 }
 
 /// What a job's value holds (§16.3): where it stopped, and each local of its memory IR that owns

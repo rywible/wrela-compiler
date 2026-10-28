@@ -39,9 +39,10 @@ pub fn emit(
     budgets: bool,
     conditional: &[bool],
     relaxed: bool,
+    set: &[(String, String)],
 ) -> BuildOutput {
     let options = wrela_wasm::Options { simd, relaxed, ..Default::default() };
-    emit_in(l, sources, options, budgets, true, conditional)
+    emit_in(l, sources, options, budgets, true, conditional, set)
 }
 
 /// A server's or a tool's build's files (language.md §15.3): its module alone, at
@@ -60,7 +61,7 @@ pub fn emit_headless(
     let max_pages =
         if tool { wrela_abi::memory::TOOL_MAX_PAGES } else { wrela_abi::memory::MAX_PAGES };
     let options = wrela_wasm::Options { simd, shared_memory: tool, max_pages, relaxed: false };
-    let mut out = emit_in(l, sources, options, false, false, &[]);
+    let mut out = emit_in(l, sources, options, false, false, &[], &[]);
     out.files.retain(|(path, _)| path == "game.wasm");
     for (path, _) in &mut out.files {
         *path = module.to_string();
@@ -98,7 +99,7 @@ pub fn pair(
 /// A CPU frame test's files: its WASM and the manifest the host uses to check its commands.
 /// There are no shader or browser files; `CpuBuild`'s explicit CPU-only loaders read it.
 pub(crate) fn emit_for_cpu(l: &Lowered, sources: &SourceMap, simd: bool) -> BuildOutput {
-    emit_in(l, sources, wrela_wasm::Options { simd, ..Default::default() }, false, false, &[])
+    emit_in(l, sources, wrela_wasm::Options { simd, ..Default::default() }, false, false, &[], &[])
 }
 
 /// Where each of a module's code offsets came from (`wrela_wasm::Emitted::lines`).
@@ -130,6 +131,7 @@ fn emit_in(
     budgets: bool,
     shaders: bool,
     conditional: &[bool],
+    set: &[(String, String)],
 ) -> BuildOutput {
     let mut diagnostics = Vec::new();
     let mut files = Vec::new();
@@ -153,6 +155,7 @@ fn emit_in(
     }
     let mut manifest = wrela_abi::Manifest::new("game.wasm");
     manifest.wasm_abi = wasm_abi;
+    manifest.set = set.iter().cloned().collect();
     if let Some((wasm, abi)) = relaxed {
         files.push((RELAXED_WASM.to_string(), wasm));
         manifest.wasm_relaxed = Some(RELAXED_WASM.to_string());
@@ -241,23 +244,6 @@ fn emit_in(
                 "move work that its own pass can do there, or keep a big function a call (`ir::opt`)",
             ));
         }
-        // Each override's name as the WGSL writer wrote it, with its value from the pipeline's
-        // key; a CPU build's, as the module names it.
-        let names: Vec<String> = wgsl.as_ref().map_or_else(
-            || p.module.overrides.iter().map(|(n, _)| wrela_ir::ident(n)).collect(),
-            |w| w.overrides.clone(),
-        );
-        let constants = names
-            .into_iter()
-            .zip(&p.constants)
-            .map(|(name, &c)| {
-                let value = match c {
-                    wrela_sema::thir::ConstArg::Bool(b) => wrela_abi::manifest::Constant::Bool(b),
-                    c => wrela_abi::manifest::Constant::Number(c.number()),
-                };
-                (name, value)
-            })
-            .collect();
         if let Some(wgsl) = wgsl {
             files.push((shader.clone(), wgsl.text.into_bytes()));
         }
@@ -279,7 +265,7 @@ fn emit_in(
             debug_flag: p.debug_flag,
             requires,
             conditional: conditional.get(i).copied().unwrap_or(false),
-            constants,
+            constants: Vec::new(),
         });
     }
     if let Err(e) = manifest.validate() {
@@ -417,7 +403,7 @@ fn records_commands() {}
             let data = wrela_lower::BuildData::default();
             let (full, errors) = wrela_lower::lower(checked, &roots, &data, true);
             assert!(!wrela_diag::has_errors(&errors), "{errors:?}");
-            let out = emit(&full, sources, true, false, &[], false);
+            let out = emit(&full, sources, true, false, &[], false, &[]);
             let page = String::from_utf8(file(&out, "index.html").to_vec()).expect("UTF-8");
             let head = &page[..page.find("</head>").expect("a head")];
             for f in ["manifest.json", "game.wasm", "pipeline_0.wgsl", "pipeline_1.wgsl"] {
@@ -445,7 +431,7 @@ fn records_commands() {}
                 if debug {
                     assert!(full.pipelines.iter().any(|p| p.debug_flag.is_some()));
                 }
-                let full = emit(&full, sources, true, false, &[], false);
+                let full = emit(&full, sources, true, false, &[], false, &[]);
                 let cpu = emit_for_cpu(&cpu, sources, true);
                 assert!(!wrela_diag::has_errors(&full.diagnostics), "{:?}", full.diagnostics);
                 assert!(!wrela_diag::has_errors(&cpu.diagnostics), "{:?}", cpu.diagnostics);

@@ -1,0 +1,55 @@
+// accepts: trait.assoc-const
+// Associated constants: a trait's, with and without defaults, of every type one may have; an
+// impl's values; a generic impl's constant read from its parameter's; and a generic function
+// that reads them, each a constant of its instantiation.
+enum Mode {
+    Plain,
+    Fancy,
+}
+
+trait Taps {
+    const K: u32
+    const ON: bool = true
+    const GAIN: f32 = 0.5
+    const SHIFT: i32 = -2
+    const MODE: Mode = Mode::Plain
+    const NAME: Text = "taps"
+}
+
+struct Four {}
+
+impl Taps for Four {
+    const K: u32 = 4
+}
+
+struct Eight {}
+
+impl Taps for Eight {
+    const K: u32 = 8
+    const ON: bool = false
+    const MODE: Mode = Mode::Fancy
+}
+
+struct Frame<S> {
+    x: u32,
+}
+
+impl<S: Taps> Frame<S> {
+    pub const N: u32 = S::K * 2
+
+    fn n(self) -> u32 {
+        Self::N + self.x
+    }
+}
+
+fn sum<S: Taps>() -> u32 {
+    if S::ON { S::K } else { 100 + S::K }
+}
+
+pub fn main() -> u32 {
+    let mode = match Eight::MODE {
+        Mode::Fancy => 1,
+        Mode::Plain => 0,
+    }
+    sum::<Four>() + sum::<Eight>() + Frame::<Four> { x: 1 }.n() + Four::NAME.len() + mode
+}

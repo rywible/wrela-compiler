@@ -302,7 +302,7 @@ type Colours = (Vec<(Colour, Vec<u32>)>, bool);
 
 impl FragmentOutput {
     /// What a fragment shader returning `t` writes; `None` if it can't return `t`: a colour
-    /// ([`Colour::of`]); an `Over` (a `vec4` to blend); a `Targets2`, `Targets3` or `Targets4`
+    /// ([`Colour::of`]); an `Over` (a `vec4` to blend); a `Targets2` to `Targets8`
     /// of colours; or a `WithDepth` of any of those and a depth.
     pub fn of(p: &Program, t: TyId) -> Option<FragmentOutput> {
         let colours = |t: TyId, at: Vec<u32>| -> Option<Colours> {
@@ -315,7 +315,13 @@ impl FragmentOutput {
                     vec![(Colour { uint: false, components: 4 }, [at, vec![0]].concat())],
                     true,
                 )),
-                Lang::Targets2 | Lang::Targets3 | Lang::Targets4 => {
+                Lang::Targets2
+                | Lang::Targets3
+                | Lang::Targets4
+                | Lang::Targets5
+                | Lang::Targets6
+                | Lang::Targets7
+                | Lang::Targets8 => {
                     let mut out = Vec::new();
                     for (k, &a) in args.iter().enumerate() {
                         let c = Colour::of(p, a)?;
@@ -398,6 +404,62 @@ pub fn is_group(p: &Program, t: TyId) -> bool {
     matches!(p.types.kind(t), TyKind::Adt(a, _) if p.adt(*a).borrow && p.adt(*a).lang.is_none() && p.adt(*a).entry.is_none())
 }
 
+/// Whether GPU code takes a value of type `t` as its fields (§18): a group, or a struct that
+/// holds a texture's handle (a `Texture3dHandle`, §20.3: a field whose data is a texture), at
+/// any depth of its fields. The texture is bound beside the value, and the value's other fields
+/// are its uniforms, as a group's are. `t` is concrete.
+pub fn is_gpu_group(p: &Program, t: TyId) -> bool {
+    is_group(p, t) || holds_texture_handle(p, t, 0)
+}
+
+/// Whether `t` holds a `Texture3dHandle` in a tuple, an array or an enum (`within` one already),
+/// at any depth: there it can't be bound beside the value, since only a struct's fields are a
+/// group's (§20.3).
+pub fn hides_texture_handle(p: &Program, t: TyId, within: bool, depth: u32) -> bool {
+    if depth > 32 {
+        return false;
+    }
+    match p.types.kind(t) {
+        _ if p.lang_of_ty(t) == Some(Lang::Texture3dHandle) => within,
+        TyKind::Tuple(ts) => ts.iter().any(|&e| hides_texture_handle(p, e, true, depth + 1)),
+        &TyKind::Array(e, _) => hides_texture_handle(p, e, true, depth + 1),
+        TyKind::Adt(a, args) if p.adt(*a).lang.is_none() => {
+            let enumed = within || p.adt(*a).is_enum();
+            let variants = if p.adt(*a).is_enum() { p.adt(*a).variants().len() } else { 1 };
+            (0..variants).any(|v| {
+                let v = p.adt(*a).is_enum().then_some(v as u32);
+                p.fields_of(*a, args, v)
+                    .into_iter()
+                    .any(|ft| hides_texture_handle(p, ft, enumed, depth + 1))
+            })
+        }
+        _ => false,
+    }
+}
+
+/// E0602: an entry point's parameter `name`, of type `t`, holds a texture's handle where it
+/// can't be bound.
+pub fn hidden_handle(p: &Program, name: &str, t: TyId, span: Span) -> Diagnostic {
+    Diagnostic::new(
+        codes::E0602,
+        span,
+        format!("`{name}` holds a texture's handle in a tuple, an array or an enum (`{}`), where the texture can't be bound beside it", p.display_ty(t)),
+    )
+    .with_help("hold each handle in a struct's field, at any depth of structs: a parameter of its own for each")
+}
+
+/// Whether a struct of type `t`, or one of its fields', holds a `Texture3dHandle`.
+fn holds_texture_handle(p: &Program, t: TyId, depth: u32) -> bool {
+    let TyKind::Adt(a, args) = p.types.kind(t) else { return false };
+    let adt = p.adt(*a);
+    if adt.borrow || adt.lang.is_some() || adt.is_enum() || depth > 32 {
+        return false;
+    }
+    p.fields_of(*a, args, None).into_iter().any(|ft| {
+        p.lang_of_ty(ft) == Some(Lang::Texture3dHandle) || holds_texture_handle(p, ft, depth + 1)
+    })
+}
+
 /// What an entry point can't take in group `t`, reached as `path` (`lit.probes`): each field
 /// is a texture or sampler, borrowed; a `GpuSpan<T>` of `GpuData`; a `GpuData` value; or a
 /// group. A group passes what the GPU reads, so nothing in it is `mut`.
@@ -425,7 +487,8 @@ fn check_group(
                 .with_help("pass what the GPU writes as a parameter of its own"),
             );
         } else if lang.is_some_and(Lang::is_texture_or_sampler) {
-            if d.mode == RetMode::Owned {
+            // A handle is a value, and a group holds it so.
+            if d.mode == RetMode::Owned && lang != Some(Lang::Texture3dHandle) {
                 out.push(Diagnostic::new(
                     codes::E0602,
                     span,
@@ -526,7 +589,7 @@ fn check_entry(p: &Program, f: FnId, entry: Entry, out: &mut Vec<Diagnostic>) {
                 format!(
                     "{stage} returns a colour (an `f32`, `vec2`, `vec3`, `vec4`, or for an integer \
                      target a `u32`, `vec2u`, `vec3u` or `vec4u`), an `Over` colour to blend, a \
-                     `Targets2`, `Targets3` or `Targets4` of colours, or a `WithDepth` of one of \
+                     `Targets2` to `Targets8` of colours, or a `WithDepth` of one of \
                      those and a depth"
                 ),
             )
@@ -624,6 +687,9 @@ fn check_entry(p: &Program, f: FnId, entry: Entry, out: &mut Vec<Diagnostic>) {
             && !p.types.has_params(ps.ty);
         if passed && !crate::traits::implements_builtin(p, ps.ty, Lang::GpuData) {
             out.push(not_gpu_data(p, &ps.name, ps.ty, ps.span));
+        }
+        if !p.types.has_params(ps.ty) && hides_texture_handle(p, ps.ty, false, 0) {
+            out.push(hidden_handle(p, &ps.name, ps.ty, ps.span));
         }
         // A run is a buffer's elements, which cross to the GPU too.
         if let TyKind::Slice(elem) = *p.types.kind(ps.ty) {

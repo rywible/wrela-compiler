@@ -91,8 +91,6 @@ pub struct PipelineOut {
     pub targets: Vec<wrela_abi::manifest::RenderTarget>,
     /// The functions its module instantiates, with their type arguments (`wrela query`).
     pub instances: Vec<(FnId, Vec<TyId>)>,
-    /// The value of each of its module's overrides (`ir::Module::overrides`), from its key.
-    pub constants: Vec<ConstArg>,
 }
 
 /// What a GPU module is for, while it's lowered.
@@ -114,6 +112,10 @@ pub(crate) struct GpuCx {
     pub domain_field: Option<u32>,
     /// A lifted build's literal table (§23): the storage buffer every pipeline binds last.
     pub literals: Option<ir::ResourceId>,
+    /// A pipeline's `const` parameters' values, in the interface's order (§18.1): each folded
+    /// into its shader where it's read. `None` for a module no pipeline's key made (a `@gpu`
+    /// function's check), whose `const` parameters stand in as zeros.
+    pub consts: Option<Vec<ir::Const>>,
 }
 
 impl GpuCx {
@@ -134,6 +136,7 @@ impl GpuCx {
             uniform_fields: Vec::new(),
             domain_field: None,
             literals: None,
+            consts: None,
         }
     }
 
@@ -203,6 +206,10 @@ fn classify(cx: &Cx, f: FnId, param: usize, ty: TyId, varyings: Option<TyId>) ->
     // decided from the declaration: `k<T>(x: T)` given a `LocalId` for `x` takes that value, not
     // the invocation's id.
     if let TyKind::Param(_) = p.types.kind(p.func(f).params[param].ty) {
+        // Unless it holds a texture's handle, which is bound as a group's fields are.
+        if wrela_sema::gpu::is_gpu_group(p, ty) {
+            return ParamClass::Group;
+        }
         return ParamClass::Uniform;
     }
     if let Some(b) = BuiltinInput::of(p, ty) {
@@ -265,7 +272,7 @@ fn class_of(cx: &Cx, ty: TyId, mode: Mode, varyings: Option<TyId>) -> ParamClass
         (_, TyKind::Slice(e)) => {
             ParamClass::Buffer { elem: *e, read_write: mode == Mode::Mut, atomic: false }
         }
-        _ if wrela_sema::gpu::is_group(p, ty) => ParamClass::Group,
+        _ if wrela_sema::gpu::is_gpu_group(p, ty) => ParamClass::Group,
         _ => ParamClass::Uniform,
     }
 }
@@ -290,7 +297,7 @@ fn resource_class(cx: &Cx, ty: TyId) -> Option<ParamClass> {
         (Lang::Texture, _) => colour(ir::TexDim::D2),
         (Lang::TextureArray, _) => colour(ir::TexDim::D2Array),
         (Lang::Cubemap, _) => colour(ir::TexDim::Cube),
-        (Lang::Texture3d, _) => colour(ir::TexDim::D3),
+        (Lang::Texture3d | Lang::Texture3dHandle, _) => colour(ir::TexDim::D3),
         (Lang::DepthTexture, _) => depth(ir::TexDim::D2),
         (Lang::DepthTextureArray, _) => depth(ir::TexDim::D2Array),
         (Lang::Sampler, _) => ParamClass::Sampler { comparison: false },
@@ -316,7 +323,7 @@ pub(crate) fn texture_format(cx: &Cx, ty: TyId) -> ir::TextureFormat {
 fn field_class(cx: &Cx, ty: TyId) -> ParamClass {
     match resource_class(cx, ty) {
         Some(class) => class,
-        None if wrela_sema::gpu::is_group(&cx.checked.program, ty) => ParamClass::Group,
+        None if wrela_sema::gpu::is_gpu_group(&cx.checked.program, ty) => ParamClass::Group,
         None => ParamClass::Uniform,
     }
 }
@@ -447,6 +454,14 @@ impl Interface {
             for (i, t) in param_types(cx, func, substs).into_iter().enumerate() {
                 let class = classify(cx, func, i, t, varyings);
                 let name = cx.checked.program.func(func).params[i].name.clone();
+                // A generic parameter's type is known only here; a written one, sema checked.
+                let ps = &cx.checked.program.func(func).params[i];
+                if cx.checked.program.types.has_params(ps.ty)
+                    && wrela_sema::gpu::hides_texture_handle(&cx.checked.program, t, false, 0)
+                {
+                    let d = wrela_sema::gpu::hidden_handle(&cx.checked.program, &name, t, ps.span);
+                    cx.err(d);
+                }
                 let leaf = Leaf { entry: e, param: i, path: Vec::new(), ty: t, class, name };
                 iface.add(cx, leaf.clone());
                 params.push((t, leaf.class));
@@ -766,11 +781,21 @@ impl Recorded {
 
 /// What `s` records in this instance: a bound entry point's value is of its entry point's
 /// bound type here, whose fields hold the arguments (`gpu::bound_fields`).
-fn recorded_shader(fl: &mut Fl, s: &mir::Shader) -> Option<Recorded> {
+/// A `const` argument that doesn't fold is reported at the command, `span`.
+fn recorded_shader(fl: &mut Fl, s: &mir::Shader, span: Span) -> Option<Recorded> {
     match s {
         mir::Shader::Named(f, args, consts) => {
-            let substs = args.iter().map(|&a| fl.concrete(a)).collect();
-            Some(Recorded { func: *f, substs, consts: consts.clone(), value: None })
+            let substs: Vec<TyId> = args.iter().map(|&a| fl.concrete(a)).collect();
+            let tys = if consts.is_empty() { Vec::new() } else { param_types(fl.cx, *f, &substs) };
+            let mut values = Vec::new();
+            for (i, src) in consts {
+                let mut src = src.clone();
+                src.for_each_ty_mut(&mut |t| *t = fl.concrete(*t));
+                let param = &fl.cx.checked.program.func(*f).params[*i];
+                let name = param.name.clone();
+                values.push((*i, fl.cx.const_src(&src, tys[*i], &name, span)?));
+            }
+            Some(Recorded { func: *f, substs, consts: values, value: None })
         }
         mir::Shader::Value(place, at) => {
             let t = fl.place_src_ty(place);
@@ -794,7 +819,7 @@ fn record_dispatch(fl: &mut Fl, d: &mir::Dispatch, span: Span) -> Option<()> {
         host_effect(fl, "`dispatch`", span);
         return None;
     }
-    let kernel = recorded_shader(fl, &d.kernel)?;
+    let kernel = recorded_shader(fl, &d.kernel, span)?;
     // A kernel a generic function dispatches over a domain is known here (§18, E0603).
     if d.over
         && kernel.value.is_some()
@@ -953,7 +978,7 @@ fn record_draw(fl: &mut Fl, d: &mir::Draw, span: Span) -> Option<()> {
         host_effect(fl, "`draw`", span);
         return None;
     }
-    let shaders = [recorded_shader(fl, &d.vertex)?, recorded_shader(fl, &d.fragment)?];
+    let shaders = [recorded_shader(fl, &d.vertex, span)?, recorded_shader(fl, &d.fragment, span)?];
     let target = draw_target(fl, d, &shaders[1], span)?;
     let vs = (shaders[0].func, shaders[0].substs.clone());
     let fs = (shaders[1].func, shaders[1].substs.clone());
@@ -1061,16 +1086,7 @@ fn draw_target(
         _ => Vec::new(),
     };
     let target = match p.lang_of_ty(t) {
-        Some(Lang::Pass | Lang::LayerPass | Lang::Pass2 | Lang::Pass3 | Lang::Pass4) => {
-            ir::RenderTarget::of(&formats, false)
-        }
-        Some(
-            Lang::DepthPass
-            | Lang::LayerDepthPass
-            | Lang::DepthPass2
-            | Lang::DepthPass3
-            | Lang::DepthPass4,
-        ) => ir::RenderTarget::of(&formats, true),
+        Some(l) if let Some(depth) = l.textures_pass() => ir::RenderTarget::of(&formats, depth),
         Some(Lang::DepthOnlyPass | Lang::DepthLayerPass) => ir::RenderTarget::of(&[], true),
         Some(Lang::ScreenPass) => ir::RenderTarget::screen(false),
         Some(Lang::ScreenDepthPass) => ir::RenderTarget::screen(true),
@@ -1134,14 +1150,18 @@ fn draw_target(
     }
     let bytes = wrela_abi::stream::color_attachment_bytes(&colours);
     if bytes > wrela_abi::stream::MAX_COLOR_ATTACHMENT_BYTES {
-        let names: Vec<&str> = colours.iter().map(|f| f.name()).collect();
+        let names: Vec<String> = colours
+            .iter()
+            .map(|f| format!("{} ({} bytes)", f.name(), f.info().target_cost))
+            .collect();
         fl.cx.err(
             Diagnostic::new(
                 codes::E0602,
                 span,
                 format!(
-                    "this draw's pass draws into {}, which take {bytes} bytes a sample: WebGPU's limit is 32",
-                    names.join(", ")
+                    "this draw's pass draws into {}: {bytes} bytes a sample, over WebGPU's {}",
+                    names.join(", "),
+                    wrela_abi::stream::MAX_COLOR_ATTACHMENT_BYTES
                 ),
             )
             .with_note("each target's cost is rounded up to its alignment before the next's is added (WebGPU's algorithm): `rgba8unorm` and `rgba16float` cost 8, `rgba32float` 16, `r32uint` and `r32float` 4")
@@ -1162,7 +1182,7 @@ pub fn blends_of(
     (0..output.colours.len())
         .map(|k| {
             if state.blend_given {
-                state.blends[k.min(3)]
+                state.blends[k.min(wrela_abi::stream::MAX_COLOR_ATTACHMENTS - 1)]
             } else if output.over {
                 Blend::Over
             } else {
@@ -1304,24 +1324,23 @@ pub(crate) fn intrinsic(
             fl.emit(ir::Stmt::Eval(ir::Expr::Host(ir::HostOp::Present, Vec::new())));
             None
         }
-        Some(
-            l @ (Lang::CreateTexture
-            | Lang::DestroyTexture
-            | Lang::CreateSampler
-            | Lang::DestroySampler
-            | Lang::BeginPass0
-            | Lang::BeginPass1
-            | Lang::BeginPass2
-            | Lang::BeginPass3
-            | Lang::BeginPass4
-            | Lang::EndPass
-            | Lang::CopyTextureCommand
-            | Lang::CopyTextureToBufferCommand
-            | Lang::CopyBufferToTextureCommand
-            | Lang::ScissorCommand
-            | Lang::ViewportCommand
-            | Lang::ScreenCommand),
-        ) => {
+        Some(l)
+            if l.begin_pass_targets().is_some()
+                || matches!(
+                    l,
+                    Lang::CreateTexture
+                        | Lang::DestroyTexture
+                        | Lang::CreateSampler
+                        | Lang::DestroySampler
+                        | Lang::EndPass
+                        | Lang::CopyTextureCommand
+                        | Lang::CopyTextureToBufferCommand
+                        | Lang::CopyBufferToTextureCommand
+                        | Lang::ScissorCommand
+                        | Lang::ViewportCommand
+                        | Lang::ScreenCommand
+                ) =>
+        {
             // (opcode, payload words, whether the first is a new handle)
             let (opcode, words, handle) = match l {
                 Lang::CreateTexture => (Opcode::CreateTexture, 7, true),
@@ -1329,11 +1348,7 @@ pub(crate) fn intrinsic(
                 Lang::CreateSampler => (Opcode::CreateSampler, 6, true),
                 Lang::DestroySampler => (Opcode::DestroySampler, 1, false),
                 // A pass: its count and join, 8 words a colour target, 4 for depth.
-                Lang::BeginPass0 => (Opcode::BeginPass, 6, false),
-                Lang::BeginPass1 => (Opcode::BeginPass, 14, false),
-                Lang::BeginPass2 => (Opcode::BeginPass, 22, false),
-                Lang::BeginPass3 => (Opcode::BeginPass, 30, false),
-                Lang::BeginPass4 => (Opcode::BeginPass, 38, false),
+                l if let Some(n) = l.begin_pass_targets() => (Opcode::BeginPass, 6 + 8 * n, false),
                 Lang::CopyTextureCommand => (Opcode::CopyTexture, 12, false),
                 Lang::CopyTextureToBufferCommand => (Opcode::CopyTextureToBuffer, 10, false),
                 Lang::CopyBufferToTextureCommand => (Opcode::CopyBufferToTexture, 10, false),
@@ -1573,6 +1588,7 @@ pub(crate) fn intrinsic(
             | Lang::DepthLoad
             | Lang::Texture3dSampleLevel
             | Lang::Texture3dLoad
+            | Lang::Texture3dHandleLoad
             | Lang::ArraySample
             | Lang::ArraySampleLevel
             | Lang::ArraySampleGrad
@@ -1980,6 +1996,7 @@ fn texture_read(
         Lang::TextureLoad
         | Lang::DepthLoad
         | Lang::Texture3dLoad
+        | Lang::Texture3dHandleLoad
         | Lang::ArrayLoad
         | Lang::DepthArrayLoad
         | Lang::MipStepLoad => T::Load,
@@ -1998,7 +2015,8 @@ fn texture_read(
             let field = match (op, lang) {
                 (T::Width, _) => 1,
                 (T::Height, _) => 2,
-                (T::Levels, Some(Lang::Texture)) | (T::Depth, Some(Lang::Texture3d)) => 3,
+                (T::Levels, Some(Lang::Texture))
+                | (T::Depth, Some(Lang::Texture3d | Lang::Texture3dHandle)) => 3,
                 (T::Layers, Some(Lang::TextureArray | Lang::DepthTextureArray)) => 3,
                 (T::Levels, Some(Lang::TextureArray)) => 4,
                 // A depth texture, and a 3D one, have one level.
@@ -2294,31 +2312,35 @@ pub(crate) fn lower_pipeline(
     sites: Vec<Span>,
     targets: Vec<ir::RenderTarget>,
 ) -> Option<PipelineOut> {
+    let consts = iface_consts(&iface, key);
     let mut out = match key {
-        PipelineKey::Compute { .. } => lower_compute(cx, iface.clone()),
-        PipelineKey::Render { .. } => lower_render(cx, iface.clone()),
+        PipelineKey::Compute { .. } => lower_compute(cx, iface.clone(), consts),
+        PipelineKey::Render { .. } => lower_render(cx, iface.clone(), consts),
     }?;
-    out.constants = iface_consts(&iface, key, &out.module);
     out.key = key.clone();
     out.sites = sites;
     out.targets = targets;
     Some(out)
 }
 
-/// Each of `module`'s overrides' values, from `key`'s `const` arguments (the interface's
-/// `consts` order, which the module's overrides follow).
-fn iface_consts(iface: &Interface, key: &PipelineKey, module: &ir::Module) -> Vec<ConstArg> {
+/// The value of each of `iface`'s `const` parameters, in its order, from `key`'s `const`
+/// arguments: what its shaders fold (§18.1).
+fn iface_consts(iface: &Interface, key: &PipelineKey) -> Vec<ir::Const> {
     let values = key.consts();
-    let out: Vec<ConstArg> = (iface.consts.iter())
+    (iface.consts.iter())
         .map(|l| {
-            values
+            let c = values
                 .iter()
                 .find(|&&(e, i, _)| (e, i) == (l.entry, l.param))
-                .map_or(ConstArg::U32(0), |&(_, _, c)| c)
+                .map_or(ConstArg::U32(0), |&(_, _, c)| c);
+            match c {
+                ConstArg::Bool(b) => ir::Const::Bool(b),
+                ConstArg::U32(x) => ir::Const::U32(x),
+                ConstArg::I32(x) => ir::Const::I32(x),
+                ConstArg::F32(bits) => ir::Const::F32(f32::from_bits(bits)),
+            }
         })
-        .collect();
-    debug_assert_eq!(out.len(), module.overrides.len());
-    out
+        .collect()
 }
 
 /// How diagnostics name the entry point `name` of a module: "the `@compute` kernel `fill`".
@@ -2342,11 +2364,18 @@ struct EntryModule {
 /// A GPU module for the entry points of `iface`, the first of them a `stage`: its buffers
 /// bound (bindings from 1, in the interface's order), its uniform block (binding 0) and, for a
 /// kernel, `num_workgroups`.
-fn entry_module(cx: &mut Cx, iface: Rc<Interface>, stage: Entry) -> EntryModule {
+fn entry_module(
+    cx: &mut Cx,
+    iface: Rc<Interface>,
+    stage: Entry,
+    consts: Option<Vec<ir::Const>>,
+) -> EntryModule {
     let checked = cx.checked;
     let program = &checked.program;
     let what = describe_entry(stage, &program.func(iface.entries[0].func).name);
-    let mut mb = ModuleBuilder::gpu(GpuCx::new(what.clone(), iface.clone(), Some(stage)));
+    let mut gpu = GpuCx::new(what.clone(), iface.clone(), Some(stage));
+    gpu.consts = consts;
+    let mut mb = ModuleBuilder::gpu(gpu);
     // What each parameter is bound to: a group's fields as they're bound below.
     let mut resources: Vec<Vec<Option<Bound>>> = Vec::new();
     for entry in &iface.entries {
@@ -2363,23 +2392,6 @@ fn entry_module(cx: &mut Cx, iface: Rc<Interface>, stage: Entry) -> EntryModule 
             _ => *slot = Some(Bound::One(r)),
         }
     };
-    // The `const` parameters, each an override named for its parameter (and its shader's, when
-    // both shaders have one of that name).
-    for leaf in &iface.consts {
-        let span = program.func(iface.entries[leaf.entry].func).params[leaf.param].span;
-        let scalar = match cx.lower_ty(&mut mb, leaf.ty, span).map(|t| mb.m.types.get(t).clone()) {
-            Some(ir::TypeDef::Scalar(s)) => s,
-            _ => ir::Scalar::U32,
-        };
-        let shared = iface.consts.iter().filter(|l| l.name == leaf.name).count() > 1;
-        let name = if shared {
-            let shader = &program.func(iface.entries[leaf.entry].func).name;
-            format!("{shader}_{}", leaf.name)
-        } else {
-            leaf.name.clone()
-        };
-        mb.m.overrides.push((name, scalar));
-    }
     let mut bindings = Vec::new();
     for leaf in &iface.bound {
         let (e, i) = (leaf.entry, leaf.param);
@@ -2839,13 +2851,13 @@ fn non_filtering(m: &ir::Module, bindings: &mut [ResourceBinding]) {
     }
 }
 
-fn lower_compute(cx: &mut Cx, iface: Rc<Interface>) -> Option<PipelineOut> {
+fn lower_compute(cx: &mut Cx, iface: Rc<Interface>, consts: Vec<ir::Const>) -> Option<PipelineOut> {
     let kernel = iface.entries[0].func;
     let Some(Entry::Compute(wg)) = cx.entry_of(kernel) else { return None };
     let checked = cx.checked;
     let name = &checked.program.func(kernel).name;
     let EntryModule { mut mb, keys, mut bindings, uniform } =
-        entry_module(cx, iface.clone(), Entry::Compute(wg));
+        entry_module(cx, iface.clone(), Entry::Compute(wg), Some(consts));
     let entry = entry_function(&mut mb, &keys[0], name, None, None);
     cx.drain(&mut mb);
     check_recursion(cx, &mb);
@@ -2877,18 +2889,17 @@ fn lower_compute(cx: &mut Cx, iface: Rc<Interface>) -> Option<PipelineOut> {
         debug_flag: None,
         targets: Vec::new(),
         instances,
-        constants: Vec::new(),
     })
 }
 
-fn lower_render(cx: &mut Cx, iface: Rc<Interface>) -> Option<PipelineOut> {
+fn lower_render(cx: &mut Cx, iface: Rc<Interface>, consts: Vec<ir::Const>) -> Option<PipelineOut> {
     let checked = cx.checked;
     let [vertex, fragment] = &iface.entries[..] else { return None };
     let vret = iface.vertex_ret?;
     let vdef = checked.program.func(vertex.func);
     let fdef = checked.program.func(fragment.func);
     let EntryModule { mut mb, keys, mut bindings, uniform } =
-        entry_module(cx, iface.clone(), Entry::Vertex);
+        entry_module(cx, iface.clone(), Entry::Vertex, Some(consts));
     let vret_ir = cx.lower_ty(&mut mb, vret, vdef.sig_span)?;
     let ventry = entry_function(&mut mb, &keys[0], &vdef.name, Some(vret_ir), None);
     cx.drain(&mut mb);
@@ -2961,7 +2972,6 @@ fn lower_render(cx: &mut Cx, iface: Rc<Interface>) -> Option<PipelineOut> {
         debug_flag: None,
         targets: Vec::new(),
         instances,
-        constants: Vec::new(),
     })
 }
 
@@ -3136,12 +3146,14 @@ pub(crate) fn bind_entry_params(fl: &mut Fl, func: FnId, entry: Entry) {
                 entry_group(fl, &at, &[], *t, b.as_ref())
             }
             ParamClass::Uniform => at.uniform_repr(&[]),
-            // A `const` parameter: the module's override of its index.
+            // A `const` parameter: its pipeline's value (a zero in a check of its own).
             ParamClass::Const => {
                 let Some(it) = fl.cx.lower_ty(fl.mb, *t, p.span) else { continue };
                 let k = iface.consts.iter().position(|l| (l.entry, l.param) == (e, i));
                 let Some(k) = k else { continue };
-                Repr::Var(fl.bind_local(&p.name, it, ir::Expr::Override(k as u32)))
+                let folded = fl.mb.gpu.as_ref().and_then(|g| g.consts.as_ref()?.get(k).cloned());
+                let value = folded.map_or(ir::Expr::Zero(it), ir::Expr::Const);
+                Repr::Var(fl.bind_local(&p.name, it, value))
             }
             ParamClass::Varyings if entry == Entry::Fragment => {
                 let Some(it) = fl.cx.lower_ty(fl.mb, *t, p.span) else { continue };
@@ -3345,7 +3357,7 @@ fn stand_in(
     span: Span,
     next: &mut u32,
 ) -> Option<Bound> {
-    if wrela_sema::gpu::is_group(&cx.checked.program, t) {
+    if wrela_sema::gpu::is_gpu_group(&cx.checked.program, t) {
         let names = group_field_names(cx, t);
         let fields = group_fields(cx, t);
         let mut bs = Vec::new();
@@ -3423,7 +3435,7 @@ pub(crate) fn check_standalone(cx: &mut Cx, f: FnId, entry: Option<Entry>, subst
             if let Entry::Compute(wg) = stage {
                 check_subgroup_invocation(cx, &iface, wg);
             }
-            let EntryModule { mut mb, keys, .. } = entry_module(cx, iface.clone(), stage);
+            let EntryModule { mut mb, keys, .. } = entry_module(cx, iface.clone(), stage, None);
             let ret = match stage {
                 Entry::Compute(_) => None,
                 Entry::Vertex | Entry::Fragment => {

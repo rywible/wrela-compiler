@@ -275,7 +275,24 @@ pub struct EnumDecl {
 #[derive(Clone, Debug, PartialEq)]
 pub enum TraitMemberKind {
     Fn(FnDecl),
-    Type { name: Ident, bounds: Vec<TypeExpr> },
+    Type {
+        name: Ident,
+        bounds: Vec<TypeExpr>,
+    },
+    /// `const K: u32` or `const ON: bool = true`: an associated constant, with its default.
+    Const(AssocConst),
+}
+
+/// An associated constant (§3.4): `const NAME: Type`, with `= value` in an impl or as a trait's
+/// default. `func` is the function it's checked and instantiated as: no parameters, the
+/// constant's type, and `{ value }` for its body, so a generic one is a constant of each
+/// instantiation.
+#[derive(Clone, Debug, PartialEq)]
+pub struct AssocConst {
+    pub name: Ident,
+    pub ty: TypeExpr,
+    pub value: Option<Expr>,
+    pub func: FnDecl,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -304,7 +321,12 @@ pub struct TraitSetDecl {
 #[derive(Clone, Debug, PartialEq)]
 pub enum ImplMemberKind {
     Fn(FnDecl),
-    Type { name: Ident, ty: TypeExpr },
+    Type {
+        name: Ident,
+        ty: TypeExpr,
+    },
+    /// `const K: u32 = 4`: an associated constant's value.
+    Const(AssocConst),
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -1055,15 +1077,19 @@ impl Item {
             }
             ItemKind::Trait(t) => {
                 for m in &t.members {
-                    if let TraitMemberKind::Fn(d) = &m.kind {
-                        fn_decl(d, f);
+                    match &m.kind {
+                        TraitMemberKind::Fn(d)
+                        | TraitMemberKind::Const(AssocConst { func: d, .. }) => fn_decl(d, f),
+                        TraitMemberKind::Type { .. } => {}
                     }
                 }
             }
             ItemKind::Impl(i) => {
                 for m in &i.members {
-                    if let ImplMemberKind::Fn(d) = &m.kind {
-                        fn_decl(d, f);
+                    match &m.kind {
+                        ImplMemberKind::Fn(d)
+                        | ImplMemberKind::Const(AssocConst { func: d, .. }) => fn_decl(d, f),
+                        ImplMemberKind::Type { .. } => {}
                     }
                 }
             }

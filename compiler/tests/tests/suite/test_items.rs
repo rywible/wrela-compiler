@@ -803,6 +803,53 @@ fn const_parameters_and_tiers_run_on_both_hosts() {
     }
 }
 
+/// Associated constants as `const` arguments (compiler/tests/assoc_consts, language.md §3.4,
+/// §18.1): a generic function dispatching `blur.bind(taps: Twice::<S>::TAPS, heavy: S::HEAVY)`
+/// for two `S`s is two pipelines, each computing what its constants say on both hosts; the
+/// instantiation whose `HEAVY` is `false` has no heavy loop in its WGSL (no `sin`, and fewer
+/// bytes), and neither shader has an override: the constants are folded into each.
+#[test]
+#[ignore = "needs a GPU"]
+fn associated_constants_specialize_each_pipeline() {
+    let dir = wrela_tests::repo_root().join("compiler/tests/assoc_consts");
+    assert_eq!(crate::tests_pass(&dir), 1);
+    let build = crate::built("assoc_consts");
+    let wgsl = |i: usize| std::fs::read_to_string(build.join(format!("pipeline_{i}.wgsl")));
+    let (wide, narrow) = (wgsl(0).expect("pipeline 0"), wgsl(1).expect("pipeline 1"));
+    eprintln!("WGSL: heavy {} bytes, folded away {} bytes", wide.len(), narrow.len());
+    assert!(wide.contains("sin(") && !narrow.contains("sin("));
+    assert!(narrow.len() < wide.len());
+    assert!(!wide.contains("override") && !narrow.contains("override"));
+}
+
+/// Passes into up to eight colour targets (compiler/tests/passes8, language.md §18): six and
+/// eight `r32uint`s (with depth), four `rgba8unorm`s and a G-buffer's `rgba16float`, two
+/// `rg32uint`s and two `r32uint`s, each read back on both hosts; `wrela pipelines --json`
+/// reports each pass's attachment bytes (an `rgba8unorm` costs 8).
+#[test]
+#[ignore = "needs a GPU"]
+fn passes_take_up_to_eight_targets_within_32_bytes() {
+    let dir = wrela_tests::repo_root().join("compiler/tests/passes8");
+    assert_eq!(crate::tests_pass(&dir), 2);
+    let pipelines = wrela_driver::check_pipelines(&dir).pipelines;
+    let bytes: Vec<Option<u32>> = pipelines.iter().map(|p| p.attachment_bytes).collect();
+    assert_eq!(bytes, [Some(24), Some(32), Some(32), Some(32)]);
+}
+
+/// A texture as a field's data (compiler/tests/sampled, language.md §20.3): a sphere cooked
+/// into a 3D texture and held by a `Sampled3d`, marched by `std::field::hit` (generic over
+/// `Surface`) in a kernel generic over the field, hits at the radius within a voxel; the same
+/// code over an analytic sphere hits exactly; a `Union` of the two composes, built on the CPU or
+/// in the kernel; and `sample`'s
+/// gradient is the distance's central differences inside cells, at the grid's edge and past it,
+/// on both hosts.
+#[test]
+#[ignore = "needs a GPU"]
+fn a_texture_is_a_fields_data() {
+    let dir = wrela_tests::repo_root().join("compiler/tests/sampled");
+    assert_eq!(crate::tests_pass(&dir), 4);
+}
+
 /// Tapes that can hold a creature (language.md §14.4): each new operation against its std
 /// twin at 10⁶ points on the CPU and the GPU (compiler/tests/tape_ops), and a full 4,096-op
 /// tape bound as storage, run on both hosts and timed (compiler/tests/tape_long).

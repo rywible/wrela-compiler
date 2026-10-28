@@ -20,6 +20,7 @@ use std::stage::Tape
 use std::quat::Quat
 use std::hash::{StateHash, pcg}
 use std::mem::debug_build
+use std::gpu::{R32Float, Texture3dHandle}
 
 /// A signed distance over 3D space: negative inside, positive outside.
 ///
@@ -622,6 +623,105 @@ impl Surface for Sphere {
     fn lipschitz(self, near: f32) -> f32 {
         1.0
     }
+}
+
+/// A surface whose distance is a texture's data (language.md §20.3): a 3D texture of distances,
+/// texel (`i`, `j`, `k`) the distance at `origin + (vec3(i, j, k) + 0.5) × voxel`, read between
+/// the eight texels round a point (trilinear). GPU code reads it; the texture is bound beside the
+/// value wherever an entry point takes one (a `Texture3dHandle`), so a march generic over
+/// `Surface` takes it as it takes an analytic field. Past the grid, its distance is the
+/// distance to the grid's box added to the distance where the point meets it, which a sphere
+/// tracer may step by.
+pub struct Sampled3d: Copy + GpuData {
+    /// The distances.
+    pub texels: Texture3dHandle<R32Float>,
+    /// The grid's corner, the first texel's outer corner.
+    pub origin: vec3,
+    /// A texel's side.
+    pub voxel: f32,
+}
+
+/// A surface of the distances `texels` holds, the grid's corner at `origin` and each texel
+/// `voxel` on a side.
+pub fn sampled3d(texels: Texture3dHandle<R32Float>, origin: vec3, voxel: f32) -> Sampled3d {
+    Sampled3d { texels, origin, voxel }
+}
+
+impl Sampled3d {
+    /// The grid's size in texels.
+    fn dims(self) -> vec3u {
+        vec3u(self.texels.width(), self.texels.height(), self.texels.depth())
+    }
+
+    /// The distance between the texels round grid point `q` (in texels, centres at `i + 0.5`),
+    /// clamped to the texel centres, and its gradient in texels: zero along an axis the clamp
+    /// holds, where the distance doesn't change with `q`.
+    fn trilinear(self, q: vec3) -> (f32, vec3) {
+        let hi = vec3(self.dims()) - vec3(1.0)
+        let u = q - vec3(0.5)
+        let c = clamp(u, vec3(0.0), hi)
+        let free = vec3(f32(u.x == c.x), f32(u.y == c.y), f32(u.z == c.z))
+        let lo = min(floor(c), max(hi - vec3(1.0), vec3(0.0)))
+        let f = c - lo
+        let i = vec3u(lo)
+        let n = min(i + vec3u(1), vec3u(hi))
+        let t = self.texels
+        let d000 = t.load(x: i.x, y: i.y, z: i.z)
+        let d100 = t.load(x: n.x, y: i.y, z: i.z)
+        let d010 = t.load(x: i.x, y: n.y, z: i.z)
+        let d110 = t.load(x: n.x, y: n.y, z: i.z)
+        let d001 = t.load(x: i.x, y: i.y, z: n.z)
+        let d101 = t.load(x: n.x, y: i.y, z: n.z)
+        let d011 = t.load(x: i.x, y: n.y, z: n.z)
+        let d111 = t.load(x: n.x, y: n.y, z: n.z)
+        let x00 = mix(d000, d100, f.x)
+        let x10 = mix(d010, d110, f.x)
+        let x01 = mix(d001, d101, f.x)
+        let x11 = mix(d011, d111, f.x)
+        let y0 = mix(x00, x10, f.y)
+        let y1 = mix(x01, x11, f.y)
+        let d = mix(y0, y1, f.z)
+        // The trilinear's derivative along each axis, from the same eight.
+        let dx = mix(mix(d100 - d000, d110 - d010, f.y), mix(d101 - d001, d111 - d011, f.y), f.z)
+        let dy = mix(x10 - x00, x11 - x01, f.z)
+        let dz = y1 - y0
+        (d, vec3(dx, dy, dz) * free)
+    }
+
+    /// `p`'s distance from the grid's box (0 inside), and the point of the box nearest it.
+    fn outside(self, p: vec3) -> (f32, vec3) {
+        let top = self.origin + vec3(self.dims()) * self.voxel
+        let near = clamp(p, self.origin, top)
+        (length(p - near), near)
+    }
+}
+
+impl Surface for Sampled3d {
+    fn distance(self, p: vec3) -> f32 {
+        let (out, near) = self.outside(p)
+        let (d, _) = self.trilinear((near - self.origin) / self.voxel)
+        d + out
+    }
+
+    /// The trilinear's own gradient (inside the grid), from the eight texels it reads.
+    fn gradient(self, p: vec3) -> vec3 {
+        let (_, g) = self.sample(p)
+        g
+    }
+
+    /// Past the grid: the box's distance's gradient, and the trilinear's along each axis that
+    /// `p` is within the box on (the point where `p` meets the box moves with `p` there).
+    fn sample(self, p: vec3) -> (f32, vec3) {
+        let (out, near) = self.outside(p)
+        let (d, g) = self.trilinear((near - self.origin) / self.voxel)
+        if out > 0.0 {
+            let along = vec3(f32(near.x == p.x), f32(near.y == p.y), f32(near.z == p.z))
+            return (d + out, g / self.voxel * along + (p - near) / out)
+        }
+        (d, g / self.voxel)
+    }
+    // No `bound`: the texels may hold distances below zero at the grid's edge, which reach past
+    // it, so the sphere round the grid holds nothing out (the default, unbounded).
 }
 
 /// An ellipsoid centred at the origin. No exact distance exists; this is the usual bound.

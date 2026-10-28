@@ -150,6 +150,7 @@ codes! {
     E0221 = "E0221", "packages that depend on each other";
     E0222 = "E0222", "a `@test` that `wrela test` can't run";
     E0223 = "E0223", "a workspace that isn't valid";
+    E0224 = "E0224", "a build's `--set` of a constant it can't override";
 
     // ---- E03xx: types ----------------------------------------------------------------------
     E0300 = "E0300", "mismatched types";
@@ -211,6 +212,7 @@ codes! {
     E0417 = "E0417", "a type that can't derive a `@fieldwise` trait it declares";
     E0418 = "E0418", "a trait set that names itself";
     E0419 = "E0419", "a trait set where one trait is needed";
+    E0420 = "E0420", "an associated constant of a type it can't have, or called as a function";
 
     // ---- E05xx: modes, moves, projections, exclusivity, closures -------------------------
     E0500 = "E0500", "a use of a moved value";

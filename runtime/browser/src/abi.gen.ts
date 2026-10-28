@@ -2,7 +2,9 @@
 // command stream and manifest. Don't edit; run `cargo run -p wrela-abi --bin generate`.
 
 export const STREAM_VERSION = 13;
-export const MANIFEST_VERSION = 11;
+export const MANIFEST_VERSION = 12;
+/** The version before, which this host reads too: its pipelines may name `constants`. */
+export const LEGACY_MANIFEST_VERSION = 11;
 /** The bytes `WRCS`, read as a little-endian u32. */
 export const STREAM_MAGIC = 0x53435257;
 export const HEADER_LEN = 12;
@@ -90,7 +92,7 @@ export const TEXTURE_FORMATS = [
 export const TEXTURE_KINDS = ["2d", "3d", "2d-array", "cube"] as const;
 /** WebGPU's default `maxColorAttachmentBytesPerSample` and `maxColorAttachments`. */
 export const MAX_COLOR_ATTACHMENT_BYTES = 32;
-export const MAX_COLOR_ATTACHMENTS = 4;
+export const MAX_COLOR_ATTACHMENTS = 8;
 /** The most mip levels a texture has, layers an array has, and anisotropy a sampler takes;
  * WebGPU's alignment of a copy's buffer offset and rows. */
 export const MAX_LEVELS = 14;

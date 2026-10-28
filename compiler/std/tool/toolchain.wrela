@@ -38,10 +38,19 @@ pub struct Override: Clone {
     pub dir: String,
 }
 
+/// A constant of the program's root module given another value (`wrela build --set
+/// NAME=VALUE`, §13): its name, and the value as the command line writes it (`8`, `true`,
+/// `Medium`, `"cel"`).
+pub struct Set: Clone {
+    pub name: String,
+    pub value: String,
+}
+
 /// How to build: through Binaryen's `wasm-opt` (`wrela build --optimize`), lifting the literals
 /// of these packages (`--lift`), with dependencies read from other packages, with SIMD or
 /// without, as a debug build or not, as a test build with the program's `@testing` exports or
-/// not (`--testing`, §9), and how long it may take in seconds (0: 300 s).
+/// not (`--testing`, §9), how long it may take in seconds (0: 300 s), and with constants set
+/// (`--set`).
 pub struct BuildOptions: Clone {
     pub optimize: bool,
     pub lift: Vec<String>,
@@ -50,6 +59,7 @@ pub struct BuildOptions: Clone {
     pub debug: bool,
     pub testing: bool,
     pub timeout: f64,
+    pub set: Vec<Set> = Vec::new(),
 }
 
 /// What `wrela build` makes: no optimizing, lifting or overrides, SIMD, a release build, no
@@ -63,6 +73,7 @@ pub fn options() -> BuildOptions {
         debug: false,
         testing: false,
         timeout: 0.0,
+        set: Vec::new(),
     }
 }
 
@@ -143,6 +154,11 @@ pub fn build(pkg: str, out: str, options: BuildOptions) -> Call<Built> {
         w.write_str(l.as_str())
     }
     write_overrides(mut w, options.overrides)
+    w.write_u32(options.set.len())
+    for s in options.set {
+        w.write_str(s.name.as_str())
+        w.write_str(s.value.as_str())
+    }
     w.write_u64(bitcast_u64(options.timeout))
     ask("toolchain/build", take w.into_bytes())
 }

@@ -81,11 +81,78 @@ fn the_second_build_computes_no_constant() {
     assert_eq!(stats(&dir), (0, all), "an edit elsewhere computes none");
 
     // The cache's files are the package's build's, and a corrupt one is a miss, not an error.
-    let cache = dir.join("build/consts");
-    for e in std::fs::read_dir(&cache).expect("the cache is in build/consts") {
+    let cache = dir.join("build/consts").join(wrela_driver::const_cache::VERSION);
+    for e in std::fs::read_dir(&cache).expect("the cache is in build/consts/<version>") {
         std::fs::write(e.expect("entry").path(), b"not a value").expect("write");
     }
     assert_eq!(stats(&dir), first, "corrupt entries are computed again");
+}
+
+/// A constant whose code reads a function in another module, with a test of its value.
+const READS: &str = r#"
+use sizes::size
+
+const SIZE: u32 = size(3)
+
+pub fn frame(time: f32, width: u32, height: u32) {
+    let _ = SIZE
+}
+
+@test
+fn the_size_is_what_the_sources_say() {
+    assert(SIZE == WANT)
+}
+"#;
+
+/// The cache holds what a value depends on (language.md §13): an edit to a function a constant
+/// calls, in another module, gives the new value; the toolchain's version names the cache's
+/// directory, so another version's entries aren't read; and `--report consts` says which
+/// constants were read from the cache.
+#[test]
+fn a_constants_key_is_its_code_and_the_toolchains_version() {
+    let dir = scratch("consts/keyed");
+    let with = |n: u32, want: u32| {
+        std::fs::write(dir.join("main.wrela"), READS.replace("WANT", &want.to_string()))
+            .expect("write");
+        let sizes = format!("pub fn size(x: u32) -> u32 {{\n    x * {n}\n}}\n");
+        std::fs::write(dir.join("sizes.wrela"), sizes).expect("write");
+    };
+    let passes = |dir: &Path| {
+        let out = wrela_driver::test(dir, None);
+        let failed: Vec<_> = out.results.iter().filter_map(|r| r.failure.clone()).collect();
+        assert!(
+            out.passed(),
+            "{}{}",
+            wrela_diag::render::render_all(&out.sources, &out.diagnostics),
+            wrela_diag::render::render_all(&out.sources, &failed)
+        );
+    };
+    let runs = |dir: &Path| wrela_driver::build(dir).consts.runs;
+    with(2, 6);
+    passes(&dir);
+    let first = runs(&dir);
+    let size = first.iter().find(|r| r.name == "SIZE").expect("SIZE was computed");
+    assert!(size.bytes > 0 && size.fuel > 0, "{size:?}");
+    assert!(runs(&dir).iter().all(|r| r.cached), "a second build reads them all");
+    // The function `SIZE` calls changed: its new value, not the cached one.
+    with(5, 15);
+    passes(&dir);
+    let after = runs(&dir);
+    assert!(after.iter().any(|r| r.name == "SIZE" && !r.cached), "computed again: {after:?}");
+
+    // Another version's directory isn't read: this version's entries, moved under another
+    // version's name, are computed again.
+    let consts = dir.join("build/consts");
+    let this = consts.join(wrela_driver::const_cache::VERSION);
+    let other = consts.join("0.0.1");
+    let _ = std::fs::remove_dir_all(&other);
+    std::fs::rename(&this, &other).expect("move the cache");
+    // (Constants with the same code share an entry within the build, so only those first of
+    // their code are computed.)
+    let moved = runs(&dir);
+    assert!(moved.iter().any(|r| r.name == "SIZE" && !r.cached), "{moved:?}");
+    assert!(moved.iter().filter(|r| !r.cached).count() > moved.len() / 2, "{moved:?}");
+    assert!(other.read_dir().expect("kept").next().is_some(), "a recent version's are kept");
 }
 
 /// Waiting constants keep their round order, including a fan-in whose inputs become ready
@@ -237,4 +304,201 @@ pub fn frame(time: f32, width: u32, height: u32) {
     let out = wrela_driver::build(&dir);
     let text = wrela_diag::render::render_all(&out.sources, &out.diagnostics);
     assert!(text.contains("ships more than one file named `a.bin`"), "{text}");
+}
+
+/// A program whose root module's constants a build may set (language.md §13).
+const SETTABLE: &str = r#"
+pub enum Tier {
+    Low,
+    High,
+}
+
+pub const N: u32 = 4
+pub const TIER: Tier = Tier::Low
+pub const SCALE: f32 = 1.5
+const HIDDEN: u32 = 1
+pub(package) const SHARED: u32 = 1
+pub const AT: vec2 = vec2(1.0, 2.0)
+pub const SPOT: Spot = vec2(1.0, 2.0)
+
+type Spot = vec2
+
+pub fn value() -> u32 {
+    N
+}
+
+pub fn length() -> u32 {
+    let a = [0.0; N]
+    a.len()
+}
+
+pub fn tier() -> u32 {
+    match TIER {
+        Tier::Low => 1,
+        Tier::High => 2,
+    }
+}
+
+pub fn frame(time: f32, width: u32, height: u32) {
+    let _ = HIDDEN + SHARED + u32(SCALE) + u32(AT.x + SPOT.x)
+}
+"#;
+
+/// `wrela build --set N=8`: the program reads 8, an array of length `N` has 8 elements, an
+/// enum's constant takes a variant by name, and the manifest records the sets; a `pub const`
+/// that isn't there, one that isn't `pub` (or is only `pub(package)`), and one of a type a build
+/// can't set (or an alias of one) are E0224.
+#[test]
+fn a_build_sets_a_programs_pub_constants() {
+    let dir = scratch("consts/set");
+    std::fs::write(dir.join("main.wrela"), SETTABLE).expect("write");
+    let set = |pairs: &[(&str, &str)]| -> Vec<(String, String)> {
+        pairs.iter().map(|&(n, v)| (n.to_string(), v.to_string())).collect()
+    };
+    let kind = wrela_driver::BuildKind::default();
+    let sets = set(&[("N", "8"), ("TIER", "High"), ("SCALE", "-2.5")]);
+    let out = wrela_driver::build_set(&dir, kind, false, &sets);
+    assert!(
+        !out.has_errors(),
+        "{}",
+        wrela_diag::render::render_all(&out.sources, &out.diagnostics)
+    );
+    let built = dir.join("build-set");
+    let _ = std::fs::remove_dir_all(&built);
+    out.write_to(&built).expect("write the build");
+    let mut host = crate::cpu_host(&built);
+    assert_eq!(wrela_tests::one_u32(&mut host, "value", &[]), 8);
+    assert_eq!(wrela_tests::one_u32(&mut host, "length", &[]), 8, "N folds where it's a length");
+    assert_eq!(wrela_tests::one_u32(&mut host, "tier", &[]), 2);
+    let manifest = wrela_tests::manifest(&built);
+    assert_eq!(manifest.set.get("N").map(String::as_str), Some("8"));
+    assert_eq!(manifest.set.get("TIER").map(String::as_str), Some("High"));
+    // Without sets, the manifest says none and the program reads what it's written with.
+    let plain = wrela_driver::build(&dir);
+    let json = plain.files.iter().find(|(p, _)| p == "manifest.json").expect("manifest");
+    assert!(!String::from_utf8_lossy(&json.1).contains("\"set\""));
+    for (pairs, says) in [
+        (set(&[("MISSING", "1")]), "has no constant `MISSING`"),
+        (set(&[("HIDDEN", "2")]), "isn't `pub`"),
+        (set(&[("SHARED", "2")]), "isn't `pub`"),
+        (set(&[("AT", "3")]), "is a `vec2`"),
+        // An alias's type is the type it names, though the value then doesn't check.
+        (set(&[("SPOT", "3")]), "is a `vec2`"),
+    ] {
+        let out = wrela_driver::build_set(&dir, kind, false, &pairs);
+        let e = out.diagnostics.iter().find(|d| d.code.as_str() == "E0224");
+        assert!(e.is_some_and(|d| d.message.contains(says)), "{pairs:?}: {:?}", out.diagnostics);
+    }
+}
+
+/// A program that chooses its renderer by a constant's variant.
+const TIERED: &str = r#"
+use std::gpu::{GlobalId, GpuBuffer, Slots, buffer, dispatch}
+
+pub enum Tier {
+    Epic,
+    Low,
+}
+
+pub const TIER: Tier = Tier::Epic
+
+@compute(64)
+fn epic(out: mut Slots<u32>, id: GlobalId) {
+    out[id] = 1
+}
+
+@compute(64)
+fn low(out: mut Slots<u32>, id: GlobalId) {
+    out[id] = 2
+}
+
+pub struct State {
+    out: GpuBuffer<u32>,
+}
+
+pub fn init() -> State {
+    State { out: buffer(64) }
+}
+
+pub fn frame(s: mut State, time: f32, width: u32, height: u32) {
+    match TIER {
+        Tier::Epic => dispatch(epic.bind(mut s.out), groups: 1),
+        Tier::Low => lowly(mut s),
+    }
+}
+
+fn lowly(s: mut State) {
+    dispatch(low.bind(mut s.out), groups: 1)
+}
+"#;
+
+/// A `match` on a constant builds only the arm it takes (language.md §13): the program has the
+/// pipeline of its tier and not the other's, `--set TIER=Low` has the other, and a function only
+/// an arm not taken calls isn't "never used".
+#[test]
+fn a_match_on_a_constant_builds_only_its_arm() {
+    let dir = scratch("consts/tiered");
+    std::fs::write(dir.join("main.wrela"), TIERED).expect("write");
+    let entries = |out: &wrela_driver::Output| -> Vec<String> {
+        assert!(
+            out.diagnostics.is_empty(),
+            "{}",
+            wrela_diag::render::render_all(&out.sources, &out.diagnostics)
+        );
+        out.pipelines.iter().flat_map(|p| p.names.clone()).collect()
+    };
+    let all = wrela_driver::check_pipelines(&dir);
+    assert_eq!(entries(&all), ["epic"]);
+    // The arm it takes always runs: its pipeline is tier 0, not one under a condition.
+    assert_eq!(all.pipelines[0].tier(), 0, "{:?}", all.pipelines[0]);
+    let low = [("TIER".to_string(), "Low".to_string())];
+    assert_eq!(entries(&wrela_driver::check_pipelines_set(&dir, &low)), ["low"]);
+}
+
+/// A computed constant of an enum, read back by its variant's index.
+const REORDERED: &str = r#"
+enum E {
+    Zero = 0,
+    A = 2,
+}
+
+const X: E = make()
+
+fn make() -> E {
+    var e = E::Zero
+    for _ in 0..3 {
+        e = E::A
+    }
+    e
+}
+
+pub fn frame(time: f32, width: u32, height: u32) {
+    let _ = u32(X)
+}
+
+@test
+fn x_is_a() {
+    assert(u32(X) == 2)
+}
+"#;
+
+/// How a constant's value is read back is in its key (language.md §13): a variant inserted
+/// before the one a cached enum holds moves its index, though the constant's code is the same,
+/// and the cache isn't read for it.
+#[test]
+fn an_enums_variants_are_in_its_constants_key() {
+    let dir = scratch("consts/reordered");
+    let passes = |text: &str| {
+        std::fs::write(dir.join("main.wrela"), text).expect("write");
+        let out = wrela_driver::test(&dir, None);
+        let failed: Vec<_> = out.results.iter().filter_map(|r| r.failure.clone()).collect();
+        assert!(
+            out.passed(),
+            "{}{}",
+            wrela_diag::render::render_all(&out.sources, &out.diagnostics),
+            wrela_diag::render::render_all(&out.sources, &failed)
+        );
+    };
+    passes(REORDERED);
+    passes(&REORDERED.replace("    A = 2,", "    B = 1,\n    A = 2,"));
 }

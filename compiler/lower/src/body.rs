@@ -708,7 +708,16 @@ impl<'c, 'a> Fl<'c, 'a> {
                     self.emit(ir::Stmt::Continue);
                     return;
                 }
-                TerminatorKind::Match { arms, merge } => {
+                // A `match` on a constant: the arm it takes, alone.
+                TerminatorKind::Match { arms, merge, taken: Some(i) } => {
+                    let Some(&arm) = arms.get(*i as usize) else { return };
+                    self.region(arm, None);
+                    if self.preds[merge.index()] == 0 {
+                        return;
+                    }
+                    b = *merge;
+                }
+                TerminatorKind::Match { arms, merge, taken: None } => {
                     // `matched` is set when an arm's body finishes; later arms run only while
                     // it's false.
                     let bool_ty = self.mb.m.types.bool();
@@ -864,7 +873,9 @@ impl<'c, 'a> Fl<'c, 'a> {
             TerminatorKind::LoopBack(l) => loop_part(*l, |b, _, _| *b),
             TerminatorKind::Break(l) => loop_part(*l, |_, _, m| *m),
             TerminatorKind::Continue(l) => loop_part(*l, |_, c, _| *c),
-            TerminatorKind::Match { arms, merge } => Some(*arms.first().unwrap_or(merge)),
+            TerminatorKind::Match { arms, merge, taken } => {
+                Some(*taken.and_then(|i| arms.get(i as usize)).or(arms.first()).unwrap_or(merge))
+            }
             TerminatorKind::ArmMatched(m) => match &code.block(*m).term.kind {
                 TerminatorKind::Match { merge, .. } => Some(*merge),
                 _ => None,
@@ -968,6 +979,32 @@ impl<'c, 'a> Fl<'c, 'a> {
             && let Some(g) = self.group_rvalue(r)
         {
             self.locals[l.index()] = g;
+            return;
+        }
+        // A texture's handle copied in GPU code (`let t = field.texels`): the texture the shader
+        // received, by another name.
+        if place.proj.is_empty()
+            && self.is_gpu()
+            && let Rvalue::Use(mir::Operand {
+                kind: mir::OperandKind::Copy(from) | mir::OperandKind::Move(from, _),
+                ..
+            }) = r
+            && crate::gpu::is_resource_ty(&self.cx.checked.program, self.place_src_ty(from))
+        {
+            // Bound once: which texture a second binding names would depend on the path taken,
+            // and the shader's bindings are fixed.
+            if !matches!(self.locals[l.index()], Repr::Unbound) {
+                self.cx.err(
+                    Diagnostic::new(
+                        codes::E0702,
+                        span,
+                        "GPU code binds a texture's handle to a local once: this one is bound already",
+                    )
+                    .with_help("give each texture a local of its own, or choose between them by an index into what each one reads"),
+                );
+                return;
+            }
+            self.locals[l.index()] = self.alias_of(from);
             return;
         }
         if place.proj.is_empty() {
@@ -1095,6 +1132,36 @@ impl<'c, 'a> Fl<'c, 'a> {
                     out.push(match a {
                         mir::Arg::Borrow(p, _) | mir::Arg::Mut(p, _) => self.alias_of(p),
                         mir::Arg::Take(o) => match self.operand(o) {
+                            Some(v) => Repr::Var(self.local_of("field", v)),
+                            None => Repr::Erased,
+                        },
+                    });
+                }
+                Some(Repr::Group(out))
+            }
+            // A value that holds a texture's handle, built in GPU code (a combinator round a
+            // `Sampled3d`): its fields as a group's, the handle the texture it names.
+            Rvalue::Adt { adt, args, variant: None, fields } => {
+                let args = args.iter().map(|&a| self.concrete(a)).collect();
+                let t = self.types().adt(*adt, args);
+                if !wrela_sema::gpu::is_gpu_group(&self.cx.checked.program, t)
+                    || wrela_sema::gpu::is_group(&self.cx.checked.program, t)
+                {
+                    return None;
+                }
+                let mut out = Vec::new();
+                for o in fields {
+                    let place = match &o.kind {
+                        mir::OperandKind::Copy(p) | mir::OperandKind::Move(p, _) => Some(p),
+                        mir::OperandKind::Const(_) => None,
+                    };
+                    let ft = self.concrete(o.ty);
+                    let program = &self.cx.checked.program;
+                    let held = wrela_sema::gpu::is_gpu_group(program, ft)
+                        || crate::gpu::is_resource_ty(program, ft);
+                    out.push(match (place, held) {
+                        (Some(p), true) => self.alias_of(p),
+                        _ => match self.operand(o) {
                             Some(v) => Repr::Var(self.local_of("field", v)),
                             None => Repr::Erased,
                         },
@@ -1599,7 +1666,7 @@ impl<'c, 'a> Fl<'c, 'a> {
                     }
                     _ => return None,
                 }
-            } else if wrela_sema::gpu::is_group(p, ft) {
+            } else if wrela_sema::gpu::is_gpu_group(p, ft) {
                 let Repr::Group(sub) = r else { return None };
                 bs.push(Some(self.pass_group(sub, ft, out, span)?));
             } else {
@@ -2457,7 +2524,7 @@ impl<'c, 'a> Fl<'c, 'a> {
                 continue;
             }
             callables.push(None);
-            if self.is_gpu() && wrela_sema::gpu::is_group(&self.cx.checked.program, pt) {
+            if self.is_gpu() && wrela_sema::gpu::is_gpu_group(&self.cx.checked.program, pt) {
                 let fields = a.place().and_then(|pl| self.group_of(pl));
                 let bound = fields.and_then(|f| self.pass_group(&f, pt, &mut out, a.span()));
                 if bound.is_none() {

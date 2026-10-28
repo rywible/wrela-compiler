@@ -849,7 +849,6 @@ impl Ad<'_> {
             Expr::Const(_)
             | Expr::Zero(_)
             | Expr::EntryInput(_)
-            | Expr::Override(_)
             | Expr::Bitcast(..)
             | Expr::ArrayLength(_) => None,
             Expr::Param(i) => {

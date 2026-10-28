@@ -1,6 +1,6 @@
 // `const` parameters of entry points (language.md §18.1): `scale`'s `double` and `add` are its
-// pipeline's constants, so its two dispatches below are two pipelines, each its constants set
-// where it's created; the branch on `double` folds where the driver compiles each. Frame 0
+// pipeline's constants, so its two dispatches below are two pipelines, each with its constants
+// folded into its shader; the branch on `double` folds where the compiler writes each. Frame 0
 // dispatches both and reads both back; the test checks what each computed.
 use std::gpu::{GlobalId, GpuBuffer, Slots, buffer, dispatch, read}
 use std::io::Pending

@@ -314,14 +314,22 @@ pub(crate) fn index_of(sources: Vec<SourceFile>) -> Index {
                 }
                 None => {
                     for m in &imp.members {
-                        let ImplMemberKind::Fn(f) = &m.kind else { continue };
                         if !documented(m.vis.as_ref(), s) {
                             continue;
                         }
+                        // A method, or an associated constant as it's written.
+                        let (name, kind, signature) = match &m.kind {
+                            ImplMemberKind::Fn(f) => (
+                                &f.name.name,
+                                "method",
+                                fn_signature(s, &m.attrs, m.vis.as_ref(), f),
+                            ),
+                            ImplMemberKind::Const(c) => (&c.name.name, "const", text(s, m.span)),
+                            ImplMemberKind::Type { .. } => continue,
+                        };
                         let mut path = index.entries[owner].path.clone();
-                        path.push(f.name.name.clone());
-                        let signature = fn_signature(s, &m.attrs, m.vis.as_ref(), f);
-                        let e = entry(s, path, "method", signature, m.span);
+                        path.push(name.clone());
+                        let e = entry(s, path, kind, signature, m.span);
                         index.entries.push(e);
                         let id = index.entries.len() - 1;
                         index.entries[owner].methods.push(id);
@@ -394,7 +402,7 @@ fn add_item(index: &mut Index, s: &Source, item: &ast::Item) {
                 .iter()
                 .filter_map(|m| match &m.kind {
                     TraitMemberKind::Fn(f) => f.body.as_ref().map(|b| b.span),
-                    TraitMemberKind::Type { .. } => None,
+                    TraitMemberKind::Type { .. } | TraitMemberKind::Const(_) => None,
                 })
                 .collect();
             ("trait", elide(s, item.span, &holes))

@@ -68,10 +68,10 @@ variant          ::= IDENT ("(" (type ("," type)* ","?)? ")" | field_block | "="
 
 # `trait Sim = Clone + StateHash` names a set of traits (language.md §7).
 trait_item       ::= "trait" IDENT generic_params? ((":" bounds)? "{" sep* (trait_member (sep+ trait_member)* sep*)? "}" | "=" bounds)
-trait_member     ::= attribute* (fn_sig block? | "type" IDENT (":" bounds)?)
+trait_member     ::= attribute* (fn_sig block? | "type" IDENT (":" bounds)? | "const" IDENT ":" type ("=" expr)?)
 
 impl_item        ::= "impl" generic_params? type ("for" type)? "{" sep* (impl_member (sep+ impl_member)* sep*)? "}"
-impl_member      ::= attribute* vis? fn_item | "type" IDENT "=" type
+impl_member      ::= attribute* vis? (fn_item | "const" IDENT ":" type "=" expr) | "type" IDENT "=" type
 
 const_item       ::= "const" IDENT (":" type)? "=" expr
 type_item        ::= "type" IDENT generic_params? "=" trait_type

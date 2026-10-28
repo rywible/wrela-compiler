@@ -14,6 +14,7 @@ mod lints;
 pub mod mir;
 pub mod program;
 pub mod resolve;
+pub mod set;
 pub mod thir;
 pub mod traits;
 pub mod ty;
@@ -112,6 +113,9 @@ pub struct Checked {
     /// Each function body's MIR.
     pub mir: BTreeMap<ty::FnId, mir::Body>,
     pub consts: BTreeMap<ty::ConstId, (ty::TyId, thir::Expr)>,
+    /// Each associated constant's value as it's written (§3.4), in its function's generics:
+    /// what lowering folds where a `const` argument names it.
+    pub assoc_consts: BTreeMap<ty::FnId, thir::Expr>,
     /// The type each function that returns by naming its traits (`-> Creature<Coat>`) returns.
     pub hidden: HashMap<ty::FnId, ty::TyId>,
     /// Each body's own effects, for lowering's checks.
@@ -183,7 +187,18 @@ pub fn check_packages(
     packages: &[collect::PackageInfo],
     diags: &mut Vec<Diagnostic>,
 ) -> Checked {
-    check(units, packages, diags, false)
+    check(units, packages, diags, false, &[])
+}
+
+/// [`check_packages`], with the program's root-module constants that `sets` names given its
+/// values (`wrela build --set NAME=VALUE`, [`set`]).
+pub fn check_packages_set(
+    units: Vec<SourceUnit>,
+    packages: &[collect::PackageInfo],
+    sets: &[(String, String)],
+    diags: &mut Vec<Diagnostic>,
+) -> Checked {
+    check(units, packages, diags, false, sets)
 }
 
 /// [`check_packages`], memory-checking std's bodies too: for std's own tests.
@@ -192,15 +207,17 @@ pub fn check_packages_and_std(
     packages: &[collect::PackageInfo],
     diags: &mut Vec<Diagnostic>,
 ) -> Checked {
-    check(units, packages, diags, true)
+    check(units, packages, diags, true, &[])
 }
 
 fn check(
-    units: Vec<SourceUnit>,
+    mut units: Vec<SourceUnit>,
     packages: &[collect::PackageInfo],
     diags: &mut Vec<Diagnostic>,
     memory_check_std: bool,
+    sets: &[(String, String)],
 ) -> Checked {
+    diags.extend(set::apply(&mut units, packages, sets));
     let mut program = collect::collect(units, packages, diags);
     let consts = {
         let p = &program;
@@ -210,6 +227,7 @@ fn check(
             diags.extend(fieldwise::check_trait(p, ty::TraitId(t as u32)));
         }
         let consts = check::check_consts(p, diags);
+        diags.extend(set::check_types(p, &consts.tys, sets));
         diags.extend(collect::check_test_inputs(p, &consts.tys));
         consts
     };
@@ -257,6 +275,7 @@ fn check(
         mir.insert(f, m);
     }
     let mut hidden = Vec::new();
+    let mut assoc_consts = BTreeMap::new();
     for i in 0..p.fns.len() {
         let f = ty::FnId(i as u32);
         let check::FnCheck { body, diags: d, incomplete } = check::check_fn(p, &const_tys, f);
@@ -265,6 +284,9 @@ fn check(
         if let Some(b) = body {
             if let Some(h) = b.hidden_ret {
                 hidden.push((f, h));
+            }
+            if p.func(f).attrs.assoc_const {
+                assoc_consts.insert(f, b.value.clone());
             }
             // The memory checker needs a well-typed, whole body; it would only add noise
             // otherwise. A `@fieldwise` trait's walk has no memory IR of its own: each type that
@@ -292,7 +314,7 @@ fn check(
         diags.extend(unused_items(p, &mir));
     }
     let hidden = hidden.into_iter().collect();
-    Checked { program, mir, consts, hidden, direct }
+    Checked { program, mir, consts, assoc_consts, hidden, direct }
 }
 
 /// W0008: a private function or constant that no other code uses (a function that only calls
@@ -346,7 +368,13 @@ fn unused_items(p: &Program, mir: &BTreeMap<ty::FnId, mir::Body>) -> Vec<Diagnos
         {
             continue;
         }
-        let kind = if f.attrs.entry.is_some() { "entry point" } else { "function" };
+        let kind = if f.attrs.entry.is_some() {
+            "entry point"
+        } else if f.attrs.assoc_const {
+            "constant"
+        } else {
+            "function"
+        };
         out.push(unused(&f.name, kind, f.name_span));
     }
     for (i, c) in p.consts.iter().enumerate() {

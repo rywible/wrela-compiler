@@ -237,6 +237,17 @@ pub enum ConstArg {
 }
 
 impl ConstArg {
+    /// A `const` argument of type `kind` (`u32`, `i32` or `f32`) from a number: `int` an
+    /// integer's exact value, `v` the number as a float. `None` if it isn't one of that type.
+    pub fn of_number(kind: &TyKind, v: f64, int: Option<i128>) -> Option<ConstArg> {
+        Some(match kind {
+            TyKind::Int(IntTy::U32) => ConstArg::U32(u32::try_from(int?).ok()?),
+            TyKind::Int(IntTy::I32) => ConstArg::I32(i32::try_from(int?).ok()?),
+            TyKind::Float(FloatTy::F32) => ConstArg::F32((v as f32).to_bits()),
+            _ => return None,
+        })
+    }
+
     /// Its value as WebGPU's `constants` take it, a number (a bool is 0 or 1).
     pub fn number(self) -> f64 {
         match self {
@@ -259,11 +270,63 @@ impl std::fmt::Display for ConstArg {
     }
 }
 
+/// A `const` parameter's argument as it's written (§18.1): its value, or an associated constant
+/// (`S::K`, §3.4), whose value is its instantiation's: lowering folds it, once the types are
+/// known.
+#[derive(Clone, Debug)]
+pub enum ConstSrc {
+    Value(ConstArg),
+    /// An inherent impl's constant, `args` its generics (the impl's).
+    Inherent {
+        func: FnId,
+        args: Vec<TyId>,
+    },
+    /// A trait's constant of `self_ty`.
+    Trait {
+        method: FnId,
+        self_ty: TyId,
+        trait_args: Vec<TyId>,
+    },
+}
+
+impl ConstSrc {
+    /// An associated constant's call (`S::K`, §3.4) as a `const` argument's source.
+    pub fn of_callee(p: &crate::program::Program, callee: &Callee) -> Option<ConstSrc> {
+        match callee {
+            Callee::Fn { func, args } if p.func(*func).attrs.assoc_const => {
+                Some(ConstSrc::Inherent { func: *func, args: args.clone() })
+            }
+            Callee::TraitMethod { method, self_ty, trait_args, .. }
+                if p.func(*method).attrs.assoc_const =>
+            {
+                Some(ConstSrc::Trait {
+                    method: *method,
+                    self_ty: *self_ty,
+                    trait_args: trait_args.clone(),
+                })
+            }
+            _ => None,
+        }
+    }
+
+    /// Calls `f` on each type it names.
+    pub fn for_each_ty_mut(&mut self, f: &mut impl FnMut(&mut TyId)) {
+        match self {
+            ConstSrc::Value(_) => {}
+            ConstSrc::Inherent { args, .. } => args.iter_mut().for_each(f),
+            ConstSrc::Trait { self_ty, trait_args, .. } => {
+                f(self_ty);
+                trait_args.iter_mut().for_each(f);
+            }
+        }
+    }
+}
+
 #[derive(Clone, Debug)]
 pub enum Shader {
     /// `k` or `k.bind(...)`, with its generic arguments: its arguments are the command's, but
     /// its `const` parameters' (§18.1), whose values are here, by parameter index.
-    Named(FnId, Vec<TyId>, Vec<(usize, ConstArg)>),
+    Named(FnId, Vec<TyId>, Vec<(usize, ConstSrc)>),
     /// A value of a bound entry point's type (`let k = k.bind(...)`, or a parameter bounded by
     /// `Kernel`): the type names the entry point once it's known, and its fields hold the
     /// arguments.
@@ -322,7 +385,7 @@ pub struct RenderState {
     pub depth: wrela_abi::manifest::DepthState,
     /// `std::gpu::Blend`s: `blend:` for every target, or `blends:` for each (the first
     /// `blend_count`), given or not (then `Replace`, or `Over` for a shader returning `Over`).
-    pub blends: [wrela_abi::manifest::Blend; 4],
+    pub blends: [wrela_abi::manifest::Blend; wrela_abi::stream::MAX_COLOR_ATTACHMENTS],
     pub blend_count: u8,
     pub blend_given: bool,
 }

@@ -1,0 +1,25 @@
+// rejects: trait.assoc-const
+// An associated constant without a default is in every impl; an impl's constant is its trait's;
+// a constant isn't called; and its type is one a constant folds.
+trait Taps {
+    const K: u32
+}
+
+struct Four {}
+
+impl Taps for Four {} //~ E0401
+
+struct Six {}
+
+impl Taps for Six {
+    const K: u32 = 6
+    const F: u32 = 1 //~ E0402
+}
+
+trait Wide {
+    const AT: vec2 //~ E0420
+}
+
+fn twice<S: Taps>() -> u32 {
+    S::K() * 2 //~ E0420
+}

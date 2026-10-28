@@ -20,13 +20,16 @@ pub fn run(args: &[String]) -> ExitCode {
     let out = args.out.unwrap_or_else(|| dir.join("build"));
     let mut output = if !args.lift.is_empty() {
         let kind = wrela_driver::BuildKind { debug: args.debug, testing: args.testing };
-        match wrela_driver::build_lifted(dir, &args.lift, kind) {
+        match wrela_driver::build_lifted(dir, &args.lift, kind, &args.set) {
             Ok(o) => o,
             Err(why) => {
                 eprintln!("error: {why}");
                 return ExitCode::from(2);
             }
         }
+    } else if !args.set.is_empty() {
+        let kind = wrela_driver::BuildKind { debug: args.debug, testing: args.testing };
+        wrela_driver::build_set(dir, kind, args.relaxed_simd, &args.set)
     } else if args.testing {
         wrela_driver::build_for_tests(dir, args.debug)
     } else if args.debug {
@@ -41,6 +44,10 @@ pub fn run(args: &[String]) -> ExitCode {
         && let Some(data) = &output.data
     {
         print!("{}", if args.json { data_json(data) } else { data_table(data) });
+    }
+    if args.report_consts {
+        let runs = &output.consts.runs;
+        print!("{}", if args.json { consts_json(runs) } else { consts_table(runs) });
     }
     if let Some(level) = args.optimize
         && !failed
@@ -101,6 +108,44 @@ pub fn run(args: &[String]) -> ExitCode {
             ExitCode::from(2)
         }
     }
+}
+
+/// `--report consts`' table: each computed constant, its value's bytes, the fuel computing it
+/// used, this build's seconds on it, and whether it was read from the cache.
+pub(crate) fn consts_table(runs: &[wrela_driver::ConstRun]) -> String {
+    let mut s =
+        format!("{:<40} {:>12} {:>16} {:>9}  {}\n", "constant", "bytes", "fuel", "seconds", "from");
+    for r in runs {
+        let from = if r.cached { "cached" } else { "computed" };
+        s.push_str(&format!(
+            "{:<40} {:>12} {:>16} {:>9.3}  {from}\n",
+            r.name, r.bytes, r.fuel, r.seconds
+        ));
+    }
+    let cached = runs.iter().filter(|r| r.cached).count();
+    s.push_str(&format!(
+        "consts: {} computed, {cached} from the cache, {:.3} s\n",
+        runs.len() - cached,
+        runs.iter().map(|r| r.seconds).sum::<f64>()
+    ));
+    s
+}
+
+/// `--report consts --json`.
+fn consts_json(runs: &[wrela_driver::ConstRun]) -> String {
+    let rows: Vec<_> = runs
+        .iter()
+        .map(|r| {
+            serde_json::json!({
+                "name": r.name,
+                "bytes": r.bytes,
+                "fuel": r.fuel,
+                "seconds": r.seconds,
+                "cached": r.cached,
+            })
+        })
+        .collect();
+    format!("{}\n", serde_json::json!({ "consts": rows }))
 }
 
 /// How many of the largest constants `--report data` lists.
@@ -271,6 +316,25 @@ fn remove_stale(out: &Path, owned: &[String], files: &[(String, Vec<u8>)]) -> st
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `--report consts` names each constant, and a cached read as cached.
+    #[test]
+    fn the_consts_report_says_which_were_cached() {
+        let run = |name: &str, cached| wrela_driver::ConstRun {
+            name: name.into(),
+            bytes: 256,
+            fuel: 1_000,
+            seconds: 0.25,
+            cached,
+        };
+        let table = consts_table(&[run("SQUARES", false), run("TOTAL", true)]);
+        let lines: Vec<&str> = table.lines().collect();
+        assert!(lines[1].starts_with("SQUARES") && lines[1].ends_with("computed"), "{table}");
+        assert!(lines[2].starts_with("TOTAL") && lines[2].ends_with("cached"), "{table}");
+        assert_eq!(lines[3], "consts: 1 computed, 1 from the cache, 0.500 s");
+        let json = consts_json(&[run("TOTAL", true)]);
+        assert!(json.contains("\"cached\":true") && json.contains("\"fuel\":1000"), "{json}");
+    }
 
     #[test]
     fn only_files_a_build_writes_are_stale() {

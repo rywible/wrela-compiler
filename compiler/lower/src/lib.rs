@@ -11,6 +11,7 @@
 //!   CPU-only types; derivatives only exist in fragment shaders. These are found while lowering
 //!   each GPU pipeline and reported with the call chain.
 
+mod assoc;
 mod body;
 mod consts;
 mod derive;
@@ -331,6 +332,8 @@ pub(crate) struct ModuleBuilder {
     pub lift: Option<lift::CpuTable>,
     /// Each job's value, as laid out (§16.3), by the job and its generics.
     pub jobs: HashMap<(FnId, Vec<TyId>), job::JobLayout>,
+    /// The files `embed` read into this module's data, by path, in the order first read.
+    pub embeds: Vec<std::sync::Arc<str>>,
 }
 
 impl ModuleBuilder {

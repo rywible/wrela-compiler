@@ -1966,7 +1966,25 @@ impl<'p> Checker<'p> {
             let path = super::expr::name_path(name);
             return self.call_variant(a, v as u32, &path, args, expected.or(Some(ty)), span);
         }
-        match self.find_associated(ty, name) {
+        let found = self.find_associated(ty, name);
+        if let Assoc::Inherent(f, _) | Assoc::Trait(f, _, _) = &found
+            && self.p.func(*f).attrs.assoc_const
+        {
+            self.err(
+                Diagnostic::new(
+                    codes::E0420,
+                    span,
+                    format!("`{}` is an associated constant, not a function", name.name),
+                )
+                .with_help(format!(
+                    "name it without a call: `{}::{}`",
+                    self.display(ty),
+                    name.name
+                )),
+            );
+            return self.failed_call(args, span);
+        }
+        match found {
             Assoc::Inherent(f, impl_args) => {
                 let mut gargs = impl_args;
                 gargs.extend(self.method_generic_args(f, generics, span));
@@ -2015,6 +2033,16 @@ impl<'p> Checker<'p> {
         span: Span,
     ) -> Option<Expr> {
         let (f, mut args) = match self.find_associated(ty, name) {
+            // An associated constant is its value: the call of the function it's checked as.
+            Assoc::Inherent(f, impl_args) if self.p.func(f).attrs.assoc_const => {
+                return Some(self.call_fn(f, impl_args, None, &[], None, span));
+            }
+            Assoc::Trait(m, r, unsure) if self.p.func(m).attrs.assoc_const => {
+                if unsure {
+                    self.trait_obligation(ty, &r, span, &name.name);
+                }
+                return Some(self.call_trait_method(m, ty, r.args, None, None, &[], span));
+            }
             Assoc::Inherent(f, impl_args) => (f, impl_args),
             Assoc::Trait(m, r, unsure) => {
                 if unsure {
@@ -2955,7 +2983,7 @@ impl<'p> Checker<'p> {
         &mut self,
         func: FnId,
         args: Vec<(usize, Expr)>,
-    ) -> (Positional<Expr>, Positional<ConstArg>) {
+    ) -> (Positional<Expr>, Positional<ConstSrc>) {
         let mut plain = Vec::new();
         let mut consts = Vec::new();
         for (i, x) in args {
@@ -2965,8 +2993,15 @@ impl<'p> Checker<'p> {
                 continue;
             }
             let ty = self.infer.resolve(&self.p.types, x.ty);
+            // An associated constant (`S::K`): its instantiation's value, folded in lowering.
+            if let ExprKind::Call(Call { callee, .. }) = &x.kind
+                && let Some(src) = ConstSrc::of_callee(self.p, callee)
+            {
+                consts.push((i, src));
+                continue;
+            }
             match self.const_arg(&x, ty) {
-                Some(c) => consts.push((i, c)),
+                Some(c) => consts.push((i, ConstSrc::Value(c))),
                 None if matches!(self.kind(ty), TyKind::Error) => {}
                 None => {
                     let (name, fname) = (ps.name.clone(), self.p.func(func).name.clone());
@@ -2976,8 +3011,8 @@ impl<'p> Checker<'p> {
                             x.span,
                             format!("`{fname}`'s `{name}` is `const`: its argument is a build-time constant, written where it's bound"),
                         )
-                        .with_note("it's a constant of the pipeline, which the host makes when the program loads; each value is a pipeline of its own")
-                        .with_help(format!("write a literal or a `const` item, e.g. `{name}: true`; pass a value that changes as an ordinary parameter")),
+                        .with_note("it's a constant of the pipeline, folded into its shader; each value is a pipeline of its own")
+                        .with_help(format!("write a literal, a negated literal, a `const` item that holds one, or an associated constant (`S::K` under a bound `S: Trait`), e.g. `{name}: true`; pass a value that changes as an ordinary parameter")),
                     );
                 }
             }
@@ -2988,15 +3023,7 @@ impl<'p> Checker<'p> {
     /// The value of a `const` parameter's argument `x` of type `ty`, if it's a literal, a
     /// negated literal or a `const` item that is one.
     fn const_arg(&self, x: &Expr, ty: TyId) -> Option<ConstArg> {
-        let make = |v: f64, int: Option<i128>| -> Option<ConstArg> {
-            Some(match self.kind(ty) {
-                TyKind::Bool => return None,
-                TyKind::Int(IntTy::U32) => ConstArg::U32(u32::try_from(int?).ok()?),
-                TyKind::Int(IntTy::I32) => ConstArg::I32(i32::try_from(int?).ok()?),
-                TyKind::Float(FloatTy::F32) => ConstArg::F32((v as f32).to_bits()),
-                _ => return None,
-            })
-        };
+        let make = |v: f64, int: Option<i128>| ConstArg::of_number(self.kind(ty), v, int);
         match &x.kind {
             ExprKind::Lit(Lit::Bool(b)) if matches!(self.kind(ty), TyKind::Bool) => {
                 Some(ConstArg::Bool(*b))
@@ -3827,7 +3854,8 @@ impl<'p> Checker<'p> {
                 }
                 "blend" => {
                     if let Some(c) = self.render_constant(&a.value, Lang::Blend) {
-                        state.blends = [nth(&wrela_abi::manifest::Blend::ALL, c[0]); 4];
+                        state.blends = [nth(&wrela_abi::manifest::Blend::ALL, c[0]);
+                            wrela_abi::stream::MAX_COLOR_ATTACHMENTS];
                         state.blend_given = true;
                     }
                 }
@@ -3844,19 +3872,20 @@ impl<'p> Checker<'p> {
                         self.check_expr(&a.value, None);
                         continue;
                     };
-                    if items.is_empty() || items.len() > 4 {
+                    let most = wrela_abi::stream::MAX_COLOR_ATTACHMENTS;
+                    if items.is_empty() || items.len() > most {
                         self.err(Diagnostic::new(
                             codes::E0603,
                             a.span,
-                            "`blends:` gives one `Blend` for each of 1 to 4 targets",
+                            format!("`blends:` gives one `Blend` for each of 1 to {most} targets"),
                         ));
                     }
-                    for (k, item) in items.iter().enumerate().take(4) {
+                    for (k, item) in items.iter().enumerate().take(most) {
                         if let Some(c) = self.render_constant(item, Lang::Blend) {
                             state.blends[k] = nth(&wrela_abi::manifest::Blend::ALL, c[0]);
                         }
                     }
-                    state.blend_count = items.len().min(4) as u8;
+                    state.blend_count = items.len().min(most) as u8;
                     state.blend_given = true;
                 }
                 "index_count" | "count" => {

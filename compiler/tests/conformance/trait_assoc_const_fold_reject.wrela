@@ -1,0 +1,35 @@
+// rejects: trait.assoc-const
+// A `const` argument's associated constant folds each step in its type, as the CPU computes it:
+// `4294967295 + 1` is past a `u32`, though the quotient fits.
+use std::gpu::{GlobalId, GpuBuffer, Slots, buffer, dispatch}
+
+trait Taps {
+    const TAPS: u32
+}
+
+struct Wide {}
+
+impl Taps for Wide {
+    const TAPS: u32 = (4294967295 + 1) / 2
+}
+
+@compute(64)
+fn fill(out: mut Slots<u32>, id: GlobalId, taps: const u32) {
+    out[id] = taps
+}
+
+pub struct State {
+    out: GpuBuffer<u32>,
+}
+
+pub fn init() -> State {
+    State { out: buffer(64) }
+}
+
+fn run<S: Taps>(out: mut GpuBuffer<u32>) {
+    dispatch(fill.bind(out: mut out, taps: S::TAPS), groups: 1) //~ E0603
+}
+
+pub fn frame(s: mut State, time: f32, width: u32, height: u32) {
+    run::<Wide>(mut s.out)
+}

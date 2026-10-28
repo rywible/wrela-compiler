@@ -88,6 +88,15 @@ impl<'a> Cx<'a> {
         if let Some(&c) = mb.type_cache.get(&t) {
             return c;
         }
+        // A type that mentions a return-position trait type (`Holder<Grown>`, `Grown` an alias
+        // that names traits) is the type it reveals (`Holder<Ball>`): one IR type, by one name,
+        // wherever it's reached.
+        let revealed = self.checked.reveal(t);
+        if revealed != t {
+            let out = self.lower_ty(mb, revealed, span);
+            mb.type_cache.insert(t, out);
+            return out;
+        }
         let k = self.checked.program.types.kind(t);
         let gpu = mb.target() == ir::Target::Gpu;
         let out = match k {
@@ -188,7 +197,6 @@ impl<'a> Cx<'a> {
                     }
                     let mut fields = Vec::new();
                     for (d, ft) in p.adt_fields(*a, None).iter().zip(p.fields_of(*a, args, None)) {
-                        let ft = self.checked.reveal(ft);
                         if let Some(f) = self.lower_ty(mb, ft, span) {
                             // A borrow struct's projection field points at its place.
                             let f = if borrow && d.mode != RetMode::Owned {
@@ -210,10 +218,6 @@ impl<'a> Cx<'a> {
                     }
                 }
             }
-            TyKind::Opaque(..) => {
-                let r = self.checked.reveal(t);
-                self.lower_ty(mb, r, span)
-            }
             // A closure that captures only `Copy` values it reads is a value: copies of them
             // (§6.7). Any other has no value of its own (it's inlined where it's passed).
             &TyKind::Closure(c, ref env) => {
@@ -232,7 +236,9 @@ impl<'a> Cx<'a> {
                 }
             }
             TyKind::Never | TyKind::FnPtr(..) | TyKind::FnDef(..) | TyKind::Error => None,
-            TyKind::Param(_)
+            // Revealed above.
+            TyKind::Opaque(..)
+            | TyKind::Param(_)
             | TyKind::Projection { .. }
             | TyKind::Var(_)
             | TyKind::ArrayN(..)

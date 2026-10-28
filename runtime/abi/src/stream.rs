@@ -31,7 +31,7 @@
 //! | 11 | `DestroyTexture` | `handle` |
 //! | 12 | `CreateSampler` | `handle`, `filter` (0 nearest, 1 linear), `address` (0 clamp, 1 repeat), `compare` ([`Compare`]; 0 for a sampler that doesn't compare), `mip filter` (0 nearest, 1 linear: between mip levels), `anisotropy` (1 to 16; above 1 only with `filter` and `mip filter` linear) |
 //! | 13 | `DestroySampler` | `handle` |
-//! | 14 | `BeginPass` | `colours` (0 to 4), `join` (1: it may join the pass before, [`Pass::join`]), then for each colour target `texture` (a texture, or [`SCREEN`] alone), `level`, `layer` (of an array or a cube; 0 of a 2D texture), `load` (0 clear, 1 keep), the clear colour `r`, `g`, `b`, `a` as f32; then `depth` (a depth texture or [`NONE`]), `depth layer`, `depth load`, `clear depth` as f32 |
+//! | 14 | `BeginPass` | `colours` (0 to 8), `join` (1: it may join the pass before, [`Pass::join`]), then for each colour target `texture` (a texture, or [`SCREEN`] alone), `level`, `layer` (of an array or a cube; 0 of a 2D texture), `load` (0 clear, 1 keep), the clear colour `r`, `g`, `b`, `a` as f32; then `depth` (a depth texture or [`NONE`]), `depth layer`, `depth load`, `clear depth` as f32 |
 //! | 15 | `EndPass` | none. Ends a pass that isn't on the screen. |
 //! | 16 | `DispatchIndirect` | `pipeline`, `arguments buffer`, `offset` (three `u32` group counts there), the bindings, the uniforms |
 //! | 17 | `DrawIndirect` | `pipeline`, `arguments buffer`, `offset` (vertex count, instance count, first vertex, first instance there), the bindings, the uniforms |
@@ -700,8 +700,9 @@ pub fn color_attachment_bytes(formats: &[TextureFormat]) -> u32 {
 
 /// WebGPU's default `maxColorAttachmentBytesPerSample`.
 pub const MAX_COLOR_ATTACHMENT_BYTES: u32 = 32;
-/// WebGPU's default `maxColorAttachments`.
-pub const MAX_COLOR_ATTACHMENTS: usize = 4;
+/// WebGPU's default `maxColorAttachments`: a pass's colour targets, whose bytes a sample are
+/// within [`MAX_COLOR_ATTACHMENT_BYTES`] too.
+pub const MAX_COLOR_ATTACHMENTS: usize = 8;
 
 impl serde::Serialize for TextureFormat {
     fn serialize<S: serde::Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
@@ -821,7 +822,7 @@ pub struct Pass {
 impl Pass {
     /// A pass with these colour targets (at most [`MAX_COLOR_ATTACHMENTS`]) and no depth.
     pub fn new(colors: &[ColorTarget]) -> Pass {
-        assert!(colors.len() <= MAX_COLOR_ATTACHMENTS, "at most four colour targets");
+        assert!(colors.len() <= MAX_COLOR_ATTACHMENTS, "at most eight colour targets");
         let mut all = [ColorTarget::of(NONE, false, [0.0; 4]); MAX_COLOR_ATTACHMENTS];
         all[..colors.len()].copy_from_slice(colors);
         Pass {
@@ -1594,7 +1595,7 @@ pub fn decode(batch: &[u8]) -> Result<Vec<Command<'_>>, StreamError> {
                 }
                 let n = w(0) as usize;
                 if n > MAX_COLOR_ATTACHMENTS {
-                    return Err(bad("a pass has at most four colour targets"));
+                    return Err(bad("a pass has at most eight colour targets"));
                 }
                 if words != 2 + 8 * n + 4 {
                     return Err(bad("the colour targets don't fill the payload"));

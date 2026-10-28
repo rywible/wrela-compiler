@@ -383,7 +383,7 @@ enum Kind {
         cull: Cull,
         depth_bias: DepthBias,
         depth: DepthState,
-        /// Its pipeline-overridable constants (the manifest's `constants`), for each variant.
+        /// A legacy build's pipeline-overridable constants (the manifest's `constants`).
         constants: Vec<(String, f64)>,
         variants: HashMap<Targets, wgpu::RenderPipeline>,
     },
@@ -1160,9 +1160,8 @@ impl Builder {
                 label: Some(&p.shader),
                 source: wgpu::ShaderSource::Wgsl(source.into()),
             });
-            let constants: Vec<(String, f64)> =
-                p.constants.iter().map(|(k, v)| (k.clone(), v.number())).collect();
-            let named: Vec<(&str, f64)> = constants.iter().map(|(k, v)| (k.as_str(), *v)).collect();
+            let named: Vec<(&str, f64)> =
+                p.constants.iter().map(|(k, v)| (k.as_str(), *v)).collect();
             match &p.stage {
                 Stage::Compute { entry, .. } => Kind::Compute(self.device.create_compute_pipeline(
                     &wgpu::ComputePipelineDescriptor {
@@ -1196,7 +1195,7 @@ impl Builder {
                         cull: *cull,
                         depth_bias: *depth_bias,
                         depth: *depth,
-                        constants: constants.clone(),
+                        constants: p.constants.clone(),
                         variants: HashMap::new(),
                     };
                     // A variant for each of its targets (the passes the program draws it in, which

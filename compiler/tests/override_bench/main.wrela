@@ -1,5 +1,5 @@
 // The microbench of language.md §18.1's `const` parameters: one kernel, as a `const` parameter
-// (`folded`, whose dead branch the driver drops when it makes the pipeline) and as a uniform
+// (`folded`, whose dead branch the compiler drops from the pipeline's shader) and as a uniform
 // (`branched`, which tests it in every invocation), each dispatched 1,000 times in frame 1 and
 // timed (`std::gpu::timed`). The test only checks both were measured; the times are printed,
 // a record of whether the driver folded it, not a claim.

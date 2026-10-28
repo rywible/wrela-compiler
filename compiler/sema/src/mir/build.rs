@@ -1646,6 +1646,44 @@ impl<'a> Builder<'a> {
         Some(Place::local(h))
     }
 
+    /// The arm a `match` on a constant takes, when the constant holds an enum's variant that
+    /// holds nothing and the arms before it test variants that hold nothing, with no guard:
+    /// lowering builds only that arm, so what the others reach (their pipelines too) isn't in the
+    /// program (a program's `TIER` or `STYLE`, §13), while every arm is checked.
+    fn arm_of_const(&self, scrutinee: &thir::Expr, arms: &[thir::Arm]) -> Option<u32> {
+        let mut e = unmut(scrutinee);
+        while let ExprKind::Const(c) = &e.kind {
+            e = &self.consts.get(c)?.1;
+        }
+        let ExprKind::Adt { variant: Some(v), fields, .. } = &e.kind else { return None };
+        if !fields.is_empty() {
+            return None;
+        }
+        fn takes(p: &thir::Pat, v: u32) -> Option<bool> {
+            match &p.kind {
+                PatKind::Wild => Some(true),
+                PatKind::Adt { variant: Some(w), fields, .. } if fields.is_empty() => Some(*w == v),
+                PatKind::Or(ps) => {
+                    let mut any = false;
+                    for p in ps {
+                        any |= takes(p, v)?;
+                    }
+                    Some(any)
+                }
+                _ => None,
+            }
+        }
+        for (i, arm) in arms.iter().enumerate() {
+            if arm.guard.is_some() {
+                return None;
+            }
+            if takes(&arm.pat, *v)? {
+                return Some(i as u32);
+            }
+        }
+        None
+    }
+
     fn match_(
         &mut self,
         scrutinee: &thir::Expr,
@@ -1656,7 +1694,8 @@ impl<'a> Builder<'a> {
     ) -> Option<Operand> {
         let sp = self.match_scrutinee(scrutinee, mutable)?;
         let r = (!self.is_unit(e.ty)).then(|| self.temp(e.ty, LocalKind::TempVar, "match", e.span));
-        self.arms(&sp, arms, e.span, |b, arm| {
+        let taken = self.arm_of_const(scrutinee, arms);
+        self.arms(&sp, arms, taken, e.span, |b, arm| {
             b.branch_into(r, arm.body.span, |b| b.value(&arm.body, want));
             true
         });
@@ -1672,6 +1711,7 @@ impl<'a> Builder<'a> {
         &mut self,
         sp: &Place,
         arms: &[thir::Arm],
+        taken: Option<u32>,
         span: Span,
         mut body: impl FnMut(&mut Self, &thir::Arm) -> bool,
     ) {
@@ -1680,7 +1720,7 @@ impl<'a> Builder<'a> {
         let entries: Vec<BlockId> = arms.iter().map(|_| self.new_block()).collect();
         // After the last arm: no arm matched, which exhaustiveness rules out.
         let none = self.new_block();
-        self.terminate(TerminatorKind::Match { arms: entries.clone(), merge }, span);
+        self.terminate(TerminatorKind::Match { arms: entries.clone(), merge, taken }, span);
         for (i, arm) in arms.iter().enumerate() {
             self.fs.cur = entries[i];
             let next = entries.get(i + 1).copied().unwrap_or(none);
@@ -1889,7 +1929,8 @@ impl<'a> Builder<'a> {
             }
             ExprKind::Match { scrutinee, arms, mutable } => {
                 let Some(sp) = self.match_scrutinee(scrutinee, *mutable) else { return };
-                self.arms(&sp, arms, e.span, |b, arm| {
+                let taken = self.arm_of_const(scrutinee, arms);
+                self.arms(&sp, arms, taken, e.span, |b, arm| {
                     b.place_tail(&arm.body);
                     false
                 });

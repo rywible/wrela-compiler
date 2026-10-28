@@ -24,6 +24,7 @@ fn scope_of(job: &Job, overrides: &[(String, PathBuf)]) -> Result<Scope, String>
         cache: Some(vec![job.cache().to_path_buf()]),
         overrides: overrides.to_vec(),
         cancel: Some(job.cancel()),
+        set: Vec::new(),
     })
 }
 
@@ -46,7 +47,7 @@ fn diagnostics_of(
 
 impl wrela_host::tool::Toolchain for Compiler {
     fn build(&self, job: &Job, package: &Path, options: &BuildOptions) -> Result<Built, String> {
-        let scope = scope_of(job, &options.overrides)?;
+        let scope = Scope { set: options.set.clone(), ..scope_of(job, &options.overrides)? };
         let kind = wrela_driver::BuildKind { debug: options.debug, testing: options.testing };
         let mut out = wrela_driver::build_in(package, kind, options.simd, &options.lift, &scope)?;
         if options.optimize && !out.has_errors() {

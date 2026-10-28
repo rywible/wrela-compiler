@@ -60,7 +60,7 @@ pub fn run(
         }
     }
     let out = if full_build {
-        build::emit(&lowered, sources, !data.no_simd, false, &[], false)
+        build::emit(&lowered, sources, !data.no_simd, false, &[], false, &[])
     } else {
         build::emit_for_cpu(&lowered, sources, !data.no_simd)
     };

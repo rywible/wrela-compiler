@@ -1,0 +1,34 @@
+// rejects: gpu.textures
+// GPU code binds a texture's handle to a local once: which texture a second binding names would
+// depend on the path taken, and a shader's bindings are fixed.
+use std::field::{Sampled3d, sampled3d}
+use std::gpu::{GlobalId, GpuBuffer, R32Float, Slots, Texture3d, buffer, dispatch, texture3d}
+
+@compute(64)
+fn pick(a: Sampled3d, b: Sampled3d, near: bool, out: mut Slots<f32>, id: GlobalId) {
+    var t = a.texels
+    if near {
+        t = b.texels //~ E0702
+    }
+    out[id] = t.load(x: 0, y: 0, z: 0)
+}
+
+pub struct State {
+    a: Texture3d<R32Float>,
+    b: Texture3d<R32Float>,
+    out: GpuBuffer<f32>,
+}
+
+pub fn init() -> State {
+    State {
+        a: texture3d(width: 2, height: 2, depth: 2),
+        b: texture3d(width: 2, height: 2, depth: 2),
+        out: buffer(64),
+    }
+}
+
+pub fn frame(s: mut State, time: f32, width: u32, height: u32) {
+    let a = sampled3d(s.a.to_handle(), vec3(0.0), 1.0)
+    let b = sampled3d(s.b.to_handle(), vec3(0.0), 1.0)
+    dispatch(pick.bind(a, b, time > 1.0, mut s.out), groups: 1)
+}

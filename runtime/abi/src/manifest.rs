@@ -55,9 +55,15 @@ pub use crate::stream::Compare;
 use crate::stream::{MAX_COLOR_ATTACHMENTS, TextureFormat, TextureKind};
 use serde::Serialize;
 use serde_json::{Map, Value};
+use std::collections::BTreeMap;
 use std::fmt;
 
-pub const VERSION: u32 = 11;
+/// The manifest's version. 12 (toolchain 0.10.0): a pipeline has no `constants` (its `const`
+/// parameters are folded into its WGSL), and a build may record its `set`.
+pub const VERSION: u32 = 12;
+/// The version before, which a host reads too, so a saved 0.9 build still runs beside a new one
+/// (`wrela same --against`): its pipelines may name pipeline-overridable `constants`.
+pub const LEGACY_VERSION: u32 = 11;
 /// The screen's texture format: what a screen target's colour is, and the format of the bytes a
 /// host reads back from the screen.
 pub const SCREEN_TEXTURE: TextureFormat = TextureFormat::Rgba8;
@@ -142,6 +148,11 @@ pub struct Manifest {
     pub wasm_relaxed: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub wasm_relaxed_abi: Option<WasmAbi>,
+    /// The program's constants the build set (`wrela build --set NAME=VALUE`, language.md
+    /// §13), by name: part of what the build is, so two builds of one program with different
+    /// sets are two builds.
+    #[serde(skip_serializing_if = "BTreeMap::is_empty")]
+    pub set: BTreeMap<String, String>,
 }
 
 /// A module's interface (language.md §15): its imported memory's limits, and the type of each
@@ -189,33 +200,16 @@ pub struct Pipeline {
     /// (or at once, when a command needs it first).
     #[serde(skip_serializing_if = "std::ops::Not::not")]
     pub conditional: bool,
-    /// Its shaders' pipeline-overridable constants, each by its name in the WGSL: what the host
-    /// sets when it creates the pipeline (WebGPU's `constants`).
+    /// A [`LEGACY_VERSION`] build's pipeline-overridable constants, by their names in its WGSL,
+    /// which the host sets when it makes the pipeline (a bool is 0 or 1). A build of this
+    /// version folds them into its WGSL and names none.
     #[serde(skip_serializing_if = "Vec::is_empty", serialize_with = "constants_map")]
-    pub constants: Vec<(String, Constant)>,
-}
-
-/// A pipeline-overridable constant's value: a `bool`, or a number (a `u32`, `i32` or `f32`).
-#[derive(Clone, Copy, Debug, PartialEq, Serialize)]
-#[serde(untagged)]
-pub enum Constant {
-    Bool(bool),
-    Number(f64),
-}
-
-impl Constant {
-    /// Its value as WebGPU's `constants` and wgpu's take it: a number, a bool 0 or 1.
-    pub fn number(self) -> f64 {
-        match self {
-            Constant::Bool(b) => f64::from(u8::from(b)),
-            Constant::Number(x) => x,
-        }
-    }
+    pub constants: Vec<(String, f64)>,
 }
 
 /// `constants` as a JSON object, in order.
 fn constants_map<S: serde::Serializer>(
-    constants: &[(String, Constant)],
+    constants: &[(String, f64)],
     s: S,
 ) -> Result<S::Ok, S::Error> {
     use serde::ser::SerializeMap;
@@ -712,6 +706,7 @@ impl Manifest {
             wasm_abi: None,
             wasm_relaxed: None,
             wasm_relaxed_abi: None,
+            set: BTreeMap::new(),
         }
     }
 
@@ -719,7 +714,10 @@ impl Manifest {
     pub fn parse(json: &str) -> Result<Manifest, ManifestError> {
         let v: Value = serde_json::from_str(json).map_err(|e| ManifestError(e.to_string()))?;
         match v.get("manifest_version") {
-            Some(got) if got.as_f64() == Some(f64::from(VERSION)) => {}
+            Some(got)
+                if [VERSION, LEGACY_VERSION]
+                    .iter()
+                    .any(|&v| got.as_f64() == Some(f64::from(v))) => {}
             Some(got) => {
                 return Err(ManifestError(format!(
                     "manifest version {}, but this host reads version {VERSION}",
@@ -739,7 +737,7 @@ impl Manifest {
 
     pub fn validate(&self) -> Result<(), ManifestError> {
         let err = |s: String| Err(ManifestError(s));
-        if self.manifest_version != VERSION {
+        if self.manifest_version != VERSION && self.manifest_version != LEGACY_VERSION {
             return err(format!("manifest version {}, expected {VERSION}", self.manifest_version));
         }
         if self.stream_version != crate::stream::VERSION {
@@ -884,7 +882,7 @@ impl Manifest {
                     ..
                 } => {
                     if outputs.len() > MAX_COLOR_ATTACHMENTS {
-                        return err(format!("pipeline {i} has more than four colour outputs"));
+                        return err(format!("pipeline {i} has more than eight colour outputs"));
                     }
                     if !blends.is_empty() && blends.len() != outputs.len() {
                         return err(format!(
@@ -1127,7 +1125,7 @@ mod read {
                     return fail(format!("{tp}.colors must be an array of formats"));
                 };
                 if cs.len() > MAX_COLOR_ATTACHMENTS {
-                    return fail(format!("{tp}.colors has more than four formats"));
+                    return fail(format!("{tp}.colors has more than eight formats"));
                 }
                 let colors = cs
                     .iter()
@@ -1296,17 +1294,17 @@ mod read {
         })?;
         // A missing `conditional` is tier 0.
         let conditional = flag(o, "conditional", &place, false)?;
-        // Missing `constants` are none.
+        // A legacy build's overrides (missing: none).
         let constants = match o.get("constants") {
             None => Vec::new(),
             Some(v) => {
                 let cp = format!("{place}.constants");
-                let co = object(v, &cp)?;
-                co.iter()
+                object(v, &cp)?
+                    .iter()
                     .map(|(k, v)| match v {
-                        Value::Bool(b) => Ok((k.clone(), Constant::Bool(*b))),
+                        Value::Bool(b) => Ok((k.clone(), f64::from(u8::from(*b)))),
                         Value::Number(n) if n.as_f64().is_some_and(f64::is_finite) => {
-                            Ok((k.clone(), Constant::Number(n.as_f64().unwrap_or(0.0))))
+                            Ok((k.clone(), n.as_f64().unwrap_or(0.0)))
                         }
                         _ => fail(format!("{cp}.{k} must be true, false or a number")),
                     })
@@ -1352,6 +1350,16 @@ mod read {
             wasm_relaxed_abi: match o.get("wasm_relaxed_abi") {
                 None => None,
                 Some(v) => Some(wasm_abi(v)?),
+            },
+            set: match o.get("set") {
+                None => BTreeMap::new(),
+                Some(v) => object(v, "the manifest's `set`")?
+                    .iter()
+                    .map(|(k, v)| match v.as_str() {
+                        Some(s) => Ok((k.clone(), s.to_string())),
+                        None => fail(format!("the manifest's `set.{k}` isn't a string")),
+                    })
+                    .collect::<Result<_>>()?,
             },
         })
     }
@@ -1414,7 +1422,7 @@ mod tests {
     fn golden_json() {
         let json = sample().to_json();
         let expected = r#"{
-  "manifest_version": 11,
+  "manifest_version": 12,
   "stream_version": 13,
   "wasm": "game.wasm",
   "pipelines": [
@@ -1478,22 +1486,22 @@ mod tests {
         assert_eq!(Manifest::parse(&json).expect("valid"), sample());
     }
 
-    /// `constants` are optional, and round-trip as a JSON object.
+    /// A legacy build (manifest 11, toolchain 0.9) is read, with its pipelines' overridable
+    /// `constants`, so a saved one runs beside a new build (`wrela same --against`); one older
+    /// is refused.
     #[test]
-    fn a_pipeline_may_set_constants() {
+    fn a_legacy_manifest_is_read_with_its_constants() {
         let mut m = sample();
-        m.pipelines[0].constants =
-            vec![("ambient".into(), Constant::Bool(true)), ("taps".into(), Constant::Number(4.0))];
+        m.manifest_version = LEGACY_VERSION;
+        m.pipelines[0].constants = vec![("taps".into(), 4.0), ("wide".into(), 1.0)];
         let json = m.to_json();
-        assert!(
-            json.contains(
-                "\"constants\": {\n        \"ambient\": true,\n        \"taps\": 4.0\n      }"
-            ),
-            "{json}"
-        );
-        assert_eq!(Manifest::parse(&json).expect("valid"), m);
-        let bad = json.replace("\"taps\": 4.0", "\"taps\": \"4\"");
-        assert!(Manifest::parse(&bad).unwrap_err().to_string().contains("constants.taps"));
+        assert!(json.contains("\"taps\": 4.0"), "{json}");
+        let read = Manifest::parse(&json).expect("a legacy manifest is read");
+        assert_eq!(read.pipelines[0].constants, m.pipelines[0].constants);
+        let older = json.replace("\"manifest_version\": 11", "\"manifest_version\": 10");
+        assert!(Manifest::parse(&older).is_err());
+        let wrong = json.replace("\"taps\": 4.0", "\"taps\": \"4\"");
+        assert!(Manifest::parse(&wrong).unwrap_err().to_string().contains("constants.taps"));
     }
 
     /// `conditional` (tier 1) is optional: a manifest without it is tier 0 throughout.
@@ -1689,8 +1697,9 @@ mod tests {
     fn a_target_with_a_gap_in_its_colours_is_refused() {
         let mut m = sample();
         if let Stage::Render { targets, .. } = &mut m.pipelines[1].stage {
-            targets[0].colors =
-                [Some(TextureFormat::Rgba8), None, Some(TextureFormat::Rgba8), None];
+            targets[0].colors = [None; MAX_COLOR_ATTACHMENTS];
+            targets[0].colors[0] = Some(TextureFormat::Rgba8);
+            targets[0].colors[2] = Some(TextureFormat::Rgba8);
         }
         assert_eq!(
             m.validate().expect_err("a colour after a gap").0,

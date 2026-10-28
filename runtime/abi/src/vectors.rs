@@ -1348,11 +1348,19 @@ fn manifests() -> Vec<Value> {
     };
     vec![
         manifest("golden", golden.clone()),
+        // Older than the legacy version a host still reads.
         manifest(
             "another manifest version",
             golden.replace(
                 &format!("\"manifest_version\": {}", crate::manifest::VERSION),
-                &format!("\"manifest_version\": {}", crate::manifest::VERSION - 1),
+                &format!("\"manifest_version\": {}", crate::manifest::LEGACY_VERSION - 1),
+            ),
+        ),
+        manifest(
+            "the legacy manifest version",
+            golden.replace(
+                &format!("\"manifest_version\": {}", crate::manifest::VERSION),
+                &format!("\"manifest_version\": {}", crate::manifest::LEGACY_VERSION),
             ),
         ),
         manifest(

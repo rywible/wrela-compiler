@@ -153,7 +153,6 @@ fn expr(m: &Module, e: &Expr) -> String {
         Expr::Host(op, args) => format!("host {op:?}({})", vals(args)),
         Expr::Mem(op, args) => format!("mem {op:?}({})", vals(args)),
         Expr::EntryInput(i) => format!("input {i}"),
-        Expr::Override(i) => format!("override {i}"),
         Expr::Param(i) => format!("param {i}"),
     }
 }
