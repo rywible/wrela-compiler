@@ -26,6 +26,7 @@ pub struct State {
     exact: GpuBuffer<f32>,
     joined: GpuBuffer<f32>,
     slopes: GpuBuffer<f32>,
+    built: GpuBuffer<f32>,
     pending: Vec<Pending<f32>>,
     seen: Vec<Vec<f32>>,
 }
@@ -38,6 +39,7 @@ pub fn init() -> State {
         exact: buffer(RAYS),
         joined: buffer(RAYS),
         slopes: buffer(SLOPES),
+        built: buffer(RAYS),
         pending: Vec::new(),
         seen: Vec::new(),
     }
@@ -98,6 +100,13 @@ fn slopes(field: Sampled3d, out: mut Slots<f32>, id: GlobalId) {
     out[id] = max(d.x, max(d.y, d.z))
 }
 
+/// The union of `joined`, built here in GPU code round the cooked field the kernel takes.
+@compute(64)
+fn march_built(field: Sampled3d, out: mut Slots<f32>, id: GlobalId) {
+    let joined = Union { a: field, b: sphere(0.2).translate(vec3(0.0, 0.0, -0.9)) }
+    out[id] = hit(joined, vec3(across(id.x), 0.0, -2.0), vec3(0.0, 0.0, 1.0), far: 4.0)
+}
+
 pub fn frame(s: mut State, time: f32, width: u32, height: u32) {
     if s.frame == 0 {
         dispatch(cook.bind(mut s.volume), groups: (SIDE / 4, SIDE / 4, SIDE / 4))
@@ -108,10 +117,12 @@ pub fn frame(s: mut State, time: f32, width: u32, height: u32) {
         let joined = Union { a: cooked, b: sphere(0.2).translate(vec3(0.0, 0.0, -0.9)) }
         dispatch(march.bind(joined, mut s.joined), groups: 1)
         dispatch(slopes.bind(cooked, mut s.slopes), groups: 1)
+        dispatch(march_built.bind(cooked, mut s.built), groups: 1)
         s.pending.push(read(s.cooked.items()))
         s.pending.push(read(s.exact.items()))
         s.pending.push(read(s.joined.items()))
         s.pending.push(read(s.slopes.items()))
+        s.pending.push(read(s.built.items()))
     }
     for i in 0..s.pending.len() {
         if s.seen.len() == i {
@@ -131,7 +142,7 @@ fn expected(i: u32, r: f32) -> f32 {
 
 @test(frames: 4, gpu: true, hosts: both)
 fn a_cooked_field_marches_as_an_analytic_one(s: State) {
-    assert(s.seen.len() == 4)
+    assert(s.seen.len() == 5)
     for i in 0..RAYS {
         let want = expected(i, RADIUS)
         assert(abs(s.seen[1][i] - want) < 0.0005)
@@ -150,6 +161,13 @@ fn a_cooked_field_composes_with_an_analytic_one(s: State) {
         } else {
             assert(abs(s.seen[2][i] - expected(i, RADIUS)) < VOXEL)
         }
+    }
+}
+
+@test(frames: 4, gpu: true, hosts: both)
+fn gpu_code_builds_a_union_round_a_cooked_field(s: State) {
+    for i in 0..RAYS {
+        assert(abs(s.seen[4][i] - s.seen[2][i]) < 0.00001)
     }
 }
 

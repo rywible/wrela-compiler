@@ -317,7 +317,11 @@ pub const N: u32 = 4
 pub const TIER: Tier = Tier::Low
 pub const SCALE: f32 = 1.5
 const HIDDEN: u32 = 1
+pub(package) const SHARED: u32 = 1
 pub const AT: vec2 = vec2(1.0, 2.0)
+pub const SPOT: Spot = vec2(1.0, 2.0)
+
+type Spot = vec2
 
 pub fn value() -> u32 {
     N
@@ -336,13 +340,14 @@ pub fn tier() -> u32 {
 }
 
 pub fn frame(time: f32, width: u32, height: u32) {
-    let _ = HIDDEN + u32(SCALE) + u32(AT.x)
+    let _ = HIDDEN + SHARED + u32(SCALE) + u32(AT.x + SPOT.x)
 }
 "#;
 
 /// `wrela build --set N=8`: the program reads 8, an array of length `N` has 8 elements, an
 /// enum's constant takes a variant by name, and the manifest records the sets; a `pub const`
-/// that isn't there, one that isn't `pub`, and one of a type a build can't set are E0224.
+/// that isn't there, one that isn't `pub` (or is only `pub(package)`), and one of a type a build
+/// can't set (or an alias of one) are E0224.
 #[test]
 fn a_build_sets_a_programs_pub_constants() {
     let dir = scratch("consts/set");
@@ -375,7 +380,10 @@ fn a_build_sets_a_programs_pub_constants() {
     for (pairs, says) in [
         (set(&[("MISSING", "1")]), "has no constant `MISSING`"),
         (set(&[("HIDDEN", "2")]), "isn't `pub`"),
+        (set(&[("SHARED", "2")]), "isn't `pub`"),
         (set(&[("AT", "3")]), "is a `vec2`"),
+        // An alias's type is the type it names, though the value then doesn't check.
+        (set(&[("SPOT", "3")]), "is a `vec2`"),
     ] {
         let out = wrela_driver::build_set(&dir, kind, false, &pairs);
         let e = out.diagnostics.iter().find(|d| d.code.as_str() == "E0224");
@@ -439,7 +447,10 @@ fn a_match_on_a_constant_builds_only_its_arm() {
         );
         out.pipelines.iter().flat_map(|p| p.names.clone()).collect()
     };
-    assert_eq!(entries(&wrela_driver::check_pipelines(&dir)), ["epic"]);
+    let all = wrela_driver::check_pipelines(&dir);
+    assert_eq!(entries(&all), ["epic"]);
+    // The arm it takes always runs: its pipeline is tier 0, not one under a condition.
+    assert_eq!(all.pipelines[0].tier(), 0, "{:?}", all.pipelines[0]);
     let low = [("TIER".to_string(), "Low".to_string())];
     assert_eq!(entries(&wrela_driver::check_pipelines_set(&dir, &low)), ["low"]);
 }

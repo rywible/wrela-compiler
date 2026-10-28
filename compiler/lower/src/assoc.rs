@@ -1,7 +1,9 @@
 //! Associated constants as `const` arguments (§3.4, §18.1): `blur.bind(taps: S::K)` records a
 //! pipeline per instantiation, so the value of `S::K` is folded here, where `S` is known, from
 //! the constant's initializer as it's written: literals, other constants, other associated
-//! constants, `const` generic parameters, arithmetic, comparisons and `if`.
+//! constants, `const` generic parameters, arithmetic, comparisons, `!`, `&&`, `||` and `if`.
+//! Each integer step is in its own type, as the CPU computes it: a step past its type's range
+//! doesn't fold (the CPU traps there), and neither does a division by zero.
 
 use crate::Cx;
 use wrela_diag::{Diagnostic, Span, codes};
@@ -43,7 +45,7 @@ impl<'a> Cx<'a> {
                     span,
                     format!("`{param}`'s associated constant doesn't fold to a `{shown}` here"),
                 )
-                .with_note("a `const` argument's associated constant is folded from what it's written as: literals, constants, other associated constants, arithmetic, comparisons and `if`")
+                .with_note("a `const` argument's associated constant is folded from what it's written as: literals, constants, other associated constants, arithmetic, comparisons, `!`, `&&`, `||` and `if`, each integer step within its type's range")
                 .with_help("give the constant a value the build can fold, or compute it in a `const` item and name that"),
             );
         }

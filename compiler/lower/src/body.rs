@@ -1139,6 +1139,36 @@ impl<'c, 'a> Fl<'c, 'a> {
                 }
                 Some(Repr::Group(out))
             }
+            // A value that holds a texture's handle, built in GPU code (a combinator round a
+            // `Sampled3d`): its fields as a group's, the handle the texture it names.
+            Rvalue::Adt { adt, args, variant: None, fields } => {
+                let args = args.iter().map(|&a| self.concrete(a)).collect();
+                let t = self.types().adt(*adt, args);
+                if !wrela_sema::gpu::is_gpu_group(&self.cx.checked.program, t)
+                    || wrela_sema::gpu::is_group(&self.cx.checked.program, t)
+                {
+                    return None;
+                }
+                let mut out = Vec::new();
+                for o in fields {
+                    let place = match &o.kind {
+                        mir::OperandKind::Copy(p) | mir::OperandKind::Move(p, _) => Some(p),
+                        mir::OperandKind::Const(_) => None,
+                    };
+                    let ft = self.concrete(o.ty);
+                    let program = &self.cx.checked.program;
+                    let held = wrela_sema::gpu::is_gpu_group(program, ft)
+                        || crate::gpu::is_resource_ty(program, ft);
+                    out.push(match (place, held) {
+                        (Some(p), true) => self.alias_of(p),
+                        _ => match self.operand(o) {
+                            Some(v) => Repr::Var(self.local_of("field", v)),
+                            None => Repr::Erased,
+                        },
+                    });
+                }
+                Some(Repr::Group(out))
+            }
             _ => None,
         }
     }

@@ -46,7 +46,9 @@ pub fn apply(
     let file = Arc::make_mut(&mut root.ast);
     for (name, value) in sets {
         let found = file.items.iter_mut().find_map(|item| match &mut item.kind {
-            ast::ItemKind::Const(c) if c.name.name == *name => Some((item.vis.is_some(), c)),
+            ast::ItemKind::Const(c) if c.name.name == *name => {
+                Some((item.vis.is_some_and(|v| !v.package), c))
+            }
             _ => None,
         });
         let Some((public, c)) = found else {
@@ -91,7 +93,7 @@ pub fn apply(
                 Diagnostic::new(
                     codes::E0224,
                     at,
-                    format!("`--set {name}=…` overrides a `pub const`, and `{name}` isn't `pub`"),
+                    format!("`--set {name}=…` overrides a `pub const`, and `{name}` isn't `pub` (a `pub(package)` one is the package's own)"),
                 )
                 .with_help(format!("make it `pub const {name}` to let a build set it")),
             );
@@ -180,7 +182,9 @@ pub fn check_types(
             continue;
         };
         let c = &p.consts[i];
-        let Some(&t) = tys.get(&ConstId(i as u32)) else { continue };
+        // Its type as written, or as its value was checked to have where it has no annotation
+        // (a value that doesn't check against its annotation is recorded with its own type).
+        let Some(t) = c.ty.or_else(|| tys.get(&ConstId(i as u32)).copied()) else { continue };
         let ok = p.is_build_constant_ty(t);
         if !ok {
             out.push(

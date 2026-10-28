@@ -7,7 +7,8 @@
 //! `if`/`else` joins again isn't under it, code after an early `return` is, and a conditional
 //! draw inside a loop is too (the other arm reaches it only on a later pass), as is code after
 //! an `if c { break }`. Branches that are no condition of the program's are left out: one on a
-//! literal (`if true`), and a loop's own test of whether to go on (`FnBody::loop_tests`). What
+//! literal (`if true`), a loop's own test of whether to go on (`FnBody::loop_tests`), and the
+//! pattern test of the arm a `match` on a constant takes (`TerminatorKind::Match::taken`). What
 //! depends on such a branch is under whatever the branch itself is under: a loop in an `if`
 //! runs only when the `if`'s condition holds.
 //!
@@ -25,7 +26,14 @@ pub fn under_condition(f: &FnBody) -> Vec<bool> {
     let exit = n;
     let mut succ: Vec<Vec<usize>> = (0..n)
         .map(|b| {
-            let s: Vec<usize> = f.successors(BlockId(b as u32)).map(|t| t.index()).collect();
+            let s: Vec<usize> = match &f.block(BlockId(b as u32)).term.kind {
+                // A `match` on a constant goes to the one arm it takes, which lowering builds
+                // alone (the memory checker still walks every arm).
+                TerminatorKind::Match { arms, taken: Some(i), .. } => {
+                    arms.get(*i as usize).map(|a| a.index()).into_iter().collect()
+                }
+                _ => f.successors(BlockId(b as u32)).map(|t| t.index()).collect(),
+            };
             if s.is_empty() { vec![exit] } else { s }
         })
         .collect();
@@ -108,8 +116,15 @@ pub fn under_condition(f: &FnBody) -> Vec<bool> {
 /// that isn't a literal, other than a loop's own test of whether to go on. An `if c { break }`
 /// the code wrote is one: what comes after it runs only while `c` doesn't hold.
 fn is_condition(f: &FnBody, x: BlockId) -> bool {
-    let TerminatorKind::If { cond, .. } = &f.block(x).term.kind else { return false };
-    !matches!(cond.kind, OperandKind::Const(_)) && !f.loop_tests.contains(&x)
+    let TerminatorKind::If { cond, then, else_, .. } = &f.block(x).term.kind else {
+        return false;
+    };
+    // A pattern's test in the arm a `match` on a constant takes: it holds, whatever it reads.
+    let tests_taken_arm = [then, else_].iter().any(|&&b| {
+        matches!(&f.block(b).term.kind, TerminatorKind::ArmFailed { match_, .. }
+            if matches!(f.block(*match_).term.kind, TerminatorKind::Match { taken: Some(_), .. }))
+    });
+    !matches!(cond.kind, OperandKind::Const(_)) && !f.loop_tests.contains(&x) && !tests_taken_arm
 }
 
 #[cfg(test)]

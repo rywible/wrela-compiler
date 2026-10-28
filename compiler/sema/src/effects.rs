@@ -545,8 +545,11 @@ const AUDIO: &[Effect] =
 /// `@deterministic` code, a constant, and what runs on several workers at once. A replayed tick
 /// mustn't touch storage either: requests are `io` (§17.1).
 pub const DETERMINISTIC: &[Effect] = &[Effect::Io, Effect::Nondet, Effect::Host];
-/// An associated constant (§3.4): what a constant can't do, nor print or time a phase.
-const ASSOC_CONST: &[Effect] = &[Effect::Io, Effect::Nondet, Effect::Host, Effect::Trace];
+/// An associated constant (§3.4), read wherever it's used rather than computed by the build:
+/// what a constant can't do, nor print or time a phase, nor recurse (a cycle of constants)
+/// nor panic (which a constant's build would report).
+const ASSOC_CONST: &[Effect] =
+    &[Effect::Io, Effect::Nondet, Effect::Host, Effect::Trace, Effect::Recursion, Effect::Panic];
 /// What's derived can't allocate, do IO, be non-deterministic or call the host (§14).
 const DERIVED: &[Effect] =
     &[Effect::Alloc, Effect::Io, Effect::Trace, Effect::Nondet, Effect::Host];

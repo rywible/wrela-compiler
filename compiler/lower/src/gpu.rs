@@ -454,6 +454,14 @@ impl Interface {
             for (i, t) in param_types(cx, func, substs).into_iter().enumerate() {
                 let class = classify(cx, func, i, t, varyings);
                 let name = cx.checked.program.func(func).params[i].name.clone();
+                // A generic parameter's type is known only here; a written one, sema checked.
+                let ps = &cx.checked.program.func(func).params[i];
+                if cx.checked.program.types.has_params(ps.ty)
+                    && wrela_sema::gpu::hides_texture_handle(&cx.checked.program, t, false, 0)
+                {
+                    let d = wrela_sema::gpu::hidden_handle(&cx.checked.program, &name, t, ps.span);
+                    cx.err(d);
+                }
                 let leaf = Leaf { entry: e, param: i, path: Vec::new(), ty: t, class, name };
                 iface.add(cx, leaf.clone());
                 params.push((t, leaf.class));

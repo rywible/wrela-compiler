@@ -1,0 +1,17 @@
+// rejects: gpu.textures
+// A texture's handle is bound beside the value that holds it in a struct's field, at any depth
+// of structs; in a tuple, an array or an enum it can't be.
+use std::field::{Sampled3d, Sphere, Surface}
+use std::gpu::{GlobalId, Slots}
+
+@compute(64)
+fn two(both: (Sampled3d, Sphere), out: mut Slots<f32>, id: GlobalId) { //~ E0602
+    out[id] = both.1.distance(vec3(0.0))
+}
+
+@compute(64)
+fn some(fields: [Sampled3d; 2], out: mut Slots<f32>, id: GlobalId) { //~ E0602
+    out[id] = 0.0
+}
+
+pub fn frame(time: f32, width: u32, height: u32) {}

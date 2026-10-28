@@ -412,6 +412,42 @@ pub fn is_gpu_group(p: &Program, t: TyId) -> bool {
     is_group(p, t) || holds_texture_handle(p, t, 0)
 }
 
+/// Whether `t` holds a `Texture3dHandle` in a tuple, an array or an enum (`within` one already),
+/// at any depth: there it can't be bound beside the value, since only a struct's fields are a
+/// group's (§20.3).
+pub fn hides_texture_handle(p: &Program, t: TyId, within: bool, depth: u32) -> bool {
+    if depth > 32 {
+        return false;
+    }
+    match p.types.kind(t) {
+        _ if p.lang_of_ty(t) == Some(Lang::Texture3dHandle) => within,
+        TyKind::Tuple(ts) => ts.iter().any(|&e| hides_texture_handle(p, e, true, depth + 1)),
+        &TyKind::Array(e, _) => hides_texture_handle(p, e, true, depth + 1),
+        TyKind::Adt(a, args) if p.adt(*a).lang.is_none() => {
+            let enumed = within || p.adt(*a).is_enum();
+            let variants = if p.adt(*a).is_enum() { p.adt(*a).variants().len() } else { 1 };
+            (0..variants).any(|v| {
+                let v = p.adt(*a).is_enum().then_some(v as u32);
+                p.fields_of(*a, args, v)
+                    .into_iter()
+                    .any(|ft| hides_texture_handle(p, ft, enumed, depth + 1))
+            })
+        }
+        _ => false,
+    }
+}
+
+/// E0602: an entry point's parameter `name`, of type `t`, holds a texture's handle where it
+/// can't be bound.
+pub fn hidden_handle(p: &Program, name: &str, t: TyId, span: Span) -> Diagnostic {
+    Diagnostic::new(
+        codes::E0602,
+        span,
+        format!("`{name}` holds a texture's handle in a tuple, an array or an enum (`{}`), where the texture can't be bound beside it", p.display_ty(t)),
+    )
+    .with_help("hold each handle in a struct's field, at any depth of structs: a parameter of its own for each")
+}
+
 /// Whether a struct of type `t`, or one of its fields', holds a `Texture3dHandle`.
 fn holds_texture_handle(p: &Program, t: TyId, depth: u32) -> bool {
     let TyKind::Adt(a, args) = p.types.kind(t) else { return false };
@@ -651,6 +687,9 @@ fn check_entry(p: &Program, f: FnId, entry: Entry, out: &mut Vec<Diagnostic>) {
             && !p.types.has_params(ps.ty);
         if passed && !crate::traits::implements_builtin(p, ps.ty, Lang::GpuData) {
             out.push(not_gpu_data(p, &ps.name, ps.ty, ps.span));
+        }
+        if !p.types.has_params(ps.ty) && hides_texture_handle(p, ps.ty, false, 0) {
+            out.push(hidden_handle(p, &ps.name, ps.ty, ps.span));
         }
         // A run is a buffer's elements, which cross to the GPU too.
         if let TyKind::Slice(elem) = *p.types.kind(ps.ty) {

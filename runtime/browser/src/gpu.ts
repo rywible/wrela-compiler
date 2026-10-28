@@ -77,6 +77,8 @@ interface RenderParts {
   /** The manifest's `depth`: how fragments' depths are tested, and whether they're kept. */
   depth: { compare: GPUCompareFunction; write: boolean };
   /** By target formats: `colours|depth`, the colours joined by commas, each a format or `none`. */
+  /** A legacy build's pipeline-overridable constants each stage is made with, by name. */
+  constants: Record<string, number>;
   variants: Map<string, GPURenderPipeline>;
 }
 
@@ -145,7 +147,7 @@ function renderDescriptor(
   return {
     label: name,
     layout: parts.layout,
-    vertex: { module: parts.module, entryPoint: parts.vertex, buffers: [] },
+    vertex: { module: parts.module, entryPoint: parts.vertex, buffers: [], constants: parts.constants },
     // Triangle list, counter-clockwise front faces (the default).
     primitive: { topology: "triangle-list", cullMode: parts.cull },
     ...(depth === null
@@ -163,6 +165,7 @@ function renderDescriptor(
     fragment: {
       module: parts.module,
       entryPoint: parts.fragment,
+      constants: parts.constants,
       targets: colors.map((format, c) => {
         const blend = BLENDS[parts.blends[c] ?? "replace"];
         return blend === null ? { format } : { format, blend: blend as GPUBlendState };
@@ -298,7 +301,7 @@ async function buildPipeline(device: GPUDevice, p: Pipeline, source: string, scr
       compute = await device.createComputePipelineAsync({
         label: p.name,
         layout: pipelineLayout,
-        compute: { module, entryPoint: p.entry },
+        compute: { module, entryPoint: p.entry, constants: Object.fromEntries(p.constants) },
       });
     } else {
       render = {
@@ -310,6 +313,7 @@ async function buildPipeline(device: GPUDevice, p: Pipeline, source: string, scr
         cull: p.cull,
         depthBias: p.depth_bias,
         depth: p.depth,
+        constants: Object.fromEntries(p.constants),
         variants: new Map(),
       };
       // A variant for each of its targets (the passes the program draws it in, which the

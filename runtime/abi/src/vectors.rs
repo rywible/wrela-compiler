@@ -538,6 +538,7 @@ pub fn check_manifest() -> Manifest {
         debug_flag: None,
         requires: Vec::new(),
         conditional: false,
+        constants: Vec::new(),
     };
     let render = target_bound(false, false);
     m.pipelines.push(shape("draw", render.clone()));
@@ -1303,6 +1304,7 @@ pub(crate) fn sample_manifest() -> Manifest {
         debug_flag: None,
         requires: Vec::new(),
         conditional: false,
+        constants: Vec::new(),
     });
     m.pipelines.push(Pipeline {
         name: "cover+shade".into(),
@@ -1313,6 +1315,7 @@ pub(crate) fn sample_manifest() -> Manifest {
         debug_flag: None,
         requires: Vec::new(),
         conditional: false,
+        constants: Vec::new(),
     });
     m
 }
@@ -1345,11 +1348,19 @@ fn manifests() -> Vec<Value> {
     };
     vec![
         manifest("golden", golden.clone()),
+        // Older than the legacy version a host still reads.
         manifest(
             "another manifest version",
             golden.replace(
                 &format!("\"manifest_version\": {}", crate::manifest::VERSION),
-                &format!("\"manifest_version\": {}", crate::manifest::VERSION - 1),
+                &format!("\"manifest_version\": {}", crate::manifest::LEGACY_VERSION - 1),
+            ),
+        ),
+        manifest(
+            "the legacy manifest version",
+            golden.replace(
+                &format!("\"manifest_version\": {}", crate::manifest::VERSION),
+                &format!("\"manifest_version\": {}", crate::manifest::LEGACY_VERSION),
             ),
         ),
         manifest(

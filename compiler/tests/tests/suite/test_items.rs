@@ -839,14 +839,15 @@ fn passes_take_up_to_eight_targets_within_32_bytes() {
 /// A texture as a field's data (compiler/tests/sampled, language.md §20.3): a sphere cooked
 /// into a 3D texture and held by a `Sampled3d`, marched by `std::field::hit` (generic over
 /// `Surface`) in a kernel generic over the field, hits at the radius within a voxel; the same
-/// code over an analytic sphere hits exactly; a `Union` of the two composes; and `sample`'s
+/// code over an analytic sphere hits exactly; a `Union` of the two composes, built on the CPU or
+/// in the kernel; and `sample`'s
 /// gradient is the distance's central differences inside cells, at the grid's edge and past it,
 /// on both hosts.
 #[test]
 #[ignore = "needs a GPU"]
 fn a_texture_is_a_fields_data() {
     let dir = wrela_tests::repo_root().join("compiler/tests/sampled");
-    assert_eq!(crate::tests_pass(&dir), 3);
+    assert_eq!(crate::tests_pass(&dir), 4);
 }
 
 /// Tapes that can hold a creature (language.md §14.4): each new operation against its std

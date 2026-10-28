@@ -3,6 +3,8 @@
 
 export const STREAM_VERSION = 13;
 export const MANIFEST_VERSION = 12;
+/** The version before, which this host reads too: its pipelines may name `constants`. */
+export const LEGACY_MANIFEST_VERSION = 11;
 /** The bytes `WRCS`, read as a little-endian u32. */
 export const STREAM_MAGIC = 0x53435257;
 export const HEADER_LEN = 12;

@@ -1,6 +1,7 @@
 // rejects: trait.assoc-const
 // An associated constant is folded where it's read, so its initializer has no effect anyone
-// sees: not even a line printed.
+// sees: not a line printed, no panic (which a constant's build would report), and no cycle of
+// constants.
 use std::io::print
 
 trait Taps {
@@ -18,6 +19,29 @@ fn shout() -> u32 {
     4
 }
 
+struct Checked {}
+
+impl Taps for Checked {
+    const TAPS: u32 = at_least(3)
+}
+
+fn at_least(x: u32) -> u32 {
+    assert(x > 5) //~ E0600
+    x
+}
+
+trait Pair {
+    const A: u32
+    const B: u32
+}
+
+struct Loop {}
+
+impl Pair for Loop {
+    const A: u32 = Self::B //~ E0600
+    const B: u32 = Self::A //~ E0600
+}
+
 pub fn frame(time: f32, width: u32, height: u32) {
-    let _ = Loud::TAPS
+    let _ = Loud::TAPS + Checked::TAPS + Loop::A
 }

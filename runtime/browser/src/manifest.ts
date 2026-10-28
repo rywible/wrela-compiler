@@ -11,6 +11,7 @@ import {
   FEATURES,
   MAX_COLOR_ATTACHMENT_BYTES,
   MAX_COLOR_ATTACHMENTS,
+  LEGACY_MANIFEST_VERSION,
   MANIFEST_VERSION,
   MAX_BINDINGS_PER_GROUP,
   MAX_UNIFORM_BUFFER_BINDING_SIZE,
@@ -153,6 +154,8 @@ export type Pipeline = Stage & {
   /** Reached only under runtime conditions: tier 1, built once tier 0 is (or when a command
    * needs it first). */
   conditional: boolean;
+  /** A legacy build's pipeline-overridable constants, by their names in its WGSL (a bool is 0 or 1). */
+  constants: [string, number][];
 };
 
 export interface Manifest {
@@ -365,7 +368,17 @@ function pipeline(v: unknown, i: number): Pipeline {
   const requires: string[] = names(o, "requires", where, FEATURES, "a feature this host knows", true);
   // A missing `conditional` is tier 0.
   const conditional = flag(o, "conditional", where, false);
-  return { ...stage, name, shader, uniform, bindings, debug_flag, requires, conditional };
+  // A legacy build's overrides (missing: none).
+  const constants: [string, number][] = [];
+  if (o["constants"] !== undefined) {
+    const co = object(o["constants"], `${where}.constants`);
+    for (const [k, v] of Object.entries(co)) {
+      if (typeof v === "boolean") constants.push([k, Number(v)]);
+      else if (typeof v === "number" && Number.isFinite(v)) constants.push([k, v]);
+      else throw new ManifestError(`${where}.constants.${k} must be true, false or a number`);
+    }
+  }
+  return { ...stage, name, shader, uniform, bindings, debug_flag, requires, conditional, constants };
 }
 
 /** The manifest's `wasm_abi`. */
@@ -412,7 +425,7 @@ export function parseManifest(json: string): Manifest {
   if (version === undefined) {
     throw new ManifestError(`no manifest_version; this host reads version ${MANIFEST_VERSION}`);
   }
-  if (version !== MANIFEST_VERSION) {
+  if (version !== MANIFEST_VERSION && version !== LEGACY_MANIFEST_VERSION) {
     throw new ManifestError(
       `manifest version ${show(version)}, but this host reads version ${MANIFEST_VERSION}`,
     );
@@ -441,7 +454,7 @@ export function plainFileName(name: string): boolean {
 
 export function validateManifest(m: Manifest): void {
   const err = (why: string) => new ManifestError(why);
-  if (m.manifest_version !== MANIFEST_VERSION) {
+  if (m.manifest_version !== MANIFEST_VERSION && m.manifest_version !== LEGACY_MANIFEST_VERSION) {
     throw err(`manifest version ${m.manifest_version}, expected ${MANIFEST_VERSION}`);
   }
   if (m.stream_version !== STREAM_VERSION) {
