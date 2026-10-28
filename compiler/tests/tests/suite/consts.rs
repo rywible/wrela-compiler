@@ -382,3 +382,64 @@ fn a_build_sets_a_programs_pub_constants() {
         assert!(e.is_some_and(|d| d.message.contains(says)), "{pairs:?}: {:?}", out.diagnostics);
     }
 }
+
+/// A program that chooses its renderer by a constant's variant.
+const TIERED: &str = r#"
+use std::gpu::{GlobalId, GpuBuffer, Slots, buffer, dispatch}
+
+pub enum Tier {
+    Epic,
+    Low,
+}
+
+pub const TIER: Tier = Tier::Epic
+
+@compute(64)
+fn epic(out: mut Slots<u32>, id: GlobalId) {
+    out[id] = 1
+}
+
+@compute(64)
+fn low(out: mut Slots<u32>, id: GlobalId) {
+    out[id] = 2
+}
+
+pub struct State {
+    out: GpuBuffer<u32>,
+}
+
+pub fn init() -> State {
+    State { out: buffer(64) }
+}
+
+pub fn frame(s: mut State, time: f32, width: u32, height: u32) {
+    match TIER {
+        Tier::Epic => dispatch(epic.bind(mut s.out), groups: 1),
+        Tier::Low => lowly(mut s),
+    }
+}
+
+fn lowly(s: mut State) {
+    dispatch(low.bind(mut s.out), groups: 1)
+}
+"#;
+
+/// A `match` on a constant builds only the arm it takes (language.md §13): the program has the
+/// pipeline of its tier and not the other's, `--set TIER=Low` has the other, and a function only
+/// an arm not taken calls isn't "never used".
+#[test]
+fn a_match_on_a_constant_builds_only_its_arm() {
+    let dir = scratch("consts/tiered");
+    std::fs::write(dir.join("main.wrela"), TIERED).expect("write");
+    let entries = |out: &wrela_driver::Output| -> Vec<String> {
+        assert!(
+            out.diagnostics.is_empty(),
+            "{}",
+            wrela_diag::render::render_all(&out.sources, &out.diagnostics)
+        );
+        out.pipelines.iter().flat_map(|p| p.names.clone()).collect()
+    };
+    assert_eq!(entries(&wrela_driver::check_pipelines(&dir)), ["epic"]);
+    let low = [("TIER".to_string(), "Low".to_string())];
+    assert_eq!(entries(&wrela_driver::check_pipelines_set(&dir, &low)), ["low"]);
+}

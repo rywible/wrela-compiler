@@ -129,7 +129,7 @@ pub(crate) fn usage() -> ExitCode {
         "wrela explain <code>",
         "wrela doc <item> [<package-dir>]",
         "wrela doc --export <dir> [--commit <sha>] [<package-dir>...]",
-        "wrela pipelines <package-dir> [--json]",
+        "wrela pipelines <package-dir> [--set NAME=VALUE]... [--json]",
         "wrela profile <package-dir> [--frames n] [--warmup n] [--workers n] [--size WxH] [--input <script.json>] [--scenario name] [--serial] [--worst n] [--chrome [--features none|<list>] [--checked]] [--optimize size|speed] [--relaxed-simd] [--json] [--baseline <report.json> | --compare <build-dir> [--pairs n]]",
         "wrela test <package-dir> [<filter>] [--exact] [--std] [--bless] [--json]",
         "wrela script <package-dir> <module>::<NAME> [-o <file>]",
@@ -263,8 +263,8 @@ pub(crate) struct PackageArgs {
     /// `--report consts`, which only `build` takes: each computed constant, and whether it was
     /// computed or read from the cache.
     pub report_consts: bool,
-    /// `--set NAME=VALUE`, which only `build` takes: the program's root-module constants given
-    /// other values (language.md §13).
+    /// `--set NAME=VALUE`, which `build` and `pipelines` take: the program's root-module
+    /// constants given other values (language.md §13).
     pub set: Vec<(String, String)>,
     /// `--relaxed-simd`, which only `build` takes: a second module beside `game.wasm` whose
     /// presentation code uses relaxed SIMD (`wrela_driver::build_relaxed`).
@@ -308,7 +308,7 @@ pub(crate) fn package_args(args: &[String], takes_out: bool) -> Result<PackageAr
                 Some("consts") => report_consts = true,
                 _ => return Err(usage()),
             },
-            "--set" if takes_out => match it.next().and_then(|s| s.split_once('=')) {
+            "--set" => match it.next().and_then(|s| s.split_once('=')) {
                 Some((name, value)) if !name.is_empty() => {
                     set.retain(|(n, _): &(String, String)| n != name);
                     set.push((name.to_string(), value.to_string()));

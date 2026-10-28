@@ -49,6 +49,9 @@ pub struct Body {
     /// argument is lent `mut`, the value's type, and where (the effects pass reports those
     /// that change nothing, E0333).
     pub discarded: Vec<(Callee, bool, TyId, Span)>,
+    /// The functions and constants the arms a `match` on a constant didn't take name
+    /// (`build::arm_of_const`): used, for the lints, though no code of theirs is built.
+    pub pruned: (Vec<FnId>, Vec<crate::ty::ConstId>),
 }
 
 impl Body {

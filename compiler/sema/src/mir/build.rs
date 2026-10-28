@@ -70,6 +70,7 @@ pub fn build(p: &Program, consts: &Consts, f: FnId, body: &thir::Body) -> (Body,
         fs: FnState::new(def.ret_mode, None, body.value.span),
         chained: None,
         discarded: Vec::new(),
+        pruned: (Vec::new(), Vec::new()),
     };
     let mut fns = vec![b.build_fn(&body.params, &body.value, def.ret_mode, None, body.value.span)];
     for (i, c) in body.closures.iter().enumerate() {
@@ -87,7 +88,9 @@ pub fn build(p: &Program, consts: &Consts, f: FnId, body: &thir::Body) -> (Body,
         })
         .collect();
     let discarded = std::mem::take(&mut b.discarded);
-    let mir = Body { locals: b.locals, fns, closures, hidden_ret: body.hidden_ret, discarded };
+    let pruned = std::mem::take(&mut b.pruned);
+    let mir =
+        Body { locals: b.locals, fns, closures, hidden_ret: body.hidden_ret, discarded, pruned };
     (mir, b.diags)
 }
 
@@ -196,6 +199,8 @@ struct Builder<'a> {
     chained: Option<Span>,
     /// Calls whose values statements discard ([`Body::discarded`]).
     discarded: Vec<(Callee, bool, TyId, Span)>,
+    /// What the arms a constant's `match` didn't take name ([`Body::pruned`]).
+    pruned: (Vec<FnId>, Vec<crate::ty::ConstId>),
 }
 
 impl<'a> Builder<'a> {
@@ -615,6 +620,10 @@ impl<'a> Builder<'a> {
             ExprKind::MutArg(inner) => self.value(inner, want),
             ExprKind::Block(b) => self.block(b, want),
             ExprKind::If { cond, then, else_ } => self.if_(cond, then, else_.as_deref(), e, want),
+            ExprKind::Match { scrutinee, arms, .. } if let Some(i) = self.arm_of_const(scrutinee, arms) => {
+                self.prune(arms, i);
+                self.value(&arms[i].body, want)
+            }
             ExprKind::Match { scrutinee, arms, mutable } => {
                 self.match_(scrutinee, arms, *mutable, e, want)
             }
@@ -1646,6 +1655,81 @@ impl<'a> Builder<'a> {
         Some(Place::local(h))
     }
 
+    /// The arm a `match` on a constant takes, when the constant holds an enum's variant that
+    /// holds nothing and the arms before it test variants that hold nothing, with no guard: only
+    /// that arm's body is built, so what the others reach (their pipelines too) isn't in the
+    /// program (a program's `TIER` or `STYLE`, §13).
+    fn arm_of_const(&self, scrutinee: &thir::Expr, arms: &[thir::Arm]) -> Option<usize> {
+        let mut e = unmut(scrutinee);
+        while let ExprKind::Const(c) = &e.kind {
+            e = &self.consts.get(c)?.1;
+        }
+        let ExprKind::Adt { variant: Some(v), fields, .. } = &e.kind else { return None };
+        if !fields.is_empty() {
+            return None;
+        }
+        fn takes(p: &thir::Pat, v: u32) -> Option<bool> {
+            match &p.kind {
+                PatKind::Wild => Some(true),
+                PatKind::Adt { variant: Some(w), fields, .. } if fields.is_empty() => Some(*w == v),
+                PatKind::Or(ps) => {
+                    let mut any = false;
+                    for p in ps {
+                        any |= takes(p, v)?;
+                    }
+                    Some(any)
+                }
+                _ => None,
+            }
+        }
+        for (i, arm) in arms.iter().enumerate() {
+            if arm.guard.is_some() {
+                return None;
+            }
+            if takes(&arm.pat, *v)? {
+                return Some(i);
+            }
+        }
+        None
+    }
+
+    /// Records what the arms but `taken` name ([`Body::pruned`]).
+    fn prune(&mut self, arms: &[thir::Arm], taken: usize) {
+        fn walk(e: &thir::Expr, out: &mut (Vec<FnId>, Vec<crate::ty::ConstId>)) {
+            match &e.kind {
+                ExprKind::Call(c) => match &c.callee {
+                    Callee::Fn { func, .. } | Callee::JobStart { func, .. } => out.0.push(*func),
+                    Callee::TraitMethod { method, .. } => out.0.push(*method),
+                    _ => {}
+                },
+                ExprKind::FnRef(f, _) => out.0.push(*f),
+                ExprKind::Const(c) => out.1.push(*c),
+                ExprKind::Dispatch(d) => {
+                    if let thir::Shader::Named(f, ..) = &d.kernel {
+                        out.0.push(*f);
+                    }
+                }
+                ExprKind::Draw(d) => {
+                    for sh in [&d.vertex, &d.fragment] {
+                        if let thir::Shader::Named(f, ..) = sh {
+                            out.0.push(*f);
+                        }
+                    }
+                }
+                _ => {}
+            }
+            e.for_each_child(&mut |c| match c {
+                thir::Child::Expr(x) => walk(x, out),
+                thir::Child::Block(b) => b.for_each_expr(&mut |x| walk(x, out)),
+            });
+        }
+        for (i, arm) in arms.iter().enumerate() {
+            if i != taken {
+                walk(&arm.body, &mut self.pruned);
+            }
+        }
+    }
+
     fn match_(
         &mut self,
         scrutinee: &thir::Expr,
@@ -1886,6 +1970,10 @@ impl<'a> Builder<'a> {
                 }
                 self.fs.cur = m;
                 self.terminate(TerminatorKind::Unreachable, e.span);
+            }
+            ExprKind::Match { scrutinee, arms, .. } if let Some(i) = self.arm_of_const(scrutinee, arms) => {
+                self.prune(arms, i);
+                self.place_tail(&arms[i].body)
             }
             ExprKind::Match { scrutinee, arms, mutable } => {
                 let Some(sp) = self.match_scrutinee(scrutinee, *mutable) else { return };

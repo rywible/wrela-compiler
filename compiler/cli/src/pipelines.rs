@@ -1,4 +1,4 @@
-//! `wrela pipelines <package-dir> [--json]`: the pipeline-count query (language.md §18.9). Each
+//! `wrela pipelines <package-dir> [--set NAME=VALUE]... [--json]`: the pipeline-count query (language.md §18.9). Each
 //! GPU entry point, how many pipelines instantiate it, the type arguments of each, and where
 //! CPU code dispatches or draws it: what to look at when a program makes more shaders than it
 //! means to (D-044, D-070).
@@ -11,7 +11,11 @@ pub fn run(args: &[String]) -> ExitCode {
         Ok(a) => a,
         Err(status) => return status,
     };
-    let out = wrela_driver::check_pipelines(&args.dir);
+    let out = if args.set.is_empty() {
+        wrela_driver::check_pipelines(&args.dir)
+    } else {
+        wrela_driver::check_pipelines_set(&args.dir, &args.set)
+    };
     if out.has_errors() {
         crate::report(&out, args.json);
         return ExitCode::from(1);

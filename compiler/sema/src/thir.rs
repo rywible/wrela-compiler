@@ -503,6 +503,45 @@ pub enum Child<'a> {
     Block(&'a Block),
 }
 
+impl Block {
+    /// Calls `f` on each expression directly in the block: its statements' (their blocks' too,
+    /// with `f` called on those blocks' expressions in turn), then its tail.
+    pub fn for_each_expr<'a>(&'a self, f: &mut impl FnMut(&'a Expr)) {
+        for s in &self.stmts {
+            match &s.kind {
+                StmtKind::Bind { init, else_, .. } => {
+                    f(init);
+                    if let Some(b) = else_ {
+                        b.for_each_expr(f);
+                    }
+                }
+                StmtKind::Assign { place, value, .. } => {
+                    f(place);
+                    f(value);
+                }
+                StmtKind::Expr(e) => f(e),
+                StmtKind::While { cond, body } => {
+                    f(cond);
+                    body.for_each_expr(f);
+                }
+                StmtKind::Loop { body } | StmtKind::ForFields { body, .. } => body.for_each_expr(f),
+                StmtKind::ForRange { start, end, body, .. } => {
+                    f(start);
+                    f(end);
+                    body.for_each_expr(f);
+                }
+                StmtKind::ForEach { array, body, .. } => {
+                    f(array);
+                    body.for_each_expr(f);
+                }
+            }
+        }
+        if let Some(t) = &self.tail {
+            f(t);
+        }
+    }
+}
+
 impl Expr {
     /// Whether this expression names a place: a local, a field or element of one, or a
     /// projection returned from a call.

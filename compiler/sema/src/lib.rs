@@ -329,6 +329,8 @@ fn unused_items(p: &Program, mir: &BTreeMap<ty::FnId, mir::Body>) -> Vec<Diagnos
         if p.is_std(p.func(owner).module) {
             continue;
         }
+        fns.extend(body.pruned.0.iter().copied());
+        consts.extend(body.pruned.1.iter().copied());
         for (s, r) in mir::rvalues(body) {
             if let mir::Rvalue::Const(c) = r {
                 consts.insert(*c);
