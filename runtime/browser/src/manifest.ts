@@ -264,7 +264,7 @@ function renderTargets(o: Json, where: string): RenderTarget[] {
     const to = object(v, tw);
     const cs = to["colors"];
     if (!Array.isArray(cs)) throw new ManifestError(`${tw}.colors must be an array of formats`);
-    if (cs.length > MAX_COLOR_ATTACHMENTS) throw new ManifestError(`${tw}.colors has more than four formats`);
+    if (cs.length > MAX_COLOR_ATTACHMENTS) throw new ManifestError(`${tw}.colors has more than eight formats`);
     const colors = cs.map((c: unknown, j) => named(c, `${tw}.colors[${j}]`, "a format", FORMAT_NAMES));
     if (typeof to["depth"] !== "boolean") throw new ManifestError(`${tw}.depth must be true or false`);
     return { colors, depth: to["depth"], screen: flag(to, "screen", tw, false) };
@@ -526,7 +526,7 @@ export function validateManifest(m: Manifest): void {
         ws[0] * ws[1] * ws[2] <= MAX_WORKGROUP_INVOCATIONS;
       if (!ok) throw err(`pipeline ${i}'s workgroup size [${ws.join(", ")}] is outside WebGPU's limits`);
     } else {
-      if (p.outputs.length > MAX_COLOR_ATTACHMENTS) throw err(`pipeline ${i} has more than four colour outputs`);
+      if (p.outputs.length > MAX_COLOR_ATTACHMENTS) throw err(`pipeline ${i} has more than eight colour outputs`);
       if (p.blends.length !== 0 && p.blends.length !== p.outputs.length) {
         throw err(`pipeline ${i} has ${p.blends.length} blends for ${p.outputs.length} colour outputs`);
       }

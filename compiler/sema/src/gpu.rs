@@ -302,7 +302,7 @@ type Colours = (Vec<(Colour, Vec<u32>)>, bool);
 
 impl FragmentOutput {
     /// What a fragment shader returning `t` writes; `None` if it can't return `t`: a colour
-    /// ([`Colour::of`]); an `Over` (a `vec4` to blend); a `Targets2`, `Targets3` or `Targets4`
+    /// ([`Colour::of`]); an `Over` (a `vec4` to blend); a `Targets2` to `Targets8`
     /// of colours; or a `WithDepth` of any of those and a depth.
     pub fn of(p: &Program, t: TyId) -> Option<FragmentOutput> {
         let colours = |t: TyId, at: Vec<u32>| -> Option<Colours> {
@@ -315,7 +315,13 @@ impl FragmentOutput {
                     vec![(Colour { uint: false, components: 4 }, [at, vec![0]].concat())],
                     true,
                 )),
-                Lang::Targets2 | Lang::Targets3 | Lang::Targets4 => {
+                Lang::Targets2
+                | Lang::Targets3
+                | Lang::Targets4
+                | Lang::Targets5
+                | Lang::Targets6
+                | Lang::Targets7
+                | Lang::Targets8 => {
                     let mut out = Vec::new();
                     for (k, &a) in args.iter().enumerate() {
                         let c = Colour::of(p, a)?;
@@ -526,7 +532,7 @@ fn check_entry(p: &Program, f: FnId, entry: Entry, out: &mut Vec<Diagnostic>) {
                 format!(
                     "{stage} returns a colour (an `f32`, `vec2`, `vec3`, `vec4`, or for an integer \
                      target a `u32`, `vec2u`, `vec3u` or `vec4u`), an `Over` colour to blend, a \
-                     `Targets2`, `Targets3` or `Targets4` of colours, or a `WithDepth` of one of \
+                     `Targets2` to `Targets8` of colours, or a `WithDepth` of one of \
                      those and a depth"
                 ),
             )

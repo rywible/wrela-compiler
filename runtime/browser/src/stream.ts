@@ -445,7 +445,7 @@ export function decode(batch: Bytes): Command[] {
       case "BeginPass": {
         if (words < 2) throw bad("expected at least 2 words");
         const n = w(0);
-        if (n > MAX_COLOR_ATTACHMENTS) throw bad("a pass has at most four colour targets");
+        if (n > MAX_COLOR_ATTACHMENTS) throw bad("a pass has at most eight colour targets");
         if (words !== 2 + 8 * n + 4) throw bad("the colour targets don't fill the payload");
         if (w(1) > 1) throw bad("the join word is 0 or 1");
         const colors: ColorTarget[] = [];

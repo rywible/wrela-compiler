@@ -498,7 +498,7 @@ pub fn present() {}
 
 /// An open pass: what a `draw` draws into (§18). Each kind of pass has it (`Pass<F>`,
 /// `DepthPass<F>`, `DepthOnlyPass`, `ScreenPass`, `ScreenDepthPass`, `LayerPass<F>`,
-/// `LayerDepthPass<F>`, `DepthLayerPass`, and `Pass2` to `Pass4` with their depth forms), and
+/// `LayerDepthPass<F>`, `DepthLayerPass`, and `Pass2` to `Pass8` with their depth forms), and
 /// only they do (an `impl` elsewhere is E0415). A function that draws into whatever pass it's
 /// given takes one bounded by it: `fn shade<P: RenderPass>(pass: P, ...)`.
 pub trait RenderPass {
@@ -2251,6 +2251,94 @@ pub borrow struct DepthPass4<A: Target, B: Target, C: Target, D: Target> {
     pub depth: mut DepthTexture,
 }
 
+/// An open pass into five textures.
+pub borrow struct Pass5<A: Target, B: Target, C: Target, D: Target, E: Target> {
+    pub first: mut Texture<A>,
+    pub second: mut Texture<B>,
+    pub third: mut Texture<C>,
+    pub fourth: mut Texture<D>,
+    pub fifth: mut Texture<E>,
+}
+
+/// An open pass into five textures and a depth target.
+pub borrow struct DepthPass5<A: Target, B: Target, C: Target, D: Target, E: Target> {
+    pub first: mut Texture<A>,
+    pub second: mut Texture<B>,
+    pub third: mut Texture<C>,
+    pub fourth: mut Texture<D>,
+    pub fifth: mut Texture<E>,
+    pub depth: mut DepthTexture,
+}
+
+/// An open pass into six textures.
+pub borrow struct Pass6<A: Target, B: Target, C: Target, D: Target, E: Target, F: Target> {
+    pub first: mut Texture<A>,
+    pub second: mut Texture<B>,
+    pub third: mut Texture<C>,
+    pub fourth: mut Texture<D>,
+    pub fifth: mut Texture<E>,
+    pub sixth: mut Texture<F>,
+}
+
+/// An open pass into six textures and a depth target.
+pub borrow struct DepthPass6<A: Target, B: Target, C: Target, D: Target, E: Target, F: Target> {
+    pub first: mut Texture<A>,
+    pub second: mut Texture<B>,
+    pub third: mut Texture<C>,
+    pub fourth: mut Texture<D>,
+    pub fifth: mut Texture<E>,
+    pub sixth: mut Texture<F>,
+    pub depth: mut DepthTexture,
+}
+
+/// An open pass into seven textures.
+pub borrow struct Pass7<A: Target, B: Target, C: Target, D: Target, E: Target, F: Target, G: Target> {
+    pub first: mut Texture<A>,
+    pub second: mut Texture<B>,
+    pub third: mut Texture<C>,
+    pub fourth: mut Texture<D>,
+    pub fifth: mut Texture<E>,
+    pub sixth: mut Texture<F>,
+    pub seventh: mut Texture<G>,
+}
+
+/// An open pass into seven textures and a depth target.
+pub borrow struct DepthPass7<A: Target, B: Target, C: Target, D: Target, E: Target, F: Target, G: Target> {
+    pub first: mut Texture<A>,
+    pub second: mut Texture<B>,
+    pub third: mut Texture<C>,
+    pub fourth: mut Texture<D>,
+    pub fifth: mut Texture<E>,
+    pub sixth: mut Texture<F>,
+    pub seventh: mut Texture<G>,
+    pub depth: mut DepthTexture,
+}
+
+/// An open pass into eight textures.
+pub borrow struct Pass8<A: Target, B: Target, C: Target, D: Target, E: Target, F: Target, G: Target, H: Target> {
+    pub first: mut Texture<A>,
+    pub second: mut Texture<B>,
+    pub third: mut Texture<C>,
+    pub fourth: mut Texture<D>,
+    pub fifth: mut Texture<E>,
+    pub sixth: mut Texture<F>,
+    pub seventh: mut Texture<G>,
+    pub eighth: mut Texture<H>,
+}
+
+/// An open pass into eight textures and a depth target.
+pub borrow struct DepthPass8<A: Target, B: Target, C: Target, D: Target, E: Target, F: Target, G: Target, H: Target> {
+    pub first: mut Texture<A>,
+    pub second: mut Texture<B>,
+    pub third: mut Texture<C>,
+    pub fourth: mut Texture<D>,
+    pub fifth: mut Texture<E>,
+    pub sixth: mut Texture<F>,
+    pub seventh: mut Texture<G>,
+    pub eighth: mut Texture<H>,
+    pub depth: mut DepthTexture,
+}
+
 impl<A: Target, B: Target> Pass2<A, B> {
     /// Ends the pass.
     pub fn end(self) {
@@ -2293,6 +2381,62 @@ impl<A: Target, B: Target, C: Target, D: Target> DepthPass4<A, B, C, D> {
     }
 }
 
+impl<A: Target, B: Target, C: Target, D: Target, E: Target> Pass5<A, B, C, D, E> {
+    /// Ends the pass.
+    pub fn end(self) {
+        end_pass_command()
+    }
+}
+
+impl<A: Target, B: Target, C: Target, D: Target, E: Target> DepthPass5<A, B, C, D, E> {
+    /// Ends the pass.
+    pub fn end(self) {
+        end_pass_command()
+    }
+}
+
+impl<A: Target, B: Target, C: Target, D: Target, E: Target, F: Target> Pass6<A, B, C, D, E, F> {
+    /// Ends the pass.
+    pub fn end(self) {
+        end_pass_command()
+    }
+}
+
+impl<A: Target, B: Target, C: Target, D: Target, E: Target, F: Target> DepthPass6<A, B, C, D, E, F> {
+    /// Ends the pass.
+    pub fn end(self) {
+        end_pass_command()
+    }
+}
+
+impl<A: Target, B: Target, C: Target, D: Target, E: Target, F: Target, G: Target> Pass7<A, B, C, D, E, F, G> {
+    /// Ends the pass.
+    pub fn end(self) {
+        end_pass_command()
+    }
+}
+
+impl<A: Target, B: Target, C: Target, D: Target, E: Target, F: Target, G: Target> DepthPass7<A, B, C, D, E, F, G> {
+    /// Ends the pass.
+    pub fn end(self) {
+        end_pass_command()
+    }
+}
+
+impl<A: Target, B: Target, C: Target, D: Target, E: Target, F: Target, G: Target, H: Target> Pass8<A, B, C, D, E, F, G, H> {
+    /// Ends the pass.
+    pub fn end(self) {
+        end_pass_command()
+    }
+}
+
+impl<A: Target, B: Target, C: Target, D: Target, E: Target, F: Target, G: Target, H: Target> DepthPass8<A, B, C, D, E, F, G, H> {
+    /// Ends the pass.
+    pub fn end(self) {
+        end_pass_command()
+    }
+}
+
 impl<A: Target, B: Target> RenderPass for Pass2<A, B> {}
 
 impl<A: Target, B: Target> RenderPass for DepthPass2<A, B> {}
@@ -2304,6 +2448,22 @@ impl<A: Target, B: Target, C: Target> RenderPass for DepthPass3<A, B, C> {}
 impl<A: Target, B: Target, C: Target, D: Target> RenderPass for Pass4<A, B, C, D> {}
 
 impl<A: Target, B: Target, C: Target, D: Target> RenderPass for DepthPass4<A, B, C, D> {}
+
+impl<A: Target, B: Target, C: Target, D: Target, E: Target> RenderPass for Pass5<A, B, C, D, E> {}
+
+impl<A: Target, B: Target, C: Target, D: Target, E: Target> RenderPass for DepthPass5<A, B, C, D, E> {}
+
+impl<A: Target, B: Target, C: Target, D: Target, E: Target, F: Target> RenderPass for Pass6<A, B, C, D, E, F> {}
+
+impl<A: Target, B: Target, C: Target, D: Target, E: Target, F: Target> RenderPass for DepthPass6<A, B, C, D, E, F> {}
+
+impl<A: Target, B: Target, C: Target, D: Target, E: Target, F: Target, G: Target> RenderPass for Pass7<A, B, C, D, E, F, G> {}
+
+impl<A: Target, B: Target, C: Target, D: Target, E: Target, F: Target, G: Target> RenderPass for DepthPass7<A, B, C, D, E, F, G> {}
+
+impl<A: Target, B: Target, C: Target, D: Target, E: Target, F: Target, G: Target, H: Target> RenderPass for Pass8<A, B, C, D, E, F, G, H> {}
+
+impl<A: Target, B: Target, C: Target, D: Target, E: Target, F: Target, G: Target, H: Target> RenderPass for DepthPass8<A, B, C, D, E, F, G, H> {}
 
 /// A fragment shader's colours for a pass of two targets (`begin_pass2`), in target order: each
 /// a `vec4`, a `vec3`, a `vec2` or an `f32` for a float target, a `u32` or `vec2u` for an
@@ -2326,6 +2486,48 @@ pub struct Targets4<A, B, C, D>: Copy {
     pub second: B,
     pub third: C,
     pub fourth: D,
+}
+
+/// A fragment shader's colours for a pass of five targets.
+pub struct Targets5<A, B, C, D, E>: Copy {
+    pub first: A,
+    pub second: B,
+    pub third: C,
+    pub fourth: D,
+    pub fifth: E,
+}
+
+/// A fragment shader's colours for a pass of six targets.
+pub struct Targets6<A, B, C, D, E, F>: Copy {
+    pub first: A,
+    pub second: B,
+    pub third: C,
+    pub fourth: D,
+    pub fifth: E,
+    pub sixth: F,
+}
+
+/// A fragment shader's colours for a pass of seven targets.
+pub struct Targets7<A, B, C, D, E, F, G>: Copy {
+    pub first: A,
+    pub second: B,
+    pub third: C,
+    pub fourth: D,
+    pub fifth: E,
+    pub sixth: F,
+    pub seventh: G,
+}
+
+/// A fragment shader's colours for a pass of eight targets.
+pub struct Targets8<A, B, C, D, E, F, G, H>: Copy {
+    pub first: A,
+    pub second: B,
+    pub third: C,
+    pub fourth: D,
+    pub fifth: E,
+    pub sixth: F,
+    pub seventh: G,
+    pub eighth: H,
 }
 
 /// How a draw's colour meets what's in its target, as WebGPU's blend states define them: part
@@ -2581,6 +2783,278 @@ pub fn begin_pass4_with_depth<A: Target, B: Target, C: Target, D: Target>(
     }
 }
 
+/// Starts a pass that draws into five textures at once.
+pub fn begin_pass5<A: Target, B: Target, C: Target, D: Target, E: Target>(
+    first: mut Texture<A>,
+    second: mut Texture<B>,
+    third: mut Texture<C>,
+    fourth: mut Texture<D>,
+    fifth: mut Texture<E>,
+    clear: vec4 = vec4(0.0, 0.0, 0.0, 1.0),
+    keep: bool = false,
+) -> Pass5<A, B, C, D, E> {
+    let (t0, t1, t2, t3, t4) = (
+        first.handle,
+        second.handle,
+        third.handle,
+        fourth.handle,
+        fifth.handle,
+    )
+    begin5(t0, t1, t2, t3, t4, clear, keep)
+    Pass5 {
+        first: mut first,
+        second: mut second,
+        third: mut third,
+        fourth: mut fourth,
+        fifth: mut fifth,
+    }
+}
+
+/// Starts a pass into five textures with a depth target.
+pub fn begin_pass5_with_depth<A: Target, B: Target, C: Target, D: Target, E: Target>(
+    first: mut Texture<A>,
+    second: mut Texture<B>,
+    third: mut Texture<C>,
+    fourth: mut Texture<D>,
+    fifth: mut Texture<E>,
+    depth: mut DepthTexture,
+    clear: vec4 = vec4(0.0, 0.0, 0.0, 1.0),
+    keep: bool = false,
+    clear_depth: f32 = 1.0,
+    keep_depth: bool = false,
+    join: bool = false,
+) -> DepthPass5<A, B, C, D, E> {
+    let (t0, t1, t2, t3, t4) = (
+        first.handle,
+        second.handle,
+        third.handle,
+        fourth.handle,
+        fifth.handle,
+    )
+    begin5(t0, t1, t2, t3, t4, clear, keep, depth.handle, clear_depth, keep_depth, join)
+    DepthPass5 {
+        first: mut first,
+        second: mut second,
+        third: mut third,
+        fourth: mut fourth,
+        fifth: mut fifth,
+        depth: mut depth,
+    }
+}
+
+/// Starts a pass that draws into six textures at once.
+pub fn begin_pass6<A: Target, B: Target, C: Target, D: Target, E: Target, F: Target>(
+    first: mut Texture<A>,
+    second: mut Texture<B>,
+    third: mut Texture<C>,
+    fourth: mut Texture<D>,
+    fifth: mut Texture<E>,
+    sixth: mut Texture<F>,
+    clear: vec4 = vec4(0.0, 0.0, 0.0, 1.0),
+    keep: bool = false,
+) -> Pass6<A, B, C, D, E, F> {
+    let (t0, t1, t2, t3, t4, t5) = (
+        first.handle,
+        second.handle,
+        third.handle,
+        fourth.handle,
+        fifth.handle,
+        sixth.handle,
+    )
+    begin6(t0, t1, t2, t3, t4, t5, clear, keep)
+    Pass6 {
+        first: mut first,
+        second: mut second,
+        third: mut third,
+        fourth: mut fourth,
+        fifth: mut fifth,
+        sixth: mut sixth,
+    }
+}
+
+/// Starts a pass into six textures with a depth target.
+pub fn begin_pass6_with_depth<A: Target, B: Target, C: Target, D: Target, E: Target, F: Target>(
+    first: mut Texture<A>,
+    second: mut Texture<B>,
+    third: mut Texture<C>,
+    fourth: mut Texture<D>,
+    fifth: mut Texture<E>,
+    sixth: mut Texture<F>,
+    depth: mut DepthTexture,
+    clear: vec4 = vec4(0.0, 0.0, 0.0, 1.0),
+    keep: bool = false,
+    clear_depth: f32 = 1.0,
+    keep_depth: bool = false,
+    join: bool = false,
+) -> DepthPass6<A, B, C, D, E, F> {
+    let (t0, t1, t2, t3, t4, t5) = (
+        first.handle,
+        second.handle,
+        third.handle,
+        fourth.handle,
+        fifth.handle,
+        sixth.handle,
+    )
+    begin6(t0, t1, t2, t3, t4, t5, clear, keep, depth.handle, clear_depth, keep_depth, join)
+    DepthPass6 {
+        first: mut first,
+        second: mut second,
+        third: mut third,
+        fourth: mut fourth,
+        fifth: mut fifth,
+        sixth: mut sixth,
+        depth: mut depth,
+    }
+}
+
+/// Starts a pass that draws into seven textures at once.
+pub fn begin_pass7<A: Target, B: Target, C: Target, D: Target, E: Target, F: Target, G: Target>(
+    first: mut Texture<A>,
+    second: mut Texture<B>,
+    third: mut Texture<C>,
+    fourth: mut Texture<D>,
+    fifth: mut Texture<E>,
+    sixth: mut Texture<F>,
+    seventh: mut Texture<G>,
+    clear: vec4 = vec4(0.0, 0.0, 0.0, 1.0),
+    keep: bool = false,
+) -> Pass7<A, B, C, D, E, F, G> {
+    let (t0, t1, t2, t3, t4, t5, t6) = (
+        first.handle,
+        second.handle,
+        third.handle,
+        fourth.handle,
+        fifth.handle,
+        sixth.handle,
+        seventh.handle,
+    )
+    begin7(t0, t1, t2, t3, t4, t5, t6, clear, keep)
+    Pass7 {
+        first: mut first,
+        second: mut second,
+        third: mut third,
+        fourth: mut fourth,
+        fifth: mut fifth,
+        sixth: mut sixth,
+        seventh: mut seventh,
+    }
+}
+
+/// Starts a pass into seven textures with a depth target.
+pub fn begin_pass7_with_depth<A: Target, B: Target, C: Target, D: Target, E: Target, F: Target, G: Target>(
+    first: mut Texture<A>,
+    second: mut Texture<B>,
+    third: mut Texture<C>,
+    fourth: mut Texture<D>,
+    fifth: mut Texture<E>,
+    sixth: mut Texture<F>,
+    seventh: mut Texture<G>,
+    depth: mut DepthTexture,
+    clear: vec4 = vec4(0.0, 0.0, 0.0, 1.0),
+    keep: bool = false,
+    clear_depth: f32 = 1.0,
+    keep_depth: bool = false,
+    join: bool = false,
+) -> DepthPass7<A, B, C, D, E, F, G> {
+    let (t0, t1, t2, t3, t4, t5, t6) = (
+        first.handle,
+        second.handle,
+        third.handle,
+        fourth.handle,
+        fifth.handle,
+        sixth.handle,
+        seventh.handle,
+    )
+    begin7(t0, t1, t2, t3, t4, t5, t6, clear, keep, depth.handle, clear_depth, keep_depth, join)
+    DepthPass7 {
+        first: mut first,
+        second: mut second,
+        third: mut third,
+        fourth: mut fourth,
+        fifth: mut fifth,
+        sixth: mut sixth,
+        seventh: mut seventh,
+        depth: mut depth,
+    }
+}
+
+/// Starts a pass that draws into eight textures at once.
+pub fn begin_pass8<A: Target, B: Target, C: Target, D: Target, E: Target, F: Target, G: Target, H: Target>(
+    first: mut Texture<A>,
+    second: mut Texture<B>,
+    third: mut Texture<C>,
+    fourth: mut Texture<D>,
+    fifth: mut Texture<E>,
+    sixth: mut Texture<F>,
+    seventh: mut Texture<G>,
+    eighth: mut Texture<H>,
+    clear: vec4 = vec4(0.0, 0.0, 0.0, 1.0),
+    keep: bool = false,
+) -> Pass8<A, B, C, D, E, F, G, H> {
+    let (t0, t1, t2, t3, t4, t5, t6, t7) = (
+        first.handle,
+        second.handle,
+        third.handle,
+        fourth.handle,
+        fifth.handle,
+        sixth.handle,
+        seventh.handle,
+        eighth.handle,
+    )
+    begin8(t0, t1, t2, t3, t4, t5, t6, t7, clear, keep)
+    Pass8 {
+        first: mut first,
+        second: mut second,
+        third: mut third,
+        fourth: mut fourth,
+        fifth: mut fifth,
+        sixth: mut sixth,
+        seventh: mut seventh,
+        eighth: mut eighth,
+    }
+}
+
+/// Starts a pass into eight textures with a depth target.
+pub fn begin_pass8_with_depth<A: Target, B: Target, C: Target, D: Target, E: Target, F: Target, G: Target, H: Target>(
+    first: mut Texture<A>,
+    second: mut Texture<B>,
+    third: mut Texture<C>,
+    fourth: mut Texture<D>,
+    fifth: mut Texture<E>,
+    sixth: mut Texture<F>,
+    seventh: mut Texture<G>,
+    eighth: mut Texture<H>,
+    depth: mut DepthTexture,
+    clear: vec4 = vec4(0.0, 0.0, 0.0, 1.0),
+    keep: bool = false,
+    clear_depth: f32 = 1.0,
+    keep_depth: bool = false,
+    join: bool = false,
+) -> DepthPass8<A, B, C, D, E, F, G, H> {
+    let (t0, t1, t2, t3, t4, t5, t6, t7) = (
+        first.handle,
+        second.handle,
+        third.handle,
+        fourth.handle,
+        fifth.handle,
+        sixth.handle,
+        seventh.handle,
+        eighth.handle,
+    )
+    begin8(t0, t1, t2, t3, t4, t5, t6, t7, clear, keep, depth.handle, clear_depth, keep_depth, join)
+    DepthPass8 {
+        first: mut first,
+        second: mut second,
+        third: mut third,
+        fourth: mut fourth,
+        fifth: mut fifth,
+        sixth: mut sixth,
+        seventh: mut seventh,
+        eighth: mut eighth,
+        depth: mut depth,
+    }
+}
+
 /// Starts drawing to the screen, cleared to `clear`, with `depth` as its depth target (the
 /// screen's size). A client's only.
 @client
@@ -2771,6 +3245,324 @@ fn begin4(
         g3: y,
         b3: z,
         a3: w,
+        depth: depth,
+        depth_layer: 0,
+        keep_depth: u32(keep_depth),
+        clear_depth: clear_depth,
+    )
+}
+
+/// Records the start of a pass into five colour targets, as `begin2`.
+fn begin5(
+    t0: u32,
+    t1: u32,
+    t2: u32,
+    t3: u32,
+    t4: u32,
+    clear: vec4,
+    keep: bool,
+    depth: u32 = NO_TARGET,
+    clear_depth: f32 = 1.0,
+    keep_depth: bool = false,
+    join: bool = false,
+) {
+    let k = u32(keep)
+    let (x, y, z, w) = (clear.x, clear.y, clear.z, clear.w)
+    begin_pass5_command(
+        count: 5,
+        join: u32(join),
+        t0: t0,
+        level0: 0,
+        layer0: 0,
+        keep0: k,
+        r0: x,
+        g0: y,
+        b0: z,
+        a0: w,
+        t1: t1,
+        level1: 0,
+        layer1: 0,
+        keep1: k,
+        r1: x,
+        g1: y,
+        b1: z,
+        a1: w,
+        t2: t2,
+        level2: 0,
+        layer2: 0,
+        keep2: k,
+        r2: x,
+        g2: y,
+        b2: z,
+        a2: w,
+        t3: t3,
+        level3: 0,
+        layer3: 0,
+        keep3: k,
+        r3: x,
+        g3: y,
+        b3: z,
+        a3: w,
+        t4: t4,
+        level4: 0,
+        layer4: 0,
+        keep4: k,
+        r4: x,
+        g4: y,
+        b4: z,
+        a4: w,
+        depth: depth,
+        depth_layer: 0,
+        keep_depth: u32(keep_depth),
+        clear_depth: clear_depth,
+    )
+}
+
+/// Records the start of a pass into six colour targets, as `begin2`.
+fn begin6(
+    t0: u32,
+    t1: u32,
+    t2: u32,
+    t3: u32,
+    t4: u32,
+    t5: u32,
+    clear: vec4,
+    keep: bool,
+    depth: u32 = NO_TARGET,
+    clear_depth: f32 = 1.0,
+    keep_depth: bool = false,
+    join: bool = false,
+) {
+    let k = u32(keep)
+    let (x, y, z, w) = (clear.x, clear.y, clear.z, clear.w)
+    begin_pass6_command(
+        count: 6,
+        join: u32(join),
+        t0: t0,
+        level0: 0,
+        layer0: 0,
+        keep0: k,
+        r0: x,
+        g0: y,
+        b0: z,
+        a0: w,
+        t1: t1,
+        level1: 0,
+        layer1: 0,
+        keep1: k,
+        r1: x,
+        g1: y,
+        b1: z,
+        a1: w,
+        t2: t2,
+        level2: 0,
+        layer2: 0,
+        keep2: k,
+        r2: x,
+        g2: y,
+        b2: z,
+        a2: w,
+        t3: t3,
+        level3: 0,
+        layer3: 0,
+        keep3: k,
+        r3: x,
+        g3: y,
+        b3: z,
+        a3: w,
+        t4: t4,
+        level4: 0,
+        layer4: 0,
+        keep4: k,
+        r4: x,
+        g4: y,
+        b4: z,
+        a4: w,
+        t5: t5,
+        level5: 0,
+        layer5: 0,
+        keep5: k,
+        r5: x,
+        g5: y,
+        b5: z,
+        a5: w,
+        depth: depth,
+        depth_layer: 0,
+        keep_depth: u32(keep_depth),
+        clear_depth: clear_depth,
+    )
+}
+
+/// Records the start of a pass into seven colour targets, as `begin2`.
+fn begin7(
+    t0: u32,
+    t1: u32,
+    t2: u32,
+    t3: u32,
+    t4: u32,
+    t5: u32,
+    t6: u32,
+    clear: vec4,
+    keep: bool,
+    depth: u32 = NO_TARGET,
+    clear_depth: f32 = 1.0,
+    keep_depth: bool = false,
+    join: bool = false,
+) {
+    let k = u32(keep)
+    let (x, y, z, w) = (clear.x, clear.y, clear.z, clear.w)
+    begin_pass7_command(
+        count: 7,
+        join: u32(join),
+        t0: t0,
+        level0: 0,
+        layer0: 0,
+        keep0: k,
+        r0: x,
+        g0: y,
+        b0: z,
+        a0: w,
+        t1: t1,
+        level1: 0,
+        layer1: 0,
+        keep1: k,
+        r1: x,
+        g1: y,
+        b1: z,
+        a1: w,
+        t2: t2,
+        level2: 0,
+        layer2: 0,
+        keep2: k,
+        r2: x,
+        g2: y,
+        b2: z,
+        a2: w,
+        t3: t3,
+        level3: 0,
+        layer3: 0,
+        keep3: k,
+        r3: x,
+        g3: y,
+        b3: z,
+        a3: w,
+        t4: t4,
+        level4: 0,
+        layer4: 0,
+        keep4: k,
+        r4: x,
+        g4: y,
+        b4: z,
+        a4: w,
+        t5: t5,
+        level5: 0,
+        layer5: 0,
+        keep5: k,
+        r5: x,
+        g5: y,
+        b5: z,
+        a5: w,
+        t6: t6,
+        level6: 0,
+        layer6: 0,
+        keep6: k,
+        r6: x,
+        g6: y,
+        b6: z,
+        a6: w,
+        depth: depth,
+        depth_layer: 0,
+        keep_depth: u32(keep_depth),
+        clear_depth: clear_depth,
+    )
+}
+
+/// Records the start of a pass into eight colour targets, as `begin2`.
+fn begin8(
+    t0: u32,
+    t1: u32,
+    t2: u32,
+    t3: u32,
+    t4: u32,
+    t5: u32,
+    t6: u32,
+    t7: u32,
+    clear: vec4,
+    keep: bool,
+    depth: u32 = NO_TARGET,
+    clear_depth: f32 = 1.0,
+    keep_depth: bool = false,
+    join: bool = false,
+) {
+    let k = u32(keep)
+    let (x, y, z, w) = (clear.x, clear.y, clear.z, clear.w)
+    begin_pass8_command(
+        count: 8,
+        join: u32(join),
+        t0: t0,
+        level0: 0,
+        layer0: 0,
+        keep0: k,
+        r0: x,
+        g0: y,
+        b0: z,
+        a0: w,
+        t1: t1,
+        level1: 0,
+        layer1: 0,
+        keep1: k,
+        r1: x,
+        g1: y,
+        b1: z,
+        a1: w,
+        t2: t2,
+        level2: 0,
+        layer2: 0,
+        keep2: k,
+        r2: x,
+        g2: y,
+        b2: z,
+        a2: w,
+        t3: t3,
+        level3: 0,
+        layer3: 0,
+        keep3: k,
+        r3: x,
+        g3: y,
+        b3: z,
+        a3: w,
+        t4: t4,
+        level4: 0,
+        layer4: 0,
+        keep4: k,
+        r4: x,
+        g4: y,
+        b4: z,
+        a4: w,
+        t5: t5,
+        level5: 0,
+        layer5: 0,
+        keep5: k,
+        r5: x,
+        g5: y,
+        b5: z,
+        a5: w,
+        t6: t6,
+        level6: 0,
+        layer6: 0,
+        keep6: k,
+        r6: x,
+        g6: y,
+        b6: z,
+        a6: w,
+        t7: t7,
+        level7: 0,
+        layer7: 0,
+        keep7: k,
+        r7: x,
+        g7: y,
+        b7: z,
+        a7: w,
         depth: depth,
         depth_layer: 0,
         keep_depth: u32(keep_depth),
@@ -3088,6 +3880,254 @@ fn begin_pass4_command(
     g3: f32,
     b3: f32,
     a3: f32,
+    depth: u32,
+    depth_layer: u32,
+    keep_depth: u32,
+    clear_depth: f32,
+) {}
+
+@intrinsic
+fn begin_pass5_command(
+    count: u32,
+    join: u32,
+    t0: u32,
+    level0: u32,
+    layer0: u32,
+    keep0: u32,
+    r0: f32,
+    g0: f32,
+    b0: f32,
+    a0: f32,
+    t1: u32,
+    level1: u32,
+    layer1: u32,
+    keep1: u32,
+    r1: f32,
+    g1: f32,
+    b1: f32,
+    a1: f32,
+    t2: u32,
+    level2: u32,
+    layer2: u32,
+    keep2: u32,
+    r2: f32,
+    g2: f32,
+    b2: f32,
+    a2: f32,
+    t3: u32,
+    level3: u32,
+    layer3: u32,
+    keep3: u32,
+    r3: f32,
+    g3: f32,
+    b3: f32,
+    a3: f32,
+    t4: u32,
+    level4: u32,
+    layer4: u32,
+    keep4: u32,
+    r4: f32,
+    g4: f32,
+    b4: f32,
+    a4: f32,
+    depth: u32,
+    depth_layer: u32,
+    keep_depth: u32,
+    clear_depth: f32,
+) {}
+
+@intrinsic
+fn begin_pass6_command(
+    count: u32,
+    join: u32,
+    t0: u32,
+    level0: u32,
+    layer0: u32,
+    keep0: u32,
+    r0: f32,
+    g0: f32,
+    b0: f32,
+    a0: f32,
+    t1: u32,
+    level1: u32,
+    layer1: u32,
+    keep1: u32,
+    r1: f32,
+    g1: f32,
+    b1: f32,
+    a1: f32,
+    t2: u32,
+    level2: u32,
+    layer2: u32,
+    keep2: u32,
+    r2: f32,
+    g2: f32,
+    b2: f32,
+    a2: f32,
+    t3: u32,
+    level3: u32,
+    layer3: u32,
+    keep3: u32,
+    r3: f32,
+    g3: f32,
+    b3: f32,
+    a3: f32,
+    t4: u32,
+    level4: u32,
+    layer4: u32,
+    keep4: u32,
+    r4: f32,
+    g4: f32,
+    b4: f32,
+    a4: f32,
+    t5: u32,
+    level5: u32,
+    layer5: u32,
+    keep5: u32,
+    r5: f32,
+    g5: f32,
+    b5: f32,
+    a5: f32,
+    depth: u32,
+    depth_layer: u32,
+    keep_depth: u32,
+    clear_depth: f32,
+) {}
+
+@intrinsic
+fn begin_pass7_command(
+    count: u32,
+    join: u32,
+    t0: u32,
+    level0: u32,
+    layer0: u32,
+    keep0: u32,
+    r0: f32,
+    g0: f32,
+    b0: f32,
+    a0: f32,
+    t1: u32,
+    level1: u32,
+    layer1: u32,
+    keep1: u32,
+    r1: f32,
+    g1: f32,
+    b1: f32,
+    a1: f32,
+    t2: u32,
+    level2: u32,
+    layer2: u32,
+    keep2: u32,
+    r2: f32,
+    g2: f32,
+    b2: f32,
+    a2: f32,
+    t3: u32,
+    level3: u32,
+    layer3: u32,
+    keep3: u32,
+    r3: f32,
+    g3: f32,
+    b3: f32,
+    a3: f32,
+    t4: u32,
+    level4: u32,
+    layer4: u32,
+    keep4: u32,
+    r4: f32,
+    g4: f32,
+    b4: f32,
+    a4: f32,
+    t5: u32,
+    level5: u32,
+    layer5: u32,
+    keep5: u32,
+    r5: f32,
+    g5: f32,
+    b5: f32,
+    a5: f32,
+    t6: u32,
+    level6: u32,
+    layer6: u32,
+    keep6: u32,
+    r6: f32,
+    g6: f32,
+    b6: f32,
+    a6: f32,
+    depth: u32,
+    depth_layer: u32,
+    keep_depth: u32,
+    clear_depth: f32,
+) {}
+
+@intrinsic
+fn begin_pass8_command(
+    count: u32,
+    join: u32,
+    t0: u32,
+    level0: u32,
+    layer0: u32,
+    keep0: u32,
+    r0: f32,
+    g0: f32,
+    b0: f32,
+    a0: f32,
+    t1: u32,
+    level1: u32,
+    layer1: u32,
+    keep1: u32,
+    r1: f32,
+    g1: f32,
+    b1: f32,
+    a1: f32,
+    t2: u32,
+    level2: u32,
+    layer2: u32,
+    keep2: u32,
+    r2: f32,
+    g2: f32,
+    b2: f32,
+    a2: f32,
+    t3: u32,
+    level3: u32,
+    layer3: u32,
+    keep3: u32,
+    r3: f32,
+    g3: f32,
+    b3: f32,
+    a3: f32,
+    t4: u32,
+    level4: u32,
+    layer4: u32,
+    keep4: u32,
+    r4: f32,
+    g4: f32,
+    b4: f32,
+    a4: f32,
+    t5: u32,
+    level5: u32,
+    layer5: u32,
+    keep5: u32,
+    r5: f32,
+    g5: f32,
+    b5: f32,
+    a5: f32,
+    t6: u32,
+    level6: u32,
+    layer6: u32,
+    keep6: u32,
+    r6: f32,
+    g6: f32,
+    b6: f32,
+    a6: f32,
+    t7: u32,
+    level7: u32,
+    layer7: u32,
+    keep7: u32,
+    r7: f32,
+    g7: f32,
+    b7: f32,
+    a7: f32,
     depth: u32,
     depth_layer: u32,
     keep_depth: u32,

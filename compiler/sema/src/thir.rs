@@ -348,7 +348,7 @@ pub struct RenderState {
     pub depth: wrela_abi::manifest::DepthState,
     /// `std::gpu::Blend`s: `blend:` for every target, or `blends:` for each (the first
     /// `blend_count`), given or not (then `Replace`, or `Over` for a shader returning `Over`).
-    pub blends: [wrela_abi::manifest::Blend; 4],
+    pub blends: [wrela_abi::manifest::Blend; wrela_abi::stream::MAX_COLOR_ATTACHMENTS],
     pub blend_count: u8,
     pub blend_given: bool,
 }

@@ -1,0 +1,193 @@
+// Passes into up to eight colour targets (language.md §18), within WebGPU's 32 attachment bytes
+// a sample: six `R32Uint`s (24 bytes), eight with a depth target (32), four `Rgba8`s (32: an
+// `Rgba8` costs 8 attachment bytes, though it stores 4), and a G-buffer's layout: an
+// `Rgba16Float`, two `Rg32Uint`s and two `R32Uint`s (8 + 8 + 8 + 4 + 4 = 32), its words packed
+// and read back. Frame 0 records each pass and asks for every target back; the tests check each
+// value, on both hosts.
+use std::gpu::{
+    ClipPosition, DepthTexture, Format, R32Uint, Texture, Rg32Uint, Rgba16Float, Rgba8, Targets4,
+    Targets5, Targets6, Targets8, TextureRead, VertexIndex, begin_pass4, begin_pass5, begin_pass6,
+    begin_pass8_with_depth, depth_texture, draw, read_texture, texture,
+}
+
+pub struct State {
+    frame: u32,
+    six: (Texture<R32Uint>, Texture<R32Uint>, Texture<R32Uint>, Texture<R32Uint>, Texture<R32Uint>, Texture<R32Uint>),
+    eight: (Texture<R32Uint>, Texture<R32Uint>, Texture<R32Uint>, Texture<R32Uint>, Texture<R32Uint>, Texture<R32Uint>, Texture<R32Uint>, Texture<R32Uint>),
+    depth: DepthTexture,
+    bytes: (Texture<Rgba8>, Texture<Rgba8>, Texture<Rgba8>, Texture<Rgba8>),
+    colour: Texture<Rgba16Float>,
+    packed: (Texture<Rg32Uint>, Texture<Rg32Uint>),
+    words: (Texture<R32Uint>, Texture<R32Uint>),
+    reads: Vec<TextureRead>,
+    got: Vec<Vec<u8>>,
+}
+
+pub fn init() -> State {
+    State {
+        frame: 0,
+        six: (sq(), sq(), sq(), sq(), sq(), sq()),
+        eight: (sq(), sq(), sq(), sq(), sq(), sq(), sq(), sq()),
+        depth: depth_texture(width: 2, height: 2),
+        bytes: (sq(), sq(), sq(), sq()),
+        colour: texture(width: 2, height: 2),
+        packed: (sq(), sq()),
+        words: (sq(), sq()),
+        reads: Vec::new(),
+        got: Vec::new(),
+    }
+}
+
+/// A 2 × 2 target.
+fn sq<F: Format>() -> Texture<F> {
+    texture(width: 2, height: 2)
+}
+
+/// One triangle that covers the target.
+@vertex
+fn cover(v: VertexIndex) -> ClipPosition {
+    let x = f32((v.index << 1) & 2) * 2.0 - 1.0
+    let y = f32(v.index & 2) * 2.0 - 1.0
+    ClipPosition { position: vec4(x, y, 0.5, 1.0) }
+}
+
+@fragment
+fn six_words() -> Targets6<u32, u32, u32, u32, u32, u32> {
+    Targets6 { first: 11, second: 22, third: 33, fourth: 44, fifth: 55, sixth: 66 }
+}
+
+@fragment
+fn eight_words() -> Targets8<u32, u32, u32, u32, u32, u32, u32, u32> {
+    Targets8 {
+        first: 1,
+        second: 2,
+        third: 3,
+        fourth: 4,
+        fifth: 5,
+        sixth: 6,
+        seventh: 7,
+        eighth: 8,
+    }
+}
+
+@fragment
+fn four_bytes() -> Targets4<vec4, vec4, vec4, vec4> {
+    let c = vec4(0.2, 0.4, 0.6, 0.8)
+    Targets4 { first: c, second: c, third: c, fourth: c }
+}
+
+/// A G-buffer's channels, each packed into its target's words.
+@fragment
+fn gbuffer() -> Targets5<vec4, vec2u, vec2u, u32, u32> {
+    Targets5 {
+        first: vec4(0.5, 0.25, 1.0, 1.0),
+        second: vec2u(0xC0003A00, 0xDEADBEEF),
+        third: vec2u(0x408000FF, 7),
+        fourth: 0x12345678,
+        fifth: 4294967295,
+    }
+}
+
+fn record(s: mut State) {
+    mut x = s.six
+    let p = begin_pass6(mut x.0, mut x.1, mut x.2, mut x.3, mut x.4, mut x.5)
+    draw(p, cover, six_words, vertices: 3)
+    p.end()
+    for t in [x.0.level(0), x.1.level(0), x.2.level(0), x.3.level(0), x.4.level(0), x.5.level(0)] {
+        s.reads.push(read_texture(t))
+    }
+    mut e = s.eight
+    let p = begin_pass8_with_depth(
+        mut e.0,
+        mut e.1,
+        mut e.2,
+        mut e.3,
+        mut e.4,
+        mut e.5,
+        mut e.6,
+        mut e.7,
+        mut s.depth,
+    )
+    draw(p, cover, eight_words, vertices: 3)
+    p.end()
+    let levels = [
+        e.0.level(0),
+        e.1.level(0),
+        e.2.level(0),
+        e.3.level(0),
+        e.4.level(0),
+        e.5.level(0),
+        e.6.level(0),
+        e.7.level(0),
+    ]
+    for t in levels {
+        s.reads.push(read_texture(t))
+    }
+    let p = begin_pass4(mut s.bytes.0, mut s.bytes.1, mut s.bytes.2, mut s.bytes.3)
+    draw(p, cover, four_bytes, vertices: 3)
+    p.end()
+    s.reads.push(read_texture(s.bytes.3.level(0)))
+    let p = begin_pass5(mut s.colour, mut s.packed.0, mut s.packed.1, mut s.words.0, mut s.words.1)
+    draw(p, cover, gbuffer, vertices: 3)
+    p.end()
+    s.reads.push(read_texture(s.colour.level(0)))
+    s.reads.push(read_texture(s.packed.0.level(0)))
+    s.reads.push(read_texture(s.packed.1.level(0)))
+    s.reads.push(read_texture(s.words.0.level(0)))
+    s.reads.push(read_texture(s.words.1.level(0)))
+}
+
+pub fn frame(s: mut State, time: f32, width: u32, height: u32) {
+    if s.frame == 0 {
+        record(mut s)
+    } else {
+        var k = 0
+        while k < s.reads.len() {
+            if s.got.len() == k {
+                match s.reads[k].poll() {
+                    Some(Ok(bytes)) => {
+                        s.got.push(take bytes)
+                    },
+                    Some(Err(_)) => {
+                        s.got.push(Vec::new())
+                    },
+                    None => {},
+                }
+            }
+            k += 1
+        }
+    }
+    s.frame += 1
+}
+
+/// The little-endian `u32` at byte `i` of `b`.
+fn word(b: [u8], i: u32) -> u32 {
+    u32(b[i]) | (u32(b[i + 1]) << 8) | (u32(b[i + 2]) << 16) | (u32(b[i + 3]) << 24)
+}
+
+@test(frames: 6, gpu: true, hosts: both)
+fn six_and_eight_targets_each_hold_their_own(s: State) {
+    assert(s.got.len() == 20)
+    for i in 0..6 {
+        for t in 0..4 {
+            assert(word(s.got[i], 4 * t) == 11 * (i + 1))
+        }
+    }
+    for i in 0..8 {
+        assert(word(s.got[6 + i], 0) == i + 1 && word(s.got[6 + i], 12) == i + 1)
+    }
+    // An `Rgba8` target: 0.2, 0.4, 0.6, 0.8 as bytes.
+    assert(u32(s.got[14][0]) == 51 && u32(s.got[14][3]) == 204)
+}
+
+@test(frames: 6, gpu: true, hosts: both)
+fn a_gbuffers_packed_channels_round_trip(s: State) {
+    // Rgba16Float: 8 bytes a texel; its first half is 0.5 (0x3800).
+    assert(s.got[15].len() == 32 && word(s.got[15], 0) & 0xFFFF == 0x3800)
+    // Rg32Uint: two words a texel.
+    assert(
+        word(s.got[16], 0) == 0xC0003A00 && word(s.got[16], 4) == 0xDEADBEEF,
+    )
+    assert(word(s.got[17], 0) == 0x408000FF && word(s.got[17], 4) == 7)
+    assert(word(s.got[18], 0) == 0x12345678 && word(s.got[19], 8) == 4294967295)
+}

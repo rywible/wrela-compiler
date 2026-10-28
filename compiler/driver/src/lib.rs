@@ -81,6 +81,9 @@ pub struct PipelineSummary {
     /// (`wrela_sema::mir::control`): its pipeline is in the build however rarely it holds.
     /// Empty unless the compile was [`check_pipelines`].
     pub conditional: Vec<bool>,
+    /// A render pipeline's colour attachments' bytes a sample, the most of its targets'
+    /// (WebGPU's count, within its 32: §18); `None` for a compute pipeline.
+    pub attachment_bytes: Option<u32>,
 }
 
 impl PipelineSummary {
@@ -1161,6 +1164,13 @@ fn summarize(
                 sites,
                 conditional: commands.as_ref().map_or_else(Vec::new, |c| {
                     out.sites.iter().map(|s| conditional(c, s)).collect()
+                }),
+                attachment_bytes: (kind == "render").then(|| {
+                    let bytes = |t: &wrela_abi::manifest::RenderTarget| {
+                        let colors: Vec<_> = t.colors().collect();
+                        wrela_abi::stream::color_attachment_bytes(&colors)
+                    };
+                    out.targets.iter().map(bytes).max().unwrap_or(0)
                 }),
             }
         })

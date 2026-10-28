@@ -1075,7 +1075,17 @@ fn draw_target(
         _ => Vec::new(),
     };
     let target = match p.lang_of_ty(t) {
-        Some(Lang::Pass | Lang::LayerPass | Lang::Pass2 | Lang::Pass3 | Lang::Pass4) => {
+        Some(
+            Lang::Pass
+            | Lang::LayerPass
+            | Lang::Pass2
+            | Lang::Pass3
+            | Lang::Pass4
+            | Lang::Pass5
+            | Lang::Pass6
+            | Lang::Pass7
+            | Lang::Pass8,
+        ) => {
             ir::RenderTarget::of(&formats, false)
         }
         Some(
@@ -1083,7 +1093,11 @@ fn draw_target(
             | Lang::LayerDepthPass
             | Lang::DepthPass2
             | Lang::DepthPass3
-            | Lang::DepthPass4,
+            | Lang::DepthPass4
+            | Lang::DepthPass5
+            | Lang::DepthPass6
+            | Lang::DepthPass7
+            | Lang::DepthPass8,
         ) => ir::RenderTarget::of(&formats, true),
         Some(Lang::DepthOnlyPass | Lang::DepthLayerPass) => ir::RenderTarget::of(&[], true),
         Some(Lang::ScreenPass) => ir::RenderTarget::screen(false),
@@ -1148,14 +1162,16 @@ fn draw_target(
     }
     let bytes = wrela_abi::stream::color_attachment_bytes(&colours);
     if bytes > wrela_abi::stream::MAX_COLOR_ATTACHMENT_BYTES {
-        let names: Vec<&str> = colours.iter().map(|f| f.name()).collect();
+        let names: Vec<String> =
+            colours.iter().map(|f| format!("{} ({} bytes)", f.name(), f.info().target_cost)).collect();
         fl.cx.err(
             Diagnostic::new(
                 codes::E0602,
                 span,
                 format!(
-                    "this draw's pass draws into {}, which take {bytes} bytes a sample: WebGPU's limit is 32",
-                    names.join(", ")
+                    "this draw's pass draws into {}: {bytes} bytes a sample, over WebGPU's {}",
+                    names.join(", "),
+                    wrela_abi::stream::MAX_COLOR_ATTACHMENT_BYTES
                 ),
             )
             .with_note("each target's cost is rounded up to its alignment before the next's is added (WebGPU's algorithm): `rgba8unorm` and `rgba16float` cost 8, `rgba32float` 16, `r32uint` and `r32float` 4")
@@ -1176,7 +1192,7 @@ pub fn blends_of(
     (0..output.colours.len())
         .map(|k| {
             if state.blend_given {
-                state.blends[k.min(3)]
+                state.blends[k.min(wrela_abi::stream::MAX_COLOR_ATTACHMENTS - 1)]
             } else if output.over {
                 Blend::Over
             } else {
@@ -1328,6 +1344,10 @@ pub(crate) fn intrinsic(
             | Lang::BeginPass2
             | Lang::BeginPass3
             | Lang::BeginPass4
+            | Lang::BeginPass5
+            | Lang::BeginPass6
+            | Lang::BeginPass7
+            | Lang::BeginPass8
             | Lang::EndPass
             | Lang::CopyTextureCommand
             | Lang::CopyTextureToBufferCommand
@@ -1348,6 +1368,10 @@ pub(crate) fn intrinsic(
                 Lang::BeginPass2 => (Opcode::BeginPass, 22, false),
                 Lang::BeginPass3 => (Opcode::BeginPass, 30, false),
                 Lang::BeginPass4 => (Opcode::BeginPass, 38, false),
+                Lang::BeginPass5 => (Opcode::BeginPass, 46, false),
+                Lang::BeginPass6 => (Opcode::BeginPass, 54, false),
+                Lang::BeginPass7 => (Opcode::BeginPass, 62, false),
+                Lang::BeginPass8 => (Opcode::BeginPass, 70, false),
                 Lang::CopyTextureCommand => (Opcode::CopyTexture, 12, false),
                 Lang::CopyTextureToBufferCommand => (Opcode::CopyTextureToBuffer, 10, false),
                 Lang::CopyBufferToTextureCommand => (Opcode::CopyBufferToTexture, 10, false),

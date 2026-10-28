@@ -90,7 +90,7 @@ export const TEXTURE_FORMATS = [
 export const TEXTURE_KINDS = ["2d", "3d", "2d-array", "cube"] as const;
 /** WebGPU's default `maxColorAttachmentBytesPerSample` and `maxColorAttachments`. */
 export const MAX_COLOR_ATTACHMENT_BYTES = 32;
-export const MAX_COLOR_ATTACHMENTS = 4;
+export const MAX_COLOR_ATTACHMENTS = 8;
 /** The most mip levels a texture has, layers an array has, and anisotropy a sampler takes;
  * WebGPU's alignment of a copy's buffer offset and rows. */
 export const MAX_LEVELS = 14;

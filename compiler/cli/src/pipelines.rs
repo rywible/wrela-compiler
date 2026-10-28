@@ -82,12 +82,13 @@ pub fn json(pipelines: &[PipelineSummary]) -> String {
         .iter()
         .map(|p| {
             format!(
-                "{{\"kind\": {}, \"entries\": {}, \"sites\": {}, \"conditional\": [{}], \"tier\": {}}}",
+                "{{\"kind\": {}, \"entries\": {}, \"sites\": {}, \"conditional\": [{}], \"tier\": {}{}}}",
                 q(p.kind),
                 list(&p.entries),
                 list(&p.sites),
                 p.conditional.iter().map(|c| c.to_string()).collect::<Vec<_>>().join(", "),
-                p.tier()
+                p.tier(),
+                p.attachment_bytes.map_or_else(String::new, |b| format!(", \"attachment_bytes\": {b}"))
             )
         })
         .collect();
@@ -110,6 +111,7 @@ mod tests {
             names: vec!["fill".into()],
             sites: vec!["main.wrela:3:5".into(), "main.wrela:9:5".into()],
             conditional: Vec::new(),
+            attachment_bytes: None,
         };
         assert!(text(std::slice::from_ref(&p)).contains("at main.wrela:3:5, main.wrela:9:5\n"));
         let p = PipelineSummary { conditional: vec![false, true], ..p };

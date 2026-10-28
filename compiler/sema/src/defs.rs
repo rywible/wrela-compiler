@@ -208,6 +208,10 @@ macro_rules! lang_items {
                         | Lang::BeginPass2
                         | Lang::BeginPass3
                         | Lang::BeginPass4
+                        | Lang::BeginPass5
+                        | Lang::BeginPass6
+                        | Lang::BeginPass7
+                        | Lang::BeginPass8
                         | Lang::EndPass
                         | Lang::CopyTextureCommand
                         | Lang::CopyTextureToBufferCommand
@@ -329,9 +333,17 @@ macro_rules! lang_items {
                         | Lang::Pass2
                         | Lang::Pass3
                         | Lang::Pass4
+                        | Lang::Pass5
+                        | Lang::Pass6
+                        | Lang::Pass7
+                        | Lang::Pass8
                         | Lang::DepthPass2
                         | Lang::DepthPass3
                         | Lang::DepthPass4
+                        | Lang::DepthPass5
+                        | Lang::DepthPass6
+                        | Lang::DepthPass7
+                        | Lang::DepthPass8
                 )
             }
 
@@ -409,12 +421,24 @@ lang_items! {
     Pass2 = "std::gpu::Pass2",
     Pass3 = "std::gpu::Pass3",
     Pass4 = "std::gpu::Pass4",
+    Pass5 = "std::gpu::Pass5",
+    Pass6 = "std::gpu::Pass6",
+    Pass7 = "std::gpu::Pass7",
+    Pass8 = "std::gpu::Pass8",
     DepthPass2 = "std::gpu::DepthPass2",
     DepthPass3 = "std::gpu::DepthPass3",
     DepthPass4 = "std::gpu::DepthPass4",
+    DepthPass5 = "std::gpu::DepthPass5",
+    DepthPass6 = "std::gpu::DepthPass6",
+    DepthPass7 = "std::gpu::DepthPass7",
+    DepthPass8 = "std::gpu::DepthPass8",
     Targets2 = "std::gpu::Targets2",
     Targets3 = "std::gpu::Targets3",
     Targets4 = "std::gpu::Targets4",
+    Targets5 = "std::gpu::Targets5",
+    Targets6 = "std::gpu::Targets6",
+    Targets7 = "std::gpu::Targets7",
+    Targets8 = "std::gpu::Targets8",
     Blend = "std::gpu::Blend",
     DrawMulti = "std::gpu::draw_multi",
     Present = "std::gpu::present",
@@ -460,6 +484,10 @@ lang_items! {
     BeginPass2 = "std::gpu::begin_pass2_command",
     BeginPass3 = "std::gpu::begin_pass3_command",
     BeginPass4 = "std::gpu::begin_pass4_command",
+    BeginPass5 = "std::gpu::begin_pass5_command",
+    BeginPass6 = "std::gpu::begin_pass6_command",
+    BeginPass7 = "std::gpu::begin_pass7_command",
+    BeginPass8 = "std::gpu::begin_pass8_command",
     CopyTextureCommand = "std::gpu::copy_texture_command",
     CopyTextureToBufferCommand = "std::gpu::copy_texture_to_buffer_command",
     CopyBufferToTextureCommand = "std::gpu::copy_buffer_to_texture_command",

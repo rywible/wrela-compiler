@@ -1,0 +1,45 @@
+// rejects: gpu.textures
+// A pass's colour targets take at most WebGPU's 32 attachment bytes a sample: eight
+// `rgba16float`s take 64, and the error names each target's bytes and the total.
+use std::gpu::{
+    ClipPosition, Rgba16Float, Targets8, Texture, VertexIndex, begin_pass8, draw, texture,
+}
+
+pub struct State {
+    t: (Texture<Rgba16Float>, Texture<Rgba16Float>, Texture<Rgba16Float>, Texture<Rgba16Float>, Texture<Rgba16Float>, Texture<Rgba16Float>, Texture<Rgba16Float>, Texture<Rgba16Float>),
+}
+
+fn sq() -> Texture<Rgba16Float> {
+    texture(width: 2, height: 2)
+}
+
+pub fn init() -> State {
+    State { t: (sq(), sq(), sq(), sq(), sq(), sq(), sq(), sq()) }
+}
+
+@vertex
+fn cover(v: VertexIndex) -> ClipPosition {
+    ClipPosition { position: vec4(f32(v.index), 0.0, 0.5, 1.0) }
+}
+
+@fragment
+fn eight() -> Targets8<vec4, vec4, vec4, vec4, vec4, vec4, vec4, vec4> {
+    let c = vec4(1.0)
+    Targets8 {
+        first: c,
+        second: c,
+        third: c,
+        fourth: c,
+        fifth: c,
+        sixth: c,
+        seventh: c,
+        eighth: c,
+    }
+}
+
+pub fn frame(s: mut State, time: f32, width: u32, height: u32) {
+    mut t = s.t
+    let p = begin_pass8(mut t.0, mut t.1, mut t.2, mut t.3, mut t.4, mut t.5, mut t.6, mut t.7)
+    draw(p, cover, eight, vertices: 3) //~ E0602
+    p.end()
+}

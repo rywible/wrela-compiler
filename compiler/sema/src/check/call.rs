@@ -3873,7 +3873,7 @@ impl<'p> Checker<'p> {
                 }
                 "blend" => {
                     if let Some(c) = self.render_constant(&a.value, Lang::Blend) {
-                        state.blends = [nth(&wrela_abi::manifest::Blend::ALL, c[0]); 4];
+                        state.blends = [nth(&wrela_abi::manifest::Blend::ALL, c[0]); wrela_abi::stream::MAX_COLOR_ATTACHMENTS];
                         state.blend_given = true;
                     }
                 }
@@ -3890,19 +3890,20 @@ impl<'p> Checker<'p> {
                         self.check_expr(&a.value, None);
                         continue;
                     };
-                    if items.is_empty() || items.len() > 4 {
+                    let most = wrela_abi::stream::MAX_COLOR_ATTACHMENTS;
+                    if items.is_empty() || items.len() > most {
                         self.err(Diagnostic::new(
                             codes::E0603,
                             a.span,
-                            "`blends:` gives one `Blend` for each of 1 to 4 targets",
+                            format!("`blends:` gives one `Blend` for each of 1 to {most} targets"),
                         ));
                     }
-                    for (k, item) in items.iter().enumerate().take(4) {
+                    for (k, item) in items.iter().enumerate().take(most) {
                         if let Some(c) = self.render_constant(item, Lang::Blend) {
                             state.blends[k] = nth(&wrela_abi::manifest::Blend::ALL, c[0]);
                         }
                     }
-                    state.blend_count = items.len().min(4) as u8;
+                    state.blend_count = items.len().min(most) as u8;
                     state.blend_given = true;
                 }
                 "index_count" | "count" => {

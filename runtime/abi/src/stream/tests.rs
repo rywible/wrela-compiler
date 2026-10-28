@@ -328,3 +328,33 @@ fn each_formats_capabilities_name_the_feature_they_need() {
     let names: std::collections::HashSet<_> = F::ALL.iter().map(|f| f.name()).collect();
     assert_eq!(names.len(), F::ALL.len());
 }
+
+/// A pass has up to eight colour targets (WebGPU's `maxColorAttachments`): eight decode, nine
+/// are refused, as the browser's decoder refuses them.
+#[test]
+fn a_pass_has_at_most_eight_colour_targets() {
+    let pass = |n: u32| {
+        let mut ws = vec![n, 0];
+        for t in 0..n {
+            ws.extend([t, 0, 0, 0, 0, 0, 0, 0]);
+        }
+        ws.extend([NONE, 0, 0, 1.0f32.to_bits()]);
+        let mut body = words(&[Opcode::BeginPass as u32, 4 * ws.len() as u32]);
+        body.extend(words(&ws));
+        let mut batch = MAGIC.to_vec();
+        batch.extend(words(&[VERSION, body.len() as u32]));
+        batch.extend(body);
+        batch
+    };
+    let eight = pass(8);
+    let cmds = decode(&eight).expect("eight targets decode");
+    assert!(matches!(&cmds[0], Command::BeginPass(p) if p.count == 8));
+    assert_eq!(
+        decode(&pass(9)).expect_err("nine targets"),
+        StreamError::BadPayload {
+            opcode: Opcode::BeginPass,
+            at: HEADER_LEN,
+            why: "a pass has at most eight colour targets",
+        }
+    );
+}

@@ -822,6 +822,20 @@ fn associated_constants_specialize_each_pipeline() {
     assert!(!wide.contains("override") && !narrow.contains("override"));
 }
 
+/// Passes into up to eight colour targets (compiler/tests/passes8, language.md §18): six and
+/// eight `r32uint`s (with depth), four `rgba8unorm`s and a G-buffer's `rgba16float`, two
+/// `rg32uint`s and two `r32uint`s, each read back on both hosts; `wrela pipelines --json`
+/// reports each pass's attachment bytes (an `rgba8unorm` costs 8).
+#[test]
+#[ignore = "needs a GPU"]
+fn passes_take_up_to_eight_targets_within_32_bytes() {
+    let dir = wrela_tests::repo_root().join("compiler/tests/passes8");
+    assert_eq!(crate::tests_pass(&dir), 2);
+    let pipelines = wrela_driver::check_pipelines(&dir).pipelines;
+    let bytes: Vec<Option<u32>> = pipelines.iter().map(|p| p.attachment_bytes).collect();
+    assert_eq!(bytes, [Some(24), Some(32), Some(32), Some(32)]);
+}
+
 /// Tapes that can hold a creature (language.md §14.4): each new operation against its std
 /// twin at 10⁶ points on the CPU and the GPU (compiler/tests/tape_ops), and a full 4,096-op
 /// tape bound as storage, run on both hosts and timed (compiler/tests/tape_long).

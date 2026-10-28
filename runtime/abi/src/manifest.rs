@@ -884,7 +884,7 @@ impl Manifest {
                     ..
                 } => {
                     if outputs.len() > MAX_COLOR_ATTACHMENTS {
-                        return err(format!("pipeline {i} has more than four colour outputs"));
+                        return err(format!("pipeline {i} has more than eight colour outputs"));
                     }
                     if !blends.is_empty() && blends.len() != outputs.len() {
                         return err(format!(
@@ -1127,7 +1127,7 @@ mod read {
                     return fail(format!("{tp}.colors must be an array of formats"));
                 };
                 if cs.len() > MAX_COLOR_ATTACHMENTS {
-                    return fail(format!("{tp}.colors has more than four formats"));
+                    return fail(format!("{tp}.colors has more than eight formats"));
                 }
                 let colors = cs
                     .iter()
@@ -1689,8 +1689,9 @@ mod tests {
     fn a_target_with_a_gap_in_its_colours_is_refused() {
         let mut m = sample();
         if let Stage::Render { targets, .. } = &mut m.pipelines[1].stage {
-            targets[0].colors =
-                [Some(TextureFormat::Rgba8), None, Some(TextureFormat::Rgba8), None];
+            targets[0].colors = [None; MAX_COLOR_ATTACHMENTS];
+            targets[0].colors[0] = Some(TextureFormat::Rgba8);
+            targets[0].colors[2] = Some(TextureFormat::Rgba8);
         }
         assert_eq!(
             m.validate().expect_err("a colour after a gap").0,
