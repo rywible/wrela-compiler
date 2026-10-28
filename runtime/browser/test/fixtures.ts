@@ -86,7 +86,6 @@ export function shapes(): Manifest {
         debug_flag: null,
         requires: [],
         conditional: false,
-        constants: [],
       },
       {
         kind: "compute",
@@ -102,7 +101,6 @@ export function shapes(): Manifest {
         debug_flag: null,
         requires: [],
         conditional: false,
-        constants: [],
       },
     ],
   };

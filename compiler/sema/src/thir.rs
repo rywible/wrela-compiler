@@ -237,6 +237,17 @@ pub enum ConstArg {
 }
 
 impl ConstArg {
+    /// A `const` argument of type `kind` (`u32`, `i32` or `f32`) from a number: `int` an
+    /// integer's exact value, `v` the number as a float. `None` if it isn't one of that type.
+    pub fn of_number(kind: &TyKind, v: f64, int: Option<i128>) -> Option<ConstArg> {
+        Some(match kind {
+            TyKind::Int(IntTy::U32) => ConstArg::U32(u32::try_from(int?).ok()?),
+            TyKind::Int(IntTy::I32) => ConstArg::I32(i32::try_from(int?).ok()?),
+            TyKind::Float(FloatTy::F32) => ConstArg::F32((v as f32).to_bits()),
+            _ => return None,
+        })
+    }
+
     /// Its value as WebGPU's `constants` take it, a number (a bool is 0 or 1).
     pub fn number(self) -> f64 {
         match self {
@@ -266,12 +277,38 @@ impl std::fmt::Display for ConstArg {
 pub enum ConstSrc {
     Value(ConstArg),
     /// An inherent impl's constant, `args` its generics (the impl's).
-    Inherent { func: FnId, args: Vec<TyId> },
+    Inherent {
+        func: FnId,
+        args: Vec<TyId>,
+    },
     /// A trait's constant of `self_ty`.
-    Trait { method: FnId, self_ty: TyId, trait_args: Vec<TyId> },
+    Trait {
+        method: FnId,
+        self_ty: TyId,
+        trait_args: Vec<TyId>,
+    },
 }
 
 impl ConstSrc {
+    /// An associated constant's call (`S::K`, §3.4) as a `const` argument's source.
+    pub fn of_callee(p: &crate::program::Program, callee: &Callee) -> Option<ConstSrc> {
+        match callee {
+            Callee::Fn { func, args } if p.func(*func).attrs.assoc_const => {
+                Some(ConstSrc::Inherent { func: *func, args: args.clone() })
+            }
+            Callee::TraitMethod { method, self_ty, trait_args, .. }
+                if p.func(*method).attrs.assoc_const =>
+            {
+                Some(ConstSrc::Trait {
+                    method: *method,
+                    self_ty: *self_ty,
+                    trait_args: trait_args.clone(),
+                })
+            }
+            _ => None,
+        }
+    }
+
     /// Calls `f` on each type it names.
     pub fn for_each_ty_mut(&mut self, f: &mut impl FnMut(&mut TyId)) {
         match self {
@@ -501,45 +538,6 @@ pub(crate) fn plain_call(
 pub enum Child<'a> {
     Expr(&'a Expr),
     Block(&'a Block),
-}
-
-impl Block {
-    /// Calls `f` on each expression directly in the block: its statements' (their blocks' too,
-    /// with `f` called on those blocks' expressions in turn), then its tail.
-    pub fn for_each_expr<'a>(&'a self, f: &mut impl FnMut(&'a Expr)) {
-        for s in &self.stmts {
-            match &s.kind {
-                StmtKind::Bind { init, else_, .. } => {
-                    f(init);
-                    if let Some(b) = else_ {
-                        b.for_each_expr(f);
-                    }
-                }
-                StmtKind::Assign { place, value, .. } => {
-                    f(place);
-                    f(value);
-                }
-                StmtKind::Expr(e) => f(e),
-                StmtKind::While { cond, body } => {
-                    f(cond);
-                    body.for_each_expr(f);
-                }
-                StmtKind::Loop { body } | StmtKind::ForFields { body, .. } => body.for_each_expr(f),
-                StmtKind::ForRange { start, end, body, .. } => {
-                    f(start);
-                    f(end);
-                    body.for_each_expr(f);
-                }
-                StmtKind::ForEach { array, body, .. } => {
-                    f(array);
-                    body.for_each_expr(f);
-                }
-            }
-        }
-        if let Some(t) = &self.tail {
-            f(t);
-        }
-    }
 }
 
 impl Expr {

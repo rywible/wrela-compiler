@@ -217,7 +217,7 @@ fn check(
     memory_check_std: bool,
     sets: &[(String, String)],
 ) -> Checked {
-    diags.extend(set::apply(&mut units, sets));
+    diags.extend(set::apply(&mut units, packages, sets));
     let mut program = collect::collect(units, packages, diags);
     let consts = {
         let p = &program;
@@ -329,8 +329,6 @@ fn unused_items(p: &Program, mir: &BTreeMap<ty::FnId, mir::Body>) -> Vec<Diagnos
         if p.is_std(p.func(owner).module) {
             continue;
         }
-        fns.extend(body.pruned.0.iter().copied());
-        consts.extend(body.pruned.1.iter().copied());
         for (s, r) in mir::rvalues(body) {
             if let mir::Rvalue::Const(c) = r {
                 consts.insert(*c);
@@ -370,7 +368,13 @@ fn unused_items(p: &Program, mir: &BTreeMap<ty::FnId, mir::Body>) -> Vec<Diagnos
         {
             continue;
         }
-        let kind = if f.attrs.entry.is_some() { "entry point" } else { "function" };
+        let kind = if f.attrs.entry.is_some() {
+            "entry point"
+        } else if f.attrs.assoc_const {
+            "constant"
+        } else {
+            "function"
+        };
         out.push(unused(&f.name, kind, f.name_span));
     }
     for (i, c) in p.consts.iter().enumerate() {

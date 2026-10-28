@@ -56,24 +56,27 @@ pub struct Entry {
     pub fuel: u64,
 }
 
-/// The entry cached under `key` in the first of `dirs` that has it, kept in each before it.
-pub fn get_in(dirs: &[PathBuf], key: &str) -> Option<Entry> {
+/// The entry cached under `key` in the first of `dirs` that has it, kept in each before it,
+/// and its bytes in the cache.
+pub fn get_in(dirs: &[PathBuf], key: &str) -> Option<(Entry, u64)> {
     for (i, dir) in dirs.iter().enumerate() {
-        if let Some(e) = get(dir, key) {
+        if let Some((e, bytes)) = read(dir, key) {
             for earlier in &dirs[..i] {
-                put(earlier, key, &e);
+                write(earlier, key, &bytes);
             }
-            return Some(e);
+            return Some((e, bytes.len() as u64));
         }
     }
     None
 }
 
-/// Stores `entry` under `key` in each of `dirs`.
-pub fn put_in(dirs: &[PathBuf], key: &str, entry: &Entry) {
+/// Stores `entry` under `key` in each of `dirs`: its bytes in the cache.
+pub fn put_in(dirs: &[PathBuf], key: &str, entry: &Entry) -> u64 {
+    let Some(bytes) = encode(key, entry) else { return 0 };
     for dir in dirs {
-        put(dir, key, entry);
+        write(dir, key, &bytes);
     }
+    bytes.len() as u64
 }
 
 /// Refuses a link in a cache path. For the package-owned `<package>/build/consts`, checks from
@@ -118,21 +121,32 @@ pub fn key(wasm: &[u8], fuel: u64, inputs: &[u8]) -> String {
 }
 
 /// The inputs a constant's key holds beside its WASM: the build's `options` (each that changes
-/// what CPU code does, written out), and each file it embeds, by its path and its bytes' hash.
-pub fn inputs<'a>(options: &str, embeds: impl IntoIterator<Item = (&'a str, &'a [u8])>) -> Vec<u8> {
+/// what CPU code does, written out), and each file it embeds, by its path and its bytes'
+/// [`digest`] (which a build computes once a file).
+pub fn inputs<'a>(options: &str, embeds: impl IntoIterator<Item = (&'a str, [u8; 32])>) -> Vec<u8> {
     let mut out = options.as_bytes().to_vec();
-    for (path, bytes) in embeds {
+    for (path, digest) in embeds {
         out.push(0);
         out.extend_from_slice(path.as_bytes());
         out.push(0);
-        out.extend_from_slice(&Sha256::digest(bytes));
+        out.extend_from_slice(&digest);
     }
     out
 }
 
-/// The entry cached under `key` in `dir`, if there's one that reads back whole. A hit marks the
-/// file used now, so it's kept.
+/// A file's bytes' hash, as [`inputs`] takes it.
+pub fn digest(bytes: &[u8]) -> [u8; 32] {
+    Sha256::digest(bytes).into()
+}
+
+/// The entry cached under `key` in `dir`, if there's one that reads back whole.
 pub fn get(dir: &Path, key: &str) -> Option<Entry> {
+    read(dir, key).map(|(e, _)| e)
+}
+
+/// The entry under `key` in `dir` and its bytes, if they read back whole. A hit marks the file
+/// used now, so it's kept.
+fn read(dir: &Path, key: &str) -> Option<(Entry, Vec<u8>)> {
     let path = dir.join(format!("{key}.wcv"));
     safe_file(dir, &path)?;
     let bytes = std::fs::read(&path).ok()?;
@@ -142,11 +156,18 @@ pub fn get(dir: &Path, key: &str) -> Option<Entry> {
         .append(true)
         .open(&path)
         .and_then(|f| f.set_modified(std::time::SystemTime::now()));
-    Some(entry)
+    Some((entry, bytes))
 }
 
 /// Stores `entry` under `key` in `dir`. Failing to is no error: the next build computes it again.
 pub fn put(dir: &Path, key: &str, entry: &Entry) {
+    if let Some(bytes) = encode(key, entry) {
+        write(dir, key, &bytes);
+    }
+}
+
+/// Writes an entry's `bytes` under `key` in `dir`, whole: to a temporary name, renamed into place.
+fn write(dir: &Path, key: &str, bytes: &[u8]) {
     if safe(dir).is_none() {
         return;
     }
@@ -156,7 +177,6 @@ pub fn put(dir: &Path, key: &str, entry: &Entry) {
     if safe(dir).is_none() {
         return;
     }
-    let Some(bytes) = encode(key, entry) else { return };
     // Unique across machines too, which share a directory but not their process ids.
     let nanos = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -165,7 +185,7 @@ pub fn put(dir: &Path, key: &str, entry: &Entry) {
     if safe_file(dir, &tmp).is_none() {
         return;
     }
-    if std::fs::write(&tmp, &bytes).is_ok()
+    if std::fs::write(&tmp, bytes).is_ok()
         && std::fs::rename(&tmp, dir.join(format!("{key}.wcv"))).is_err()
     {
         let _ = std::fs::remove_file(&tmp);
@@ -178,22 +198,41 @@ pub fn put(dir: &Path, key: &str, entry: &Entry) {
 pub fn clean(dir: &Path) {
     clean_one(dir);
     let Some(parent) = dir.parent() else { return };
-    if safe(parent).is_none() {
+    if safe(parent).is_none() || !due(&parent.join(SWEPT)) {
         return;
     }
     clean_one(parent);
     let Ok(entries) = std::fs::read_dir(parent) else { return };
     for e in entries.flatten() {
         let other = e.path();
-        let versioned = e.file_name().to_str().is_some_and(|n| {
-            !n.is_empty() && n.bytes().all(|b| b.is_ascii_digit() || b == b'.')
-        });
+        let versioned = e
+            .file_name()
+            .to_str()
+            .is_some_and(|n| !n.is_empty() && n.bytes().all(|b| b.is_ascii_digit() || b == b'.'));
         if versioned && other != dir && e.file_type().is_ok_and(|t| t.is_dir()) {
             clean_one(&other);
             // Only once nothing is left in it.
             let _ = std::fs::remove_dir(&other);
         }
     }
+}
+
+/// The file whose time says when [`clean`] last swept other versions' directories.
+const SWEPT: &str = ".swept";
+
+/// Whether a day has passed since the file at `marker` was touched (or there's none), touching
+/// it if so: the other versions' sweep runs at most once a day, not every build.
+fn due(marker: &Path) -> bool {
+    let day = std::time::Duration::from_secs(24 * 3600);
+    let fresh = std::fs::metadata(marker)
+        .and_then(|m| m.modified())
+        .ok()
+        .and_then(|t| t.elapsed().ok())
+        .is_some_and(|age| age < day);
+    if !fresh {
+        let _ = std::fs::write(marker, b"");
+    }
+    !fresh
 }
 
 /// [`clean`]'s work in one directory.
@@ -277,13 +316,6 @@ pub fn decode(key: &str, bytes: &[u8]) -> Option<Entry> {
     let fuel = r.u64()?;
     let value = r.value(0)?;
     (r.at == r.bytes.len()).then_some(Entry { value, fuel })
-}
-
-/// How many bytes a value takes in an entry: what `--report consts` says a constant is.
-pub fn value_bytes(v: &Value) -> u64 {
-    let mut out = Vec::new();
-    put_value(&mut out, v);
-    out.len() as u64
 }
 
 /// Whether `s` is a key as [`key`] writes it: [`KEY_BYTES`] hex digits.
@@ -524,7 +556,8 @@ mod tests {
     #[test]
     fn the_cache_is_the_packages_then_the_shared_directory() {
         let root = std::env::temp_dir();
-        let own = root.canonicalize().expect("temporary directory").join("build/consts").join(VERSION);
+        let own =
+            root.canonicalize().expect("temporary directory").join("build/consts").join(VERSION);
         assert_eq!(dirs_in(&root, None), std::slice::from_ref(&own));
         assert_eq!(dirs_in(&root, Some("".into())), std::slice::from_ref(&own));
         assert_eq!(dirs_in(&root, Some("/s/c".into())), [own, Path::new("/s/c").join(VERSION)]);
@@ -540,7 +573,7 @@ mod tests {
         let (k, v) = (key(b"\0asm two", 1, b""), Entry { value: Value::Bytes(vec![7]), fuel: 1 });
         put(&shared, &k, &v);
         assert!(get(&own, &k).is_none());
-        assert_eq!(get_in(&dirs, &k), Some(v.clone()));
+        assert_eq!(get_in(&dirs, &k).map(|(e, _)| e), Some(v.clone()));
         assert_eq!(get(&own, &k), Some(v.clone()), "kept in the package's");
         let k2 = key(b"\0asm three", 1, b"");
         put_in(&dirs, &k2, &v);

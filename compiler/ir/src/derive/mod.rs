@@ -716,7 +716,7 @@ fn expr_bits(cx: &Walk<'_>, e: &Expr, a: &Activity, ty: TypeId) -> Bits {
     let any = |b: bool| if b { all } else { 0 };
     let v = |x: &ValueId| a.value(*x);
     match e {
-        Expr::Const(_) | Expr::Zero(_) | Expr::EntryInput(_) | Expr::Override(_) => 0,
+        Expr::Const(_) | Expr::Zero(_) | Expr::EntryInput(_) => 0,
         Expr::Texture(_, _, _, xs) | Expr::Subgroup(_, xs) => any(xs.iter().any(v)),
         Expr::Atomic(..) | Expr::TextureStore(..) | Expr::Barrier | Expr::Discard => all,
         Expr::Param(i) => a.params[*i as usize],

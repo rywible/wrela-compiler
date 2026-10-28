@@ -196,17 +196,14 @@ pub fn build_set(
     relaxed_simd: bool,
     set: &[(String, String)],
 ) -> Output {
-    let mode =
-        Mode { debug: kind.debug, testing: kind.testing, relaxed_simd, ..Mode::RELEASE };
+    let mode = Mode { debug: kind.debug, testing: kind.testing, relaxed_simd, ..Mode::RELEASE };
     on_compiler_thread(|| compile_set(root, mode, set))
 }
 
 /// [`compile`] with constants set.
 fn compile_set(root: &Path, mode: Mode, set: &[(String, String)]) -> Output {
-    let loaded = load_with(root, &Overlay::new());
     let scope = Scope { set: set.to_vec(), ..Scope::default() };
-    compile_loaded_in(root, mode, wrela_lower::Roots::of, &[], loaded, &scope)
-        .expect("an uncancelled compile")
+    compile_scoped(root, mode, wrela_lower::Roots::of, &[], &Overlay::new(), &scope)
 }
 
 /// Files' texts that stand in for what's on disk, by their canonical paths: for checking a
@@ -275,10 +272,16 @@ pub struct BuildKind {
 /// which says where each literal is and why any float literal of those packages isn't lifted.
 /// `kind` makes it a debug build, a test build, or both. An error if a name isn't one of the
 /// program's packages.
-pub fn build_lifted(root: &Path, lift: &[String], kind: BuildKind) -> Result<Output, String> {
-    // Unscoped, [`build_in`]'s only error is its `lift:` one, which the command line names
-    // `--lift`.
-    build_in(root, kind, true, lift, &Scope::default()).map_err(|e| format!("--{e}"))
+pub fn build_lifted(
+    root: &Path,
+    lift: &[String],
+    kind: BuildKind,
+    set: &[(String, String)],
+) -> Result<Output, String> {
+    // Never cancelled, [`build_in`]'s only error is its `lift:` one, which the command line
+    // names `--lift`.
+    let scope = Scope { set: set.to_vec(), ..Scope::default() };
+    build_in(root, kind, true, lift, &scope).map_err(|e| format!("--{e}"))
 }
 
 /// What a compile reaches beyond its package, and what stops it: where it may read, where it
@@ -884,9 +887,21 @@ fn compile_with(
     lift: &[String],
     overlay: &Overlay,
 ) -> Output {
+    compile_scoped(root, mode, roots, lift, overlay, &Scope::default())
+}
+
+/// [`compile_with`] within `scope`, which never cancels it (its sets, say).
+fn compile_scoped(
+    root: &Path,
+    mode: Mode,
+    roots: fn(&wrela_sema::Checked) -> wrela_lower::Roots,
+    lift: &[String],
+    overlay: &Overlay,
+    scope: &Scope,
+) -> Output {
     let loaded = load_with(root, overlay);
-    compile_loaded_in(root, mode, roots, lift, loaded, &Scope::default())
-        .expect("an unscoped compile isn't cancelled")
+    compile_loaded_in(root, mode, roots, lift, loaded, scope)
+        .expect("a compile with no cancel isn't cancelled")
 }
 
 /// A compile of the program [`load_scoped`] read, within `scope`, which may cancel it between
@@ -991,7 +1006,15 @@ fn compile_loaded_in(
             let budgets = !(mode.debug || mode.no_simd || mode.testing) && lift.is_empty();
             let tier1: Vec<bool> = pipelines.iter().map(|p| p.tier() == 1).collect();
             let relaxed = mode.relaxed_simd && !data.no_simd;
-            let out = build::emit(&lowered, &sources, !data.no_simd, budgets, &tier1, relaxed);
+            let out = build::emit(
+                &lowered,
+                &sources,
+                !data.no_simd,
+                budgets,
+                &tier1,
+                relaxed,
+                &scope.set,
+            );
             diagnostics.extend(out.diagnostics);
             files.extend(out.files);
             files.append(&mut shipped_files);
@@ -1012,9 +1035,6 @@ fn compile_loaded_in(
         }
         if client.is_some() || server.is_some() {
             build::pair(client, server, relaxed);
-        }
-        if !scope.set.is_empty() {
-            record_set(&mut files, &scope.set, &mut diagnostics);
         }
     }
     sort_and_dedup(&mut diagnostics);
@@ -1211,22 +1231,6 @@ fn summarize(
             }
         })
         .collect()
-}
-
-/// Records the constants a build set in its manifest (`Manifest::set`).
-fn record_set(
-    files: &mut [(String, Vec<u8>)],
-    set: &[(String, String)],
-    diagnostics: &mut Vec<Diagnostic>,
-) {
-    let Some((_, bytes)) = files.iter_mut().find(|(p, _)| p == "manifest.json") else { return };
-    match wrela_abi::Manifest::parse(&String::from_utf8_lossy(bytes)) {
-        Ok(mut m) => {
-            m.set = set.iter().cloned().collect();
-            *bytes = m.to_json().into_bytes();
-        }
-        Err(e) => diagnostics.push(Diagnostic::internal(format!("recording `--set`: {e}"))),
-    }
 }
 
 /// The program package's own files, and where each is.

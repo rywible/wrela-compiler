@@ -49,9 +49,6 @@ pub struct Body {
     /// argument is lent `mut`, the value's type, and where (the effects pass reports those
     /// that change nothing, E0333).
     pub discarded: Vec<(Callee, bool, TyId, Span)>,
-    /// The functions and constants the arms a `match` on a constant didn't take name
-    /// (`build::arm_of_const`): used, for the lints, though no code of theirs is built.
-    pub pruned: (Vec<FnId>, Vec<crate::ty::ConstId>),
 }
 
 impl Body {
@@ -537,6 +534,9 @@ pub enum TerminatorKind {
     Match {
         arms: Vec<BlockId>,
         merge: BlockId,
+        /// The one arm a `match` on a constant takes, where its value says which (`build::
+        /// arm_of_const`): lowering builds that arm alone (§13).
+        taken: Option<u32>,
     },
     /// Names the `Match` block.
     ArmMatched(BlockId),
@@ -590,7 +590,7 @@ impl FnBody {
                 TerminatorKind::Loop { continuing, .. } => one(*continuing),
                 _ => [None, None],
             },
-            TerminatorKind::Match { arms, merge } => one(*arms.first().unwrap_or(merge)),
+            TerminatorKind::Match { arms, merge, .. } => one(*arms.first().unwrap_or(merge)),
             TerminatorKind::ArmMatched(m) => match &self.block(*m).term.kind {
                 TerminatorKind::Match { merge, .. } => one(*merge),
                 _ => [None, None],

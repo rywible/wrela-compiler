@@ -275,7 +275,10 @@ pub struct EnumDecl {
 #[derive(Clone, Debug, PartialEq)]
 pub enum TraitMemberKind {
     Fn(FnDecl),
-    Type { name: Ident, bounds: Vec<TypeExpr> },
+    Type {
+        name: Ident,
+        bounds: Vec<TypeExpr>,
+    },
     /// `const K: u32` or `const ON: bool = true`: an associated constant, with its default.
     Const(AssocConst),
 }
@@ -318,7 +321,10 @@ pub struct TraitSetDecl {
 #[derive(Clone, Debug, PartialEq)]
 pub enum ImplMemberKind {
     Fn(FnDecl),
-    Type { name: Ident, ty: TypeExpr },
+    Type {
+        name: Ident,
+        ty: TypeExpr,
+    },
     /// `const K: u32 = 4`: an associated constant's value.
     Const(AssocConst),
 }
@@ -1072,9 +1078,8 @@ impl Item {
             ItemKind::Trait(t) => {
                 for m in &t.members {
                     match &m.kind {
-                        TraitMemberKind::Fn(d) | TraitMemberKind::Const(AssocConst { func: d, .. }) => {
-                            fn_decl(d, f)
-                        }
+                        TraitMemberKind::Fn(d)
+                        | TraitMemberKind::Const(AssocConst { func: d, .. }) => fn_decl(d, f),
                         TraitMemberKind::Type { .. } => {}
                     }
                 }
@@ -1082,9 +1087,8 @@ impl Item {
             ItemKind::Impl(i) => {
                 for m in &i.members {
                     match &m.kind {
-                        ImplMemberKind::Fn(d) | ImplMemberKind::Const(AssocConst { func: d, .. }) => {
-                            fn_decl(d, f)
-                        }
+                        ImplMemberKind::Fn(d)
+                        | ImplMemberKind::Const(AssocConst { func: d, .. }) => fn_decl(d, f),
                         ImplMemberKind::Type { .. } => {}
                     }
                 }

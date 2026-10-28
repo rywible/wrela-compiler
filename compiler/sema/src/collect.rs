@@ -2884,7 +2884,7 @@ impl<'d, 'u> Collector<'d, 'u> {
         } else {
             ret
         };
-        if self.p.func(id).attrs.assoc_const && !assoc_const_ty(&self.p, ret) {
+        if self.p.func(id).attrs.assoc_const && !self.p.is_build_constant_ty(ret) {
             let shown = self.p.display_ty(ret);
             self.diags.push(
                 Diagnostic::new(
@@ -3650,7 +3650,10 @@ fn check_members(
                     Diagnostic::new(
                         codes::E0405,
                         p.func(f).sig_span,
-                        format!("`{}` is {is} here, and `{}` declares {declared}", tdef.name, tr.name),
+                        format!(
+                            "`{}` is {is} here, and `{}` declares {declared}",
+                            tdef.name, tr.name
+                        ),
                     )
                     .with_secondary(tdef.sig_span, "the trait declares it here"),
                 );
@@ -4486,20 +4489,5 @@ mod tests {
             "{:?}",
             diagnostics.iter().map(|d| (&d.code, &d.message)).collect::<Vec<_>>()
         );
-    }
-}
-
-/// Whether `t` is a type an associated constant can have (§3.4): a `const` parameter's scalar,
-/// an enum whose variants hold nothing, or a `Text`.
-fn assoc_const_ty(p: &Program, t: TyId) -> bool {
-    match p.types.kind(t) {
-        TyKind::Bool | TyKind::Int(IntTy::U32 | IntTy::I32) | TyKind::Float(FloatTy::F32) => true,
-        TyKind::Error => true,
-        &TyKind::Adt(a, _) => {
-            let adt = p.adt(a);
-            (adt.is_enum() && adt.variants().iter().all(|v| v.fields.is_empty()))
-                || Some(a) == p.lang_adt(Lang::Text)
-        }
-        _ => false,
     }
 }

@@ -153,8 +153,6 @@ export type Pipeline = Stage & {
   /** Reached only under runtime conditions: tier 1, built once tier 0 is (or when a command
    * needs it first). */
   conditional: boolean;
-  /** Its shaders' pipeline-overridable constants, each by its name in the WGSL, in order. */
-  constants: [string, boolean | number][];
 };
 
 export interface Manifest {
@@ -367,18 +365,7 @@ function pipeline(v: unknown, i: number): Pipeline {
   const requires: string[] = names(o, "requires", where, FEATURES, "a feature this host knows", true);
   // A missing `conditional` is tier 0.
   const conditional = flag(o, "conditional", where, false);
-  // Missing `constants` are none.
-  const constants: [string, boolean | number][] = [];
-  if (o["constants"] !== undefined) {
-    const co = object(o["constants"], `${where}.constants`);
-    for (const [k, v] of Object.entries(co)) {
-      if (typeof v !== "boolean" && !(typeof v === "number" && Number.isFinite(v))) {
-        throw new ManifestError(`${where}.constants.${k} must be true, false or a number`);
-      }
-      constants.push([k, v]);
-    }
-  }
-  return { ...stage, name, shader, uniform, bindings, debug_flag, requires, conditional, constants };
+  return { ...stage, name, shader, uniform, bindings, debug_flag, requires, conditional };
 }
 
 /** The manifest's `wasm_abi`. */

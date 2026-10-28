@@ -21,6 +21,10 @@ const FROM_TESTS: &[&str] = &["E0706"];
 /// The codes only a shipped build reports: their programs are built, not only checked.
 const FROM_BUILDS: &[&str] = &["E0707"];
 
+/// The codes only a build with `--set` reports (language.md §3.5), and the set their programs
+/// are checked with.
+const FROM_SETS: &[(&str, &str, &str)] = &[("E0224", "TAPS", "8")];
+
 /// A program's diagnostics: `wrela check`'s, or for a code only tests report, `wrela test`'s
 /// with each failed test's.
 fn diagnose(
@@ -34,6 +38,9 @@ fn diagnose(
         (out.sources, all)
     } else if FROM_BUILDS.contains(&code) {
         let out = wrela_driver::build(dir);
+        (out.sources, out.diagnostics)
+    } else if let Some(&(_, name, value)) = FROM_SETS.iter().find(|s| s.0 == code) {
+        let out = wrela_driver::check_pipelines_set(dir, &[(name.into(), value.into())]);
         (out.sources, out.diagnostics)
     } else {
         let out = wrela_driver::check(dir);

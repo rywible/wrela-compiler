@@ -5,10 +5,10 @@
 //! nothing (`--set TIER=Medium` names a variant of the constant's enum type): what a program
 //! names its tier or its style by.
 
-use crate::collect::SourceUnit;
-use crate::defs::Lang;
+use crate::collect::{PackageInfo, SourceUnit};
+use crate::defs::PackageKind;
 use crate::program::Program;
-use crate::ty::{ConstId, FloatTy, IntTy, TyKind};
+use crate::ty::ConstId;
 use std::sync::Arc;
 use wrela_diag::{Diagnostic, Span, codes};
 use wrela_syntax::ast;
@@ -19,22 +19,28 @@ fn unplaced(message: String) -> Diagnostic {
     Diagnostic { primary: None, ..Diagnostic::new(codes::E0224, nowhere, message) }
 }
 
-/// The root module of the program's package: its `main.wrela`.
-fn is_root(u: &SourceUnit) -> bool {
-    u.package == 1 && u.path == ["main"]
+/// The root module of the program's package (its `main.wrela`), as `collect` finds `Program::
+/// main`.
+fn is_root(u: &SourceUnit, packages: &[PackageInfo]) -> bool {
+    u.path == ["main"] && packages.get(u.package).is_some_and(|p| p.kind == PackageKind::Program)
 }
 
 /// Puts each of `sets`' values in place of its constant's initializer, in the root module of
 /// the program's package: the names it can't set, each an error (E0224).
-pub fn apply(units: &mut [SourceUnit], sets: &[(String, String)]) -> Vec<Diagnostic> {
+pub fn apply(
+    units: &mut [SourceUnit],
+    packages: &[PackageInfo],
+    sets: &[(String, String)],
+) -> Vec<Diagnostic> {
     let mut out = Vec::new();
-    let Some(root) = units.iter_mut().find(|u| is_root(u)) else {
-        if !sets.is_empty() {
-            out.push(unplaced(
-                "`--set` overrides a constant of a program's `main.wrela`, and this package has none"
-                    .into(),
-            ));
-        }
+    if sets.is_empty() {
+        return out;
+    }
+    let Some(root) = units.iter_mut().find(|u| is_root(u, packages)) else {
+        out.push(unplaced(
+            "`--set` overrides a constant of a program's `main.wrela`, and this package has none"
+                .into(),
+        ));
         return out;
     };
     let file = Arc::make_mut(&mut root.ast);
@@ -57,18 +63,26 @@ pub fn apply(units: &mut [SourceUnit], sets: &[(String, String)]) -> Vec<Diagnos
             out.push(Diagnostic::new(
                 codes::E0224,
                 at,
-                format!("`--set {name}=…` needs `{name}`'s type written: `pub const {name}: T = …`"),
+                format!(
+                    "`--set {name}=…` needs `{name}`'s type written: `pub const {name}: T = …`"
+                ),
             ));
             continue;
         };
         if !settable_type(ty) {
             let shown = match &ty.kind {
-                ast::TypeExprKind::Path(path) if path.is_single() => path.segments[0].ident.name.clone(),
+                ast::TypeExprKind::Path(path) if path.is_single() => {
+                    path.segments[0].ident.name.clone()
+                }
                 _ => "that type".to_string(),
             };
             out.push(
-                Diagnostic::new(codes::E0224, at, format!("`--set {name}=…`: `{name}` is a `{shown}`"))
-                    .with_note(SETTABLE),
+                Diagnostic::new(
+                    codes::E0224,
+                    at,
+                    format!("`--set {name}=…`: `{name}` is a `{shown}`"),
+                )
+                .with_note(SETTABLE),
             );
             continue;
         }
@@ -122,8 +136,10 @@ fn value_expr(value: &str, ty: &ast::TypeExpr, span: Span) -> Option<ast::Expr> 
     let v = value.trim();
     if let Some(rest) = v.strip_prefix('-') {
         let inner = value_expr(rest, ty, span)?;
-        return matches!(&inner.kind, ast::ExprKind::Lit(_))
-            .then(|| ast::Expr { kind: ast::ExprKind::Unary(ast::UnOp::Neg, Box::new(inner)), span });
+        return matches!(&inner.kind, ast::ExprKind::Lit(_)).then(|| ast::Expr {
+            kind: ast::ExprKind::Unary(ast::UnOp::Neg, Box::new(inner)),
+            span,
+        });
     }
     if v == "true" || v == "false" {
         return Some(lit(ast::LitKind::Bool(v == "true"), v));
@@ -139,14 +155,13 @@ fn value_expr(value: &str, ty: &ast::TypeExpr, span: Span) -> Option<ast::Expr> 
     {
         return Some(lit(ast::LitKind::Float(f), v));
     }
-    let ident = v.bytes().next().is_some_and(|b| b.is_ascii_alphabetic() || b == b'_')
-        && v.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_');
     let ast::TypeExprKind::Path(path) = &ty.kind else { return None };
-    if !ident {
+    if !wrela_syntax::lexer::is_name(v) {
         return None;
     }
     let mut segments = path.segments.clone();
-    segments.push(ast::PathSegment { ident: ast::Ident { name: v.to_string(), span }, generics: None });
+    segments
+        .push(ast::PathSegment { ident: ast::Ident { name: v.to_string(), span }, generics: None });
     Some(ast::Expr { kind: ast::ExprKind::Path(ast::Path { segments, span }), span })
 }
 
@@ -159,25 +174,14 @@ pub fn check_types(
 ) -> Vec<Diagnostic> {
     let mut out = Vec::new();
     for (name, _) in sets {
-        let Some(i) = p.consts.iter().position(|c| {
-            !c.default && c.name == *name && p.module(c.module).path == ["main"] && !p.is_std(c.module)
-        }) else {
+        let Some(i) =
+            p.consts.iter().position(|c| !c.default && c.name == *name && Some(c.module) == p.main)
+        else {
             continue;
         };
         let c = &p.consts[i];
         let Some(&t) = tys.get(&ConstId(i as u32)) else { continue };
-        let ok = match p.types.kind(t) {
-            TyKind::Bool | TyKind::Int(IntTy::U32 | IntTy::I32) | TyKind::Float(FloatTy::F32) => {
-                true
-            }
-            TyKind::Error => true,
-            &TyKind::Adt(a, _) => {
-                let adt = p.adt(a);
-                (adt.is_enum() && adt.variants().iter().all(|v| v.fields.is_empty()))
-                    || Some(a) == p.lang_adt(Lang::Text)
-            }
-            _ => false,
-        };
+        let ok = p.is_build_constant_ty(t);
         if !ok {
             out.push(
                 Diagnostic::new(

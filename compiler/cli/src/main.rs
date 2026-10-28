@@ -308,13 +308,11 @@ pub(crate) fn package_args(args: &[String], takes_out: bool) -> Result<PackageAr
                 Some("consts") => report_consts = true,
                 _ => return Err(usage()),
             },
-            "--set" => match it.next().and_then(|s| s.split_once('=')) {
-                Some((name, value)) if !name.is_empty() => {
-                    set.retain(|(n, _): &(String, String)| n != name);
-                    set.push((name.to_string(), value.to_string()));
+            "--set" => {
+                if !it.next().is_some_and(|s| add_set(&mut set, s)) {
+                    return Err(usage());
                 }
-                _ => return Err(usage()),
-            },
+            }
             "--lift" if takes_out => match it.next() {
                 Some(p) => lift.extend(p.split(',').map(String::from)),
                 None => return Err(usage()),
@@ -463,6 +461,17 @@ pub(crate) fn build_set_into(
     }
     write_build(&out, &built)?;
     Ok(built)
+}
+
+/// Adds `--set`'s `NAME=VALUE` to `set`, in place of an earlier value of `NAME`: false if it
+/// isn't one.
+pub(crate) fn add_set(set: &mut Vec<(String, String)>, arg: &str) -> bool {
+    let Some((name, value)) = arg.split_once('=').filter(|(n, _)| !n.is_empty()) else {
+        return false;
+    };
+    set.retain(|(n, _)| n != name);
+    set.push((name.to_string(), value.to_string()));
+    true
 }
 
 /// The last line of `logs` that starts `{`: a program's JSON answer.

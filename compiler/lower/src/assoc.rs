@@ -5,8 +5,8 @@
 
 use crate::Cx;
 use wrela_diag::{Diagnostic, Span, codes};
-use wrela_sema::thir::{Block, Callee, ConstArg, ConstSrc, Expr, ExprKind, Lit};
-use wrela_sema::ty::{FloatTy, FnId, IntTy, Subst, TyId, TyKind};
+use wrela_sema::thir::{Block, ConstArg, ConstSrc, Expr, ExprKind, Lit};
+use wrela_sema::ty::{Subst, TyId, TyKind};
 use wrela_syntax::ast::{BinOp, UnOp};
 
 /// A folded value, before it takes its parameter's type.
@@ -32,10 +32,7 @@ impl<'a> Cx<'a> {
     ) -> Option<ConstArg> {
         let folded = match src {
             &ConstSrc::Value(c) => return Some(c),
-            ConstSrc::Inherent { func, args } => self.fold_assoc(*func, args.clone(), None, 0),
-            ConstSrc::Trait { method, self_ty, trait_args } => {
-                self.fold_assoc(*method, Vec::new(), Some((*self_ty, trait_args.clone())), 0)
-            }
+            src => self.fold_src(src, 0),
         };
         let arg = folded.and_then(|v| self.const_arg_of(v, ty));
         if arg.is_none() {
@@ -53,24 +50,20 @@ impl<'a> Cx<'a> {
         arg
     }
 
-    /// The value of the associated constant `func` (an inherent one, `args` its impl's), or
-    /// the trait's `func` of `of`'s type (and the trait's arguments).
-    fn fold_assoc(
-        &mut self,
-        func: FnId,
-        args: Vec<TyId>,
-        of: Option<(TyId, Vec<TyId>)>,
-        depth: u32,
-    ) -> Option<Folded> {
+    /// The value of the associated constant `src` names, its types concrete.
+    fn fold_src(&mut self, src: &ConstSrc, depth: u32) -> Option<Folded> {
         if depth > MAX_DEPTH {
             return None;
         }
         let p = &self.checked.program;
-        let (func, subst) = match of {
-            Some((self_ty, trait_args)) => {
-                wrela_sema::traits::resolve_trait_method(p, func, self_ty, &trait_args, &[])?
+        let (func, subst) = match src {
+            ConstSrc::Value(_) => return None,
+            ConstSrc::Inherent { func, args } => {
+                (*func, Subst::from_pairs(&p.fn_all_generics(*func), args))
             }
-            None => (func, Subst::from_pairs(&p.fn_all_generics(func), &args)),
+            ConstSrc::Trait { method, self_ty, trait_args } => {
+                wrela_sema::traits::resolve_trait_method(p, *method, *self_ty, trait_args, &[])?
+            }
         };
         let checked = self.checked;
         let e = checked.assoc_consts.get(&func)?;
@@ -106,20 +99,11 @@ impl<'a> Cx<'a> {
                     self.fold_expr(init, &Subst::default(), depth + 1)?
                 }
             }
-            ExprKind::Call(call) => match &call.callee {
-                Callee::Fn { func, args } if checked.program.func(*func).attrs.assoc_const => {
-                    let args = args.iter().map(|&a| self.concrete(a, subst)).collect();
-                    self.fold_assoc(*func, args, None, depth)?
-                }
-                Callee::TraitMethod { method, self_ty, trait_args, .. }
-                    if checked.program.func(*method).attrs.assoc_const =>
-                {
-                    let self_ty = self.concrete(*self_ty, subst);
-                    let trait_args = trait_args.iter().map(|&a| self.concrete(a, subst)).collect();
-                    self.fold_assoc(*method, Vec::new(), Some((self_ty, trait_args)), depth)?
-                }
-                _ => return None,
-            },
+            ExprKind::Call(call) => {
+                let mut src = ConstSrc::of_callee(&checked.program, &call.callee)?;
+                src.for_each_ty_mut(&mut |t| *t = self.concrete(*t, subst));
+                self.fold_src(&src, depth)?
+            }
             ExprKind::Block(b) => self.fold_block(b, subst, depth)?,
             ExprKind::Unary(op, x) => match (op, self.fold_expr(x, subst, depth)?) {
                 (UnOp::Neg, Folded::Int(n)) => Folded::Int(-n),
@@ -150,16 +134,12 @@ impl<'a> Cx<'a> {
 
     /// `v` as a `const` argument of type `ty`, if it is one.
     fn const_arg_of(&self, v: Folded, ty: TyId) -> Option<ConstArg> {
-        Some(match (self.checked.program.types.kind(ty), v) {
-            (TyKind::Bool, Folded::Bool(b)) => ConstArg::Bool(b),
-            (TyKind::Int(IntTy::U32), Folded::Int(n)) => ConstArg::U32(u32::try_from(n).ok()?),
-            (TyKind::Int(IntTy::I32), Folded::Int(n)) => ConstArg::I32(i32::try_from(n).ok()?),
-            (TyKind::Float(FloatTy::F32), Folded::Float(x)) => ConstArg::F32(x.to_bits()),
-            (TyKind::Float(FloatTy::F32), Folded::Int(n)) => {
-                ConstArg::F32((n as f32).to_bits())
-            }
-            _ => return None,
-        })
+        let kind = self.checked.program.types.kind(ty);
+        match v {
+            Folded::Bool(b) => matches!(kind, TyKind::Bool).then_some(ConstArg::Bool(b)),
+            Folded::Int(n) => ConstArg::of_number(kind, n as f64, Some(n)),
+            Folded::Float(x) => ConstArg::of_number(kind, f64::from(x), None),
+        }
     }
 }
 

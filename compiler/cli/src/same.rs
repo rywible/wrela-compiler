@@ -63,9 +63,9 @@ fn parse(args: &[String]) -> Option<Args> {
             }
             "--no-gpu" => a.no_gpu = true,
             "--set" => {
-                let (name, value) = it.next()?.split_once('=')?;
-                a.set.retain(|(n, _)| n != name);
-                a.set.push((name.to_string(), value.to_string()));
+                if !crate::add_set(&mut a.set, it.next()?) {
+                    return None;
+                }
             }
             "--json" => a.json = true,
             s if !s.starts_with('-') && dir.is_none() => dir = Some(PathBuf::from(s)),

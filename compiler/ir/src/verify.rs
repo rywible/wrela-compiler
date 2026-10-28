@@ -148,10 +148,6 @@ impl Verifier<'_> {
                 _ => return Err(bug(format!("param {i} isn't a by-value parameter"))),
             },
             Expr::EntryInput(_) => return Ok(None),
-            Expr::Override(i) => match self.m.overrides.get(*i as usize) {
-                Some(&(_, s)) => types.lookup(&TypeDef::Scalar(s)),
-                None => return Err(bug(format!("override {i} isn't the module's"))),
-            },
             Expr::Load(p) => Some(self.place(p)?),
             Expr::Run(p) => match self.def(self.place(p)?) {
                 TypeDef::Array(e, _) => types.lookup(&TypeDef::Run(*e)),

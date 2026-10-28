@@ -708,7 +708,16 @@ impl<'c, 'a> Fl<'c, 'a> {
                     self.emit(ir::Stmt::Continue);
                     return;
                 }
-                TerminatorKind::Match { arms, merge } => {
+                // A `match` on a constant: the arm it takes, alone.
+                TerminatorKind::Match { arms, merge, taken: Some(i) } => {
+                    let Some(&arm) = arms.get(*i as usize) else { return };
+                    self.region(arm, None);
+                    if self.preds[merge.index()] == 0 {
+                        return;
+                    }
+                    b = *merge;
+                }
+                TerminatorKind::Match { arms, merge, taken: None } => {
                     // `matched` is set when an arm's body finishes; later arms run only while
                     // it's false.
                     let bool_ty = self.mb.m.types.bool();
@@ -864,7 +873,9 @@ impl<'c, 'a> Fl<'c, 'a> {
             TerminatorKind::LoopBack(l) => loop_part(*l, |b, _, _| *b),
             TerminatorKind::Break(l) => loop_part(*l, |_, _, m| *m),
             TerminatorKind::Continue(l) => loop_part(*l, |_, c, _| *c),
-            TerminatorKind::Match { arms, merge } => Some(*arms.first().unwrap_or(merge)),
+            TerminatorKind::Match { arms, merge, taken } => {
+                Some(*taken.and_then(|i| arms.get(i as usize)).or(arms.first()).unwrap_or(merge))
+            }
             TerminatorKind::ArmMatched(m) => match &code.block(*m).term.kind {
                 TerminatorKind::Match { merge, .. } => Some(*merge),
                 _ => None,

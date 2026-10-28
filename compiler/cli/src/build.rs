@@ -20,7 +20,7 @@ pub fn run(args: &[String]) -> ExitCode {
     let out = args.out.unwrap_or_else(|| dir.join("build"));
     let mut output = if !args.lift.is_empty() {
         let kind = wrela_driver::BuildKind { debug: args.debug, testing: args.testing };
-        match wrela_driver::build_lifted(dir, &args.lift, kind) {
+        match wrela_driver::build_lifted(dir, &args.lift, kind, &args.set) {
             Ok(o) => o,
             Err(why) => {
                 eprintln!("error: {why}");

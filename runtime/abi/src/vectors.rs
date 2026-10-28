@@ -538,7 +538,6 @@ pub fn check_manifest() -> Manifest {
         debug_flag: None,
         requires: Vec::new(),
         conditional: false,
-        constants: Vec::new(),
     };
     let render = target_bound(false, false);
     m.pipelines.push(shape("draw", render.clone()));
@@ -1304,7 +1303,6 @@ pub(crate) fn sample_manifest() -> Manifest {
         debug_flag: None,
         requires: Vec::new(),
         conditional: false,
-        constants: Vec::new(),
     });
     m.pipelines.push(Pipeline {
         name: "cover+shade".into(),
@@ -1315,7 +1313,6 @@ pub(crate) fn sample_manifest() -> Manifest {
         debug_flag: None,
         requires: Vec::new(),
         conditional: false,
-        constants: Vec::new(),
     });
     m
 }

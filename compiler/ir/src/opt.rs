@@ -1117,7 +1117,6 @@ fn outlined_with(
                         }
                     }
                     Expr::EntryInput(_)
-                    | Expr::Override(_)
                     | Expr::Barrier
                     | Expr::Subgroup(..)
                     | Expr::Discard

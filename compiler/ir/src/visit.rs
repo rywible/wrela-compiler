@@ -61,7 +61,6 @@ impl Expr {
             Expr::Const(_)
             | Expr::Zero(_)
             | Expr::EntryInput(_)
-            | Expr::Override(_)
             | Expr::Param(_)
             | Expr::Barrier
             | Expr::Discard => {}
@@ -112,7 +111,6 @@ impl Expr {
             Expr::Const(_)
             | Expr::Zero(_)
             | Expr::EntryInput(_)
-            | Expr::Override(_)
             | Expr::Param(_)
             | Expr::Barrier
             | Expr::Discard => {}
@@ -178,7 +176,6 @@ impl Expr {
             Expr::Const(_)
             | Expr::Zero(_)
             | Expr::EntryInput(_)
-            | Expr::Override(_)
             | Expr::Param(_)
             | Expr::Unary(..)
             | Expr::Extract(..)
@@ -220,7 +217,6 @@ impl Expr {
             Expr::Const(_)
             | Expr::Zero(_)
             | Expr::EntryInput(_)
-            | Expr::Override(_)
             | Expr::Param(_)
             | Expr::Unary(..)
             | Expr::Extract(..)
@@ -293,7 +289,6 @@ impl Expr {
             | Expr::Barrier
             | Expr::Discard
             | Expr::EntryInput(_)
-            | Expr::Override(_)
             | Expr::Param(_) => false,
         }
     }

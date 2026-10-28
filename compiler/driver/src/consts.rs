@@ -91,7 +91,7 @@ pub struct ConstStats {
 #[derive(Clone, Debug, PartialEq)]
 pub struct ConstRun {
     pub name: String,
-    /// Its value's bytes, as the cache holds it.
+    /// Its entry's bytes in the cache.
     pub bytes: u64,
     /// The fuel computing it used (from the cache: when it was computed).
     pub fuel: u64,
@@ -129,6 +129,9 @@ pub fn compute(
         .map(|c| (c, BTreeSet::new()))
         .collect();
     let mut failed = BTreeSet::new();
+    // Each embedded file's digest for the keys, once a build.
+    let mut digests: std::collections::HashMap<std::sync::Arc<str>, [u8; 32]> =
+        std::collections::HashMap::new();
     let simd = !data.no_simd;
     // The build's options that change what CPU code does, in every key.
     let options = format!(
@@ -185,10 +188,10 @@ pub fn compute(
             let fuel = checked.program.const_(c).fuel.unwrap_or(FUEL);
             let started = std::time::Instant::now();
             let name = checked.program.const_(c).name.clone();
-            let ran = |stats: &mut ConstStats, v: &wrela_lower::Value, used, cached| {
+            let ran = |stats: &mut ConstStats, bytes, used, cached| {
                 stats.runs.push(ConstRun {
                     name: name.clone(),
-                    bytes: const_cache::value_bytes(v),
+                    bytes,
                     fuel: used,
                     seconds: started.elapsed().as_secs_f64(),
                     cached,
@@ -200,14 +203,18 @@ pub fn compute(
                 Err(msg) => Err(Diagnostic::internal(msg)),
                 Ok(out) => {
                     let embeds = module.embeds.iter().filter_map(|path| {
-                        data.embeds.get(path).map(|b| (path.as_ref(), b.as_ref()))
+                        let bytes = data.embeds.get(path)?;
+                        let d = *digests
+                            .entry(path.clone())
+                            .or_insert_with(|| const_cache::digest(bytes));
+                        Some((path.as_ref(), d))
                     });
                     let inputs = const_cache::inputs(&options, embeds);
                     let key = const_cache::key(&out.wasm, fuel, &inputs);
                     match const_cache::get_in(cache, &key) {
-                        Some(e) => {
+                        Some((e, bytes)) => {
                             stats.cached += 1;
-                            ran(&mut stats, &e.value, e.fuel, true);
+                            ran(&mut stats, bytes, e.fuel, true);
                             Ok(e.value)
                         }
                         None => {
@@ -241,9 +248,9 @@ pub fn compute(
                                 stats.traced.push((name.clone(), traced));
                             }
                             r.map(|(value, fuel)| {
-                                ran(&mut stats, &value, fuel, false);
                                 let entry = const_cache::Entry { value, fuel };
-                                const_cache::put_in(cache, &key, &entry);
+                                let bytes = const_cache::put_in(cache, &key, &entry);
+                                ran(&mut stats, bytes, fuel, false);
                                 entry.value
                             })
                         }
@@ -506,20 +513,22 @@ fn run_one(
         Ok(addr) if used <= fuel => {
             return running.read(|bytes| {
                 let mem = Memory { bytes };
-                wrela_lower::read_value(checked, c, &mem, addr).map(|v| (v, helped, used)).map_err(|e| {
-                    let def = checked.program.const_(c);
-                    Box::new(match e {
-                        wrela_lower::ReadError::TooDeep => Diagnostic::new(
-                            codes::E0704,
-                            def.span,
-                            format!("computing {} failed: {e}", def.shown()),
-                        ),
-                        _ => Diagnostic::internal(format!(
-                            "reading the value of `{}`: {e}",
-                            def.name
-                        )),
-                    })
-                })
+                wrela_lower::read_value(checked, c, &mem, addr).map(|v| (v, helped, used)).map_err(
+                    |e| {
+                        let def = checked.program.const_(c);
+                        Box::new(match e {
+                            wrela_lower::ReadError::TooDeep => Diagnostic::new(
+                                codes::E0704,
+                                def.span,
+                                format!("computing {} failed: {e}", def.shown()),
+                            ),
+                            _ => Diagnostic::internal(format!(
+                                "reading the value of `{}`: {e}",
+                                def.name
+                            )),
+                        })
+                    },
+                )
             });
         }
         // Its threads' work together was past its fuel.

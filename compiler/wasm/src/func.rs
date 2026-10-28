@@ -1667,7 +1667,6 @@ impl<'m> Fe<'m> {
             ir::Expr::Host(op, args) => ops::host(self, op, args, Some(v))?,
             ir::Expr::Mem(op, args) => self.mem_op(*op, args, Some(v))?,
             ir::Expr::EntryInput(_) => return Err("internal: a GPU entry input in CPU code".into()),
-            ir::Expr::Override(_) => return Err("internal: a GPU override in CPU code".into()),
             ir::Expr::ArrayLength(_) => {
                 return Err("internal: a storage buffer's length in CPU code".into());
             }

@@ -321,31 +321,56 @@ macro_rules! lang_items {
 
             /// Whether it's an open pass's type: what a draw draws into.
             pub fn is_pass(self) -> bool {
-                matches!(
-                    self,
+                self.textures_pass().is_some()
+                    || matches!(
+                        self,
+                        Lang::DepthOnlyPass
+                            | Lang::ScreenPass
+                            | Lang::ScreenDepthPass
+                            | Lang::DepthLayerPass
+                    )
+            }
+
+            /// For an open pass into textures' colours (`Pass`, `LayerPass`, `Pass2` to `Pass8`
+            /// and their depth forms): whether it has a depth target.
+            pub fn textures_pass(self) -> Option<bool> {
+                match self {
                     Lang::Pass
-                        | Lang::DepthPass
-                        | Lang::DepthOnlyPass
-                        | Lang::ScreenPass
-                        | Lang::ScreenDepthPass
-                        | Lang::LayerPass
-                        | Lang::LayerDepthPass
-                        | Lang::DepthLayerPass
-                        | Lang::Pass2
-                        | Lang::Pass3
-                        | Lang::Pass4
-                        | Lang::Pass5
-                        | Lang::Pass6
-                        | Lang::Pass7
-                        | Lang::Pass8
-                        | Lang::DepthPass2
-                        | Lang::DepthPass3
-                        | Lang::DepthPass4
-                        | Lang::DepthPass5
-                        | Lang::DepthPass6
-                        | Lang::DepthPass7
-                        | Lang::DepthPass8
-                )
+                    | Lang::LayerPass
+                    | Lang::Pass2
+                    | Lang::Pass3
+                    | Lang::Pass4
+                    | Lang::Pass5
+                    | Lang::Pass6
+                    | Lang::Pass7
+                    | Lang::Pass8 => Some(false),
+                    Lang::DepthPass
+                    | Lang::LayerDepthPass
+                    | Lang::DepthPass2
+                    | Lang::DepthPass3
+                    | Lang::DepthPass4
+                    | Lang::DepthPass5
+                    | Lang::DepthPass6
+                    | Lang::DepthPass7
+                    | Lang::DepthPass8 => Some(true),
+                    _ => None,
+                }
+            }
+
+            /// For `begin_pass0_command` to `begin_pass8_command`: its colour targets.
+            pub fn begin_pass_targets(self) -> Option<u32> {
+                Some(match self {
+                    Lang::BeginPass0 => 0,
+                    Lang::BeginPass1 => 1,
+                    Lang::BeginPass2 => 2,
+                    Lang::BeginPass3 => 3,
+                    Lang::BeginPass4 => 4,
+                    Lang::BeginPass5 => 5,
+                    Lang::BeginPass6 => 6,
+                    Lang::BeginPass7 => 7,
+                    Lang::BeginPass8 => 8,
+                    _ => return None,
+                })
             }
 
             /// Whether it's workgroup memory: what the invocations of a kernel's workgroup share

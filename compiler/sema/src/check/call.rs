@@ -1976,7 +1976,11 @@ impl<'p> Checker<'p> {
                     span,
                     format!("`{}` is an associated constant, not a function", name.name),
                 )
-                .with_help(format!("name it without a call: `{}::{}`", self.display(ty), name.name)),
+                .with_help(format!(
+                    "name it without a call: `{}::{}`",
+                    self.display(ty),
+                    name.name
+                )),
             );
             return self.failed_call(args, span);
         }
@@ -2990,26 +2994,11 @@ impl<'p> Checker<'p> {
             }
             let ty = self.infer.resolve(&self.p.types, x.ty);
             // An associated constant (`S::K`): its instantiation's value, folded in lowering.
-            if let ExprKind::Call(Call { callee, .. }) = &x.kind {
-                let src = match callee {
-                    Callee::Fn { func, args } if self.p.func(*func).attrs.assoc_const => {
-                        Some(ConstSrc::Inherent { func: *func, args: args.clone() })
-                    }
-                    Callee::TraitMethod { method, self_ty, trait_args, .. }
-                        if self.p.func(*method).attrs.assoc_const =>
-                    {
-                        Some(ConstSrc::Trait {
-                            method: *method,
-                            self_ty: *self_ty,
-                            trait_args: trait_args.clone(),
-                        })
-                    }
-                    _ => None,
-                };
-                if let Some(src) = src {
-                    consts.push((i, src));
-                    continue;
-                }
+            if let ExprKind::Call(Call { callee, .. }) = &x.kind
+                && let Some(src) = ConstSrc::of_callee(self.p, callee)
+            {
+                consts.push((i, src));
+                continue;
             }
             match self.const_arg(&x, ty) {
                 Some(c) => consts.push((i, ConstSrc::Value(c))),
@@ -3034,15 +3023,7 @@ impl<'p> Checker<'p> {
     /// The value of a `const` parameter's argument `x` of type `ty`, if it's a literal, a
     /// negated literal or a `const` item that is one.
     fn const_arg(&self, x: &Expr, ty: TyId) -> Option<ConstArg> {
-        let make = |v: f64, int: Option<i128>| -> Option<ConstArg> {
-            Some(match self.kind(ty) {
-                TyKind::Bool => return None,
-                TyKind::Int(IntTy::U32) => ConstArg::U32(u32::try_from(int?).ok()?),
-                TyKind::Int(IntTy::I32) => ConstArg::I32(i32::try_from(int?).ok()?),
-                TyKind::Float(FloatTy::F32) => ConstArg::F32((v as f32).to_bits()),
-                _ => return None,
-            })
-        };
+        let make = |v: f64, int: Option<i128>| ConstArg::of_number(self.kind(ty), v, int);
         match &x.kind {
             ExprKind::Lit(Lit::Bool(b)) if matches!(self.kind(ty), TyKind::Bool) => {
                 Some(ConstArg::Bool(*b))
@@ -3873,7 +3854,8 @@ impl<'p> Checker<'p> {
                 }
                 "blend" => {
                     if let Some(c) = self.render_constant(&a.value, Lang::Blend) {
-                        state.blends = [nth(&wrela_abi::manifest::Blend::ALL, c[0]); wrela_abi::stream::MAX_COLOR_ATTACHMENTS];
+                        state.blends = [nth(&wrela_abi::manifest::Blend::ALL, c[0]);
+                            wrela_abi::stream::MAX_COLOR_ATTACHMENTS];
                         state.blend_given = true;
                     }
                 }
