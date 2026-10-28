@@ -1,0 +1,48 @@
+// accepts: struct.base
+// A struct update whose base's field is generic over a return-position trait type (`Grown`, an
+// alias that names a trait): the field the update copies and the field it fills are one type
+// once the alias is revealed. Toolchain 0.9.0's lowering named them two (`Holder<Grown>` and
+// `Holder<Ball>`) and made malformed IR.
+trait Shape {
+    fn r(self) -> f32
+}
+
+struct Ball: Copy {
+    r: f32,
+}
+
+impl Shape for Ball {
+    fn r(self) -> f32 {
+        self.r
+    }
+}
+
+type Grown = Shape
+
+fn grown() -> Grown {
+    Ball { r: 2.0 }
+}
+
+struct Holder<K: Shape> {
+    k: K,
+    n: u32,
+}
+
+struct Stage {
+    a: u32,
+    h: Holder<Grown>,
+}
+
+fn stage() -> Stage {
+    Stage { a: 1, h: Holder { k: grown(), n: 3 } }
+}
+
+pub fn main() -> f32 {
+    let s = Stage { a: 5, ..stage() }
+    f32(s.a + s.h.n) + s.h.k.r()
+}
+
+@test
+fn the_update_keeps_the_base_fields() {
+    assert(main() == 10.0)
+}
