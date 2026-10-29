@@ -121,3 +121,42 @@ fn a_draw_behind_a_false_associated_constant_is_no_pipeline() {
     let v = common::json(common::wrela().arg("pipelines").arg(&dir).arg("--json"));
     assert_eq!(v["pipelines"].as_array().map(Vec::len), Some(0), "{v}");
 }
+
+/// An associated constant of an `f64` comparison isn't folded (the folder takes floats as `f32`s,
+/// where `16777217.0` and `16777216.0` are one number): its branch stays a run-time one, and is
+/// the program's.
+#[test]
+fn an_f64_associated_constant_is_not_folded_as_an_f32() {
+    let main = format!(
+        "const A: f64 = 16777217.0\nconst B: f64 = 16777216.0\n\nstruct Off {{}}\n\nimpl Off {{\n    const SAME: bool = A == B\n}}\n\npub fn frame(time: f32, width: u32, height: u32) {{\n    let screen = std::gpu::begin_screen_pass(clear: vec4())\n    if Off::SAME {{\n        {DRAW}\n    }}\n    screen.present()\n}}\n{SHADERS}"
+    );
+    let dir = common::package(
+        "pipelines-assoc-f64",
+        &[("wrela.toml", &common::manifest("p")), ("main.wrela", &main)],
+    );
+    let v = common::json(common::wrela().arg("pipelines").arg(&dir).arg("--json"));
+    assert_eq!(v["pipelines"][0]["conditional"], serde_json::json!([true]), "{v}");
+}
+
+/// In a relaxed-SIMD build too (its presentation code is relaxable, and keeps strict code, such as
+/// a constant `init` reads as well, a call), the branch on a `false` associated constant is gone,
+/// and what only it reached.
+#[test]
+fn a_relaxed_build_folds_an_associated_constant() {
+    let main = "trait Switches {\n    const ON: bool = true\n}\n\nstruct Off {}\n\nimpl Switches for Off {\n    const ON: bool = false\n}\n\npub struct S {\n    on: bool,\n}\n\npub fn init() -> S {\n    S { on: Off::ON }\n}\n\npub fn frame(s: mut S, time: f32, width: u32, height: u32) {\n    if Off::ON {\n        std::io::print(f\"behind the switch {time}\")\n    }\n}\n";
+    let dir = common::package(
+        "relaxed-assoc",
+        &[("wrela.toml", &common::manifest("p")), ("main.wrela", main)],
+    );
+    let out = dir.join("out");
+    let (code, text) = common::run(
+        common::wrela().arg("build").arg(&dir).arg("-o").arg(&out).arg("--relaxed-simd"),
+    );
+    assert_eq!(code, Some(0), "{text}");
+    // The branch's printing of a float is what makes a WASM big (230,147 bytes in 0.10.0's
+    // relaxed build; its literal's bytes stay either way); without it, about 2 KB.
+    for wasm in ["game.wasm", "game.relaxed.wasm"] {
+        let size = std::fs::metadata(out.join(wasm)).expect(wasm).len();
+        assert!(size < 20_000, "{wasm} keeps the branch: {size} bytes");
+    }
+}
