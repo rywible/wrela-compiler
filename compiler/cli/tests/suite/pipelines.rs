@@ -138,6 +138,44 @@ fn an_f64_associated_constant_is_not_folded_as_an_f32() {
     assert_eq!(v["pipelines"][0]["conditional"], serde_json::json!([true]), "{v}");
 }
 
+/// A program's tier, an enum whose variants hold nothing, folds into the associated constants
+/// its switches read (`!=` and `match`), so `--set TIER=Low` builds none of what `Low` turns
+/// off; a `match` arm with a guard, or one that binds, leaves the constant a call.
+#[test]
+fn a_tier_folds_into_its_switches() {
+    let main = |fog: &str| {
+        format!(
+            "pub enum Tier: Copy + Eq + Fieldless {{\n    Epic,\n    High,\n    Low,\n}}\n\npub const TIER: Tier = Tier::Epic\n\nstruct Mine {{}}\n\nimpl Mine {{\n    const FOG: bool = {fog}\n}}\n\npub fn frame(time: f32, width: u32, height: u32) {{\n    let screen = std::gpu::begin_screen_pass(clear: vec4())\n    if Mine::FOG {{\n        {DRAW}\n    }}\n    screen.present()\n}}\n{SHADERS}"
+        )
+    };
+    let count = |name: &str, fog: &str, set: Option<&str>| {
+        let main = main(fog);
+        let dir =
+            common::package(name, &[("wrela.toml", &common::manifest("p")), ("main.wrela", &main)]);
+        let mut cmd = common::wrela();
+        cmd.arg("pipelines").arg(&dir).arg("--json");
+        if let Some(s) = set {
+            cmd.arg("--set").arg(s);
+        }
+        let v = common::json(&mut cmd);
+        v["pipelines"].as_array().expect("pipelines").len()
+    };
+    for (name, fog) in [
+        ("tier-ne", "TIER != Tier::Low"),
+        ("tier-match", "match TIER {\n        Tier::Low => false,\n        _ => true,\n    }"),
+        (
+            "tier-or",
+            "match TIER {\n        Tier::High | Tier::Low => false,\n        Tier::Epic => true,\n    }",
+        ),
+    ] {
+        assert_eq!(count(name, fog, None), 1, "{fog}: Epic draws");
+        assert_eq!(count(name, fog, Some("TIER=Low")), 0, "{fog}: Low builds no fog");
+    }
+    // A guard isn't folded: the branch stays, and its pipeline with it.
+    let guarded = "match TIER {\n        Tier::Low if true => false,\n        _ => true,\n    }";
+    assert_eq!(count("tier-guard", guarded, Some("TIER=Low")), 1);
+}
+
 /// In a relaxed-SIMD build too (its presentation code is relaxable, and keeps strict code, such as
 /// a constant `init` reads as well, a call), the branch on a `false` associated constant is gone,
 /// and what only it reached.
