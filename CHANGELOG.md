@@ -3,6 +3,17 @@
 Each release's changes a program or a tool can see. The pull request of each release holds the
 detail; `docs/release.md` says how a release is cut.
 
+## 0.10.1
+
+- **An associated constant whose initializer folds (§18.1's list) is folded where it's read**
+  (language.md §3.4), however long the function that reads it and in a relaxed-SIMD build too: a
+  branch on one that's `false` builds none of what only it reaches, its pipelines included. In
+  0.10.0 it was a call, folded only once inlined: the CPU's inliner stops at its budget, and keeps
+  strict code a call in relaxable code, so there the branch, and every pipeline behind it, stayed.
+  One read in a debug build (whose arithmetic checks for NaN as it runs) or a lifted one (whose
+  literals are the table's), one only a role's build may read (its call is E0708 elsewhere), and
+  one of `f64` arithmetic (the folder's floats are `f32`s) stay calls, as before.
+
 ## 0.10.0
 
 - **Associated constants** (language.md §3.4): a trait declares `const K: u32`, with an optional

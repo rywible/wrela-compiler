@@ -138,6 +138,33 @@ pub fn serve(time: f32) {
     assert!(text.contains("`frame` → `helper`"), "{text}");
 }
 
+/// An associated constant only the server's build may read is E0708 read from the client's,
+/// though its value would fold (it stays a call, which checks the role), and through another
+/// constant that reads it.
+#[test]
+fn a_server_associated_constant_read_from_the_client_is_e0708() {
+    let main = r#"
+struct Keys {}
+
+impl Keys {
+    @server
+    const SECRET: u32 = 4
+    const TWICE: u32 = Keys::SECRET * 2
+}
+
+pub fn frame(time: f32, width: u32, height: u32) {
+    let _ = Keys::SECRET + width
+    let _ = Keys::TWICE + width
+}
+
+pub fn serve(time: f32) {
+    let _ = Keys::SECRET
+}
+"#;
+    let (codes, text) = errors("server-constant-from-client", main);
+    assert_eq!(codes, ["E0708", "E0708"], "{text}");
+}
+
 #[test]
 fn client_code_reached_from_the_server_is_e0708_through_generics_and_closures() {
     let main = r#"

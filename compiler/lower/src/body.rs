@@ -20,7 +20,7 @@ use wrela_sema::defs::{FnOwner, Lang, RetMode};
 use wrela_sema::mir::{
     self, BlockId, Local, LocalKind, OperandKind, Rvalue, StatementKind, TerminatorKind,
 };
-use wrela_sema::thir::Lit;
+use wrela_sema::thir::{ConstSrc, Lit};
 use wrela_sema::ty::*;
 use wrela_syntax::ast::{BinOp, UnOp};
 
@@ -2306,6 +2306,9 @@ impl<'c, 'a> Fl<'c, 'a> {
 
     fn call(&mut self, c: &mir::Call, ty: Option<TyId>) -> Option<ir::ValueId> {
         let span = c.span;
+        if let Some(v) = self.assoc_const_value(&c.callee, ty) {
+            return Some(v);
+        }
         match &c.callee {
             mir::Callee::Builtin(BuiltinFn::Panic) => {
                 self.panic_call(c.args.first()?);
@@ -2407,6 +2410,16 @@ impl<'c, 'a> Fl<'c, 'a> {
                 self.call_fn(func, substs, &c.args, span)
             }
         }
+    }
+
+    /// An associated constant's call (`S::K`, §3.4) as its value, where its initializer folds
+    /// for this instance's types (`Cx::assoc_value`).
+    fn assoc_const_value(&mut self, callee: &mir::Callee, ty: Option<TyId>) -> Option<ir::ValueId> {
+        let mut src = ConstSrc::of_callee(&self.cx.checked.program, callee)?;
+        let ty = self.concrete(ty?);
+        src.for_each_ty_mut(&mut |t| *t = self.concrete(*t));
+        let k = self.cx.assoc_value(&src, ty)?;
+        Some(self.konst(k))
     }
 
     /// E0708 for a call, in a CPU module, to what only another role's build may run (§15.3):
