@@ -619,6 +619,17 @@ function runNext(program: Program, tickFrom: number | null, schedule: number, fp
   return r;
 }
 
+/** What a start waited for (`results/starts.json`): each pipeline's name and when it was built
+ * (ms since the epoch, as `frames.json`'s `began_ms`; null if it never was), and each time a
+ * command waited for one, its frame, the pipeline and when it began waiting. */
+function startsJson(build: Build, executor: GpuExecutor): string {
+  const epoch = (ms: number | null) => (ms === null ? null : performance.timeOrigin + ms);
+  return JSON.stringify({
+    built: build.manifest.pipelines.map((p, i) => ({ name: p.name, conditional: p.conditional, ms: epoch(executor.builtAt[i] ?? null) })),
+    waits: executor.waits.map((w) => ({ frame: w.frame, pipeline: w.pipeline, ms: epoch(w.at) })),
+  });
+}
+
 /** The adapter a test ran on, the optional features its program saw, and the browser's user agent:
  * what a profile's report names its hardware by (`results/device.json`), a device on the LAN too. */
 function deviceInfo(device: GPUDevice): { vendor: string; architecture: string; device: string; description: string; features: readonly string[]; agent: string } {
@@ -896,6 +907,7 @@ async function saveResults(
     timings !== null ? putResult(base, "timings.json", JSON.stringify(timings)) : null,
     params.salt > 0 ? putResult(base, "pipelines.json", JSON.stringify({ ms: pipelinesMs, tier1_ms: tier1Ms, count: build.manifest.pipelines.length, tier1: build.manifest.pipelines.filter((p) => p.conditional).length, each })) : null,
     putResult(base, "counters.json", JSON.stringify(record.counters)),
+    putResult(base, "starts.json", startsJson(build, executor)),
     putResult(base, "device.json", JSON.stringify(deviceInfo(device))),
     putResult(base, "memory.json", JSON.stringify({ gpu: executor.memory, wasm: program.memoryBytes })),
   ]);

@@ -2,7 +2,7 @@
 // the same behaviour on a real GPU).
 
 import { describe, expect, spyOn, test } from "bun:test";
-import { type BuiltPipeline, buildPipelines, preparePipelines, GpuExecutor, type PipelineCache, screenFormat, ShaderError, shaderSource } from "../src/gpu.ts";
+import { BUILDS_AT_ONCE, type BuiltPipeline, buildPipelines, preparePipelines, GpuExecutor, type PipelineCache, screenFormat, ShaderError, shaderSource } from "../src/gpu.ts";
 import type { Manifest, Pipeline } from "../src/manifest.ts";
 import { NONE, SCREEN_FORMAT, TEXTURE_FORMATS, UPLOAD_MAX, UPLOAD_START } from "../src/abi.gen.ts";
 import { decode, onePass, type Pass } from "../src/stream.ts";
@@ -1446,29 +1446,35 @@ test("a pass that joins one with a scissor starts from the whole target again", 
 });
 
 describe("pipeline tiers", () => {
-  test("tier 0 builds first, biggest first, and tier 1 once it has settled", async () => {
-    const device = new FakeDevice();
+  /** `BUILDS_AT_ONCE` + 2 compute pipelines, pipeline i's shader i lines longer than the first:
+   * the last, the biggest, tier 1. */
+  const many = () => {
     const m = shapes();
-    m.pipelines[1] = { ...m.pipelines[1]!, conditional: true };
-    const building = buildPipelines(device.gpu, m, [SHADER, SHADER], SCREEN_FORMAT);
-    expect(building.order).toEqual([0]);
-    await building.tier0;
-    await new Promise((r) => setTimeout(r, 0));
-    expect(building.order).toEqual([0, 1]);
+    const n = BUILDS_AT_ONCE + 2;
+    m.pipelines = Array.from({ length: n }, (_, i) => ({ ...shapes().pipelines[1]!, conditional: i === n - 1 }));
+    return { m, n, shaders: m.pipelines.map((_, i) => SHADER + "\n".repeat(i)) };
+  };
+
+  test("at most BUILDS_AT_ONCE build at once: tier 0's first, the biggest first, then tier 1's", async () => {
+    const device = new FakeDevice();
+    const { m, n, shaders } = many();
+    const building = buildPipelines(device.gpu, m, shaders, SCREEN_FORMAT);
+    const tier0 = Array.from({ length: n - 1 }, (_, i) => n - 2 - i);
+    expect(building.order).toEqual(tier0.slice(0, BUILDS_AT_ONCE));
     await Promise.all(building.each);
+    expect(building.order).toEqual([...tier0, n - 1]);
   });
 
-  test("a command that needs a tier-1 pipeline starts it at once, and runs when it's built", async () => {
+  test("a command that needs a pipeline not started starts it at once, and runs when it's built", async () => {
     const device = new FakeDevice();
-    const m = shapes();
-    m.pipelines[1] = { ...m.pipelines[1]!, conditional: true };
-    const building = buildPipelines(device.gpu, m, [SHADER, SHADER], SCREEN_FORMAT);
+    const { m, n, shaders } = many();
+    const building = buildPipelines(device.gpu, m, shaders, SCREEN_FORMAT);
     const executor = new GpuExecutor(device.gpu, building.each, SCREEN_TARGET, "off", false, building);
-    for (const cmd of decode(new Encoder().createBuffer(1, 64).createBuffer(2, 64).dispatch(1, [1, 1, 1], [1, 2], u(0)).finish())) {
+    for (const cmd of decode(new Encoder().createBuffer(1, 64).createBuffer(2, 64).dispatch(n - 1, [1, 1, 1], [1, 2], u(0)).finish())) {
       executor.execute(cmd);
     }
-    // Bumped before tier 0 settled.
-    expect(building.order).toEqual([0, 1]);
+    // Beside the first BUILDS_AT_ONCE, before tier 0 has left it room.
+    expect(building.order).toEqual([...Array.from({ length: BUILDS_AT_ONCE }, (_, i) => n - 2 - i), n - 1]);
     await executor.caughtUp();
     expect(kinds(device.events)).toContain("dispatch");
     await executor.built;
