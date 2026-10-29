@@ -1,13 +1,15 @@
 //! Associated constants as `const` arguments (§3.4, §18.1): `blur.bind(taps: S::K)` records a
 //! pipeline per instantiation, so the value of `S::K` is folded here, where `S` is known, from
 //! the constant's initializer as it's written: literals, other constants, other associated
-//! constants, `const` generic parameters, arithmetic, comparisons, `!`, `&&`, `||` and `if`.
+//! constants, `const` generic parameters, arithmetic, comparisons, `!`, `&&`, `||` and `if`, and
+//! an enum's variants that hold nothing, compared with `==` and `!=` and matched (a program's
+//! `const TIER: Tier`, which `wrela build --set TIER=Medium` overrides).
 //! Each integer step is in its own type, as the CPU computes it: a step past its type's range
 //! doesn't fold (the CPU traps there), and neither does a division by zero.
 
 use crate::Cx;
 use wrela_diag::{Diagnostic, Span, codes};
-use wrela_sema::thir::{Block, ConstArg, ConstSrc, Expr, ExprKind, Lit};
+use wrela_sema::thir::{Arm, Block, ConstArg, ConstSrc, Expr, ExprKind, Lit, Pat, PatKind};
 use wrela_sema::ty::{FloatTy, IntTy, Subst, TyId, TyKind};
 use wrela_syntax::ast::{BinOp, UnOp};
 
@@ -17,6 +19,9 @@ enum Folded {
     Bool(bool),
     Int(i128),
     Float(f32),
+    /// A variant, by index, of an enum whose variants hold nothing (its type is the
+    /// expression's: two compared are of one enum).
+    Variant(u32),
 }
 
 /// How deep a constant may name constants that name constants: past it, a cycle.
@@ -45,7 +50,7 @@ impl<'a> Cx<'a> {
                     span,
                     format!("`{param}`'s associated constant doesn't fold to a `{shown}` here"),
                 )
-                .with_note("a `const` argument's associated constant is folded from what it's written as: literals, constants, other associated constants, arithmetic, comparisons, `!`, `&&`, `||` and `if`, each integer step within its type's range")
+                .with_note("a `const` argument's associated constant is folded from what it's written as: literals, constants, other associated constants, arithmetic, comparisons, `!`, `&&`, `||`, `if`, and an enum's variants that hold nothing, compared and matched; each integer step within its type's range")
                 .with_help("give the constant a value the build can fold, or compute it in a `const` item and name that"),
             );
         }
@@ -116,6 +121,7 @@ impl<'a> Cx<'a> {
                     let v = self.data.values.get(&c)?.clone();
                     match &*v {
                         crate::eval::Value::Scalar(k) => scalar(k)?,
+                        crate::eval::Value::Variant(k, None) => Folded::Variant(*k),
                         _ => return None,
                     }
                 } else {
@@ -129,6 +135,15 @@ impl<'a> Cx<'a> {
                 self.fold_src(&src, depth)?
             }
             ExprKind::Block(b) => self.fold_block(b, subst, depth)?,
+            ExprKind::Adt { variant: Some(k), fields, base: None, .. } if fields.is_empty() => {
+                Folded::Variant(*k)
+            }
+            ExprKind::Match { scrutinee, arms, .. } => {
+                let Folded::Variant(k) = self.fold_expr(scrutinee, subst, depth)? else {
+                    return None;
+                };
+                self.fold_arm(arms, k, subst, depth)?
+            }
             ExprKind::Unary(op, x) => match (op, self.fold_expr(x, subst, depth)?) {
                 (UnOp::Neg, Folded::Int(n)) => fits(checked.program.types.kind(ty), -n)?,
                 (UnOp::Neg, Folded::Float(v)) => Folded::Float(-v),
@@ -165,6 +180,20 @@ impl<'a> Cx<'a> {
         })
     }
 
+    /// The value of the first of `arms` whose pattern holds variant `k`: one with a guard, or
+    /// one before it that binds what it matches, doesn't fold.
+    fn fold_arm(&mut self, arms: &[Arm], k: u32, subst: &Subst, depth: u32) -> Option<Folded> {
+        for arm in arms {
+            if arm.guard.is_some() {
+                return None;
+            }
+            if holds(&arm.pat, k)? {
+                return self.fold_expr(&arm.body, subst, depth);
+            }
+        }
+        None
+    }
+
     /// A block that's only its value.
     fn fold_block(&mut self, b: &Block, subst: &Subst, depth: u32) -> Option<Folded> {
         if !b.stmts.is_empty() {
@@ -180,7 +209,25 @@ impl<'a> Cx<'a> {
             Folded::Bool(b) => matches!(kind, TyKind::Bool).then_some(ConstArg::Bool(b)),
             Folded::Int(n) => ConstArg::of_number(kind, n as f64, Some(n)),
             Folded::Float(x) => ConstArg::of_number(kind, f64::from(x), None),
+            Folded::Variant(_) => None,
         }
+    }
+}
+
+/// Whether `pat` holds variant `k` of an enum whose variants hold nothing; `None` for a pattern
+/// that binds (its arm's body may read what it bound) or isn't a variant's.
+fn holds(pat: &Pat, k: u32) -> Option<bool> {
+    match &pat.kind {
+        PatKind::Wild => Some(true),
+        PatKind::Adt { variant: Some(v), fields, .. } if fields.is_empty() => Some(*v == k),
+        PatKind::Or(pats) => {
+            let mut any = false;
+            for p in pats {
+                any |= holds(p, k)?;
+            }
+            Some(any)
+        }
+        _ => None,
     }
 }
 
@@ -251,6 +298,11 @@ fn binary(op: BinOp, a: Folded, b: Folded) -> Option<Folded> {
             _ => return None,
         },
         (Bool(x), Bool(y)) => match op {
+            BinOp::Eq => Bool(x == y),
+            BinOp::Ne => Bool(x != y),
+            _ => return None,
+        },
+        (Variant(x), Variant(y)) => match op {
             BinOp::Eq => Bool(x == y),
             BinOp::Ne => Bool(x != y),
             _ => return None,

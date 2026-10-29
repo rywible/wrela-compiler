@@ -3,6 +3,14 @@
 Each release's changes a program or a tool can see. The pull request of each release holds the
 detail; `docs/release.md` says how a release is cut.
 
+## 0.10.3
+
+- **An associated constant folds an enum's variants** (language.md §3.4), where the enum's
+  variants hold nothing: `const FOG: bool = TIER != Tier::Low` and `match TIER { Tier::Low =>
+  false, _ => true }` fold, so a program's `const TIER: Tier`, set with `wrela build --set
+  TIER=Low`, builds none of what its tier turns off. In 0.10.2 they stayed calls, and the branch
+  and its pipelines with them. An arm with a guard, or one that binds, still doesn't fold.
+
 ## 0.10.2
 
 - **The browser host builds six pipelines at a time** (language.md §18's tiers), tier 0's first and
