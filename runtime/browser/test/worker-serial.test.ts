@@ -16,7 +16,7 @@ test("serial timing counts each frame's commands once its drain has run them", a
   let frames = 0;
   let draws = 0;
   const executor = {
-    built: Promise.resolve(), frame: 0, presented: false, timed: true, memory: { bytes: 0, peak: 0 },
+    built: Promise.resolve(), frame: 0, presented: false, timed: true, memory: { bytes: 0, peak: 0 }, builtAt: [], waits: [],
     caughtUp: async () => {}, checkDebugFlag: async () => {}, destroyAll() {}, timings: async () => [],
     async drain() {
       const batch = recorded.splice(0);

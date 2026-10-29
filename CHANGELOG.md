@@ -3,6 +3,18 @@
 Each release's changes a program or a tool can see. The pull request of each release holds the
 detail; `docs/release.md` says how a release is cut.
 
+## 0.10.2
+
+- **The browser host builds six pipelines at a time** (language.md §18's tiers), tier 0's first and
+  the largest first, then tier 1's; one a command waits for starts at once, beside them. 0.10.1
+  asked for all of tier 0's at once (tier 1's once they'd settled): the GPU process compiles a few
+  at a time whatever's asked, so a small pipeline a frame needed waited behind every other. On an
+  M4 Air (rywible/wrela's C5, three starts each), the Last Green's warm start went from 6.5 s to
+  5.4 s and the vale's cold one from 8.0 s to 6.7 s.
+- **Test mode's `starts.json`**: when each pipeline was built, and each time a command waited for
+  one (its frame, the pipeline, when it began waiting), in milliseconds since the epoch as
+  `frames.json`'s `began_ms`: what a start waited for.
+
 ## 0.10.1
 
 - **An associated constant whose initializer folds (§18.1's list) is folded where it's read**

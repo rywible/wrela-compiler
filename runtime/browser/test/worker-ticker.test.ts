@@ -25,7 +25,7 @@ async function tickerScenario(reloading: boolean, history = false, hz = 60, asyn
   const reported = Promise.withResolvers<void>();
   const done: string[] = [];
   const configured: GPUTextureFormat[] = [];
-  const executor = { built: Promise.resolve(), frame: 0, presented: false, caughtUp: async () => {}, checkDebugFlag: async () => {}, destroyAll() {}, takeCounters: () => ({}) };
+  const executor = { built: Promise.resolve(), frame: 0, presented: false, builtAt: [], waits: [], caughtUp: async () => {}, checkDebugFlag: async () => {}, destroyAll() {}, takeCounters: () => ({}) };
   const device = {
     createTexture: () => ({ width: 1, height: 1 }), pushErrorScope() {}, popErrorScope: async () => null,
     createBuffer: () => ({

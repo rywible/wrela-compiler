@@ -243,12 +243,13 @@ export async function startProgram(
 ): Promise<Program> {
   const started = performance.now();
   const pipelines = buildPipelines(device, build.manifest, build.shaders, screen.format, gpu.cache);
-  // Every pipeline, tier 1's too: how long the whole set took.
-  Promise.all(pipelines.each).then(() => gpu.onTier1?.(performance.now() - started), () => {});
   const compiled = (build.compiled ??= await Program.compile(build.wasm, build.manifest.wasm_abi, gpu.hashWasm ?? false));
   const debug = build.manifest.pipelines.some((p) => p.debug_flag !== null);
   const executor = new GpuExecutor(device, pipelines.each, screen, gpu.timing, debug, pipelines);
   executor.built.then(() => gpu.onPipelines?.(performance.now() - started), () => {});
+  // Every pipeline, tier 1's too: how long the whole set took, timed after tier 0's (the tiers
+  // build together, and the last of them may finish beside tier 0's last).
+  executor.built.then(() => Promise.all(pipelines.each)).then(() => gpu.onTier1?.(performance.now() - started), () => {});
   const checker = new Checker(build.manifest, deviceLimits(device));
   try {
     const instantiating = performance.now();

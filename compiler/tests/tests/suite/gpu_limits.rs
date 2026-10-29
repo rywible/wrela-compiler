@@ -110,7 +110,7 @@ fn std_counts_the_gpu_memory_the_host_does() {
 /// time as `ms` and every pipeline's as `tier1_ms` (`pipelines.json`), and the frames run.
 #[test]
 #[ignore = "needs the runtime"]
-fn tier_1_builds_after_tier_0_and_is_reported() {
+fn tiers_are_marked_and_reported() {
     let (dir, rel) = wrela_tests::page("compiler/tests/tiers", "tiers-browser");
     let manifest: serde_json::Value = serde_json::from_str(
         &std::fs::read_to_string(dir.join("manifest.json")).expect("manifest"),
