@@ -101,3 +101,23 @@ fn the_report_says_which_sites_are_conditional() {
     let text = String::from_utf8_lossy(&out.stdout);
     assert!(out.status.success() && text.contains("(under a condition)"), "{text}");
 }
+
+/// A draw behind an associated constant that's `false` is no pipeline, however much code comes
+/// before it in its function (§3.4): the constant is folded where it's read, so the branch on it
+/// folds as one on a literal does. (An associated constant is a function, and the CPU's inliner
+/// stops at its budget: a call it left past that kept the branch, and the pipeline behind it.)
+#[test]
+fn a_draw_behind_a_false_associated_constant_is_no_pipeline() {
+    // A body past the inliner's budget before the draw, every value of it used (so none of it is
+    // dropped as dead).
+    let steps: String = (0..1500).map(|k| format!("    y = y * 1.5 + {k}.25\n")).collect();
+    let main = format!(
+        "trait Switches {{\n    const ON: bool = true\n}}\n\nstruct Off {{}}\n\nimpl Switches for Off {{\n    const ON: bool = false\n}}\n\npub fn frame(time: f32, width: u32, height: u32) {{\n    let screen = std::gpu::begin_screen_pass(clear: vec4())\n    var y = time\n{steps}    std::io::print(f\"{{y}}\")\n    if Off::ON {{\n        {DRAW}\n    }}\n    screen.present()\n}}\n{SHADERS}"
+    );
+    let dir = common::package(
+        "pipelines-assoc",
+        &[("wrela.toml", &common::manifest("p")), ("main.wrela", &main)],
+    );
+    let v = common::json(common::wrela().arg("pipelines").arg(&dir).arg("--json"));
+    assert_eq!(v["pipelines"].as_array().map(Vec::len), Some(0), "{v}");
+}

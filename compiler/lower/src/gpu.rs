@@ -2333,12 +2333,7 @@ fn iface_consts(iface: &Interface, key: &PipelineKey) -> Vec<ir::Const> {
                 .iter()
                 .find(|&&(e, i, _)| (e, i) == (l.entry, l.param))
                 .map_or(ConstArg::U32(0), |&(_, _, c)| c);
-            match c {
-                ConstArg::Bool(b) => ir::Const::Bool(b),
-                ConstArg::U32(x) => ir::Const::U32(x),
-                ConstArg::I32(x) => ir::Const::I32(x),
-                ConstArg::F32(bits) => ir::Const::F32(f32::from_bits(bits)),
-            }
+            crate::assoc::ir_const(c)
         })
         .collect()
 }

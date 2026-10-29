@@ -52,6 +52,14 @@ impl<'a> Cx<'a> {
         arg
     }
 
+    /// The associated constant `src` names (its types concrete) as the IR's constant of type
+    /// `ty`, where its initializer folds: read in code, it's lowered as that, so a branch on it
+    /// folds before any inlining (the CPU's inliner stops at its budget, and keeps strict code a
+    /// call in relaxable code). `None` where it doesn't fold: it stays a call.
+    pub(crate) fn assoc_value(&mut self, src: &ConstSrc, ty: TyId) -> Option<wrela_ir::Const> {
+        self.fold_src(src, 0).and_then(|v| self.const_arg_of(v, ty)).map(ir_const)
+    }
+
     /// The value of the associated constant `src` names, its types concrete.
     fn fold_src(&mut self, src: &ConstSrc, depth: u32) -> Option<Folded> {
         if depth > MAX_DEPTH {
@@ -159,6 +167,16 @@ impl<'a> Cx<'a> {
             Folded::Int(n) => ConstArg::of_number(kind, n as f64, Some(n)),
             Folded::Float(x) => ConstArg::of_number(kind, f64::from(x), None),
         }
+    }
+}
+
+/// A `const` argument's value as the IR's constant.
+pub(crate) fn ir_const(c: ConstArg) -> wrela_ir::Const {
+    match c {
+        ConstArg::Bool(b) => wrela_ir::Const::Bool(b),
+        ConstArg::U32(x) => wrela_ir::Const::U32(x),
+        ConstArg::I32(x) => wrela_ir::Const::I32(x),
+        ConstArg::F32(bits) => wrela_ir::Const::F32(f32::from_bits(bits)),
     }
 }
 
