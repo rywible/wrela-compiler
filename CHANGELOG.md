@@ -3,6 +3,13 @@
 Each release's changes a program or a tool can see. The pull request of each release holds the
 detail; `docs/release.md` says how a release is cut.
 
+## 0.11.1
+
+- **An associated constant made with `&`, `|`, `^`, `<<` or `>>` folds** (language.md §3.4): a
+  look's mask, `const SUBSTANCE: u32 = FORM | TONE`, decides its branches as a literal would. 0.11.0
+  left it a call, so an `if` on it built both branches, and a look whose mask was written so drew
+  its four-target shaders into a one-target pass (E0603).
+
 ## 0.11.0
 
 - **A fragment shader may return its look's associated type** (language.md §18.1: `-> Y::Out`),
