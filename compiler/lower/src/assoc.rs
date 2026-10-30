@@ -276,6 +276,13 @@ fn binary(op: BinOp, a: Folded, b: Folded) -> Option<Folded> {
             BinOp::Mul => Int(x.checked_mul(y)?),
             BinOp::Div => Int(x.checked_div(y)?),
             BinOp::Rem => Int(x.checked_rem(y)?),
+            // Bitwise on the integers' values (a look's mask: `FORM | TONE`); a shift within its
+            // type's width, as `fits` then checks the result's range.
+            BinOp::BitAnd => Int(x & y),
+            BinOp::BitOr => Int(x | y),
+            BinOp::BitXor => Int(x ^ y),
+            BinOp::Shl if (0..64).contains(&y) => Int(x.checked_shl(y as u32)?),
+            BinOp::Shr if (0..64).contains(&y) => Int(x >> y),
             BinOp::Eq => Bool(x == y),
             BinOp::Ne => Bool(x != y),
             BinOp::Lt => Bool(x < y),

@@ -349,3 +349,25 @@ pub fn frame(time: f32, width: u32, height: u32) {{
     let private = bytes("look-private", "", Some("LOOK=Full"));
     assert!(private.to_string().contains("E0224"), "{private}");
 }
+
+/// An associated constant made of others with `|`, `&`, `^` and shifts folds (a look's mask,
+/// `FORM | TONE`): a branch it rules out builds no pipeline, and one it doesn't builds its own.
+#[test]
+fn a_mask_made_with_bitwise_operators_folds() {
+    let main = format!(
+        "const FORM: u32 = 1\nconst CAUSE: u32 = 2\nconst TONE: u32 = 4\n\ntrait Look {{\n    const MASK: u32 = 0\n}}\n\nstruct Cel {{}}\n\nimpl Look for Cel {{\n    const MASK: u32 = FORM | TONE ^ (CAUSE << 1) | (8 >> 3) & 1\n}}\n\npub fn frame(time: f32, width: u32, height: u32) {{\n    let screen = std::gpu::begin_screen_pass(clear: vec4())\n    if (Cel::MASK & CAUSE) != 0 {{\n        {DRAW}\n    }}\n    screen.present()\n}}\n{SHADERS}"
+    );
+    let dir = common::package(
+        "pipelines-assoc-mask",
+        &[("wrela.toml", &common::manifest("p")), ("main.wrela", &main)],
+    );
+    let v = common::json(common::wrela().arg("pipelines").arg(&dir).arg("--json"));
+    assert_eq!(v["pipelines"].as_array().map(Vec::len), Some(0), "{v}");
+    let on = main.replace("(Cel::MASK & CAUSE) != 0", "(Cel::MASK & FORM) != 0");
+    let dir = common::package(
+        "pipelines-assoc-mask-on",
+        &[("wrela.toml", &common::manifest("p")), ("main.wrela", &on)],
+    );
+    let v = common::json(common::wrela().arg("pipelines").arg(&dir).arg("--json"));
+    assert_eq!(v["pipelines"].as_array().map(Vec::len), Some(1), "{v}");
+}
