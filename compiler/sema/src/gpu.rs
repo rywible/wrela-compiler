@@ -580,6 +580,7 @@ fn check_entry(p: &Program, f: FnId, entry: Entry, out: &mut Vec<Diagnostic>) {
         }
         Entry::Fragment
             if FragmentOutput::of(p, def.ret).is_none()
+                && !p.types.has_params(def.ret)
                 && !p.types.any(def.ret, &mut |k| matches!(k, TyKind::Error)) =>
         {
             out.push(

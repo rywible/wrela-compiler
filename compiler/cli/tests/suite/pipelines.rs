@@ -198,3 +198,154 @@ fn a_relaxed_build_folds_an_associated_constant() {
         assert!(size < 20_000, "{wasm} keeps the branch: {size} bytes");
     }
 }
+
+/// A fragment shader may return its look's associated type (`Y::Out`), checked for each look it's
+/// drawn with; and an `if` on an associated constant lowers only its taken branch, so a look's
+/// pass of one target draws its one colour, another's of two its two, and neither instance's
+/// other branch is a draw its pass can't take.
+#[test]
+fn a_fragment_returns_its_looks_type_in_the_pass_its_constant_picks() {
+    let main = "use std::gpu::{ClipPosition, Pass, Pass2, R32Uint, RenderPass, Rgba16Float, Targets2, VertexIndex, begin_pass, begin_pass2, draw, texture}
+
+pub trait Look {
+    const MASK: u32 = 0
+    type Out: Copy
+    fn out(c: vec4, n: u32) -> Self::Out
+}
+
+pub struct Plain {}
+
+impl Look for Plain {
+    type Out = vec4
+    fn out(c: vec4, n: u32) -> vec4 { c }
+}
+
+pub struct Full {}
+
+impl Look for Full {
+    const MASK: u32 = 1
+    type Out = Targets2<vec4, u32>
+    fn out(c: vec4, n: u32) -> Targets2<vec4, u32> { Targets2 { first: c, second: n } }
+}
+
+@vertex
+fn tri(i: VertexIndex) -> ClipPosition {
+    ClipPosition { position: vec4(f32(i.index % 2) * 4.0 - 1.0, f32(i.index / 2) * 4.0 - 1.0, 0.0, 1.0) }
+}
+
+@fragment
+fn paint<Y: Look>(tint: f32) -> Y::Out {
+    Y::out(vec4(tint), 7)
+}
+
+fn shade<P: RenderPass, Y: Look>(pass: P) {
+    draw(pass, tri.bind(), paint::<Y>.bind(tint: 0.5), vertices: 3)
+}
+
+fn looked<Y: Look>() {
+    var a = texture::<Rgba16Float>(width: 4, height: 4)
+    var b = texture::<R32Uint>(width: 4, height: 4)
+    if Y::MASK == 0 {
+        let p = begin_pass(mut a)
+        shade::<Pass<Rgba16Float>, Y>(p)
+        p.end()
+    } else {
+        let p = begin_pass2(mut a, mut b)
+        shade::<Pass2<Rgba16Float, R32Uint>, Y>(p)
+        p.end()
+    }
+}
+
+pub fn frame(time: f32, width: u32, height: u32) {
+    looked::<Plain>()
+    looked::<Full>()
+}
+";
+    let dir = common::package(
+        "pipelines-look-out",
+        &[("wrela.toml", &common::manifest("p")), ("main.wrela", main)],
+    );
+    let v = common::json(common::wrela().arg("pipelines").arg(&dir).arg("--json"));
+    let pipelines = v["pipelines"].as_array().expect("pipelines");
+    assert_eq!(pipelines.len(), 2, "{v}");
+    let mut bytes: Vec<u64> =
+        pipelines.iter().filter_map(|p| p["attachment_bytes"].as_u64()).collect();
+    bytes.sort_unstable();
+    assert_eq!(bytes, vec![8, 12], "{v}");
+}
+
+/// `--set LOOK=Full` points the program's `pub type LOOK` at another type, so the program builds
+/// in that look (its shading's two targets in place of one); an alias that isn't `pub` can't be
+/// set (E0224).
+#[test]
+fn a_set_points_a_programs_look_at_another_type() {
+    let main = |vis: &str| {
+        format!("use std::gpu::{{ClipPosition, Pass, Pass2, R32Uint, RenderPass, Rgba16Float, Targets2, VertexIndex, begin_pass, begin_pass2, draw, texture}}
+
+pub trait Look {{
+    const MASK: u32 = 0
+    type Out: Copy
+    fn out(c: vec4, n: u32) -> Self::Out
+}}
+
+pub struct Plain {{}}
+
+impl Look for Plain {{
+    type Out = vec4
+    fn out(c: vec4, n: u32) -> vec4 {{ c }}
+}}
+
+pub struct Full {{}}
+
+impl Look for Full {{
+    const MASK: u32 = 1
+    type Out = Targets2<vec4, u32>
+    fn out(c: vec4, n: u32) -> Targets2<vec4, u32> {{ Targets2 {{ first: c, second: n }} }}
+}}
+
+{vis}type LOOK = Plain
+
+@vertex
+fn tri(i: VertexIndex) -> ClipPosition {{
+    ClipPosition {{ position: vec4(f32(i.index % 2) * 4.0 - 1.0, f32(i.index / 2) * 4.0 - 1.0, 0.0, 1.0) }}
+}}
+
+@fragment
+fn paint<Y: Look>(tint: f32) -> Y::Out {{
+    Y::out(vec4(tint), 7)
+}}
+
+pub fn frame(time: f32, width: u32, height: u32) {{
+    var a = texture::<Rgba16Float>(width: 4, height: 4)
+    var b = texture::<R32Uint>(width: 4, height: 4)
+    if LOOK::MASK == 0 {{
+        let p = begin_pass(mut a)
+        draw(p, tri.bind(), paint::<LOOK>.bind(tint: 0.5), vertices: 3)
+        p.end()
+    }} else {{
+        let p = begin_pass2(mut a, mut b)
+        draw(p, tri.bind(), paint::<LOOK>.bind(tint: 0.5), vertices: 3)
+        p.end()
+    }}
+}}
+")
+    };
+    let bytes = |name: &str, vis: &str, set: Option<&str>| {
+        let main = main(vis);
+        let dir =
+            common::package(name, &[("wrela.toml", &common::manifest("p")), ("main.wrela", &main)]);
+        let mut cmd = common::wrela();
+        cmd.arg("pipelines").arg(&dir).arg("--json");
+        if let Some(s) = set {
+            cmd.arg("--set").arg(s);
+        }
+        common::json(&mut cmd)
+    };
+    let plain = bytes("look-plain", "pub ", None);
+    assert_eq!(plain["pipelines"][0]["attachment_bytes"], serde_json::json!(8), "{plain}");
+    let full = bytes("look-full", "pub ", Some("LOOK=Full"));
+    assert_eq!(full["pipelines"].as_array().map(Vec::len), Some(1), "{full}");
+    assert_eq!(full["pipelines"][0]["attachment_bytes"], serde_json::json!(12), "{full}");
+    let private = bytes("look-private", "", Some("LOOK=Full"));
+    assert!(private.to_string().contains("E0224"), "{private}");
+}

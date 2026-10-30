@@ -3,7 +3,8 @@
 //! before anything reads it, so its uses fold with the new value as they would with one
 //! written there. It's a constant of a scalar type, a `Text`, or an enum whose variants hold
 //! nothing (`--set TIER=Medium` names a variant of the constant's enum type): what a program
-//! names its tier or its style by.
+//! names its tier by. A `pub type` alias of the root module is set the same way, to a type's
+//! path (`--set LOOK=Cel`): what a program names its look by.
 
 use crate::collect::{PackageInfo, SourceUnit};
 use crate::defs::PackageKind;
@@ -45,6 +46,16 @@ pub fn apply(
     };
     let file = Arc::make_mut(&mut root.ast);
     for (name, value) in sets {
+        let alias = file.items.iter_mut().find_map(|item| match &mut item.kind {
+            ast::ItemKind::TypeAlias(t) if t.name.name == *name => {
+                Some((item.vis.is_some_and(|v| !v.package), t))
+            }
+            _ => None,
+        });
+        if let Some((public, t)) = alias {
+            out.extend(set_alias(name, value, public, t));
+            continue;
+        }
         let found = file.items.iter_mut().find_map(|item| match &mut item.kind {
             ast::ItemKind::Const(c) if c.name.name == *name => {
                 Some((item.vis.is_some_and(|v| !v.package), c))
@@ -109,6 +120,57 @@ pub fn apply(
         }
     }
     out
+}
+
+/// `--set NAME=PATH` for the program's `pub type NAME = …`: the alias names the type at `PATH`
+/// (`Cel`, or `styles::cel::Cel`), resolved where the alias is, as if written there: what a
+/// program names its look by (`pub type LOOK = Physical`), so one program builds in each.
+fn set_alias(
+    name: &str,
+    value: &str,
+    public: bool,
+    t: &mut ast::TypeAliasDecl,
+) -> Option<Diagnostic> {
+    let at = t.name.span;
+    if !public {
+        return Some(
+            Diagnostic::new(
+                codes::E0224,
+                at,
+                format!("`--set {name}=…` overrides a `pub type`, and `{name}` isn't `pub`"),
+            )
+            .with_help(format!("make it `pub type {name}` to let a build set it")),
+        );
+    }
+    if !t.generics.is_empty() {
+        return Some(Diagnostic::new(
+            codes::E0224,
+            at,
+            format!(
+                "`--set {name}=…`: `{name}` takes type parameters, and a build sets an alias that takes none"
+            ),
+        ));
+    }
+    let span = t.ty.span;
+    let names: Vec<&str> = value.trim().split("::").collect();
+    if names.iter().any(|n| !wrela_syntax::lexer::is_name(n)) {
+        return Some(Diagnostic::new(
+            codes::E0224,
+            at,
+            format!(
+                "`--set {name}={value}`: `{value}` isn't a type's path (`Cel`, `styles::cel::Cel`)"
+            ),
+        ));
+    }
+    let segments = names
+        .iter()
+        .map(|n| ast::PathSegment {
+            ident: ast::Ident { name: n.to_string(), span },
+            generics: None,
+        })
+        .collect();
+    t.ty = ast::TypeExpr { kind: ast::TypeExprKind::Path(ast::Path { segments, span }), span };
+    None
 }
 
 /// What a build sets.
