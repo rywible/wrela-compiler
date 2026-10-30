@@ -3,6 +3,20 @@
 Each release's changes a program or a tool can see. The pull request of each release holds the
 detail; `docs/release.md` says how a release is cut.
 
+## 0.11.0
+
+- **A fragment shader may return its look's associated type** (language.md §18.1: `-> Y::Out`),
+  checked for each instantiation, so one shader writes one target for one type and four for
+  another. 0.10.3 refused it before instantiation (E0602).
+- **An `if` on an associated constant builds only its taken branch** (§3.4), where its condition
+  folds: the constant, or a comparison (of integers or `f32`s), `!`, `&&`, `||`, `&`, `|` or `^` of
+  such and literals, written in the condition. The branch the instantiation doesn't take
+  instantiates nothing, so it may draw into a pass the instantiation's shaders couldn't. 0.10.3 lowered both branches, and a
+  draw in the other one was E0603 though it was never taken. The shaders are those 0.10.3 wrote
+  but for their locals' names and order, and where a constant `if` reached WGSL before, it's gone.
+- **`--set` points a `pub type` of the program's `main.wrela` at another type** (§13: `--set
+  LOOK=styles::cel::Cel`), as it sets a `pub const`: so one program builds in each look.
+
 ## 0.10.3
 
 - **An associated constant folds an enum's variants** (language.md §3.4), where the enum's

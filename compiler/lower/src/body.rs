@@ -74,6 +74,10 @@ pub(crate) struct Fl<'c, 'a> {
     blocks: Vec<Open>,
     /// The open block each value was defined in, by [`Open::id`].
     defined: HashMap<ir::ValueId, u32>,
+    /// The values known at lowering: constants, and what's computed from them (`folded`). An
+    /// `if` on one lowers only its taken branch, so a branch an instance's associated constants
+    /// rule out instantiates nothing (§3.4).
+    known: HashMap<ir::ValueId, ir::Const>,
     /// The id of the next block opened.
     next_block: u32,
     /// How many reachable blocks go to each block.
@@ -339,6 +343,7 @@ impl<'c, 'a> Fl<'c, 'a> {
             locals: vec![Repr::Unbound; mir.locals.len()],
             blocks: vec![Open::new(0)],
             defined: HashMap::new(),
+            known: HashMap::new(),
             next_block: 1,
             preds: reachable_preds(code),
             matched: HashMap::new(),
@@ -419,6 +424,9 @@ impl<'c, 'a> Fl<'c, 'a> {
 
     pub fn value(&mut self, ty: ir::TypeId, e: ir::Expr) -> ir::ValueId {
         let v = self.f.new_value(ty);
+        if let Some(c) = folded(&self.known, &e) {
+            self.known.insert(v, c);
+        }
         self.emit(ir::Stmt::Let(v, e));
         v
     }
@@ -674,6 +682,14 @@ impl<'c, 'a> Fl<'c, 'a> {
                 TerminatorKind::Goto(t) => b = *t,
                 TerminatorKind::If { cond, then, else_, merge } => {
                     let Some(c) = self.operand(cond) else { return };
+                    if let Some(ir::Const::Bool(k)) = self.known.get(&c).cloned() {
+                        self.region(if k { *then } else { *else_ }, Some(*merge));
+                        if self.preds[merge.index()] == 0 || self.terminated() {
+                            return;
+                        }
+                        b = *merge;
+                        continue;
+                    }
                     self.push_block();
                     self.region(*then, Some(*merge));
                     let tb = self.pop_block();
@@ -2924,5 +2940,72 @@ pub(crate) fn builtin_ir(b: BuiltinFn) -> BuiltinIr {
         BuiltinFn::Len => BuiltinIr::Len,
         BuiltinFn::Panic | BuiltinFn::Assert => BuiltinIr::Panic,
         BuiltinFn::Embed => BuiltinIr::Embed,
+    }
+}
+
+/// `e`'s value where its operands are `known` (`Fl::known`): a constant, a comparison of known
+/// integers or `f32`s, a logical operation of known booleans, a bitwise one of known `u32`s or `i32`s
+/// (a look's mask: `Y::SUBSTANCE & FORM`), or a known boolean's negation.
+fn folded(known: &HashMap<ir::ValueId, ir::Const>, e: &ir::Expr) -> Option<ir::Const> {
+    use ir::{BinOp, Const};
+    match e {
+        ir::Expr::Const(c) => Some(c.clone()),
+        ir::Expr::Unary(ir::UnOp::Not, a) => match known.get(a)? {
+            Const::Bool(b) => Some(Const::Bool(!b)),
+            _ => None,
+        },
+        ir::Expr::Binary(op, a, b) => {
+            let (a, b) = (known.get(a)?, known.get(b)?);
+            let int = |c: &Const| match *c {
+                Const::I32(n) => Some(i128::from(n)),
+                Const::U32(n) => Some(i128::from(n)),
+                Const::I64(n) => Some(i128::from(n)),
+                Const::U64(n) => Some(i128::from(n)),
+                Const::Small(_, n) => Some(i128::from(n)),
+                _ => None,
+            };
+            if let (Const::Bool(x), Const::Bool(y)) = (a, b) {
+                return match op {
+                    BinOp::And => Some(Const::Bool(*x && *y)),
+                    BinOp::Or => Some(Const::Bool(*x || *y)),
+                    BinOp::Eq => Some(Const::Bool(x == y)),
+                    BinOp::Ne => Some(Const::Bool(x != y)),
+                    _ => None,
+                };
+            }
+            match (op, a, b) {
+                (BinOp::BitAnd, Const::U32(x), Const::U32(y)) => return Some(Const::U32(x & y)),
+                (BinOp::BitOr, Const::U32(x), Const::U32(y)) => return Some(Const::U32(x | y)),
+                (BinOp::BitXor, Const::U32(x), Const::U32(y)) => return Some(Const::U32(x ^ y)),
+                (BinOp::BitAnd, Const::I32(x), Const::I32(y)) => return Some(Const::I32(x & y)),
+                (BinOp::BitOr, Const::I32(x), Const::I32(y)) => return Some(Const::I32(x | y)),
+                (BinOp::BitXor, Const::I32(x), Const::I32(y)) => return Some(Const::I32(x ^ y)),
+                _ => {}
+            }
+            if let (Const::F32(x), Const::F32(y)) = (a, b) {
+                let r = match op {
+                    BinOp::Eq => x == y,
+                    BinOp::Ne => x != y,
+                    BinOp::Lt => x < y,
+                    BinOp::Le => x <= y,
+                    BinOp::Gt => x > y,
+                    BinOp::Ge => x >= y,
+                    _ => return None,
+                };
+                return Some(Const::Bool(r));
+            }
+            let (x, y) = (int(a)?, int(b)?);
+            let r = match op {
+                BinOp::Eq => x == y,
+                BinOp::Ne => x != y,
+                BinOp::Lt => x < y,
+                BinOp::Le => x <= y,
+                BinOp::Gt => x > y,
+                BinOp::Ge => x >= y,
+                _ => return None,
+            };
+            Some(Const::Bool(r))
+        }
+        _ => None,
     }
 }
