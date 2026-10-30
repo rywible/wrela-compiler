@@ -166,7 +166,12 @@ export const EventKind = {
   Message: 13,
   Connection: 14,
   Field: 15,
+  Posted: 16,
 } as const;
+/** The host service a program posts a record into its ticks with (`EventKind.Posted`), and its
+ * body's bytes: the record's words 1 to 5. */
+export const SERVICE_POST = "tick/post";
+export const POST_BODY = 20;
 export const MODIFIER_SHIFT = 1;
 export const MODIFIER_CONTROL = 2;
 export const MODIFIER_ALT = 4;

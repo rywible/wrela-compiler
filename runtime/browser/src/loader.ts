@@ -228,7 +228,7 @@ export interface GpuOptions {
   hashWasm?: boolean;
 }
 
-/** Starts building every pipeline, compiles the WASM meanwhile (unless the build comes compiled:
+/** Gets every pipeline ready to build, the first frame's first (`buildPipelines`, held), compiles the WASM meanwhile (unless the build comes compiled:
  * one got ready for a hand-over, or one started before), then instantiates the program with the decoder behind its
  * import. A program whose `init` fails leaves nothing on the GPU. The program starts while its pipelines build: a command
  * that needs one waits for it (`GpuExecutor`), and the frames wait for the commands
@@ -242,7 +242,8 @@ export async function startProgram(
   gpu: GpuOptions = {},
 ): Promise<Program> {
   const started = performance.now();
-  const pipelines = buildPipelines(device, build.manifest, build.shaders, screen.format, gpu.cache);
+  // Held: the first frame's pipelines build first, alone (`GpuExecutor` releases the rest).
+  const pipelines = buildPipelines(device, build.manifest, build.shaders, screen.format, gpu.cache, true);
   const compiled = (build.compiled ??= await Program.compile(build.wasm, build.manifest.wasm_abi, gpu.hashWasm ?? false));
   const debug = build.manifest.pipelines.some((p) => p.debug_flag !== null);
   const executor = new GpuExecutor(device, pipelines.each, screen, gpu.timing, debug, pipelines);

@@ -17,7 +17,7 @@ use wasmtime::{
 };
 use wrela_abi::check::{Checker, CommandError};
 use wrela_abi::hash::StateHash;
-use wrela_abi::input::{EVENT_SIZE, Event, Queue, Scripted};
+use wrela_abi::input::{EVENT_SIZE, Event, Queue, SERVICE_POST, Scripted};
 use wrela_abi::lines::{self, Lines};
 use wrela_abi::memory::{self, MAX_WORKERS};
 use wrela_abi::stream::{self, Command, Sequencer};
@@ -359,6 +359,9 @@ struct State<E> {
     /// Where it doesn't, each such request fails.
     handing: Vec<Handing>,
     hands_over: bool,
+    /// The records the program posted into its ticks during the current call (`std::tick::post`),
+    /// for the host to queue for the ticker after it, as an input event that arrives then is.
+    posted: Vec<[u8; EVENT_SIZE as usize]>,
 }
 
 /// What a program asks of another build (`std::reload`): the path is as the program wrote it,
@@ -708,6 +711,18 @@ impl<E: Executor> State<E> {
                 let answer =
                     self.executor.read_back(*handle, *offset, *size).map_err(|e| e.to_string());
                 self.requests.arriving.push((*request, answer));
+            }
+            // A record posted into the ticks (runtime/abi `input`): never answered.
+            Command::HostRequest { service, body, .. } if *service == SERVICE_POST => {
+                let no_ticker =
+                    "it posts into its ticks (`std::tick::post`) but has started no ticker";
+                let record = match self.ticker {
+                    Some(_) => Event::from_post(body),
+                    None => Err(no_ticker.to_string()),
+                };
+                let record = record
+                    .map_err(|why| Error::Command(CommandError { opcode: cmd.opcode(), why }))?;
+                self.posted.push(record.bytes());
             }
             Command::StorageRead { .. }
             | Command::StorageWrite { .. }
@@ -1372,6 +1387,7 @@ impl<E: Executor> Program<E> {
             keeping: Vec::new(),
             handing: Vec::new(),
             hands_over: false,
+            posted: Vec::new(),
         };
         let mut store = Store::new(engine, state);
         never_due(&mut store);
@@ -1703,6 +1719,12 @@ impl<E: Executor> Program<E> {
                 Err(self.trapped(&trap, memory::THREAD_MAIN))
             }
         };
+        // What a call that succeeded posted into the ticks waits for the next tick, after
+        // what's queued.
+        let posted = std::mem::take(&mut self.store.data_mut().posted);
+        if result.is_ok() {
+            self.records.extend(posted);
+        }
         // What the call's requests got, the program sees from its next call on. The call's
         // phase ends with it.
         self.store.data_mut().requests.settle();
@@ -1874,6 +1896,12 @@ impl<E: Executor> Program<E> {
     /// Queues records exactly as a tick log has them.
     pub(crate) fn push_raw_records(&mut self, records: &[[u8; EVENT_SIZE as usize]]) {
         self.records.extend(records.iter().copied());
+    }
+
+    /// Drops the records queued for the ticker: a replay's ticks take the log's alone, never
+    /// what the program posted again as it ran (`std::tick::post`).
+    pub(crate) fn drop_records(&mut self) {
+        self.records.clear();
     }
 
     /// The next tick's number.

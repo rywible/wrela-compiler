@@ -38,6 +38,7 @@ import {
   THREAD_HELPER0,
   THREAD_MAIN,
   EVENT_SIZE,
+  EventKind,
   EXPORT_LIFT_SET,
   IMPORT_AUDIO,
   IMPORT_INPUT,
@@ -62,6 +63,8 @@ import {
   REQUEST_FAILED,
   REQUEST_MISSING,
   REQUEST_PENDING,
+  POST_BODY,
+  SERVICE_POST,
 } from "./abi.gen.ts";
 import { type Checker, checkHostRules, CommandError } from "./check.ts";
 import { errorMessage } from "./errors.ts";
@@ -415,6 +418,21 @@ export interface ProgramOptions {
   /** Its connections (`std::net`): without them, `net/` requests fail as any request this
    * host can't answer. */
   net?: Pick<Net, "open" | "send" | "close" | "closeAll" | "plan"> | undefined;
+  /** Queues a record the program posted into its ticks (`std::tick::post`, runtime/abi
+   * `input`) for its ticker; without it, posts are kept nowhere. */
+  postTick?: (record: Uint8Array) => void;
+}
+
+/** The record a post's body makes (`std::tick::post`, runtime/abi `input`'s `Event::from_post`):
+ * the `Posted` kind, then the body's words. */
+export function postedRecord(body: Uint8Array): Uint8Array<ArrayBuffer> {
+  if (body.length !== POST_BODY) {
+    throw new CommandError("HostRequest", `a post's body is ${POST_BODY} bytes (its tag, \`a\` and \`b\`), not ${body.length}`);
+  }
+  const record = new Uint8Array(EVENT_SIZE);
+  new DataView(record.buffer).setUint32(0, EventKind.Posted, true);
+  record.set(body, 4);
+  return record;
 }
 
 /** The pair id in a module's PAIR_SECTION, if it has one. */
@@ -469,6 +487,7 @@ export class Program {
   /** Input events not yet read (`wrela.input`), with messages' bytes. */
   readonly #inbox: Inbox;
   readonly #net: ProgramOptions["net"] | null;
+  readonly #postTick: ProgramOptions["postTick"] | null;
   /** This export's planned connection states, made only when it submits a network command. */
   #netPlan: Pick<Net, "open" | "send" | "close"> | null = null;
   /** Its build's pair id, which its connections give its server. */
@@ -493,6 +512,7 @@ export class Program {
     this.#kept = options.kept ?? new Uint8Array(0);
     this.#inbox = options.inbox ?? new Inbox();
     this.#net = options.net ?? null;
+    this.#postTick = options.postTick ?? null;
   }
 
   static async load(wasm: Bytes, abi: WasmAbi | null, checker: Checker, executor: Executor, options: ProgramOptions = {}): Promise<Program> {
@@ -669,6 +689,9 @@ export class Program {
       else checkHostRules(cmd);
       if (cmd.op === "HostRequest" && this.#net && cmd.service.startsWith("net/")) {
         this.#netCommand(cmd.service, cmd.body, false);
+      } else if (cmd.op === "HostRequest" && cmd.service === SERVICE_POST) {
+        // Never answered: its record is the ticks'.
+        postedRecord(cmd.body);
       } else if ("request" in cmd) {
         this.#requests.reserve(cmd.op, cmd.request);
       }
@@ -714,6 +737,11 @@ export class Program {
       case "HostRequest": {
         if (this.#net && cmd.service.startsWith("net/")) {
           this.#netCommand(cmd.service, cmd.body);
+          return;
+        }
+        if (cmd.service === SERVICE_POST) {
+          if (this.#ticker === null) throw new CommandError(cmd.op, "it posts into its ticks (`std::tick::post`) but has started no ticker");
+          this.#postTick?.(postedRecord(cmd.body));
           return;
         }
         const body = cmd.body.slice();

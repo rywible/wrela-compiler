@@ -426,11 +426,13 @@ export function preparePipelines(
 /** A build's pipelines as they're built: each one's promise, in manifest order; `tier0`, settled
  * when every tier-0 pipeline is (`Pipeline.conditional` is tier 1); `start(i)`, which starts
  * pipeline `i`'s build now if it hasn't started (a command needs it before its tier's turn);
- * and the order the builds started in. */
+ * `release()`, which lets the builds no command asked for start, if they were held; and the
+ * order the builds started in. */
 export interface Building {
   each: Promise<BuiltPipeline>[];
   tier0: Promise<unknown>;
   start(i: number): void;
+  release(): void;
   order: number[];
 }
 
@@ -443,16 +445,21 @@ export const BUILDS_AT_ONCE = 6;
 
 /** Starts building the pipelines, `BUILDS_AT_ONCE` at a time: tier 0's, the biggest first, then
  * tier 1's (those reached only under a runtime condition); one a command needs before its turn
- * (`Building.start`) starts then, beside them. `shaders[i]` is pipeline `i`'s WGSL, and screen targets
- * draw in `screenFormat` (`ScreenTarget.format`). With `cache` (a hot reload), a pipeline whose
- * manifest entry and WGSL are the same as one of the last build's is kept, and the cache then
- * holds this build's pipelines alone. */
+ * (`Building.start`) starts then, beside them, and no other starts until every one a command
+ * asked for is built: the GPU process compiles a few at a time, and one a frame waits for would
+ * wait for those. `shaders[i]` is pipeline `i`'s WGSL, and screen targets draw in `screenFormat`
+ * (`ScreenTarget.format`). With `cache` (a hot reload), a pipeline whose manifest entry and WGSL
+ * are the same as one of the last build's is kept, and the cache then holds this build's
+ * pipelines alone. `held`, none starts until a command asks for it or `Building.release`: a
+ * program's first frame gets the GPU process to itself (`GpuExecutor` releases them once that
+ * frame's commands have run). */
 export function buildPipelines(
   device: GPUDevice,
   manifest: Manifest,
   shaders: string[],
   screenFormat: GPUTextureFormat,
   cache?: PipelineCache,
+  held = false,
 ): Building {
   const order = biggestFirst(shaders);
   const each: Promise<BuiltPipeline>[] = [];
@@ -461,14 +468,19 @@ export function buildPipelines(
   const queued: number[] = [];
   const resolvers = new Map<number, PromiseWithResolvers<BuiltPipeline>>();
   let running = 0;
+  // The builds a command asked for, still going: none other starts meanwhile.
+  let asked = 0;
+  let released = !held;
   // Builds pipeline `i`, counted against `BUILDS_AT_ONCE` unless a command asked for it.
   const launch = (i: number, counted: boolean) => {
     const d = resolvers.get(i)!;
     resolvers.delete(i);
     if (counted) running++;
+    else asked++;
     started.push(i);
     const done = () => {
       if (counted) running--;
+      else asked--;
       pump();
     };
     buildPipeline(device, manifest.pipelines[i]!, shaders[i]!, screenFormat).then(
@@ -483,6 +495,7 @@ export function buildPipelines(
     );
   };
   const pump = () => {
+    if (!released || asked > 0) return;
     while (running < BUILDS_AT_ONCE && queued.length > 0) {
       const i = queued.shift()!;
       if (resolvers.has(i)) launch(i, true);
@@ -516,7 +529,12 @@ export function buildPipelines(
   const start = (i: number) => {
     if (resolvers.has(i)) launch(i, false);
   };
-  return { each, tier0, start, order: started };
+  const release = () => {
+    if (released) return;
+    released = true;
+    pump();
+  };
+  return { each, tier0, start, release, order: started };
 }
 
 /** What a pass records, waiting for it to end: draws, with their own copies of their uniform
@@ -921,6 +939,9 @@ export class GpuExecutor {
   /** A frame begins: no label carries over from the last one to its commands (`#run`), even
    * while the last one's commands still run late. */
   set frame(i: number) {
+    // A frame begins only once the last one's commands have run: the pipelines it needed are
+    // built.
+    if (this.#begun++ > 0) this.#release();
     this.#frame = i;
     this.#generation++;
     if (this.#asked.length > 0) this.#answerTimes();
@@ -950,6 +971,14 @@ export class GpuExecutor {
   readonly built: Promise<void>;
   /** Starts building pipeline `i` now, if it hasn't started (`Building.start`). */
   readonly #start: (i: number) => void;
+  /** Lets the pipelines no command asked for start building (`Building.release`): once the first
+   * frame's commands have all run (`caughtUp`, after it), or the next frame begins. Not when
+   * `init`'s commands catch up after a frame has begun: that frame may not have asked yet. */
+  readonly #release: () => void;
+  /** How many frames have begun (`frame`). */
+  #begun = 0;
+  /** A frame's commands wait: `#release` once they've run. */
+  #releaseCaughtUp = false;
   /** When each pipeline was built (`performance.now()`), or null if it was built before the
    * program started or isn't yet; and each time a command waited for one (its frame, the
    * pipeline, and when): test mode's `starts.json`, what a start waited for. */
@@ -994,13 +1023,14 @@ export class GpuExecutor {
     readonly screen: ScreenTarget,
     timing: Timing = "off",
     debug = pipelines.some((p) => !(p instanceof Promise) && p.debugFlag !== null),
-    tiers?: Pick<Building, "tier0" | "start">,
+    tiers?: Pick<Building, "tier0" | "start" | "release">,
   ) {
     this.#deferred = timing === "serial" ? [] : null;
     this.#pipelines = pipelines.map((p) => (p instanceof Promise ? undefined : p));
     this.builtAt = pipelines.map(() => null);
     this.#building = pipelines.map((p) => Promise.resolve(p));
     this.#start = tiers?.start ?? (() => {});
+    this.#release = tiers?.release ?? (() => {});
     this.built = (tiers ? tiers.tier0 : Promise.all(this.#building)).then(
       () => {},
       (e: unknown) => {
@@ -1197,10 +1227,15 @@ export class GpuExecutor {
   }
 
   /** Resolves once no command waits for a pipeline being built (at once, if none does); rejects
-   * if a pipeline couldn't be built. */
+   * if a pipeline couldn't be built. Called after a frame, the pipelines no command asked for
+   * may build once it resolves. */
   caughtUp(): Promise<void> {
     if (this.#failed !== null) return Promise.reject(this.#failed);
-    if (this.#waitingAt === this.#waiting.length) return Promise.resolve();
+    if (this.#waitingAt === this.#waiting.length) {
+      if (this.#begun > 0) this.#release();
+      return Promise.resolve();
+    }
+    if (this.#begun > 0) this.#releaseCaughtUp = true;
     this.#idle ??= Promise.withResolvers<void>();
     return this.#idle.promise;
   }
@@ -1226,6 +1261,8 @@ export class GpuExecutor {
     this.flush();
     this.#idle?.resolve();
     this.#idle = null;
+    // A frame's commands have all run: the rest of the pipelines may build now.
+    if (this.#releaseCaughtUp) this.#release();
   }
 
   /** Runs `cmd` as part of the frame it was recorded in (`at`): its timings and its label are

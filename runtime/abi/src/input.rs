@@ -33,6 +33,17 @@
 //! | `Message` | the connection, the serial's low word | the serial's high word, the bytes' length |
 //! | `Connection` | the connection, 1 if it's open (0: closed) | its tag (below), 0 |
 //! | `Field` | the node, the field's revision | 0, 0 |
+//! | `Posted` | `a`'s low and high words | `b`'s low and high words |
+//!
+//! A `Posted` event is never input: it's a record the program posted into its own ticks
+//! (language.md's `std::tick::post`), its tag in word 1 (where an input event has its
+//! modifiers) and two `u64`s, `a` and `b`, in words 2 to 5. The program asks for it with the host
+//! service [`SERVICE_POST`], whose body is the event's words 1 to 5 (20 bytes) and which is never
+//! answered; the host queues it for the ticker, as it queues an input event that arrives then
+//! (after the call that posted it, before the next call's input), so the next tick the ticker
+//! runs stamps it into its records and a tick log keeps it. A program that has started no
+//! ticker fails the call's commands (a host command error). The frames never read one, and a
+//! host replaying a tick log drops the program's posts: the log's records are the ticks' input.
 //!
 //! ## Messages
 //!
@@ -136,6 +147,10 @@ pub fn within_call(given: usize, len: usize) -> bool {
 }
 /// Bytes per event: six words.
 pub const EVENT_SIZE: u32 = 24;
+/// The host service a program posts a record into its ticks with ([`EventKind::Posted`]).
+pub const SERVICE_POST: &str = "tick/post";
+/// The bytes of a post's body: a `Posted` event's words 1 to 5.
+pub const POST_BODY: usize = 20;
 
 /// What an event is (word 0).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -156,10 +171,11 @@ pub enum EventKind {
     Message = 13,
     Connection = 14,
     Field = 15,
+    Posted = 16,
 }
 
 impl EventKind {
-    pub const ALL: [EventKind; 15] = [
+    pub const ALL: [EventKind; 16] = [
         EventKind::PointerMove,
         EventKind::PointerDown,
         EventKind::PointerUp,
@@ -175,6 +191,7 @@ impl EventKind {
         EventKind::Message,
         EventKind::Connection,
         EventKind::Field,
+        EventKind::Posted,
     ];
 
     pub fn name(self) -> &'static str {
@@ -194,6 +211,7 @@ impl EventKind {
             EventKind::Message => "Message",
             EventKind::Connection => "Connection",
             EventKind::Field => "Field",
+            EventKind::Posted => "Posted",
         }
     }
 
@@ -405,6 +423,24 @@ impl Event {
     /// The field the host keeps for `node` changed: its newest revision.
     pub fn field(node: u32, revision: u32) -> Event {
         Event { kind: EventKind::Field, modifiers: 0, words: [node, revision, 0, 0] }
+    }
+
+    /// A record the program posted into its ticks: its tag, `a` and `b`.
+    pub fn posted(tag: u32, a: u64, b: u64) -> Event {
+        let words = [a as u32, (a >> 32) as u32, b as u32, (b >> 32) as u32];
+        Event { kind: EventKind::Posted, modifiers: tag, words }
+    }
+
+    /// The record a post's body ([`SERVICE_POST`]) makes, or why it makes none.
+    pub fn from_post(body: &[u8]) -> Result<Event, String> {
+        if body.len() != POST_BODY {
+            return Err(format!(
+                "a post's body is {POST_BODY} bytes (its tag, `a` and `b`), not {}",
+                body.len()
+            ));
+        }
+        let w = |i: usize| u32::from_le_bytes(body[4 * i..4 * i + 4].try_into().expect("4 bytes"));
+        Ok(Event { kind: EventKind::Posted, modifiers: w(0), words: [w(1), w(2), w(3), w(4)] })
     }
 
     pub fn pad_button(pad: u32, button: u32, value: f32, pressed: bool) -> Event {
@@ -842,6 +878,22 @@ mod tests {
         let bytes = s[3].event.bytes();
         assert_eq!(&bytes[..4], &4u32.to_le_bytes());
         assert_eq!(&bytes[20..], &120.0f32.to_bits().to_le_bytes());
+    }
+
+    /// A post's body is a `Posted` record's words 1 to 5: its tag, then `a` and `b`, each low
+    /// word first; a body of another length makes none.
+    #[test]
+    fn a_posts_body_is_its_records_words() {
+        let (a, b) = (0x0102_0304_0506_0708u64, 0xfedc_ba98_7654_3210u64);
+        let mut body = 7u32.to_le_bytes().to_vec();
+        body.extend(a.to_le_bytes());
+        body.extend(b.to_le_bytes());
+        let e = Event::from_post(&body).expect("a record");
+        assert_eq!(e, Event::posted(7, a, b));
+        assert_eq!(e.bytes()[..4], (EventKind::Posted as u32).to_le_bytes());
+        assert_eq!(e.bytes()[4..], body[..]);
+        assert!(!e.kind.is_network());
+        assert!(Event::from_post(&body[..19]).unwrap_err().contains("20 bytes"));
     }
 
     /// A message's bytes are the call's that was given it, and no other's; a call stops taking

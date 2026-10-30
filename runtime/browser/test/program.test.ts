@@ -4,7 +4,7 @@ import { describe, expect, spyOn, test } from "bun:test";
 import { AUDIO_CHANNELS, AUDIO_OUT, AUDIO_QUANTUM, EVENT_SIZE, MAX_TICK_RECORDS, PANIC, PAR_SHUTDOWN, RUNNING, SCREEN, STREAM_VERSION, TASK_SLOTS, THREAD_BLOCK_SIZE, THREAD_BLOCKS, THREAD_HELPER0, TICK_RECORDS } from "../src/abi.gen.ts";
 import { CommandError } from "../src/check.ts";
 import { parseManifest } from "../src/manifest.ts";
-import { checkAbi, otherInstance, Program, ProgramError, type ProgramOptions, runWorker, TrapError, trapMessage } from "../src/program.ts";
+import { checkAbi, otherInstance, postedRecord, Program, ProgramError, type ProgramOptions, runWorker, TrapError, trapMessage } from "../src/program.ts";
 import { StateHash } from "../src/hash.ts";
 import { type Command, onePass, StreamError } from "../src/stream.ts";
 import { Lines, locate, wasmOffsets } from "../src/lines.ts";
@@ -936,6 +936,17 @@ describe("requests", () => {
     expect(absent.call("status")).toBe(-2);
     const invalid = await program(new Encoder().hostRequest(4, "../escape", new Uint8Array()).finish(), { io });
     expect(() => invalid.call("ask")).toThrow("HostRequest failed");
+  });
+
+  test("a post into the ticks is its record, needs a ticker, and is never answered", async () => {
+    const body = Uint8Array.from({ length: 20 }, (_, i) => i + 1);
+    expect([...postedRecord(body)]).toEqual([16, 0, 0, 0, ...body]);
+    const posted: Uint8Array[] = [];
+    const p = await program(new Encoder().hostRequest(4, "tick/post", body).finish(), { postTick: (r) => void posted.push(r) });
+    expect(() => p.call("ask")).toThrow("has started no ticker");
+    expect(posted).toEqual([]);
+    const short = await program(new Encoder().hostRequest(4, "tick/post", body.subarray(1)).finish());
+    expect(() => short.call("ask")).toThrow("a post's body is 20 bytes");
   });
 
   test("network commands go to the connections at once, and are never answered", async () => {

@@ -1481,6 +1481,110 @@ describe("pipeline tiers", () => {
   });
 });
 
+describe("the first frame's pipelines first", () => {
+  /** `BUILDS_AT_ONCE` + 2 compute pipelines, pipeline i's shader i lines longer than the first:
+   * the last, the biggest, tier 1. */
+  const many = () => {
+    const m = shapes();
+    const n = BUILDS_AT_ONCE + 2;
+    m.pipelines = Array.from({ length: n }, (_, i) => ({ ...shapes().pipelines[1]!, conditional: i === n - 1 }));
+    return { m, n, shaders: m.pipelines.map((_, i) => SHADER + "\n".repeat(i)) };
+  };
+  /** A device whose compute pipelines are made only once `let(i)` lets pipeline i's go (`i` the
+   * number of lines its shader has past `SHADER`'s). */
+  class Gated extends FakeDevice {
+    readonly #gates = new Map<number, PromiseWithResolvers<void>>();
+    #gate(i: number): PromiseWithResolvers<void> {
+      let g = this.#gates.get(i);
+      if (g === undefined) this.#gates.set(i, (g = Promise.withResolvers<void>()));
+      return g;
+    }
+    override createShaderModule(desc: GPUShaderModuleDescriptor) {
+      return { ...super.createShaderModule(desc), lines: desc.code.length - SHADER.length };
+    }
+    override async createComputePipelineAsync(desc: GPUComputePipelineDescriptor) {
+      await this.#gate((desc.compute.module as unknown as { lines: number }).lines).promise;
+      return super.createComputePipelineAsync(desc);
+    }
+    let(i: number): void {
+      this.#gate(i).resolve();
+    }
+  }
+  const settled = () => new Promise((go) => setTimeout(go, 0));
+  const dispatch = (pipeline: number) => decode(new Encoder().createBuffer(1, 64).createBuffer(2, 64).dispatch(pipeline, [1, 1, 1], [1, 2], u(0)).finish());
+
+  test("held, none builds until the first frame asks for its own; the rest once its commands have run", async () => {
+    const device = new FakeDevice();
+    const { m, n, shaders } = many();
+    const building = buildPipelines(device.gpu, m, shaders, SCREEN_FORMAT, undefined, true);
+    const executor = new GpuExecutor(device.gpu, building.each, SCREEN_TARGET, "off", false, building);
+    await settled();
+    expect(building.order).toEqual([]);
+    executor.frame = 0;
+    for (const cmd of dispatch(0)) executor.execute(cmd);
+    expect(building.order).toEqual([0]);
+    await executor.caughtUp();
+    expect(kinds(device.events)).toContain("dispatch");
+    // Then tier 0's others, the biggest first, `BUILDS_AT_ONCE` at a time; then tier 1's.
+    const rest = Array.from({ length: n - 2 }, (_, i) => n - 2 - i);
+    expect(building.order).toEqual([0, ...rest.slice(0, BUILDS_AT_ONCE)]);
+    await executor.built;
+    await Promise.all(building.each);
+    expect(building.order).toEqual([0, ...rest, n - 1]);
+  });
+
+  test("held, init's commands catching up after the first frame began let none build", async () => {
+    const device = new FakeDevice();
+    const { m, shaders } = many();
+    const building = buildPipelines(device.gpu, m, shaders, SCREEN_FORMAT, undefined, true);
+    const executor = new GpuExecutor(device.gpu, building.each, SCREEN_TARGET, "off", false, building);
+    // `init` asks for pipeline 0; frame 0 begins before it's built.
+    for (const cmd of dispatch(0)) executor.execute(cmd);
+    executor.frame = 0;
+    await settled();
+    expect(kinds(device.events)).toContain("dispatch");
+    expect(building.order).toEqual([0]);
+    // Frame 0 asks for pipeline 1; once it has run, the rest build.
+    for (const cmd of dispatch(1)) executor.execute(cmd);
+    await executor.caughtUp();
+    expect(building.order.slice(0, 2)).toEqual([0, 1]);
+    expect(building.order.length).toBe(2 + BUILDS_AT_ONCE);
+  });
+
+  test("held, a first frame that waits for none lets the rest build when the next frame begins", async () => {
+    const device = new FakeDevice();
+    const { m, shaders } = many();
+    const building = buildPipelines(device.gpu, m, shaders, SCREEN_FORMAT, undefined, true);
+    const executor = new GpuExecutor(device.gpu, building.each, SCREEN_TARGET, "off", false, building);
+    executor.frame = 0;
+    expect(building.order).toEqual([]);
+    executor.frame = 1;
+    expect(building.order.length).toBe(BUILDS_AT_ONCE);
+  });
+
+  test("no build starts while one a command asked for goes", async () => {
+    const device = new Gated();
+    const { m, n, shaders } = many();
+    const building = buildPipelines(device.gpu, m, shaders, SCREEN_FORMAT);
+    const executor = new GpuExecutor(device.gpu, building.each, SCREEN_TARGET, "off", false, building);
+    const first = Array.from({ length: BUILDS_AT_ONCE }, (_, i) => n - 2 - i);
+    expect(building.order).toEqual(first);
+    // Tier 1's pipeline, asked for before its turn: it starts at once.
+    for (const cmd of dispatch(n - 1)) executor.execute(cmd);
+    expect(building.order).toEqual([...first, n - 1]);
+    // One of the first is built: pipeline 0 waits while the asked-for one goes.
+    device.let(n - 2);
+    await settled();
+    expect(building.order).toEqual([...first, n - 1]);
+    device.let(n - 1);
+    await executor.caughtUp();
+    await settled();
+    expect(building.order).toEqual([...first, n - 1, 0]);
+    for (let i = 0; i < n; i++) device.let(i);
+    await Promise.all(building.each);
+  });
+});
+
 describe("the screen", () => {
   /** A screen whose `apply` records what it was asked, and always shows it. */
   const shown = () => {
