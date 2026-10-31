@@ -1,0 +1,17 @@
+{
+  "name": "wrela-cloudflare",
+  "private": true,
+  "license": "MIT",
+  "type": "module",
+  "description": "The Cloudflare host: a server build's HTTP instance in a Durable Object, and the Worker's router",
+  "scripts": {
+    "build": "bun scripts/build.ts",
+    "check-dist": "bun scripts/check-dist.ts",
+    "typecheck": "tsc --noEmit -p tsconfig.json",
+    "checks": "bun test && bun run typecheck && bun run check-dist"
+  },
+  "devDependencies": {
+    "@types/bun": "1.4.2",
+    "typescript": "5.9.3"
+  }
+}

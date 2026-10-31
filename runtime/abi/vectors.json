@@ -1656,6 +1656,45 @@
       "hash": "a5b6b4f7ee0d554e"
     }
   ],
+  "http": {
+    "request": {
+      "body": "010203",
+      "bytes": "574851317b8c418fa101000004000000504f53540c0000002f6170692f7369676e2d696e06000000737465703d32030000000c000000636f6e74656e742d74797065180000006170706c69636174696f6e2f6f637465742d73747265616d06000000636f6f6b69651e0000005f5f486f73742d73657373696f6e3d6162633b207468656d653d6461726b0c000000782d7772656c612d6373726602000000376603000000010203",
+      "headers": [
+        [
+          "content-type",
+          "application/octet-stream"
+        ],
+        [
+          "cookie",
+          "__Host-session=abc; theme=dark"
+        ],
+        [
+          "x-wrela-csrf",
+          "7f"
+        ]
+      ],
+      "method": "POST",
+      "path": "/api/sign-in",
+      "query": "step=2",
+      "time": "1793404800123"
+    },
+    "response": {
+      "body": "6d616465",
+      "bytes": "57485231c9000000020000000c000000636f6e74656e742d7479706519000000746578742f706c61696e3b20636861727365743d7574662d380a0000007365742d636f6f6b69653d0000005f5f486f73742d73657373696f6e3d6162633b20506174683d2f3b205365637572653b20487474704f6e6c793b2053616d65536974653d537472696374040000006d616465",
+      "headers": [
+        [
+          "content-type",
+          "text/plain; charset=utf-8"
+        ],
+        [
+          "set-cookie",
+          "__Host-session=abc; Path=/; Secure; HttpOnly; SameSite=Strict"
+        ]
+      ],
+      "status": 201
+    }
+  },
   "input": [
     {
       "at": [

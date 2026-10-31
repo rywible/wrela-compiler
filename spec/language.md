@@ -1598,6 +1598,7 @@ Three hosts run builds, from the same ABI (`runtime/abi`), and the native host h
 | The browser host | A page in Chrome, on WebGPU (`runtime/browser`) | A client build |
 | The native host | `wrela-host`, on wgpu and wasmtime (`runtime/native`) | A client build, on the machine's GPU; or its CPU alone (`--no-gpu`, and the frame tests of §13.2), which checks commands but runs no shaders |
 | The server host | `wrela-serve` (`wrela_host::server`) | A server build's rooms (§15.3, §19) |
+| The Cloudflare host | A Durable Object and the site's Worker (`runtime/cloudflare`), which `wrela build` writes beside a server build | A server build's HTTP requests (§19.5) |
 | The native host's tool profile | `wrela tool` (`wrela_host::tool`), on wasmtime | A tool build, with what its command line grants (§15.5) |
 
 Where this spec says "both hosts", it means the browser host and the native host: a program gives the same results, and the same command stream, on both.
@@ -2590,10 +2591,56 @@ A server build asks its host for what outlives a room, and for cryptography, thr
   - A key is at most 1 KiB and a value at most 1020 KiB, so a put of both fits in one host request (1 MiB). Keys sort as bytes: `append_u32` and `append_u64` put a number in a key big-endian, so keys sort by it.
 - **Randomness** (`std::crypto::random(n)`): up to 1 KiB of bytes from the operating system's generator.
 - **Signatures** (`std::crypto::verify(algorithm, key, message, signature)`): whether the signature is the key's over the message, by ES256, Ed25519 or RS256, the algorithms of passkeys. The host checks it with vetted libraries; std does no cryptography of its own. A key that is not one of the algorithm's fails the request.
+- **The time of day** (`std::time::wall_clock()`): the host's wall clock, milliseconds since the Unix epoch, which `std::time::unix_ms(answer)` reads. It is for what lasts past a run, such as an expiry or an hour's count. It can go back when the host sets its clock, so a program that needs an order keeps its own counter. `serve`'s `time` still counts from the server's start.
 
 Each is `@server`. `wrela-serve` and `wrela run` open the store in their data directory.
 
 **Passkeys** are the client's half and the server's together. A page asks the person's authenticator to make a passkey or to sign a challenge (`std::host::create_passkey` and `use_passkey`, `@client`, §17.1). The host makes every passkey discoverable, asks for the person's verification each time and asks for no attestation, and offers ES256, Ed25519 and RS256; the program chooses the relying party, the account's handle and the challenge (from `std::crypto::random`), and names at most 64 credentials to exclude or allow (`MAX_CREDENTIALS`: more panics). The server checks what the authenticator answered with `std::webauthn` (WebAuthn Level 3, §7): `registration` gives the passkey's public key once the client's data (its type, challenge, origin, and that it wasn't made inside another site's frame) and the authenticator's data (the relying party's hash, the person present and verified, a backup only of a passkey eligible for one, the credential the browser named) pass; `assertion` gives the bytes the signature must cover once the same checks and the signature counter pass, for `std::crypto::verify`. A passkey's attestation is not checked.
+
+### 19.5 A server over HTTP
+
+A server build also answers HTTP requests to its page's own origin, so a page and its server share a first-party cookie, and the site's protections apply to the server's paths. The Cloudflare host serves them: `wrela build` writes it beside the server's module as `server/cloudflare.js`, with the Wrangler settings it needs in `server/cloudflare.json` (a Durable Object binding `WRELA_SERVER` of class `WrelaServer`, its SQLite migration, the module rule for `game.wasm`, a CPU limit, and `WRELA_ORIGINS` for the release to fill). The site's Worker exports `WrelaServer` and calls `api(request, env)` first in its `fetch`: it answers a request under `/api/` and gives `null` for any other.
+
+**A request is a short connection** (`std::http`). The events are the ones a room's connection gives (§17.2):
+
+1. `Event::Connection` opens connection `conn`: a request came.
+2. One `Event::Message` on `conn` carries the request. `std::http::request(conn, bytes)` reads it from its payload (`None` for bytes that aren't a request): its method, path, query, headers, body, and `time`, the host's wall clock in Unix milliseconds when it took the request.
+3. The program answers once, with `std::http::respond(conn, response)`, a status (100 to 599), headers and a body. The response is a command, carried out once the call's writes are committed, as `send` is (§19.4).
+4. The connection closes on a later call (`Event::Connection`, closed): when the response went, the client went away, or 30 s passed without a response (the client gets 504).
+
+A second response, a header a server can't set, and `send`, `close`, `tag`, `keep` or `compact` on this host fail the call as the program's. A response is one host request, at most 1 MiB less its headers, so a program pages a larger body.
+
+**What crosses is allowlisted** (`runtime/abi` `http`), so no address reaches a program:
+
+- A server sees `accept`, `accept-language`, `content-type`, `cookie`, `if-none-match`, `origin` and the `sec-fetch-*` headers, and the program's own (`x-wrela-*`). It never sees `cf-connecting-ip`, `x-forwarded-for`, `true-client-ip`, `x-real-ip`, `cf-ipcountry` or `user-agent`. Headers come in name order, a name's values joined.
+- It sets `cache-control`, `content-disposition`, `content-type`, `etag`, `last-modified`, `location`, `retry-after`, `set-cookie`, `vary`, `www-authenticate` and its own.
+- The host adds `cache-control: no-store` when the program sets none, `x-content-type-options: nosniff`, `referrer-policy: same-origin` and `content-security-policy: default-src 'none'`.
+- `std::http::session_cookie(name, value, max_age)` makes `__Host-<name>=<value>; Path=/; Max-Age=<s>; Secure; HttpOnly; SameSite=Strict`. A browser refuses a `__Host-` cookie without `Secure` and `Path=/`, or with a `Domain`.
+
+**Before the program runs,** `api` refuses what it can:
+
+- a method other than `GET`, `HEAD`, `POST`, `PUT`, `PATCH`, `DELETE` and `OPTIONS` (405);
+- any but `GET`, `HEAD` and `OPTIONS` whose `Origin` isn't one of `WRELA_ORIGINS`, or whose `Sec-Fetch-Site`, when sent, isn't `same-origin` (403);
+- a request past 1 MiB (413).
+
+The host logs no request.
+
+**The store and the calls.** One SQLite-backed Durable Object holds the store (the same table and order as `wrela-serve`'s `store.sqlite`) and runs the program's instance. The contract of §19.4 holds:
+
+- A read is answered on the next call, from what is committed.
+- A call's writes commit in one transaction when it returns, before its responses go.
+- A call that fails commits nothing.
+- The host calls again at once while a call's requests were answered, as `wrela-serve` does. With no request waiting, it goes on from the object's alarm, which also brings an evicted object back to `serve_init` and one call.
+
+**Where it differs from `wrela-serve`:**
+
+- **The instance's memory may go between any two requests:** when the object is evicted, a call fails, or a new build is deployed. Only the store lasts.
+- **A call has no deadline,** since JavaScript can't interrupt WASM it runs. Its bound is the Worker's CPU limit, past which the object resets.
+- **The memory cap (64 MiB) is checked after each call.**
+- **A failed call fails every request open on the instance,** with 500 for the program's own failure and 503 for the host's limits. The next request starts a fresh instance.
+- **Signatures and randomness come from WebCrypto.** Its Ed25519 doesn't promise `wrela-serve`'s refusal of small-order keys.
+
+**A client** asks its page's origin with `std::http::fetch(method, path, headers, body)` (`@client`, a host service, §17.1). The path is absolute (`/api/me`). The browser sends the origin's cookies, follows no redirect and caches nothing, and the request carries only `accept`, `content-type`, `if-none-match` and the program's own headers. Its answer, read with `std::http::response`, carries `cache-control`, `content-type`, `etag`, `location`, `retry-after` and the program's own headers, never `set-cookie`, which the browser keeps. The native host fails it: it has no origin.
 
 ## 20. The stdlib boundary
 
@@ -2676,10 +2723,11 @@ The compiler knows the language, a closed list of std items and its targets; the
 | `std::semantics` | A program's semantic tree, which a host shows as real elements: `Node`, `Role`, `Field`, `FieldKind`; `structure`, `geometry` and `clip`, the tree's bytes; `changes`, the part of the tree to send since `Sent`; `steps`, a slider's step from an `Assist`; `FieldState` and `read_field_state`, a field's text as the host has it (§17.2) |
 | `std::pack` | `Pack`: values in as few bits as they allow, read back exactly (§6.11) |
 | `std::net` | `Room`, `Log`, `Reduce`: a room's ordered log, delivered exactly once; the host's network commands: a client's `open`, `send` and `close`, and a server's `keep`, `compact`, `tag` and `serve_room` (§19) |
+| `std::http` | HTTP to the program's own origin: a server's `request` (`Request`, its `header` and `cookie`) and `respond` (`Response`, `text`, `json`, `bytes`, `session_cookie`); a client's `fetch` (`Header`) and `response` (§19.5) |
 | `std::store` | A server's store, which outlives its builds: `get` (`value`), `scan` (`entries`, `Entry`), `put`, `delete`; keys in order: `append_u32`, `append_u64`, `past` (§19.4) |
 | `std::crypto` | A server's randomness and signature checks: `random`, `verify` (`Signature`, `verified`), and keys in the forms it takes, `p256_key` and `rsa_key` (§19.4) |
 | `std::webauthn` | A server's checks of a passkey's ceremonies: `registration` (`Credential`), `assertion` (`Signed`), against what it `Expected`; `base64url` (§19.4) |
-| `std::time` | `now`, seconds on the host's clock, and `since`, to time work while the program runs; both are `nondet`, so not in `@deterministic` code, a constant or a test (§17.3). `phase(name)` marks a phase of the thread's work, which the host times and reports (`trace`); it is available everywhere except GPU, `@audio` and derived code |
+| `std::time` | `now`, seconds on the host's clock, and `since`, to time work while the program runs; both are `nondet`, so not in `@deterministic` code, a constant or a test (§17.3). `phase(name)` marks a phase of the thread's work, which the host times and reports (`trace`); it is available everywhere except GPU, `@audio` and derived code. A server's time of day: `wall_clock` (`unix_ms`) (§19.4) |
 | `std::lift` | A lifted build's literals: `Literal`, `count`, `literal`, their values, sources and files, `set`, `generation` and `Watch`; `gradient` by literals, and `reads`; the spec types `Checks`, `Loss` and `Report`; `Minimize`, which makes a function of some literals as small as it can (BFGS, then rounding to the literals' decimals) (§23.1, §23.6) |
 | `std::reload` | Hot reload: `keep` gives bytes to the build that replaces this one, and that build's `kept` returns them. One build hands its place to another with `prepare`, `unprepare` and `hand_over` (§15.4, §23.2) |
 | `std::job` | Work over several frames: `Job<f>`, a `@job fn` started and resumed to each `yield`, and `Step`, what a `resume` did (§16.3) |

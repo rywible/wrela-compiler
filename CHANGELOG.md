@@ -3,6 +3,23 @@
 Each release's changes a program or a tool can see. The pull request of each release holds the
 detail; `docs/release.md` says how a release is cut.
 
+## 0.13.0
+
+- **A server build runs on Cloudflare** (language.md §19.5): `wrela build` writes its host beside
+  `server/game.wasm`, `server/cloudflare.js` (a Durable Object, `WrelaServer`, and `api` for the
+  site's Worker) and `server/cloudflare.json` (the Wrangler settings it needs). One SQLite-backed
+  object holds the store, with §19.4's contract: reads on the next call, a call's writes in one
+  transaction before its responses, nothing of a failed call. Its signatures and randomness are
+  WebCrypto's.
+- **A server answers HTTP** (`std::http`): a request comes as a short connection, whose message
+  `request` reads (method, path, query, the headers a server may see, body, and the time of day),
+  and `respond` answers it once; `session_cookie` makes a `__Host-` cookie. The host passes only an
+  allowlist of headers, never an address, and refuses a request that changes something from
+  another origin before the program runs.
+- **A client asks its page's origin** with `std::http::fetch`, its cookies sent (the browser host).
+- **A server asks the time of day** (`std::time::wall_clock`, read with `unix_ms`), on
+  `wrela-serve` and on Cloudflare.
+
 ## 0.11.1
 
 - **An associated constant made with `&`, `|`, `^`, `<<` or `>>` folds** (language.md §3.4): a

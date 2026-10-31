@@ -100,7 +100,8 @@ fn a_server_only_program_builds_no_client() {
     let main = "pub fn serve(time: f32) {}\n";
     let files = files(&package("server-only", main));
     let paths: Vec<&str> = files.iter().map(|(p, _)| p.as_str()).collect();
-    assert_eq!(paths, ["server/game.wasm"]);
+    // The module, and the Cloudflare host beside it (language.md §19.5).
+    assert_eq!(paths, ["server/game.wasm", "server/cloudflare.js", "server/cloudflare.json"]);
     assert!(wrela_abi::read_pair(&files[0].1).is_some());
 }
 

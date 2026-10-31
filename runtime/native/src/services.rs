@@ -9,6 +9,8 @@
 //!   before anything it sent goes ([`crate::rooms`]), so a peer never sees an answer whose write
 //!   isn't kept.
 //! - **Randomness** (`crypto/random`): bytes from the operating system's generator.
+//! - **The time of day** (`time/unix`): the system clock's milliseconds since the Unix epoch,
+//!   eight bytes.
 //! - **Signatures** (`crypto/verify`): whether a signature is a key's over a message, by the
 //!   algorithms passkeys use: ES256 (ECDSA on P-256 with SHA-256), Ed25519 and RS256 (RSA
 //!   PKCS #1 v1.5 with SHA-256). The checks are the RustCrypto and dalek crates'; nothing here
@@ -74,6 +76,7 @@ impl Services {
             "store/get" => self.get(body),
             "store/scan" => self.scan(body),
             "crypto/random" => random(body),
+            "time/unix" => unix_ms(body).map(|ms| ms.to_le_bytes().to_vec()),
             "crypto/verify" => verify(body).map(|ok| vec![u8::from(ok)]),
             _ => Err(format!("this server has no service `{service}`")),
         }
@@ -213,6 +216,15 @@ fn key(body: &[u8]) -> Result<&[u8], String> {
         return Err(format!("a key is longer than {MAX_KEY} bytes"));
     }
     Ok(body)
+}
+
+/// `time/unix`: nothing → the system clock's milliseconds since the Unix epoch.
+fn unix_ms(body: &[u8]) -> Result<u64, String> {
+    Bytes(body).end()?;
+    let since = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_err(|_| "the system clock is before 1970".to_string())?;
+    Ok(since.as_millis() as u64)
 }
 
 /// `crypto/random`: how many bytes → that many from the operating system's generator.
@@ -447,6 +459,17 @@ mod tests {
         assert_eq!(a.len(), 16);
         assert_ne!(a, b, "two draws of 128 bits differ");
         assert!(random(&(MAX_RANDOM as u32 + 1).to_le_bytes()).is_err());
+    }
+
+    #[test]
+    fn the_time_of_day_is_eight_bytes_of_milliseconds() {
+        let d = dir("time");
+        let s = Services::open(&d.join("store.sqlite")).expect("open");
+        let answer = s.answer("time/unix", &[]).expect("the time");
+        let ms = u64::from_le_bytes(answer.try_into().expect("eight bytes"));
+        assert!(ms > 1_700_000_000_000, "after November 2023: {ms}");
+        assert!(s.answer("time/unix", &[0]).is_err(), "it takes no bytes");
+        let _ = std::fs::remove_dir_all(&d);
     }
 
     fn verify_body(alg: u8, key: &[u8], message: &[u8], sig: &[u8]) -> Vec<u8> {

@@ -1,0 +1,9 @@
+{
+  "//": "The host, its tests and its build scripts.",
+  "extends": "../browser/tsconfig.base.json",
+  "compilerOptions": {
+    "lib": ["ES2024", "DOM", "DOM.Iterable"],
+    "types": ["bun"]
+  },
+  "include": ["src", "test", "scripts"]
+}
