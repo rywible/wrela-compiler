@@ -80,6 +80,10 @@ test("prefetching fetches each URL at low priority until it is stopped", async (
   const many = ["stop", ...Array.from({ length: 20 }, (_, i) => `f${i}`)].map(n => `https://a.example/${n}`).join("\n");
   await prefetch(many, "https://console.example/", controller.signal, fetchFn);
   expect(seen.length).toBeLessThanOrEqual(3);
+  // A fragment is the opened program's, not the network's: the page is fetched without it.
+  seen.length = 0;
+  await prefetch("capybara/#attract", "https://console.example/", new AbortController().signal, fetchFn);
+  expect(seen.map(s => s.url)).toEqual(["https://console.example/capybara/"]);
   // A URL that isn't a secure, plain address is refused before anything is fetched.
   await expect(prefetch("javascript:alert(1)", "https://console.example/", new AbortController().signal, fetchFn)).rejects.toThrow();
 });
@@ -95,9 +99,13 @@ test("program URLs require a secure origin and reject credential and query injec
   const base = "https://games.wrela.dev/";
   expect(programUrl("https://last-green.games.wrela.dev/session/", base).origin).toBe("https://last-green.games.wrela.dev");
   expect(programUrl("http://127.0.0.1:8100/session/", base).hostname).toBe("127.0.0.1");
-  for (const url of ["javascript:alert(1)", "http://example.com/", "https://user:secret@example.com/", "https://example.com/?redirect=other", "https://example.com/#mode"]) {
+  for (const url of ["javascript:alert(1)", "http://example.com/", "https://user:secret@example.com/", "https://example.com/?redirect=other", "https://example.com/?#mode"]) {
     expect(() => programUrl(url, base)).toThrow();
   }
+  // A fragment is the program's to read, but never test mode, which only a page's own address asks for.
+  expect(programUrl("capybara/#attract", base).href).toBe("https://games.wrela.dev/capybara/#attract");
+  expect(programUrl("https://example.com/#mode", base).hash).toBe("#mode");
+  for (const url of ["capybara/#test", "http://127.0.0.1:8100/#test&frames=3"]) expect(() => programUrl(url, base)).toThrow("test mode");
   expect(wordAt(wordBytes(0xffff_fffe))).toBe(0xffff_fffe);
   expect(() => wordAt(new Uint8Array(3))).toThrow("missing");
 });
@@ -178,6 +186,50 @@ test("reloading an embedded program closes its surface and restores the console"
   }
 });
 
+
+test("a program opened at an address with a fragment reads it as its own address", async () => {
+  const oldWindow = Object.getOwnPropertyDescriptor(globalThis, "window");
+  const oldDocument = Object.getOwnPropertyDescriptor(globalThis, "document");
+  const oldLocation = Object.getOwnPropertyDescriptor(globalThis, "location");
+  const ports: MessagePort[] = [];
+  const frame = {
+    src: "",
+    style: {},
+    onload: null as (() => void) | null,
+    onerror: null as (() => void) | null,
+    contentWindow: {
+      postMessage: (_message: unknown, origin: string, transferred: MessagePort[]) => {
+        expect(origin).toBe("https://console.example");
+        ports.push(transferred[0]!);
+        transferred[0]!.postMessage({ type: "connected" });
+      },
+    },
+    remove: () => {},
+  };
+  Object.defineProperty(globalThis, "window", { configurable: true, value: { parent: {}, addEventListener: () => {} } });
+  Object.defineProperty(globalThis, "document", { configurable: true, value: {
+    baseURI: "https://console.example/",
+    createElement: () => frame,
+    body: { append: () => queueMicrotask(() => frame.onload?.()) },
+  } });
+  const canvas = { style: {}, tabIndex: -1, focus: () => {} } as HTMLCanvasElement;
+  const opener = new BrowserPlatform(canvas, () => {});
+  let opened: BrowserPlatform | null = null;
+  try {
+    await opener.request("surface/open", new TextEncoder().encode("capybara/#attract"));
+    expect(frame.src).toBe("https://console.example/capybara/#attract");
+    // In the frame, at that address: its own address keeps the fragment.
+    Object.defineProperty(globalThis, "location", { configurable: true, value: new URL(frame.src) });
+    opened = new BrowserPlatform(canvas, () => {});
+    expect(new TextDecoder().decode(await opened.request("nav/location", new Uint8Array()))).toBe("/capybara/#attract");
+  } finally {
+    opener.dispose(); opened?.dispose();
+    for (const port of ports) port.close();
+    if (oldWindow) Object.defineProperty(globalThis, "window", oldWindow); else Reflect.deleteProperty(globalThis, "window");
+    if (oldDocument) Object.defineProperty(globalThis, "document", oldDocument); else Reflect.deleteProperty(globalThis, "document");
+    if (oldLocation) Object.defineProperty(globalThis, "location", oldLocation); else Reflect.deleteProperty(globalThis, "location");
+  }
+});
 
 test("export filenames fit full session keys and reject traversal or truncation", () => {
   const body = (name: string) => { const text = new TextEncoder().encode(name); const b = new Uint8Array(4 + text.length); b.set(wordBytes(text.length)); b.set(text, 4); return b; };

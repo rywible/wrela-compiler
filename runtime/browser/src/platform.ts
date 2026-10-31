@@ -1,6 +1,7 @@
 // Application-host mechanisms. Services transport opaque bytes; the Wrela application
 // owns its catalog, UI, session protocol and save policy.
 import { httpFetch } from "./http.ts";
+import { asksForTest } from "./testmode.ts";
 import { glyph, type Paper } from "./glyph.ts";
 import type { Listener } from "./listen.ts";
 import type { Bytes } from "./stream.ts";
@@ -170,7 +171,9 @@ const PREFETCHES = 3;
  * response (`no-cors`) of a shader or a manifest is blocked, and the cache may keep requests
  * with and without credentials apart. */
 export async function prefetch(list: string, base: string, signal: AbortSignal, fetchFn: typeof fetch): Promise<Bytes> {
-  const urls = list.split("\n").map(line => line.trim()).filter(line => line !== "").map(line => programUrl(line, base));
+  const urls = list.split("\n").map(line => line.trim()).filter(line => line !== "").map(line => {
+    const url = programUrl(line, base); url.hash = ""; return url;
+  });
   let next = 0;
   const run = async () => {
     while (next < urls.length && !signal.aborted) {
@@ -272,9 +275,16 @@ export function shownName(body: Bytes): string | null {
   return name;
 }
 
+/** The address of a program to open (`surface/open`) or fetch ahead (`prefetch`), resolved against
+ * the page's `base`. A fragment is the opened program's to read (`host::address`): the browser
+ * fetches and caches its page without it, and its build's files resolve without it. A query
+ * would reach the server and key the cache, so it's refused, as credentials are, and so is a
+ * fragment that asks for test mode, which only a page's own address may. */
 export function programUrl(text: string, base: string): URL {
   const url = new URL(text, base);
-  if (url.username || url.password || url.hash || url.search) throw new Error("program URLs cannot contain credentials, queries or fragments");
+  // An empty query (`/?`) is still one: `search` is empty, but the request isn't the same.
+  if (url.username || url.password || url.href.split("#")[0]!.includes("?")) throw new Error("program URLs cannot contain credentials or queries");
+  if (asksForTest(url.hash)) throw new Error("a program URL cannot ask for test mode");
   if (url.protocol !== "https:" && !(url.protocol === "http:" && ["localhost", "127.0.0.1", "[::1]"].includes(url.hostname))) throw new Error("programs require HTTPS or loopback HTTP");
   return url;
 }
