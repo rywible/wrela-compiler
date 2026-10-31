@@ -20,6 +20,7 @@
 // path and query (each a `u32` length and UTF-8), the headers (a count, then each name and value),
 // and the body (a length and bytes); a response is `WHR1`, its status, its headers and its body.
 
+use std::abi::{HTTP_REQUEST_MAGIC, HTTP_RESPONSE_MAGIC}
 use std::host::request as host_request
 use std::io::Pending
 use std::serialize::{Reader, Writer}
@@ -136,7 +137,7 @@ pub fn bytes(status: u32, body: [u8], content_type: str) -> Response {
 /// none if they aren't one.
 pub fn request(conn: u32, bytes: [u8]) -> Option<Request> {
     var r = Reader::new(Vec::from(bytes))
-    if r.read_u32().ok()? != REQUEST_MAGIC {
+    if r.read_u32().ok()? != HTTP_REQUEST_MAGIC {
         return None
     }
     let time = r.read_u64().ok()?
@@ -208,7 +209,7 @@ pub fn fetch(method: str, path: str, headers: [Header], body: [u8]) -> Pending<u
         None => n,
     }
     var w = Writer::new()
-    w.write_u32(REQUEST_MAGIC)
+    w.write_u32(HTTP_REQUEST_MAGIC)
     w.write_u64(0)
     w.write_str(method)
     w.write_str(path.slice(0, cut))
@@ -225,7 +226,7 @@ pub fn fetch(method: str, path: str, headers: [Header], body: [u8]) -> Pending<u
 /// The response a `fetch` answered with, or none if the answer isn't one.
 pub fn response(answer: [u8]) -> Option<Response> {
     var r = Reader::new(Vec::from(answer))
-    if r.read_u32().ok()? != RESPONSE_MAGIC {
+    if r.read_u32().ok()? != HTTP_RESPONSE_MAGIC {
         return None
     }
     let status = r.read_u32().ok()?
@@ -236,10 +237,6 @@ pub fn response(answer: [u8]) -> Option<Response> {
     }
     Some(Response { status, headers, body })
 }
-
-/// `WHQ1` and `WHR1`, as little-endian words.
-const REQUEST_MAGIC: u32 = 827410519
-const RESPONSE_MAGIC: u32 = 827476055
 
 fn read_headers(r: mut Reader) -> Option<Vec<Header>> {
     let n = r.read_u32().ok()?
@@ -257,7 +254,7 @@ fn read_headers(r: mut Reader) -> Option<Vec<Header>> {
 }
 
 fn write_response(w: mut Writer, response: Response) {
-    w.write_u32(RESPONSE_MAGIC)
+    w.write_u32(HTTP_RESPONSE_MAGIC)
     w.write_u32(response.status)
     w.write_u32(response.headers.len())
     for h in response.headers {
@@ -272,7 +269,7 @@ fn write_response(w: mut Writer, response: Response) {
 @test
 fn a_request_reads_its_headers_and_cookies() {
     var w = Writer::new()
-    w.write_u32(REQUEST_MAGIC)
+    w.write_u32(HTTP_REQUEST_MAGIC)
     w.write_u64(1793404800123)
     w.write_str("POST")
     w.write_str("/api/sign-in")

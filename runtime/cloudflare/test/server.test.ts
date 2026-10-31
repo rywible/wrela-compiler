@@ -11,7 +11,12 @@ import { decodeResponse, encodeRequest, Server, type Storage } from "../src/host
 function storage(): Storage {
   const db = new Database(":memory:");
   return {
-    sql: { exec: (q: string, ...b: unknown[]) => ({ toArray: () => db.query(q).all(...(b as never[])) as Record<string, unknown>[] }) },
+    sql: {
+      exec: (q: string, ...b: unknown[]) => {
+        const rows = db.query(q).all(...(b as never[])) as Record<string, unknown>[];
+        return Object.assign(rows[Symbol.iterator](), { toArray: () => rows });
+      },
+    },
     transactionSync: <T>(fn: () => T): T => db.transaction(fn)(),
   };
 }

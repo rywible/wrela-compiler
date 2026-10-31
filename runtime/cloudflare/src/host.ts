@@ -22,9 +22,7 @@
 // lines when asked for, are all that reach the log.
 
 import {
-  CLIENT_SEES,
   EVENT_SIZE,
-  EventKind,
   EXPORT_MEMORY,
   IMPORT_CLOCK,
   IMPORT_INPUT,
@@ -36,21 +34,17 @@ import {
   IMPORT_REQUEST_STATUS,
   IMPORT_REQUEST_TAKE,
   IMPORT_SUBMIT,
-  OWN_HEADER_PREFIX,
-  PANIC,
-  PANIC_CAP,
-  PAYLOAD_PER_CALL,
   REQUEST_FAILED,
   REQUEST_PENDING,
   RESPOND_WITHIN_MS,
-  SERVER_SETS,
   SERVICE_RESPOND,
   SERVICE_TIME,
-  THREAD_BLOCK_SIZE,
-  THREAD_BLOCKS,
   THREAD_MAIN,
 } from "../../browser/src/abi.gen.ts";
-import { decodeResponse, encodeResponse, type HttpResponse } from "../../browser/src/http.ts";
+import { decodeResponse, encodeResponse, type Header, type HttpResponse, In, Out, setByServer } from "../../browser/src/http.ts";
+import { connectionEvent } from "../../browser/src/input.ts";
+import { Inbox } from "../../browser/src/net.ts";
+import { takePanicMessage } from "../../browser/src/imports.ts";
 import { decode } from "../../browser/src/stream.ts";
 
 /** A server build's exports. */
@@ -75,8 +69,8 @@ export interface Limits {
 
 export const LIMITS: Limits = { memory: 64 << 20, commands: 16 << 20, turn: 250 };
 
-/** The rows of a query, as `ctx.storage.sql.exec` gives them. */
-export interface Cursor {
+/** The rows of a query, as `ctx.storage.sql.exec` gives them, one at a time. */
+export interface Cursor extends Iterable<Record<string, unknown>> {
   toArray(): Record<string, unknown>[];
 }
 
@@ -108,92 +102,9 @@ export class Failure extends Error {
   }
 }
 
-// ---- bytes -----------------------------------------------------------------------------------
-
-const UTF8 = new TextDecoder("utf-8", { fatal: true });
-const ENCODER = new TextEncoder();
-
-/** Bytes read from the front, as `wrela_host::services::Bytes`. */
-export class Bytes {
-  at = 0;
-  readonly view: DataView;
-  constructor(readonly bytes: Uint8Array) {
-    this.view = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
-  }
-  left(): number {
-    return this.bytes.length - this.at;
-  }
-  take(n: number): Uint8Array {
-    if (this.left() < n) throw new Error("a service's bytes end early");
-    const out = this.bytes.subarray(this.at, this.at + n);
-    this.at += n;
-    return out;
-  }
-  byte(): number {
-    return this.take(1)[0]!;
-  }
-  word(): number {
-    const w = this.view.getUint32(this.take(4).byteOffset - this.bytes.byteOffset, true);
-    return w;
-  }
-  u64(): bigint {
-    const at = this.take(8).byteOffset - this.bytes.byteOffset;
-    return this.view.getBigUint64(at, true);
-  }
-  chunk(): Uint8Array {
-    return this.take(this.word());
-  }
-  text(): string {
-    return UTF8.decode(this.chunk());
-  }
-  end(): void {
-    if (this.left() !== 0) throw new Error("a service's bytes go on past their end");
-  }
-}
-
-/** Bytes being written, little-endian. */
-export class Out {
-  parts: Uint8Array[] = [];
-  length = 0;
-  push(b: Uint8Array): this {
-    this.parts.push(b);
-    this.length += b.length;
-    return this;
-  }
-  word(x: number): this {
-    const b = new Uint8Array(4);
-    new DataView(b.buffer).setUint32(0, x, true);
-    return this.push(b);
-  }
-  u64(x: bigint): this {
-    const b = new Uint8Array(8);
-    new DataView(b.buffer).setBigUint64(0, x, true);
-    return this.push(b);
-  }
-  chunk(b: Uint8Array): this {
-    return this.word(b.length).push(b);
-  }
-  text(s: string): this {
-    return this.chunk(ENCODER.encode(s));
-  }
-  bytes(): Uint8Array {
-    const out = new Uint8Array(this.length);
-    let at = 0;
-    for (const p of this.parts) {
-      out.set(p, at);
-      at += p.length;
-    }
-    return out;
-  }
-}
-
 // ---- HTTP's bytes (runtime/abi `http`) ----------------------------------------------------------
 
 export { decodeRequest, decodeResponse, encodeRequest, encodeResponse, type Header, type HttpRequest, type HttpResponse } from "../../browser/src/http.ts";
-
-const listed = (list: readonly string[], name: string) => name.startsWith(OWN_HEADER_PREFIX) || list.includes(name);
-export const setByServer = (name: string) => listed(SERVER_SETS, name);
-export const seenByClient = (name: string) => listed(CLIENT_SEES, name);
 
 /** A header a program wrote is a token in lower case, and its value has no line break or NUL. */
 const HEADER_NAME = /^[a-z0-9!#$%&'*+.^_`|~-]+$/;
@@ -210,12 +121,19 @@ export function checkResponse(bytes: Uint8Array): HttpResponse {
   return s;
 }
 
+/** The headers the host gives every response it sends, the program's and its own. */
+export const HOST_HEADERS: readonly Header[] = [
+  ["x-content-type-options", "nosniff"],
+  ["referrer-policy", "same-origin"],
+  ["content-security-policy", "default-src 'none'"],
+];
+
 /** What the host adds to every response: nothing of the API is a page, and nothing is cached
  * unless the program says so. */
 export function withHostHeaders(s: HttpResponse): HttpResponse {
   const headers = [...s.headers];
   if (!headers.some(([n]) => n === "cache-control")) headers.push(["cache-control", "no-store"]);
-  headers.push(["x-content-type-options", "nosniff"], ["referrer-policy", "same-origin"], ["content-security-policy", "default-src 'none'"]);
+  headers.push(...HOST_HEADERS);
   return { ...s, headers };
 }
 
@@ -244,12 +162,12 @@ export class Store {
   /** `store/scan`: entries with `from <= key < to` (an empty `to`: no end), at most `limit`, up
    * or down, after their count; it stops early past `MAX_SCAN` bytes. */
   scan(body: Uint8Array): Uint8Array {
-    const r = new Bytes(body);
+    const r = new In(body);
     const from = r.chunk();
     const to = r.chunk();
     const limit = r.word();
     const down = r.byte() === 1;
-    r.end();
+    r.end("service");
     if (from.length > MAX_KEY || to.length > MAX_KEY) throw new Error(`a key is longer than ${MAX_KEY} bytes`);
     const order = down ? "DESC" : "ASC";
     const rows =
@@ -259,7 +177,8 @@ export class Store {
     const out = new Out();
     let count = 0;
     let bytes = 0;
-    for (const row of rows.toArray()) {
+    // Read row by row: a scan stops at its bytes, whatever its limit.
+    for (const row of rows) {
       const k = asBytes(row["key"]);
       const v = asBytes(row["value"]);
       bytes += k.length + v.length;
@@ -275,7 +194,7 @@ export class Store {
   commit(batches: Uint8Array[]): void {
     const ops: [Uint8Array, Uint8Array | null][] = [];
     for (const b of batches) {
-      const r = new Bytes(b);
+      const r = new In(b);
       while (r.left() > 0) {
         const kind = r.byte();
         const k = r.chunk();
@@ -305,9 +224,9 @@ export class Store {
 
 /** `crypto/random`: how many bytes → that many from the runtime's generator. */
 export function random(body: Uint8Array): Uint8Array {
-  const r = new Bytes(body);
+  const r = new In(body);
   const n = r.word();
-  r.end();
+  r.end("service");
   if (n > MAX_RANDOM) throw new Error(`more than ${MAX_RANDOM} random bytes at once`);
   return crypto.getRandomValues(new Uint8Array(n));
 }
@@ -354,12 +273,12 @@ const unsigned = (b: Uint8Array): Uint8Array => {
  * → 1 if the signature is the key's over the message, else 0. A key the algorithm can't import
  * fails the request; a malformed signature is simply not the key's. */
 export async function verify(body: Uint8Array): Promise<Uint8Array> {
-  const r = new Bytes(body);
+  const r = new In(body);
   const alg = r.byte();
   const key = r.chunk().slice() as Uint8Array<ArrayBuffer>;
   const message = r.chunk().slice() as Uint8Array<ArrayBuffer>;
   const signature = r.chunk().slice() as Uint8Array<ArrayBuffer>;
-  r.end();
+  r.end("service");
   const answer = (ok: boolean) => new Uint8Array([ok ? 1 : 0]);
   const imported = async (format: "raw" | "jwk", data: Uint8Array | JsonWebKey, algorithm: AlgorithmIdentifier | EcKeyImportParams | RsaHashedImportParams) => {
     try {
@@ -384,10 +303,10 @@ export async function verify(body: Uint8Array): Promise<Uint8Array> {
       return answer(await crypto.subtle.verify({ name: "Ed25519" }, k, signature, message));
     }
     case 3: {
-      const kr = new Bytes(key);
+      const kr = new In(key);
       const n = unsigned(kr.chunk());
       const e = unsigned(kr.chunk());
-      kr.end();
+      kr.end("service");
       const jwk: JsonWebKey = { kty: "RSA", n: base64url(n), e: base64url(e), alg: "RS256", ext: true };
       const k = await imported("jwk", jwk, { name: "RSASSA-PKCS1-v1_5", hash: "SHA-256" });
       return answer(await crypto.subtle.verify({ name: "RSASSA-PKCS1-v1_5" }, k, signature, message));
@@ -399,18 +318,17 @@ export async function verify(body: Uint8Array): Promise<Uint8Array> {
 
 // ---- an instance ------------------------------------------------------------------------------
 
-/** An event waiting for the program, and a message's bytes. */
-interface Queued {
-  event: Uint8Array;
-  serial: number;
+/** What `f` answers, or null (a failed request) if it throws. */
+function now(f: () => Uint8Array): Uint8Array | null {
+  try {
+    return f();
+  } catch {
+    return null;
+  }
 }
 
-function event(kind: number, a: number, b: number, c: number, d: number): Uint8Array {
-  const out = new Uint8Array(EVENT_SIZE);
-  const v = new DataView(out.buffer);
-  for (const [i, w] of [kind, 0, a, b, c, d].entries()) v.setUint32(4 * i, w >>> 0, true);
-  return out;
-}
+/** A printed line's text, whatever its bytes. */
+const LINES = new TextDecoder();
 
 /** A call's command the host carries out after it returns. */
 type Command = { kind: "write"; body: Uint8Array } | { kind: "respond"; conn: number; response: HttpResponse };
@@ -431,7 +349,7 @@ class Instance {
 
   private constructor(
     readonly host: Server,
-    readonly instance: WebAssembly.Instance,
+    instance: WebAssembly.Instance,
   ) {
     const exports = instance.exports;
     const memory = exports[EXPORT_MEMORY];
@@ -485,21 +403,10 @@ class Instance {
     if (this.refused !== null) return new Failure(true, this.refused);
     if (e instanceof RangeError && /call stack/i.test(e.message)) return new Failure(false, "the call went deeper than the stack allows");
     if (e instanceof WebAssembly.RuntimeError) {
-      const panic = this.panicMessage();
+      const panic = takePanicMessage(this.memory, THREAD_MAIN);
       return new Failure(true, panic ?? e.message);
     }
     return new Failure(false, (e as Error)?.message ?? String(e));
-  }
-
-  /** The message a panic left in the main thread's block, cleared. */
-  private panicMessage(): string | null {
-    const at = THREAD_BLOCKS + THREAD_MAIN * THREAD_BLOCK_SIZE + PANIC;
-    if (at + 4 + PANIC_CAP > this.memory.buffer.byteLength) return null;
-    const view = new DataView(this.memory.buffer);
-    const n = Math.min(view.getUint32(at, true), PANIC_CAP);
-    if (n === 0) return null;
-    view.setUint32(at, 0, true);
-    return new TextDecoder().decode(new Uint8Array(this.memory.buffer, at + 4, n));
   }
 
   /** The host refuses what the program asked: `why` fails the call, as the program's (it
@@ -520,65 +427,6 @@ class Instance {
   }
 }
 
-/** The events the program hasn't read, and the bytes of the messages among them
- * (`wrela_abi::input::Queue`). */
-class Queue {
-  events: Queued[] = [];
-  payloads = new Map<number, Uint8Array>();
-  delivered: number[] = [];
-  serial = 0;
-  /** Whether events came since the last call: a call is due. */
-  fresh = false;
-
-  push(e: Uint8Array): void {
-    this.events.push({ event: e, serial: 0 });
-    this.fresh = true;
-  }
-
-  pushMessage(conn: number, bytes: Uint8Array): void {
-    const serial = ++this.serial;
-    this.events.push({ event: event(EventKind.Message, conn, serial >>> 0, Math.floor(serial / 2 ** 32), bytes.length), serial });
-    this.payloads.set(serial, bytes);
-    this.fresh = true;
-  }
-
-  /** Up to `cap` events, as bytes; messages stop once the call's bytes reach PAYLOAD_PER_CALL. */
-  take(cap: number): Uint8Array {
-    let given = this.delivered.reduce((n, s) => n + (this.payloads.get(s)?.length ?? 0), 0);
-    const out: Uint8Array[] = [];
-    while (out.length < cap && this.events.length > 0) {
-      const q = this.events[0]!;
-      if (q.serial !== 0) {
-        const len = this.payloads.get(q.serial)?.length ?? 0;
-        if (given !== 0 && given + len > PAYLOAD_PER_CALL) break;
-        given += len;
-        this.delivered.push(q.serial);
-      }
-      this.events.shift();
-      out.push(q.event);
-    }
-    const bytes = new Uint8Array(out.length * EVENT_SIZE);
-    out.forEach((e, i) => bytes.set(e, i * EVENT_SIZE));
-    return bytes;
-  }
-
-  payload(serial: number): Uint8Array | null {
-    return this.delivered.includes(serial) ? (this.payloads.get(serial) ?? null) : null;
-  }
-
-  endCall(): void {
-    for (const s of this.delivered) this.payloads.delete(s);
-    this.delivered = [];
-  }
-
-  clear(): void {
-    this.events = [];
-    this.payloads.clear();
-    this.delivered = [];
-    this.fresh = false;
-  }
-}
-
 /** A request waiting for its response. */
 interface Open {
   resolve: (response: Uint8Array) => void;
@@ -592,7 +440,9 @@ const POISONED = 2 ** 31;
 export class Server {
   readonly limits: Limits;
   readonly store: Store;
-  readonly queue = new Queue();
+  /** The events the program hasn't read, and whether any came since its last call. */
+  queue = new Inbox();
+  private fresh = false;
   private instance: Instance | null = null;
   private starting: Promise<Instance> | null = null;
   private readonly open = new Map<number, Open>();
@@ -600,9 +450,8 @@ export class Server {
   private readonly started: number;
   private lastClock = 0;
   private pumping = false;
-  private again = false;
-  /** Whether the last call's requests were answered: the next call should come. */
-  private answeredLast = false;
+  /** Whether the alarm asked for a call though nothing came. */
+  private woken = false;
   private readonly now: () => number;
 
   constructor(
@@ -624,8 +473,9 @@ export class Server {
       const timer = setTimeout(() => this.finish(conn, bare(504)), RESPOND_WITHIN_MS);
       this.open.set(conn, { resolve, timer });
     });
-    this.queue.push(event(EventKind.Connection, conn, 1, 0, 0));
+    this.queue.push(connectionEvent(conn, true));
     this.queue.pushMessage(conn, bytes);
+    this.fresh = true;
     void this.pump();
     return answer;
   }
@@ -633,36 +483,31 @@ export class Server {
   /** The object's alarm: the work that no request waits on. An object woken from eviction starts
    * its instance and calls it once, so a program that keeps its queue in the store goes on. */
   async alarm(): Promise<void> {
-    this.answeredLast = true;
+    this.woken = true;
     await this.pump();
   }
 
   /** Whether a call is due. */
   private due(): boolean {
-    return this.queue.fresh || this.answeredLast || (this.instance?.arriving.length ?? 0) > 0;
+    return this.fresh || this.woken || (this.instance?.arriving.length ?? 0) > 0;
   }
 
   /** Calls while a call is due: a turn at a time, yielding between calls. With no request open
    * past a turn's time, it leaves the rest to the alarm. */
   async pump(): Promise<void> {
-    if (this.pumping) {
-      this.again = true;
-      return;
-    }
+    // A pump under way sees what came since: it asks `due` after each call.
+    if (this.pumping) return;
     this.pumping = true;
     try {
       const began = this.now();
-      do {
-        this.again = false;
-        while (this.due()) {
-          await this.once();
-          if (this.open.size === 0 && this.due() && this.now() - began >= this.limits.turn) {
-            this.options.setAlarm?.(this.now());
-            return;
-          }
-          await new Promise((r) => setTimeout(r, 0));
+      while (this.due()) {
+        await this.once();
+        if (this.open.size === 0 && this.due() && this.now() - began >= this.limits.turn) {
+          this.options.setAlarm?.(this.now());
+          return;
         }
-      } while (this.again);
+        await new Promise((r) => setTimeout(r, 0));
+      }
     } finally {
       this.pumping = false;
     }
@@ -681,13 +526,13 @@ export class Server {
     const arrived = await Promise.all(instance.arriving.splice(0));
     for (const [id, answer] of arrived) instance.answered.set(id, answer);
     if (instance !== this.instance) return;
-    this.queue.fresh = false;
+    this.fresh = false;
+    this.woken = false;
     instance.commands = [];
     instance.commandBytes = 0;
     try {
       const time = Math.fround((this.now() - this.started) / 1000);
       instance.call(() => instance.serve(time));
-      this.answeredLast = instance.arriving.length > 0;
       this.carryOut(instance.commands);
     } catch (e) {
       this.fail(e);
@@ -727,7 +572,8 @@ export class Server {
     this.open.delete(conn);
     o.resolve(response);
     if (this.instance !== null) {
-      this.queue.push(event(EventKind.Connection, conn, 0, 0, 0));
+      this.queue.push(connectionEvent(conn, false));
+      this.fresh = true;
       void this.pump();
     }
   }
@@ -737,8 +583,9 @@ export class Server {
     const f = e instanceof Failure ? e : new Failure(false, String((e as Error)?.message ?? e));
     this.options.log?.(`wrela: the server's call failed: ${f.program ? "the program's: " : "the host's limits: "}${f.message}`);
     this.instance = null;
-    this.answeredLast = false;
-    this.queue.clear();
+    this.woken = false;
+    this.fresh = false;
+    this.queue = new Inbox();
     for (const conn of [...this.open.keys()]) this.finish(conn, bare(f.program ? 500 : 503));
   }
 
@@ -756,7 +603,7 @@ export class Server {
         }
         for (const c of commands) {
           if (c.op !== "HostRequest") self.refuse(`a server host can't carry out ${c.op}`);
-          host.submit(self, c.request, c.service, c.body.slice());
+          host.submit(self, c.request, c.service, c.body);
         }
       },
       [IMPORT_REQUEST_STATUS](id: number): number {
@@ -774,21 +621,20 @@ export class Server {
       },
       [IMPORT_LIMIT]: () => 0,
       [IMPORT_PRINT](at: number, len: number) {
-        const line = new TextDecoder().decode(me().read(at, len));
-        host.options.print?.(line);
+        const print = host.options.print;
+        if (print !== undefined) print(LINES.decode(me().read(at, len)));
       },
       [IMPORT_INPUT](at: number, cap: number): number {
         const self = me();
-        const n = Math.min(cap, host.queue.events.length);
-        if (at + n * EVENT_SIZE > self.memory.buffer.byteLength) self.refuse(`input(${at}, ${cap}) reaches past the end of the program's memory`);
-        const bytes = host.queue.take(cap);
-        self.write(at, bytes, `input(${at}, ${cap})`);
-        return bytes.length / EVENT_SIZE;
+        // A copy that doesn't fit fails the call, and its events go with its instance.
+        const events = host.queue.take(cap);
+        events.forEach((e, i) => self.write(at + i * EVENT_SIZE, e, `input(${at}, ${cap})`));
+        return events.length;
       },
       [IMPORT_PAYLOAD](lo: number, hi: number, at: number, cap: number): number {
         const self = me();
         const bytes = host.queue.payload((lo >>> 0) + (hi >>> 0) * 2 ** 32);
-        if (bytes === null) return -1;
+        if (bytes === undefined) return -1;
         self.write(at, bytes.subarray(0, Math.min(cap, bytes.length)), `payload(.., ${at}, ${cap})`);
         return bytes.length;
       },
@@ -838,33 +684,17 @@ export class Server {
       case "net/compact":
         return self.refuse(`\`${service}\`: an HTTP server's connections take one response (\`std::http::respond\`)`);
       case "store/get":
+        return answer(now(() => this.store.get(body)));
       case "store/scan":
+        return answer(now(() => this.store.scan(body)));
       case "crypto/random":
+        return answer(now(() => random(body)));
       case SERVICE_TIME:
-        try {
-          return answer(this.answerNow(service, body));
-        } catch {
-          return answer(null);
-        }
+        return answer(body.length === 0 ? new Out().u64(BigInt(Math.floor(this.now()))).bytes() : null);
       case "crypto/verify":
         return answer(verify(body).catch(() => null));
       default:
         return answer(null);
-    }
-  }
-
-  private answerNow(service: string, body: Uint8Array): Uint8Array {
-    switch (service) {
-      case "store/get":
-        return this.store.get(body);
-      case "store/scan":
-        return this.store.scan(body);
-      case "crypto/random":
-        return random(body);
-      default: {
-        if (body.length !== 0) throw new Error("`time/unix` takes no bytes");
-        return new Out().u64(BigInt(Math.floor(this.now()))).bytes();
-      }
     }
   }
 }

@@ -16,6 +16,7 @@ use std::abi::CLOCK
 use std::host::request
 use std::io::Pending
 use std::mem::{read, read_clock, thread_block}
+use std::serialize::Reader
 
 /// Seconds on the host's clock, which never goes back: for timing a phase of work, `let t =
 /// now()` before it and `since(t)` after.
@@ -73,11 +74,7 @@ pub fn unix_ms(answer: [u8]) -> Option<u64> {
     if answer.len() != 8 {
         return None
     }
-    var ms: u64 = 0
-    for k in 0..8 {
-        ms = ms | (u64(answer[k]) << (8 * k))
-    }
-    Some(ms)
+    Reader::new(Vec::from(answer)).read_u64().ok()
 }
 
 @intrinsic

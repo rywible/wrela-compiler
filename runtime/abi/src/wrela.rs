@@ -10,6 +10,16 @@ pub const WRELA_PATH: &str = "compiler/std/abi.wrela";
 /// Every `u32` std reads, each with its doc comment there.
 const NUMBERS: &[(&str, u32, &str)] = &[
     ("ALLOC_STATE", ALLOC_STATE, "The allocator's state: std's own words, from here on."),
+    (
+        "HTTP_REQUEST_MAGIC",
+        u32::from_le_bytes(crate::http::REQUEST_MAGIC),
+        "What an HTTP request's bytes start with (`std::http`), `WHQ1` as a little-endian word.",
+    ),
+    (
+        "HTTP_RESPONSE_MAGIC",
+        u32::from_le_bytes(crate::http::RESPONSE_MAGIC),
+        "What an HTTP response's bytes start with, `WHR1`.",
+    ),
     ("PAR_WAKE", PAR_WAKE, "Bumped whenever work appears: the helpers wait on it."),
     ("PAR_SHUTDOWN", PAR_SHUTDOWN, "Nonzero once the host wants its helpers to return."),
     ("PAR_HELPED", PAR_HELPED, "How many chunks the helpers have run, ever."),

@@ -5,7 +5,8 @@ import { Database } from "bun:sqlite";
 import { describe, expect, test } from "bun:test";
 import { readFileSync } from "node:fs";
 import { join } from "node:path";
-import { checkResponse, decodeRequest, decodeResponse, derToRaw, encodeRequest, encodeResponse, MAX_SCAN, Out, random, Store, verify } from "../src/host.ts";
+import { Out } from "../../browser/src/http.ts";
+import { checkResponse, decodeRequest, decodeResponse, derToRaw, encodeRequest, encodeResponse, MAX_SCAN, random, Store, verify } from "../src/host.ts";
 
 const hex = (s: string) => new Uint8Array((s.match(/../g) ?? []).map((b) => parseInt(b, 16)));
 const vectors = JSON.parse(readFileSync(join(import.meta.dir, "../../abi/vectors.json"), "utf8")).http;
@@ -16,7 +17,7 @@ function store(): [Store, Database] {
     sql: {
       exec(query: string, ...bindings: unknown[]) {
         const rows = db.query(query).all(...(bindings as never[])) as Record<string, unknown>[];
-        return { toArray: () => rows };
+        return Object.assign(rows[Symbol.iterator](), { toArray: () => rows });
       },
     },
     transactionSync: <T>(fn: () => T): T => db.transaction(fn)(),

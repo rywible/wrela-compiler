@@ -12,8 +12,9 @@
 // the address is a rate limit's key and nothing else.
 
 import { DurableObject } from "cloudflare:workers";
-import { HTTP_METHODS, MAX_HTTP_REQUEST, OWN_HEADER_PREFIX, SAFE_METHODS, SERVER_SEES } from "../../browser/src/abi.gen.ts";
-import { bare, decodeResponse, encodeRequest, type Header, Server } from "./host.ts";
+import { HTTP_METHODS, MAX_HTTP_REQUEST, SAFE_METHODS } from "../../browser/src/abi.gen.ts";
+import { Out, seenByServer } from "../../browser/src/http.ts";
+import { bare, decodeResponse, encodeRequest, type Header, HOST_HEADERS, Server } from "./host.ts";
 
 /** A Workers Rate Limiting binding (`ratelimits` in the Wrangler configuration). */
 export interface RateLimit {
@@ -62,11 +63,9 @@ export interface ApiOptions {
 /** The one object that holds the store and runs the program's HTTP instance. */
 export const SERVER_OBJECT = "server";
 
-const seen = (name: string) => name.startsWith(OWN_HEADER_PREFIX) || SERVER_SEES.includes(name);
-
-/** A response of the host's own, with no body. */
+/** A response of the host's own, with no body: its headers as any response of the API's. */
 function refusal(status: number, headers: Record<string, string> = {}): Response {
-  return new Response(null, { status, headers: { "cache-control": "no-store", ...headers } });
+  return new Response(null, { status, headers: [["cache-control", "no-store"], ...HOST_HEADERS, ...Object.entries(headers)] });
 }
 
 /** The body, at most `max` bytes: null if it's longer. */
@@ -74,26 +73,18 @@ async function bodyWithin(request: Request, max: number): Promise<Uint8Array | n
   const declared = request.headers.get("content-length");
   if (declared !== null && Number(declared) > max) return null;
   if (request.body === null) return new Uint8Array(0);
-  const parts: Uint8Array[] = [];
-  let length = 0;
+  const out = new Out();
   const reader = request.body.getReader();
   for (;;) {
     const { done, value } = await reader.read();
     if (done) break;
-    length += value.length;
-    if (length > max) {
+    if (out.length + value.length > max) {
       await reader.cancel();
       return null;
     }
-    parts.push(value);
+    out.push(value);
   }
-  const out = new Uint8Array(length);
-  let at = 0;
-  for (const p of parts) {
-    out.set(p, at);
-    at += p.length;
-  }
-  return out;
+  return out.bytes();
 }
 
 /** Whether a response may be kept for every client: a 200 that says `public` with a lifetime,
@@ -112,13 +103,18 @@ export function shareable(r: Response): boolean {
   );
 }
 
-/** The rate limits from `WRELA_LIMITS`; a malformed list is a configuration error. */
+/** The rate limits from `WRELA_LIMITS`, read once for each value it has; a malformed list is a
+ * configuration error. */
+let limitsRead: { text: string; list: Limit[] } | null = null;
 function limits(env: Env): Limit[] {
-  const list: unknown = JSON.parse(env.WRELA_LIMITS ?? "[]");
+  const text = env.WRELA_LIMITS ?? "[]";
+  if (limitsRead?.text === text) return limitsRead.list;
+  const list: unknown = JSON.parse(text);
   if (!Array.isArray(list) || !list.every((l) => typeof l?.binding === "string" && typeof l?.prefix === "string")) {
     throw new Error("WRELA_LIMITS isn't a list of { binding, prefix, methods?, period? }");
   }
-  return list as Limit[];
+  limitsRead = { text, list: list as Limit[] };
+  return limitsRead.list;
 }
 
 /** The first limit `method` on `path` is past, from this client's address: none if it's past
@@ -142,10 +138,10 @@ export async function api(request: Request, env: Env, options: ApiOptions = {}):
   if (!HTTP_METHODS.includes(method)) return refusal(405, { allow: HTTP_METHODS.join(", ") });
   const limited = await pastLimit(env, method, url.pathname, request.headers.get("cf-connecting-ip") ?? "unknown");
   if (limited !== null) return refusal(429, { "retry-after": String(limited.period ?? 60) });
-  const cache = options.cache ?? (globalThis as { caches?: { default?: ResponseCache } }).caches?.default;
-  // Keyed by the URL alone: a public answer is the same whoever asks.
-  const key = new Request(url.href, { method: "GET" });
-  if (method === "GET" && cache !== undefined) {
+  // A GET's public answer, kept by its URL alone: it's the same whoever asks.
+  const cache = method === "GET" ? (options.cache ?? (globalThis as { caches?: { default?: ResponseCache } }).caches?.default) : undefined;
+  const key = cache === undefined ? null : new Request(url.href, { method: "GET" });
+  if (cache !== undefined && key !== null) {
     const hit = await cache.match(key);
     if (hit !== undefined) return hit;
   }
@@ -159,7 +155,7 @@ export async function api(request: Request, env: Env, options: ApiOptions = {}):
   if (body === null) return refusal(413);
   // Headers iterate in name order, lower case, with a name's values joined.
   const headers: Header[] = [];
-  for (const [name, value] of request.headers) if (seen(name)) headers.push([name, value]);
+  for (const [name, value] of request.headers) if (seenByServer(name)) headers.push([name, value]);
   const bytes = encodeRequest({ time: BigInt(Date.now()), method, path: url.pathname, query: url.search.slice(1), headers, body });
   if (bytes.length > MAX_HTTP_REQUEST) return refusal(413);
   let answer: Uint8Array;
@@ -174,7 +170,7 @@ export async function api(request: Request, env: Env, options: ApiOptions = {}):
   for (const [n, v] of s.headers) out.append(n, v);
   const empty = method === "HEAD" || s.status === 204 || s.status === 304;
   const response = new Response(empty ? null : (s.body.slice() as Uint8Array<ArrayBuffer>), { status: s.status, headers: out });
-  if (method === "GET" && cache !== undefined && shareable(response)) {
+  if (cache !== undefined && key !== null && shareable(response)) {
     const kept = cache.put(key, response.clone());
     if (options.ctx !== undefined) options.ctx.waitUntil(kept);
     else await kept;
@@ -198,7 +194,7 @@ export function serverClass(module: WebAssembly.Module) {
 
     /** A request's bytes, answered with a response's (RPC from `api`). */
     async request(bytes: Uint8Array): Promise<Uint8Array> {
-      return this.server.request(new Uint8Array(bytes));
+      return this.server.request(bytes instanceof Uint8Array ? bytes : new Uint8Array(bytes));
     }
 
     async alarm(): Promise<void> {

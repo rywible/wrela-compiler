@@ -3,7 +3,7 @@
 // page's own origin, cookies sent, with only the headers a client may set, answered with the
 // response and only the headers a client may see.
 
-import { CLIENT_SEES, CLIENT_SETS, HTTP_METHODS, HTTP_REQUEST_MAGIC, HTTP_RESPONSE_MAGIC, OWN_HEADER_PREFIX } from "./abi.gen.ts";
+import { CLIENT_SEES, CLIENT_SETS, HTTP_METHODS, HTTP_REQUEST_MAGIC, HTTP_RESPONSE_MAGIC, OWN_HEADER_PREFIX, SERVER_SEES, SERVER_SETS } from "./abi.gen.ts";
 
 export type Header = [name: string, value: string];
 
@@ -26,8 +26,8 @@ export interface HttpResponse {
 const UTF8 = new TextDecoder("utf-8", { fatal: true });
 const ENCODER = new TextEncoder();
 
-/** HTTP's bytes, read from the front. */
-class In {
+/** HTTP's bytes, and a host service's, read from the front (little-endian). */
+export class In {
   at = 0;
   readonly view: DataView;
   constructor(readonly bytes: Uint8Array) {
@@ -40,6 +40,9 @@ class In {
     if (this.left() < n) throw new Error("the bytes end early");
     this.at += n;
     return this.bytes.subarray(this.at - n, this.at);
+  }
+  byte(): number {
+    return this.take(1)[0]!;
   }
   word(): number {
     this.take(4);
@@ -68,8 +71,8 @@ class In {
   }
 }
 
-/** HTTP's bytes, written. */
-class Out {
+/** HTTP's bytes, and a host service's, written (little-endian). */
+export class Out {
   parts: Uint8Array[] = [];
   length = 0;
   push(b: Uint8Array): this {
@@ -136,6 +139,12 @@ export function decodeResponse(bytes: Uint8Array): HttpResponse {
 }
 
 const listed = (list: readonly string[], name: string) => name.startsWith(OWN_HEADER_PREFIX) || list.includes(name);
+/** Whether a server sees request header `name` (lower case), sets response header `name`, and a
+ * client sets or sees it (runtime/abi `http`'s lists). */
+export const seenByServer = (name: string) => listed(SERVER_SEES, name);
+export const setByServer = (name: string) => listed(SERVER_SETS, name);
+export const setByClient = (name: string) => listed(CLIENT_SETS, name);
+export const seenByClient = (name: string) => listed(CLIENT_SEES, name);
 
 /** `http/fetch`: a request's bytes (`std::http::fetch`) → the response's. The path is absolute on
  * the page's origin, so nothing leaves it; a redirect isn't followed, and nothing is cached. */
@@ -145,7 +154,7 @@ export async function httpFetch(body: Uint8Array, origin: string, send: typeof f
   if (!q.path.startsWith("/") || q.path.startsWith("//")) throw new Error("a fetch's path is absolute on the page's origin");
   const headers = new Headers();
   for (const [n, v] of q.headers) {
-    if (!listed(CLIENT_SETS, n)) throw new Error(`a program can't set header \`${n}\``);
+    if (!setByClient(n)) throw new Error(`a program can't set header \`${n}\``);
     headers.append(n, v);
   }
   const url = new URL(q.path + (q.query === "" ? "" : `?${q.query}`), origin);
@@ -160,6 +169,6 @@ export async function httpFetch(body: Uint8Array, origin: string, send: typeof f
     cache: "no-store",
   });
   const seen: Header[] = [];
-  for (const [n, v] of r.headers) if (listed(CLIENT_SEES, n)) seen.push([n, v]);
+  for (const [n, v] of r.headers) if (seenByClient(n)) seen.push([n, v]);
   return encodeResponse({ status: r.status, headers: seen, body: new Uint8Array(await r.arrayBuffer()) });
 }

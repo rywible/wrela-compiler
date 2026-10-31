@@ -76,7 +76,7 @@ impl Services {
             "store/get" => self.get(body),
             "store/scan" => self.scan(body),
             "crypto/random" => random(body),
-            "time/unix" => unix_ms(body).map(|ms| ms.to_le_bytes().to_vec()),
+            wrela_abi::http::SERVICE_TIME => unix_ms(body).map(|ms| ms.to_le_bytes().to_vec()),
             "crypto/verify" => verify(body).map(|ok| vec![u8::from(ok)]),
             _ => Err(format!("this server has no service `{service}`")),
         }

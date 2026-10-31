@@ -108,6 +108,7 @@ var EventKind = {
   Connection: 14,
   Field: 15
 };
+var KEYS = ["Unknown", "KeyA", "KeyB", "KeyC", "KeyD", "KeyE", "KeyF", "KeyG", "KeyH", "KeyI", "KeyJ", "KeyK", "KeyL", "KeyM", "KeyN", "KeyO", "KeyP", "KeyQ", "KeyR", "KeyS", "KeyT", "KeyU", "KeyV", "KeyW", "KeyX", "KeyY", "KeyZ", "Digit0", "Digit1", "Digit2", "Digit3", "Digit4", "Digit5", "Digit6", "Digit7", "Digit8", "Digit9", "Enter", "Escape", "Backspace", "Tab", "Space", "ArrowLeft", "ArrowRight", "ArrowUp", "ArrowDown", "Home", "End", "PageUp", "PageDown", "Insert", "Delete", "ShiftLeft", "ShiftRight", "ControlLeft", "ControlRight", "AltLeft", "AltRight", "MetaLeft", "MetaRight", "CapsLock", "Minus", "Equal", "BracketLeft", "BracketRight", "Backslash", "Semicolon", "Quote", "Backquote", "Comma", "Period", "Slash", "F1", "F2", "F3", "F4", "F5", "F6", "F7", "F8", "F9", "F10", "F11", "F12", "NumpadEnter", "NumpadAdd", "NumpadSubtract", "NumpadMultiply", "NumpadDivide", "NumpadDecimal"];
 var THREAD_MAIN = 0;
 var THREAD_BLOCKS = 1114112;
 var THREAD_BLOCK_SIZE = 8192;
@@ -148,6 +149,9 @@ class In {
       throw new Error("the bytes end early");
     this.at += n;
     return this.bytes.subarray(this.at - n, this.at);
+  }
+  byte() {
+    return this.take(1)[0];
   }
   word() {
     this.take(4);
@@ -234,6 +238,197 @@ function decodeResponse(bytes) {
   const s = { status, headers: r.headers(), body: r.chunk() };
   r.end("response");
   return s;
+}
+var listed = (list, name) => name.startsWith(OWN_HEADER_PREFIX) || list.includes(name);
+var seenByServer = (name) => listed(SERVER_SEES, name);
+var setByServer = (name) => listed(SERVER_SETS, name);
+
+// ../browser/src/input.ts
+function encodeEvent(kind, modifiers, a, b, c, d) {
+  const out = new Uint8Array(EVENT_SIZE);
+  const view = new DataView(out.buffer);
+  [kind, modifiers, a, b, c, d].forEach((w, i) => view.setUint32(4 * i, w >>> 0, true));
+  return out;
+}
+var F32 = new Float32Array(1);
+var U32 = new Uint32Array(F32.buffer);
+var KEY_CODES = new Map(KEYS.map((k, i) => [k, i]));
+var messageEvent = (conn, serial, length) => encodeEvent(EventKind.Message, 0, conn, serial % 2 ** 32, Math.floor(serial / 2 ** 32), length);
+var connectionEvent = (conn, open) => encodeEvent(EventKind.Connection, 0, conn, open ? 1 : 0, 0, 0);
+function isNetwork(event) {
+  const kind = new DataView(event.buffer, event.byteOffset, 4).getUint32(0, true);
+  return kind === EventKind.Message || kind === EventKind.Connection;
+}
+var NO_EVENTS = Object.freeze({
+  events: new Uint8Array(0),
+  times: Object.freeze([])
+});
+
+class InputRing {
+  buffer;
+  static CAPACITY = 1024;
+  static SLOT = EVENT_SIZE + 8;
+  static HEADER = 16;
+  #counts;
+  #bytes;
+  #view;
+  constructor(buffer) {
+    this.buffer = buffer;
+    this.#counts = new Int32Array(buffer, 0, 4);
+    this.#bytes = new Uint8Array(buffer, InputRing.HEADER);
+    this.#view = new DataView(buffer, InputRing.HEADER);
+  }
+  static create() {
+    return new InputRing(new SharedArrayBuffer(InputRing.HEADER + InputRing.CAPACITY * InputRing.SLOT));
+  }
+  write(event, time) {
+    return this.writeAll([event], time);
+  }
+  writeAll(events, time) {
+    const written = Atomics.load(this.#counts, 0) >>> 0;
+    const slowest = (Atomics.load(this.#counts, 3) !== 0 ? Atomics.load(this.#counts, 2) : Atomics.load(this.#counts, 1)) >>> 0;
+    if ((written - slowest >>> 0) + events.length > InputRing.CAPACITY)
+      return false;
+    events.forEach((event, i) => {
+      const at = this.#slot(written + i);
+      this.#bytes.set(event, at);
+      this.#view.setFloat64(at + EVENT_SIZE, time, true);
+    });
+    Atomics.store(this.#counts, 0, written + events.length);
+    return true;
+  }
+  attachTicker() {
+    Atomics.store(this.#counts, 2, Atomics.load(this.#counts, 0));
+    Atomics.store(this.#counts, 3, 1);
+  }
+  detachTicker() {
+    Atomics.store(this.#counts, 3, 0);
+  }
+  read() {
+    const written = Atomics.load(this.#counts, 0) >>> 0;
+    let read = Atomics.load(this.#counts, 1) >>> 0;
+    const room = InputRing.CAPACITY - (Atomics.load(this.#counts, 3) !== 0 ? 64 : 0);
+    if (written - read >>> 0 > room)
+      read = written - room >>> 0;
+    const n = written - read >>> 0;
+    if (n === 0)
+      return NO_EVENTS;
+    const events = new Uint8Array(n * EVENT_SIZE);
+    this.#copy(read, n, events, 0);
+    const times = Array.from({ length: n }, (_, i) => this.#view.getFloat64(this.#slot(read + i) + EVENT_SIZE, true));
+    Atomics.store(this.#counts, 1, read + n);
+    return { events, times };
+  }
+  readTicker(out, at, cap) {
+    const read = Atomics.load(this.#counts, 2) >>> 0;
+    const n = Math.min((Atomics.load(this.#counts, 0) >>> 0) - read >>> 0, cap);
+    this.#copy(read, n, out, at);
+    Atomics.store(this.#counts, 2, read + n);
+    return n;
+  }
+  #slot(i) {
+    return i % InputRing.CAPACITY * InputRing.SLOT;
+  }
+  #copy(from, n, out, at) {
+    for (let i = 0;i < n; i++) {
+      const slot = this.#slot(from + i);
+      out.set(this.#bytes.subarray(slot, slot + EVENT_SIZE), at + i * EVENT_SIZE);
+    }
+  }
+}
+
+// ../browser/src/net.ts
+var MAX_FRAME = 64 * 1024;
+var MAX_UP = MAX_FRAME - 64;
+var OVERHEAD = 64;
+var HELD = 16 << 20;
+var PENDING = 1 << 20;
+
+class Inbox {
+  #events = [];
+  #payloads = new Map;
+  #delivered = [];
+  #serial = 0;
+  #held = 0;
+  #pair = undefined;
+  push(event) {
+    this.#events.push(event);
+  }
+  pushMessage(conn, bytes) {
+    const serial = ++this.#serial;
+    this.#events.push(messageEvent(conn, serial, bytes.length));
+    this.#payloads.set(serial, bytes);
+    this.#held += bytes.length + OVERHEAD;
+    return serial;
+  }
+  get held() {
+    return this.#held;
+  }
+  get length() {
+    return this.#events.length;
+  }
+  get events() {
+    return this.#events;
+  }
+  take(cap) {
+    let given = 0;
+    for (const s of this.#delivered)
+      given += this.#payloads.get(s)?.length ?? 0;
+    let n = 0;
+    for (;n < cap && n < this.#events.length; n++) {
+      const view = new DataView(this.#events[n].buffer, this.#events[n].byteOffset, EVENT_SIZE);
+      if (view.getUint32(0, true) !== EventKind.Message)
+        continue;
+      const length = view.getUint32(20, true);
+      if (given > 0 && given + length > PAYLOAD_PER_CALL)
+        break;
+      given += length;
+      this.#delivered.push(view.getUint32(12, true) + view.getUint32(16, true) * 2 ** 32);
+    }
+    return this.#events.splice(0, n);
+  }
+  payload(serial) {
+    return this.#delivered.includes(serial) ? this.#payloads.get(serial) : undefined;
+  }
+  endCall() {
+    for (const s of this.#delivered)
+      this.#drop(s);
+    this.#delivered = [];
+  }
+  #drop(serial) {
+    const bytes = this.#payloads.get(serial);
+    if (bytes === undefined)
+      return;
+    this.#held -= bytes.length + OVERHEAD;
+    this.#payloads.delete(serial);
+  }
+  forBuild(pair) {
+    const changed = this.#pair !== undefined && this.#pair !== pair;
+    if (changed) {
+      for (let i = this.#events.length - 1;i >= 0; i--)
+        if (isNetwork(this.#events[i]))
+          this.#events.splice(i, 1);
+      this.#delivered = [];
+      this.#payloads.clear();
+      this.#held = 0;
+    }
+    this.#pair = pair;
+    return changed;
+  }
+}
+
+// ../browser/src/imports.ts
+function takePanicMessage(memory, thread) {
+  const at = THREAD_BLOCKS + thread * THREAD_BLOCK_SIZE + PANIC;
+  if (at + 4 + PANIC_CAP > memory.buffer.byteLength)
+    return null;
+  const view = new DataView(memory.buffer);
+  const count = Math.min(view.getUint32(at, true), PANIC_CAP);
+  if (count === 0)
+    return null;
+  const bytes = new Uint8Array(memory.buffer, at + 4, count).slice();
+  view.setUint32(at, 0, true);
+  return new TextDecoder().decode(bytes);
 }
 
 // ../browser/src/wasm.ts
@@ -673,86 +868,6 @@ class Failure extends Error {
     this.program = program;
   }
 }
-var UTF83 = new TextDecoder("utf-8", { fatal: true });
-var ENCODER2 = new TextEncoder;
-
-class Bytes {
-  bytes;
-  at = 0;
-  view;
-  constructor(bytes) {
-    this.bytes = bytes;
-    this.view = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
-  }
-  left() {
-    return this.bytes.length - this.at;
-  }
-  take(n) {
-    if (this.left() < n)
-      throw new Error("a service's bytes end early");
-    const out = this.bytes.subarray(this.at, this.at + n);
-    this.at += n;
-    return out;
-  }
-  byte() {
-    return this.take(1)[0];
-  }
-  word() {
-    const w = this.view.getUint32(this.take(4).byteOffset - this.bytes.byteOffset, true);
-    return w;
-  }
-  u64() {
-    const at = this.take(8).byteOffset - this.bytes.byteOffset;
-    return this.view.getBigUint64(at, true);
-  }
-  chunk() {
-    return this.take(this.word());
-  }
-  text() {
-    return UTF83.decode(this.chunk());
-  }
-  end() {
-    if (this.left() !== 0)
-      throw new Error("a service's bytes go on past their end");
-  }
-}
-
-class Out2 {
-  parts = [];
-  length = 0;
-  push(b) {
-    this.parts.push(b);
-    this.length += b.length;
-    return this;
-  }
-  word(x) {
-    const b = new Uint8Array(4);
-    new DataView(b.buffer).setUint32(0, x, true);
-    return this.push(b);
-  }
-  u64(x) {
-    const b = new Uint8Array(8);
-    new DataView(b.buffer).setBigUint64(0, x, true);
-    return this.push(b);
-  }
-  chunk(b) {
-    return this.word(b.length).push(b);
-  }
-  text(s) {
-    return this.chunk(ENCODER2.encode(s));
-  }
-  bytes() {
-    const out = new Uint8Array(this.length);
-    let at = 0;
-    for (const p of this.parts) {
-      out.set(p, at);
-      at += p.length;
-    }
-    return out;
-  }
-}
-var listed = (list, name) => name.startsWith(OWN_HEADER_PREFIX) || list.includes(name);
-var setByServer = (name) => listed(SERVER_SETS, name);
 var HEADER_NAME = /^[a-z0-9!#$%&'*+.^_`|~-]+$/;
 var HEADER_VALUE = /^[^\r\n\0]*$/;
 function checkResponse(bytes) {
@@ -767,11 +882,16 @@ function checkResponse(bytes) {
   }
   return s;
 }
+var HOST_HEADERS = [
+  ["x-content-type-options", "nosniff"],
+  ["referrer-policy", "same-origin"],
+  ["content-security-policy", "default-src 'none'"]
+];
 function withHostHeaders(s) {
   const headers = [...s.headers];
   if (!headers.some(([n]) => n === "cache-control"))
     headers.push(["cache-control", "no-store"]);
-  headers.push(["x-content-type-options", "nosniff"], ["referrer-policy", "same-origin"], ["content-security-policy", "default-src 'none'"]);
+  headers.push(...HOST_HEADERS);
   return { ...s, headers };
 }
 var bare = (status) => encodeResponse(withHostHeaders({ status, headers: [], body: new Uint8Array(0) }));
@@ -789,23 +909,23 @@ class Store {
     const rows = this.storage.sql.exec("SELECT value FROM kv WHERE key = ?", body).toArray();
     if (rows.length === 0)
       return new Uint8Array([0]);
-    return new Out2().push(new Uint8Array([1])).push(asBytes(rows[0]["value"])).bytes();
+    return new Out().push(new Uint8Array([1])).push(asBytes(rows[0]["value"])).bytes();
   }
   scan(body) {
-    const r = new Bytes(body);
+    const r = new In(body);
     const from = r.chunk();
     const to = r.chunk();
     const limit = r.word();
     const down = r.byte() === 1;
-    r.end();
+    r.end("service");
     if (from.length > MAX_KEY || to.length > MAX_KEY)
       throw new Error(`a key is longer than ${MAX_KEY} bytes`);
     const order = down ? "DESC" : "ASC";
     const rows = to.length === 0 ? this.storage.sql.exec(`SELECT key, value FROM kv WHERE key >= ? ORDER BY key ${order} LIMIT ?`, from, limit) : this.storage.sql.exec(`SELECT key, value FROM kv WHERE key >= ? AND key < ? ORDER BY key ${order} LIMIT ?`, from, to, limit);
-    const out = new Out2;
+    const out = new Out;
     let count = 0;
     let bytes = 0;
-    for (const row of rows.toArray()) {
+    for (const row of rows) {
       const k = asBytes(row["key"]);
       const v = asBytes(row["value"]);
       bytes += k.length + v.length;
@@ -814,12 +934,12 @@ class Store {
       out.chunk(k).chunk(v);
       count++;
     }
-    return new Out2().word(count).push(out.bytes()).bytes();
+    return new Out().word(count).push(out.bytes()).bytes();
   }
   commit(batches) {
     const ops = [];
     for (const b of batches) {
-      const r = new Bytes(b);
+      const r = new In(b);
       while (r.left() > 0) {
         const kind = r.byte();
         const k = r.chunk();
@@ -850,9 +970,9 @@ class Store {
   }
 }
 function random(body) {
-  const r = new Bytes(body);
+  const r = new In(body);
   const n = r.word();
-  r.end();
+  r.end("service");
   if (n > MAX_RANDOM)
     throw new Error(`more than ${MAX_RANDOM} random bytes at once`);
   return crypto.getRandomValues(new Uint8Array(n));
@@ -897,12 +1017,12 @@ var unsigned = (b) => {
   return b.subarray(i);
 };
 async function verify(body) {
-  const r = new Bytes(body);
+  const r = new In(body);
   const alg = r.byte();
   const key = r.chunk().slice();
   const message = r.chunk().slice();
   const signature = r.chunk().slice();
-  r.end();
+  r.end("service");
   const answer = (ok) => new Uint8Array([ok ? 1 : 0]);
   const imported = async (format, data, algorithm) => {
     try {
@@ -928,10 +1048,10 @@ async function verify(body) {
       return answer(await crypto.subtle.verify({ name: "Ed25519" }, k, signature, message));
     }
     case 3: {
-      const kr = new Bytes(key);
+      const kr = new In(key);
       const n = unsigned(kr.chunk());
       const e = unsigned(kr.chunk());
-      kr.end();
+      kr.end("service");
       const jwk = { kty: "RSA", n: base64url(n), e: base64url(e), alg: "RS256", ext: true };
       const k = await imported("jwk", jwk, { name: "RSASSA-PKCS1-v1_5", hash: "SHA-256" });
       return answer(await crypto.subtle.verify({ name: "RSASSA-PKCS1-v1_5" }, k, signature, message));
@@ -940,17 +1060,17 @@ async function verify(body) {
       throw new Error(`no signature algorithm ${alg}`);
   }
 }
-function event(kind, a, b, c, d) {
-  const out = new Uint8Array(EVENT_SIZE);
-  const v = new DataView(out.buffer);
-  for (const [i, w] of [kind, 0, a, b, c, d].entries())
-    v.setUint32(4 * i, w >>> 0, true);
-  return out;
+function now(f) {
+  try {
+    return f();
+  } catch {
+    return null;
+  }
 }
+var LINES = new TextDecoder;
 
 class Instance {
   host;
-  instance;
   memory;
   serve;
   answered = new Map;
@@ -961,7 +1081,6 @@ class Instance {
   responding = new Set;
   constructor(host, instance) {
     this.host = host;
-    this.instance = instance;
     const exports = instance.exports;
     const memory = exports[EXPORT_MEMORY];
     if (!(memory instanceof WebAssembly.Memory))
@@ -1017,21 +1136,10 @@ class Instance {
     if (e instanceof RangeError && /call stack/i.test(e.message))
       return new Failure(false, "the call went deeper than the stack allows");
     if (e instanceof WebAssembly.RuntimeError) {
-      const panic = this.panicMessage();
+      const panic = takePanicMessage(this.memory, THREAD_MAIN);
       return new Failure(true, panic ?? e.message);
     }
     return new Failure(false, e?.message ?? String(e));
-  }
-  panicMessage() {
-    const at = THREAD_BLOCKS + THREAD_MAIN * THREAD_BLOCK_SIZE + PANIC;
-    if (at + 4 + PANIC_CAP > this.memory.buffer.byteLength)
-      return null;
-    const view = new DataView(this.memory.buffer);
-    const n = Math.min(view.getUint32(at, true), PANIC_CAP);
-    if (n === 0)
-      return null;
-    view.setUint32(at, 0, true);
-    return new TextDecoder().decode(new Uint8Array(this.memory.buffer, at + 4, n));
   }
   refuse(why, limit = false) {
     this.refused = why;
@@ -1048,57 +1156,6 @@ class Instance {
     new Uint8Array(this.memory.buffer, at, bytes.length).set(bytes);
   }
 }
-
-class Queue {
-  events = [];
-  payloads = new Map;
-  delivered = [];
-  serial = 0;
-  fresh = false;
-  push(e) {
-    this.events.push({ event: e, serial: 0 });
-    this.fresh = true;
-  }
-  pushMessage(conn, bytes) {
-    const serial = ++this.serial;
-    this.events.push({ event: event(EventKind.Message, conn, serial >>> 0, Math.floor(serial / 2 ** 32), bytes.length), serial });
-    this.payloads.set(serial, bytes);
-    this.fresh = true;
-  }
-  take(cap) {
-    let given = this.delivered.reduce((n, s) => n + (this.payloads.get(s)?.length ?? 0), 0);
-    const out = [];
-    while (out.length < cap && this.events.length > 0) {
-      const q = this.events[0];
-      if (q.serial !== 0) {
-        const len = this.payloads.get(q.serial)?.length ?? 0;
-        if (given !== 0 && given + len > PAYLOAD_PER_CALL)
-          break;
-        given += len;
-        this.delivered.push(q.serial);
-      }
-      this.events.shift();
-      out.push(q.event);
-    }
-    const bytes = new Uint8Array(out.length * EVENT_SIZE);
-    out.forEach((e, i) => bytes.set(e, i * EVENT_SIZE));
-    return bytes;
-  }
-  payload(serial) {
-    return this.delivered.includes(serial) ? this.payloads.get(serial) ?? null : null;
-  }
-  endCall() {
-    for (const s of this.delivered)
-      this.payloads.delete(s);
-    this.delivered = [];
-  }
-  clear() {
-    this.events = [];
-    this.payloads.clear();
-    this.delivered = [];
-    this.fresh = false;
-  }
-}
 var POISONED = 2 ** 31;
 
 class Server {
@@ -1106,7 +1163,8 @@ class Server {
   options;
   limits;
   store;
-  queue = new Queue;
+  queue = new Inbox;
+  fresh = false;
   instance = null;
   starting = null;
   open = new Map;
@@ -1114,8 +1172,7 @@ class Server {
   started;
   lastClock = 0;
   pumping = false;
-  again = false;
-  answeredLast = false;
+  woken = false;
   now;
   constructor(module, storage, options = {}) {
     this.module = module;
@@ -1133,37 +1190,33 @@ class Server {
       const timer = setTimeout(() => this.finish(conn, bare(504)), RESPOND_WITHIN_MS);
       this.open.set(conn, { resolve, timer });
     });
-    this.queue.push(event(EventKind.Connection, conn, 1, 0, 0));
+    this.queue.push(connectionEvent(conn, true));
     this.queue.pushMessage(conn, bytes);
+    this.fresh = true;
     this.pump();
     return answer;
   }
   async alarm() {
-    this.answeredLast = true;
+    this.woken = true;
     await this.pump();
   }
   due() {
-    return this.queue.fresh || this.answeredLast || (this.instance?.arriving.length ?? 0) > 0;
+    return this.fresh || this.woken || (this.instance?.arriving.length ?? 0) > 0;
   }
   async pump() {
-    if (this.pumping) {
-      this.again = true;
+    if (this.pumping)
       return;
-    }
     this.pumping = true;
     try {
       const began = this.now();
-      do {
-        this.again = false;
-        while (this.due()) {
-          await this.once();
-          if (this.open.size === 0 && this.due() && this.now() - began >= this.limits.turn) {
-            this.options.setAlarm?.(this.now());
-            return;
-          }
-          await new Promise((r) => setTimeout(r, 0));
+      while (this.due()) {
+        await this.once();
+        if (this.open.size === 0 && this.due() && this.now() - began >= this.limits.turn) {
+          this.options.setAlarm?.(this.now());
+          return;
         }
-      } while (this.again);
+        await new Promise((r) => setTimeout(r, 0));
+      }
     } finally {
       this.pumping = false;
     }
@@ -1181,13 +1234,13 @@ class Server {
       instance.answered.set(id, answer);
     if (instance !== this.instance)
       return;
-    this.queue.fresh = false;
+    this.fresh = false;
+    this.woken = false;
     instance.commands = [];
     instance.commandBytes = 0;
     try {
       const time = Math.fround((this.now() - this.started) / 1000);
       instance.call(() => instance.serve(time));
-      this.answeredLast = instance.arriving.length > 0;
       this.carryOut(instance.commands);
     } catch (e) {
       this.fail(e);
@@ -1221,7 +1274,8 @@ class Server {
     this.open.delete(conn);
     o.resolve(response);
     if (this.instance !== null) {
-      this.queue.push(event(EventKind.Connection, conn, 0, 0, 0));
+      this.queue.push(connectionEvent(conn, false));
+      this.fresh = true;
       this.pump();
     }
   }
@@ -1229,8 +1283,9 @@ class Server {
     const f = e instanceof Failure ? e : new Failure(false, String(e?.message ?? e));
     this.options.log?.(`wrela: the server's call failed: ${f.program ? "the program's: " : "the host's limits: "}${f.message}`);
     this.instance = null;
-    this.answeredLast = false;
-    this.queue.clear();
+    this.woken = false;
+    this.fresh = false;
+    this.queue = new Inbox;
     for (const conn of [...this.open.keys()])
       this.finish(conn, bare(f.program ? 500 : 503));
   }
@@ -1248,7 +1303,7 @@ class Server {
         for (const c of commands) {
           if (c.op !== "HostRequest")
             self.refuse(`a server host can't carry out ${c.op}`);
-          host.submit(self, c.request, c.service, c.body.slice());
+          host.submit(self, c.request, c.service, c.body);
         }
       },
       [IMPORT_REQUEST_STATUS](id) {
@@ -1268,22 +1323,20 @@ class Server {
       },
       [IMPORT_LIMIT]: () => 0,
       [IMPORT_PRINT](at, len) {
-        const line = new TextDecoder().decode(me().read(at, len));
-        host.options.print?.(line);
+        const print = host.options.print;
+        if (print !== undefined)
+          print(LINES.decode(me().read(at, len)));
       },
       [IMPORT_INPUT](at, cap) {
         const self = me();
-        const n = Math.min(cap, host.queue.events.length);
-        if (at + n * EVENT_SIZE > self.memory.buffer.byteLength)
-          self.refuse(`input(${at}, ${cap}) reaches past the end of the program's memory`);
-        const bytes = host.queue.take(cap);
-        self.write(at, bytes, `input(${at}, ${cap})`);
-        return bytes.length / EVENT_SIZE;
+        const events = host.queue.take(cap);
+        events.forEach((e, i) => self.write(at + i * EVENT_SIZE, e, `input(${at}, ${cap})`));
+        return events.length;
       },
       [IMPORT_PAYLOAD](lo, hi, at, cap) {
         const self = me();
         const bytes = host.queue.payload((lo >>> 0) + (hi >>> 0) * 2 ** 32);
-        if (bytes === null)
+        if (bytes === undefined)
           return -1;
         self.write(at, bytes.subarray(0, Math.min(cap, bytes.length)), `payload(.., ${at}, ${cap})`);
         return bytes.length;
@@ -1334,42 +1387,25 @@ class Server {
       case "net/compact":
         return self.refuse(`\`${service}\`: an HTTP server's connections take one response (\`std::http::respond\`)`);
       case "store/get":
+        return answer(now(() => this.store.get(body)));
       case "store/scan":
+        return answer(now(() => this.store.scan(body)));
       case "crypto/random":
+        return answer(now(() => random(body)));
       case SERVICE_TIME:
-        try {
-          return answer(this.answerNow(service, body));
-        } catch {
-          return answer(null);
-        }
+        return answer(body.length === 0 ? new Out().u64(BigInt(Math.floor(this.now()))).bytes() : null);
       case "crypto/verify":
         return answer(verify(body).catch(() => null));
       default:
         return answer(null);
     }
   }
-  answerNow(service, body) {
-    switch (service) {
-      case "store/get":
-        return this.store.get(body);
-      case "store/scan":
-        return this.store.scan(body);
-      case "crypto/random":
-        return random(body);
-      default: {
-        if (body.length !== 0)
-          throw new Error("`time/unix` takes no bytes");
-        return new Out2().u64(BigInt(Math.floor(this.now()))).bytes();
-      }
-    }
-  }
 }
 
 // src/cloudflare.ts
 var SERVER_OBJECT = "server";
-var seen = (name) => name.startsWith(OWN_HEADER_PREFIX) || SERVER_SEES.includes(name);
 function refusal(status, headers = {}) {
-  return new Response(null, { status, headers: { "cache-control": "no-store", ...headers } });
+  return new Response(null, { status, headers: [["cache-control", "no-store"], ...HOST_HEADERS, ...Object.entries(headers)] });
 }
 async function bodyWithin(request, max) {
   const declared = request.headers.get("content-length");
@@ -1377,39 +1413,36 @@ async function bodyWithin(request, max) {
     return null;
   if (request.body === null)
     return new Uint8Array(0);
-  const parts = [];
-  let length = 0;
+  const out = new Out;
   const reader = request.body.getReader();
   for (;; ) {
     const { done, value } = await reader.read();
     if (done)
       break;
-    length += value.length;
-    if (length > max) {
+    if (out.length + value.length > max) {
       await reader.cancel();
       return null;
     }
-    parts.push(value);
+    out.push(value);
   }
-  const out = new Uint8Array(length);
-  let at = 0;
-  for (const p of parts) {
-    out.set(p, at);
-    at += p.length;
-  }
-  return out;
+  return out.bytes();
 }
 function shareable(r) {
   const control = r.headers.get("cache-control") ?? "";
   const life = /(?:^|[\s,])(?:s-maxage|max-age)=(\d+)/.exec(control);
   return r.status === 200 && /(?:^|[\s,])public(?:$|[\s,])/.test(control) && life !== null && Number(life[1]) > 0 && !/(?:^|[\s,])(?:private|no-store|no-cache)/.test(control) && !r.headers.has("set-cookie") && !r.headers.has("vary");
 }
+var limitsRead = null;
 function limits(env) {
-  const list = JSON.parse(env.WRELA_LIMITS ?? "[]");
+  const text = env.WRELA_LIMITS ?? "[]";
+  if (limitsRead?.text === text)
+    return limitsRead.list;
+  const list = JSON.parse(text);
   if (!Array.isArray(list) || !list.every((l) => typeof l?.binding === "string" && typeof l?.prefix === "string")) {
     throw new Error("WRELA_LIMITS isn't a list of { binding, prefix, methods?, period? }");
   }
-  return list;
+  limitsRead = { text, list };
+  return limitsRead.list;
 }
 async function pastLimit(env, method, path, address) {
   for (const l of limits(env)) {
@@ -1434,9 +1467,9 @@ async function api(request, env, options = {}) {
   const limited = await pastLimit(env, method, url.pathname, request.headers.get("cf-connecting-ip") ?? "unknown");
   if (limited !== null)
     return refusal(429, { "retry-after": String(limited.period ?? 60) });
-  const cache = options.cache ?? globalThis.caches?.default;
-  const key = new Request(url.href, { method: "GET" });
-  if (method === "GET" && cache !== undefined) {
+  const cache = method === "GET" ? options.cache ?? globalThis.caches?.default : undefined;
+  const key = cache === undefined ? null : new Request(url.href, { method: "GET" });
+  if (cache !== undefined && key !== null) {
     const hit = await cache.match(key);
     if (hit !== undefined)
       return hit;
@@ -1453,7 +1486,7 @@ async function api(request, env, options = {}) {
     return refusal(413);
   const headers = [];
   for (const [name, value] of request.headers)
-    if (seen(name))
+    if (seenByServer(name))
       headers.push([name, value]);
   const bytes = encodeRequest({ time: BigInt(Date.now()), method, path: url.pathname, query: url.search.slice(1), headers, body });
   if (bytes.length > MAX_HTTP_REQUEST)
@@ -1470,7 +1503,7 @@ async function api(request, env, options = {}) {
     out.append(n, v);
   const empty = method === "HEAD" || s.status === 204 || s.status === 304;
   const response = new Response(empty ? null : s.body.slice(), { status: s.status, headers: out });
-  if (method === "GET" && cache !== undefined && shareable(response)) {
+  if (cache !== undefined && key !== null && shareable(response)) {
     const kept = cache.put(key, response.clone());
     if (options.ctx !== undefined)
       options.ctx.waitUntil(kept);
@@ -1491,7 +1524,7 @@ function serverClass(module) {
       });
     }
     async request(bytes) {
-      return this.server.request(new Uint8Array(bytes));
+      return this.server.request(bytes instanceof Uint8Array ? bytes : new Uint8Array(bytes));
     }
     async alarm() {
       await this.server.alarm();

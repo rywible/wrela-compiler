@@ -20,7 +20,7 @@ function storage(db: Database, alarms: number[]): Storage & { setAlarm(at: numbe
     sql: {
       exec(query: string, ...bindings: unknown[]) {
         const rows = db.query(query).all(...(bindings as never[])) as Record<string, unknown>[];
-        return { toArray: () => rows };
+        return Object.assign(rows[Symbol.iterator](), { toArray: () => rows });
       },
     },
     transactionSync: <T>(fn: () => T): T => db.transaction(fn)(),
