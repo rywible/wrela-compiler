@@ -203,8 +203,8 @@ On this host:
   ([limits](https://developers.cloudflare.com/workers/platform/limits/)), which can't verify a
   run. A call past the limit fails the invocation (error 1102) and resets the object; the
   requests in flight fail and the store keeps only committed writes. 0.13.0's config set
-  `limits.cpu_ms` to 5000; from 0.14.0 it sets none, since Ryan launches on Workers Free, which
-  takes none, and a release on Paid may add it (open question 2).
+  `limits.cpu_ms` to 5000; from 0.14.0 it sets none, which leaves Paid's default of 30 s. Launch
+  is on Workers Paid (below), and a release may set a lower cap (open question 2).
 - **What the host spends of a call's CPU** (estimates, to be measured on the first deploy):
   - The module compiles once, when the isolate loads the Worker. That counts against startup
     (1 s), not a request.
@@ -215,12 +215,35 @@ On this host:
   - WebCrypto's verify is native: tens to a few hundred microseconds.
   - The rate limit and the RPC from the Worker to the object are I/O.
 
-  On Free, a program keeps each call well under 10 ms (the accounts engine plans 200 ticks a call,
-  2 to 3 ms on a Ryzen 5 5500U).
+  The accounts engine plans 200 ticks a call, 2 to 3 ms on a Ryzen 5 5500U.
 - **Memory.** The instance's cap is 64 MiB, as `wrela-serve`'s. JavaScript can't refuse a
   `memory.grow` inside a call, so the host checks after each call and drops an instance past the
   cap (a host failure). An isolate's hard limit is 128 MB
   ([limits](https://developers.cloudflare.com/workers/platform/limits/)).
+
+**Workers Paid, not Free.** Ryan launches on Workers Paid. Each invocation (a request, a
+WebSocket message, an alarm) gets its own CPU budget
+([Durable Objects limits](https://developers.cloudflare.com/durable-objects/platform/limits/),
+footnote 4), and on Free that budget is 10 ms. Free would need:
+
+- a turn of one call, not 250 ms of wall time, with the rest left to a fresh alarm. The host
+  counts calls, since a Worker's clock moves only on I/O;
+- a restarted room replaying its journal a slice an alarm, holding new messages meanwhile;
+- each call under about 8 ms, which the host can't split: the verifier checks a run in chunks of
+  about 500 ticks;
+- a fresh instance (`serve_init`) under the limit, which is unmeasured.
+
+Free's daily limits, account-wide and failing until 00:00 UTC once reached, are the real bound
+([pricing](https://developers.cloudflare.com/durable-objects/platform/pricing/)):
+
+- 100,000 Durable Object requests a day. Requests include RPC calls and alarms; incoming
+  WebSocket messages count 20 to 1. That's about 23 messages a second over a day, about two
+  players online at all times at 10 messages a second each.
+- 100,000 SQLite rows written a day, counting each kept record, each store commit and each
+  `setAlarm`.
+
+The console's HTTP fits Free. Rooms fit only testing. Free support isn't built, and a release
+could add it for staging and development accounts.
 
 **A failed call** (the program's trap, a host limit) drops the instance. Every request open on it
 gets 500 (the program's trap) or 503 (the host's limits), with an empty body. Their state lived
@@ -415,9 +438,8 @@ the session from the `__Host-` cookie, and checks Origin and its CSRF header. Th
   (`new_sqlite_classes: ["WrelaRoom"]`), and `/room/*` in `run_worker_first`.
 - A `ratelimits` entry with prefix `/room/` limits upgrades.
 - `net.json` beside the client build names the site, `{"url": "wss://<site>"}`.
-- `limits.cpu_ms` is no longer in `cloudflare.json` (Workers Free takes none).
-- Deploy commands and secrets: as 0.13.0. The plan: Workers Free at launch, Paid only if calls
-  come near the 10 ms limit.
+- `limits.cpu_ms` is no longer in `cloudflare.json`, which leaves Paid's default of 30 s.
+- Deploy commands and secrets: as 0.13.0. The plan: Workers Paid (§5 says why Free doesn't fit).
 
 ## 12. Later, listed but not built
 
@@ -435,8 +457,8 @@ the session from the `__Host-` cookie, and checks Origin and its CSRF header. Th
 1. **`user-agent`.** Left out of what a server sees, since it fingerprints and the privacy policy
    lists what's kept. Does the accounts server want it, say to name a session's device ("Chrome
    on a Mac")? If so, the host could pass a coarse family instead.
-2. **`limits.cpu_ms`.** Launch is on Workers Free (10 ms, no `cpu_ms`), with Paid only if
-   calls come near it. On Paid, 5000 would cap what a runaway call costs; measure first.
+2. **`limits.cpu_ms`.** Launch is on Workers Paid, with no `cpu_ms` (30 s). 5000 would cap what
+   a runaway call costs; measure first.
 3. **Isolating a failing request.** Today a trap fails every request open on the instance.
    `wrela-serve` retries a room's events one at a time to find the poisoned one. Is that worth
    doing for HTTP, where one attacker's request could otherwise fail others' concurrent
