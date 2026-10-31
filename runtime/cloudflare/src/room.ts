@@ -19,17 +19,23 @@
 // Each WebSocket binary message is one frame (no varint), at most `MAX_UP` bytes from a peer; a
 // text message, or a longer one, closes its connection. A connection with more than `CONN_IN`
 // bytes waiting for the room is closed too.
+//
+// A room's storage is its build's: the object's name holds the build's pair id, but a deploy
+// gives a hibernated object the new build's code with the old build's sockets and journal. Such an
+// object reads nothing back; it closes its sockets (1012), and their peers come back to the new
+// build's rooms.
 
 import { SERVICE_RESPOND } from "../../browser/src/abi.gen.ts";
 import { connectionEvent } from "../../browser/src/input.ts";
-import { Inbox, MAX_FRAME, MAX_UP, withinCall } from "../../browser/src/net.ts";
+import { Inbox, MAX_FRAME, MAX_UP, OVERHEAD, pairOf, pairParam, withinCall } from "../../browser/src/net.ts";
 import { blob, commonAnswer, Failure, Instance, LIMITS, type Limits, type Owner, POISONED, type Storage, writes } from "./host.ts";
 
 /** The connection a room's journal comes from (`std::net::JOURNAL`). */
 export const JOURNAL = 0;
 /** Failures at the host's limits in a row before a room lets its peers go. */
 export const RETRIES = 3;
-/** The bytes a connection's messages may hold waiting for the room. */
+/** The bytes a connection's messages may hold waiting for the room, each counted with OVERHEAD
+ * more (`wrela_serve`'s). */
 export const CONN_IN = 1 << 20;
 /** How soon a room that failed at the host's limits tries again, in milliseconds. */
 export const RETRY_MS = 250;
@@ -92,7 +98,11 @@ export class Room implements Owner<Net> {
   /** The bytes each open connection's messages hold in `incoming`. */
   private readonly waiting = new Map<number, number>();
   private failures = 0;
+  /** When a room that failed at the host's limits tries again (0: whenever it's woken). */
+  private retryAt = 0;
   private quarantined: string | null;
+  /** Whether its storage is another build's (a deploy since): it serves nothing. */
+  private readonly replaced: boolean;
   /** The last connection number given, kept so none is given twice. */
   private lastConn: number;
   /** Unix milliseconds the room's time counts from, kept so it goes on after a restart. */
@@ -122,6 +132,16 @@ export class Room implements Owner<Net> {
     this.quarantined = typeof q === "string" ? q : null;
     const last = meta.get("conn");
     this.lastConn = typeof last === "number" ? last : JOURNAL;
+    const pair = pairOf(module);
+    const build = pair === null ? "none" : pairParam(pair);
+    const kept = meta.get("pair");
+    if (kept === undefined) sql.exec("INSERT INTO meta (key, value) VALUES ('pair', ?)", build);
+    this.replaced = kept !== undefined && kept !== build;
+    if (this.replaced) {
+      this.options.log?.("wrela: a room's storage is another build's, and it serves nothing");
+      for (const socket of open) socket.close(1012, "the room's build was replaced");
+      return;
+    }
     // Its sockets outlive the object: each says which connection it is.
     for (const socket of open) {
       const a = attached(socket);
@@ -144,8 +164,8 @@ export class Room implements Owner<Net> {
 
   /** A peer connected on `socket`. A quarantined room closes it. */
   connect(socket: Socket): void {
-    if (this.quarantined !== null) {
-      socket.close(1011, "the room is closed");
+    if (this.replaced || this.quarantined !== null) {
+      socket.close(this.replaced ? 1012 : 1011, "the room is closed");
       return;
     }
     const conn = this.nextConn();
@@ -162,7 +182,7 @@ export class Room implements Owner<Net> {
     if (conn === null) return;
     if (typeof data === "string") return this.cut(conn, 1003, "a room takes binary messages");
     if (data.byteLength > MAX_UP) return this.cut(conn, 1009, `a message past ${MAX_UP} bytes`);
-    const waiting = (this.waiting.get(conn) ?? 0) + data.byteLength;
+    const waiting = (this.waiting.get(conn) ?? 0) + data.byteLength + OVERHEAD;
     if (waiting > CONN_IN) return this.cut(conn, 1008, `more than ${CONN_IN} bytes wait for the room`);
     this.waiting.set(conn, waiting);
     this.incoming.push({ kind: "message", conn, bytes: new Uint8Array(data) });
@@ -177,7 +197,7 @@ export class Room implements Owner<Net> {
 
   /** The object's alarm: a room that failed at the host's limits tries again. */
   alarm(): Promise<void> {
-    return this.wake();
+    return this.wake(true);
   }
 
   /** Settles once the room has taken what it was given. */
@@ -185,11 +205,12 @@ export class Room implements Owner<Net> {
     return this.running;
   }
 
-  /** Whatever came, taken in order, one wake at a time. */
-  wake(): Promise<void> {
+  /** Whatever came, taken in order, one wake at a time; while a failure at the host's limits
+   * waits for the alarm (`alarm`), only the alarm's. */
+  wake(alarm = false): Promise<void> {
     this.running = this.running.then(
-      () => this.wakeNow(),
-      () => this.wakeNow(),
+      () => this.wakeNow(alarm),
+      () => this.wakeNow(alarm),
     );
     return this.running;
   }
@@ -208,7 +229,11 @@ export class Room implements Owner<Net> {
 
   /** Closes connection `conn`'s socket, and the room hears it closed. */
   private cut(conn: number, code: number, why: string): void {
-    this.sockets.get(conn)?.close(code, why);
+    try {
+      this.sockets.get(conn)?.close(code, why);
+    } catch {
+      // It's closed already.
+    }
     this.disconnect(conn);
   }
 
@@ -224,7 +249,7 @@ export class Room implements Owner<Net> {
   private requeue(events: Incoming[]): void {
     for (const e of events) {
       const w = e.kind === "message" ? this.waiting.get(e.conn) : undefined;
-      if (w !== undefined && e.kind === "message") this.waiting.set(e.conn, w + e.bytes.length);
+      if (w !== undefined && e.kind === "message") this.waiting.set(e.conn, w + e.bytes.length + OVERHEAD);
     }
     this.incoming.unshift(...events);
   }
@@ -241,9 +266,11 @@ export class Room implements Owner<Net> {
     this.options.log?.(`wrela: a room's call failed at the host's limits: ${f.message}`);
     if (this.failures >= RETRIES) {
       this.failures = 0;
+      this.retryAt = 0;
       this.closeAll(1013, "the room is unavailable");
     } else {
-      void this.storage.setAlarm(this.now() + RETRY_MS);
+      this.retryAt = this.now() + RETRY_MS;
+      void this.storage.setAlarm(this.retryAt);
     }
   }
 
@@ -258,8 +285,9 @@ export class Room implements Owner<Net> {
   }
 
   /** The room's events, a call's worth at a time, until none waits and no answer is due. */
-  private async wakeNow(): Promise<void> {
-    if (this.quarantined !== null) return;
+  private async wakeNow(alarm: boolean): Promise<void> {
+    if (this.replaced || this.quarantined !== null) return;
+    if (!alarm && this.now() < this.retryAt) return;
     for (;;) {
       if (this.instance === null) {
         const f = await this.restart();
@@ -293,7 +321,7 @@ export class Room implements Owner<Net> {
       if (!withinCall(given, e.bytes.length)) break;
       given += e.bytes.length;
       const w = this.waiting.get(e.conn);
-      if (w !== undefined) this.waiting.set(e.conn, w - e.bytes.length);
+      if (w !== undefined) this.waiting.set(e.conn, w - e.bytes.length - OVERHEAD);
     }
     return this.incoming.splice(0, n);
   }
@@ -312,6 +340,8 @@ export class Room implements Owner<Net> {
     let compacted: { snapshot: Uint8Array; unread: number } | null = null;
     while (this.queue.length > 0) {
       const before = this.queue.length;
+      // What its last call asked is answered for this one, as on an ordinary call.
+      await instance.settle();
       try {
         instance.call(() => instance.serve(0));
         if (this.queue.length >= before) throw new Failure(true, UNREAD);
@@ -354,10 +384,14 @@ export class Room implements Owner<Net> {
       if (this.queue.length > 0) throw new Failure(true, UNREAD);
       r = await this.carryOut(instance.commands);
     } catch (e) {
-      r = { room: e as Failure };
+      r = { room: Failure.of(e) };
     }
-    if (r === null) this.failures = 0;
-    else this.instance = null;
+    if (r === null) {
+      this.failures = 0;
+      this.retryAt = 0;
+    } else {
+      this.instance = null;
+    }
     return r;
   }
 
@@ -426,15 +460,22 @@ export class Room implements Owner<Net> {
       this.closeAll(1011, "the room's records weren't kept");
       return { journal: f };
     }
+    // The call is settled now: a socket that fails from here is its peer's to come back on, and
+    // the call isn't taken again.
     for (const c of commands) {
-      const s = "conn" in c ? this.sockets.get(c.conn) : undefined;
-      if (s === undefined) continue;
-      if (c.kind === "tag") s.serializeAttachment({ conn: c.conn, tag: c.tag } satisfies Attached);
-      else if (c.kind === "send") s.send(c.bytes);
-      else if (c.kind === "close") {
-        s.close(1000, "");
-        this.sockets.delete(c.conn);
-        this.waiting.delete(c.conn);
+      const conn = "conn" in c ? c.conn : null;
+      const s = conn === null ? undefined : this.sockets.get(conn);
+      if (conn === null || s === undefined) continue;
+      try {
+        if (c.kind === "tag") s.serializeAttachment({ conn: c.conn, tag: c.tag } satisfies Attached);
+        else if (c.kind === "send") s.send(c.bytes);
+        else if (c.kind === "close") {
+          this.sockets.delete(c.conn);
+          this.waiting.delete(c.conn);
+          s.close(1000, "");
+        }
+      } catch {
+        this.cut(conn, 1011, "the connection failed");
       }
     }
     return null;

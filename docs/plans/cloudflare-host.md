@@ -355,7 +355,11 @@ Built in 0.14.0, its own pull request and release (language.md §19.6).
 - **One room, one Durable Object** (`WrelaRoom`), named `<pair hex>:<room name>`. The pair id
   hashes both modules (language.md §15), so each build's rooms are their own, as `wrela-serve`
   keeps them under the build's hash. Its journal is a SQLite table (`journal`), and its `meta`
-  table keeps the next connection's number, the room's time origin and a quarantine. A record
+  table keeps the next connection's number, the room's time origin, a quarantine, and the pair
+  id of the build that made it. A deploy gives a hibernated object the new code with the old
+  build's sockets and journal
+  ([code updates](https://developers.cloudflare.com/durable-objects/deployments/durable-objects-code-updates/));
+  an object of another build closes them (1012) and reads nothing back. A record
   carries no CRC-32C: SQLite's transaction keeps it whole or not at all.
 - **The same call contract as `wrela-serve`** (`wrela_host::rooms`, ported in
   `runtime/cloudflare/src/room.ts`):

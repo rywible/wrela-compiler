@@ -1,10 +1,16 @@
-// A room's host on hand-built modules: what a peer may send, and a room whose program fails on
-// every message is quarantined, and stays so in its storage.
+// A room's host on hand-built modules: what a peer may send and hold waiting, a room whose program
+// fails on every message quarantined for good, a socket that fails after a call is settled, the
+// wait for the alarm after a failure at the host's limits, and a room whose storage is another
+// build's.
 
+import { Database } from "bun:sqlite";
 import { expect, test } from "bun:test";
-import { MAX_UP } from "../../browser/src/net.ts";
-import { buildModule, op } from "../../browser/test/wasm-builder.ts";
-import { Room } from "../src/room.ts";
+import { PAIR_SECTION } from "../../browser/src/abi.gen.ts";
+import { MAX_UP, OVERHEAD } from "../../browser/src/net.ts";
+import { Encoder } from "../../browser/test/encoder.ts";
+import { buildModule, op, SUBMIT } from "../../browser/test/wasm-builder.ts";
+import { LIMITS } from "../src/host.ts";
+import { CONN_IN, Room } from "../src/room.ts";
 import { FakeSocket, storage } from "./fakes.ts";
 
 const INPUT = { module: "wrela", name: "input", kind: "func" as const, type: { params: ["i32" as const, "i32" as const], results: ["i32" as const] } };
@@ -53,4 +59,83 @@ test("a message the program traps on, then on poisoned, quarantines the room for
   const b = new FakeSocket();
   again.connect(b);
   expect(b.closed).toBe(1011);
+});
+
+test("a peer's empty messages count toward what may wait for the room", () => {
+  const room = new Room(program(), storage(), store, []);
+  const a = new FakeSocket();
+  room.connect(a);
+  for (let i = 0; i < CONN_IN / OVERHEAD; i++) room.message(a, new ArrayBuffer(0));
+  expect(a.closed).toBeNull();
+  room.message(a, new ArrayBuffer(0));
+  expect(a.closed).toBe(1008);
+});
+
+/** Each call reads its events, keeps a record and sends a byte to connection 1. */
+function keepAndSend(): WebAssembly.Module {
+  const batch = new Encoder()
+    .hostRequest(1, "net/keep", new Uint8Array([7]))
+    .hostRequest(2, "net/send", new Uint8Array([1, 0, 0, 0, 9]))
+    .finish();
+  const body = [...op.i32(1024), ...op.i32(64), ...op.call(0), 0x1a, ...op.i32(64), ...op.i32(batch.length), ...op.call(1)];
+  return new WebAssembly.Module(
+    buildModule({ imports: [INPUT, SUBMIT], memory: 1, ownMemory: true, data: [{ offset: 64, bytes: batch }], funcs: [{ type: SERVE, body, export: "serve" }] }),
+  );
+}
+
+test("a socket that fails once a call is settled closes, and the call isn't taken again", async () => {
+  const db = new Database(":memory:");
+  const logs: string[] = [];
+  const room = new Room(keepAndSend(), storage(db), store, [], { log: (l) => logs.push(l) });
+  const a = new FakeSocket();
+  a.send = () => {
+    throw new Error("the socket is closing");
+  };
+  room.connect(a);
+  await room.settled;
+  expect(a.closed).toBe(1011);
+  expect(logs).toEqual([]);
+  // One record for the call that opened it, one for the call that heard it closed.
+  expect(db.query("SELECT count(*) AS n FROM journal").get()).toEqual({ n: 2 });
+});
+
+test("after a failure at the host's limits, the room waits for its alarm", async () => {
+  // Each call grows its memory past the cap: the host's limits.
+  const body = [...op.i32(2), 0x40, 0x00, 0x1a];
+  const module = new WebAssembly.Module(buildModule({ memory: 1, ownMemory: true, funcs: [{ type: SERVE, body, export: "serve" }] }));
+  const alarms: number[] = [];
+  const room = new Room(module, storage(new Database(":memory:"), (at) => alarms.push(at)), store, [], {
+    now: () => 1000,
+    limits: { ...LIMITS, memory: 2 * 65536 },
+  });
+  const a = new FakeSocket();
+  room.connect(a);
+  room.message(a, new Uint8Array([1]).buffer);
+  room.message(a, new Uint8Array([2]).buffer);
+  await room.settled;
+  expect([a.closed, alarms]).toEqual([null, [1250]]);
+  await room.alarm();
+  expect(a.closed).toBeNull();
+  // The third failure in a row lets its peers go.
+  await room.alarm();
+  expect(a.closed).toBe(1013);
+});
+
+test("a room whose storage is another build's reads nothing back and closes its sockets", () => {
+  const db = new Database(":memory:");
+  const s = storage(db);
+  const first = new Room(program(), s, store, []);
+  const a = new FakeSocket();
+  first.connect(a);
+  db.query("INSERT INTO journal (record) VALUES (?)").run(new Uint8Array([5]));
+  // The same object after a deploy: the new build's code (another pair id), the old sockets.
+  const name = new TextEncoder().encode(PAIR_SECTION);
+  const custom = [0, 1 + name.length + 8, name.length, ...name, 1, 2, 3, 4, 5, 6, 7, 8];
+  const paired = new WebAssembly.Module(new Uint8Array([...buildModule({ memory: 1, ownMemory: true, funcs: [{ type: SERVE, body: [], export: "serve" }] }), ...custom]));
+  const again = new Room(paired, s, store, [a]);
+  expect(a.closed).toBe(1012);
+  const b = new FakeSocket();
+  again.connect(b);
+  expect(b.closed).toBe(1012);
+  expect(db.query("SELECT count(*) AS n FROM journal").get()).toEqual({ n: 1 });
 });

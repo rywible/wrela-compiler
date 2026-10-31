@@ -1507,7 +1507,9 @@ class Room {
   incoming = [];
   waiting = new Map;
   failures = 0;
+  retryAt = 0;
   quarantined;
+  replaced;
   lastConn;
   origin;
   lastClock = 0;
@@ -1533,6 +1535,18 @@ class Room {
     this.quarantined = typeof q === "string" ? q : null;
     const last = meta.get("conn");
     this.lastConn = typeof last === "number" ? last : JOURNAL;
+    const pair = pairOf(module);
+    const build = pair === null ? "none" : pairParam(pair);
+    const kept = meta.get("pair");
+    if (kept === undefined)
+      sql.exec("INSERT INTO meta (key, value) VALUES ('pair', ?)", build);
+    this.replaced = kept !== undefined && kept !== build;
+    if (this.replaced) {
+      this.options.log?.("wrela: a room's storage is another build's, and it serves nothing");
+      for (const socket of open)
+        socket.close(1012, "the room's build was replaced");
+      return;
+    }
     for (const socket of open) {
       const a = attached(socket);
       if (typeof a?.conn === "number")
@@ -1549,8 +1563,8 @@ class Room {
     return this.lastConn;
   }
   connect(socket) {
-    if (this.quarantined !== null) {
-      socket.close(1011, "the room is closed");
+    if (this.replaced || this.quarantined !== null) {
+      socket.close(this.replaced ? 1012 : 1011, "the room is closed");
       return;
     }
     const conn = this.nextConn();
@@ -1568,7 +1582,7 @@ class Room {
       return this.cut(conn, 1003, "a room takes binary messages");
     if (data.byteLength > MAX_UP)
       return this.cut(conn, 1009, `a message past ${MAX_UP} bytes`);
-    const waiting = (this.waiting.get(conn) ?? 0) + data.byteLength;
+    const waiting = (this.waiting.get(conn) ?? 0) + data.byteLength + OVERHEAD;
     if (waiting > CONN_IN)
       return this.cut(conn, 1008, `more than ${CONN_IN} bytes wait for the room`);
     this.waiting.set(conn, waiting);
@@ -1581,13 +1595,13 @@ class Room {
       this.disconnect(conn);
   }
   alarm() {
-    return this.wake();
+    return this.wake(true);
   }
   get settled() {
     return this.running;
   }
-  wake() {
-    this.running = this.running.then(() => this.wakeNow(), () => this.wakeNow());
+  wake(alarm = false) {
+    this.running = this.running.then(() => this.wakeNow(alarm), () => this.wakeNow(alarm));
     return this.running;
   }
   connOf(socket) {
@@ -1602,7 +1616,9 @@ class Room {
     this.wake();
   }
   cut(conn, code, why) {
-    this.sockets.get(conn)?.close(code, why);
+    try {
+      this.sockets.get(conn)?.close(code, why);
+    } catch {}
     this.disconnect(conn);
   }
   closeAll(code, why) {
@@ -1616,7 +1632,7 @@ class Room {
     for (const e of events) {
       const w = e.kind === "message" ? this.waiting.get(e.conn) : undefined;
       if (w !== undefined && e.kind === "message")
-        this.waiting.set(e.conn, w + e.bytes.length);
+        this.waiting.set(e.conn, w + e.bytes.length + OVERHEAD);
     }
     this.incoming.unshift(...events);
   }
@@ -1631,9 +1647,11 @@ class Room {
     this.options.log?.(`wrela: a room's call failed at the host's limits: ${f.message}`);
     if (this.failures >= RETRIES) {
       this.failures = 0;
+      this.retryAt = 0;
       this.closeAll(1013, "the room is unavailable");
     } else {
-      this.storage.setAlarm(this.now() + RETRY_MS);
+      this.retryAt = this.now() + RETRY_MS;
+      this.storage.setAlarm(this.retryAt);
     }
   }
   async restart() {
@@ -1644,8 +1662,10 @@ class Room {
       return Failure.of(e);
     }
   }
-  async wakeNow() {
-    if (this.quarantined !== null)
+  async wakeNow(alarm) {
+    if (this.replaced || this.quarantined !== null)
+      return;
+    if (!alarm && this.now() < this.retryAt)
       return;
     for (;; ) {
       if (this.instance === null) {
@@ -1685,7 +1705,7 @@ class Room {
       given += e.bytes.length;
       const w = this.waiting.get(e.conn);
       if (w !== undefined)
-        this.waiting.set(e.conn, w - e.bytes.length);
+        this.waiting.set(e.conn, w - e.bytes.length - OVERHEAD);
     }
     return this.incoming.splice(0, n);
   }
@@ -1701,6 +1721,7 @@ class Room {
     let compacted = null;
     while (this.queue.length > 0) {
       const before = this.queue.length;
+      await instance.settle();
       try {
         instance.call(() => instance.serve(0));
         if (this.queue.length >= before)
@@ -1748,12 +1769,14 @@ class Room {
         throw new Failure(true, UNREAD);
       r = await this.carryOut(instance.commands);
     } catch (e) {
-      r = { room: e };
+      r = { room: Failure.of(e) };
     }
-    if (r === null)
+    if (r === null) {
       this.failures = 0;
-    else
+      this.retryAt = 0;
+    } else {
       this.instance = null;
+    }
     return r;
   }
   async oneByOne(batch) {
@@ -1821,17 +1844,22 @@ class Room {
       return { journal: f };
     }
     for (const c of commands) {
-      const s = "conn" in c ? this.sockets.get(c.conn) : undefined;
-      if (s === undefined)
+      const conn = "conn" in c ? c.conn : null;
+      const s = conn === null ? undefined : this.sockets.get(conn);
+      if (conn === null || s === undefined)
         continue;
-      if (c.kind === "tag")
-        s.serializeAttachment({ conn: c.conn, tag: c.tag });
-      else if (c.kind === "send")
-        s.send(c.bytes);
-      else if (c.kind === "close") {
-        s.close(1000, "");
-        this.sockets.delete(c.conn);
-        this.waiting.delete(c.conn);
+      try {
+        if (c.kind === "tag")
+          s.serializeAttachment({ conn: c.conn, tag: c.tag });
+        else if (c.kind === "send")
+          s.send(c.bytes);
+        else if (c.kind === "close") {
+          this.sockets.delete(c.conn);
+          this.waiting.delete(c.conn);
+          s.close(1000, "");
+        }
+      } catch {
+        this.cut(conn, 1011, "the connection failed");
       }
     }
     return null;
