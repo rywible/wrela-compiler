@@ -292,6 +292,31 @@ test("the environment says which input services the host has, and they reach the
   }
 });
 
+test("only the page's own program reloads the page", async () => {
+  const oldWindow = Object.getOwnPropertyDescriptor(globalThis, "window");
+  const oldLocation = Object.getOwnPropertyDescriptor(globalThis, "location");
+  let reloads = 0;
+  const page: { parent?: unknown; addEventListener: () => void } = { addEventListener: () => {} };
+  Object.defineProperty(globalThis, "window", { configurable: true, value: page });
+  Object.defineProperty(globalThis, "location", { configurable: true, value: { reload: () => { reloads++; } } });
+  const canvas = { style: {}, tabIndex: -1, focus: () => {} } as HTMLCanvasElement;
+  const platform = new BrowserPlatform(canvas, () => {});
+  try {
+    // A program in a surface: its window's parent is the page that opened it.
+    page.parent = {};
+    await expect(platform.request("nav/reload", new Uint8Array())).rejects.toThrow("only the page's own program");
+    expect(reloads).toBe(0);
+    page.parent = page;
+    expect(await platform.request("nav/reload", new Uint8Array())).toEqual(new Uint8Array());
+    expect(reloads).toBe(1);
+  } finally {
+    platform.dispose();
+    for (const [name, old] of [["window", oldWindow], ["location", oldLocation]] as const) {
+      if (old) Object.defineProperty(globalThis, name, old); else Reflect.deleteProperty(globalThis, name);
+    }
+  }
+});
+
 test("a shown program is named in the address, and Back asks it to return", async () => {
   const oldWindow = Object.getOwnPropertyDescriptor(globalThis, "window");
   const oldDocument = Object.getOwnPropertyDescriptor(globalThis, "document");

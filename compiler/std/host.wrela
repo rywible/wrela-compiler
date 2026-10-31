@@ -473,6 +473,15 @@ pub fn go(address: str) -> Pending<u8> {
     request("nav/go", utf8(address))
 }
 
+/// Loads the page again from its address, so the program starts again from its bootstrap; the
+/// page's storage stays, and the new load's `environment` says it reloaded. Only the program the
+/// page itself runs reloads the page: one in a surface that another program opened (`open`) is
+/// declined, as a host without a page (the native host) declines. Nothing waits on the answer.
+@client
+pub fn reload() -> Pending<u8> {
+    request("nav/reload", [u8(0); 0])
+}
+
 /// Whether the program takes the browser's find keys (Ctrl or Cmd with F or G, and F3) for a find
 /// of its own: the browser's finds nothing in a canvas. The program hears the keys either way.
 @client

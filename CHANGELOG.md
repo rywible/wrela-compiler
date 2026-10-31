@@ -3,6 +3,14 @@
 Each release's changes a program or a tool can see. The pull request of each release holds the
 detail; `docs/release.md` says how a release is cut.
 
+## 0.15.0
+
+- **A program reloads its page** (language.md §17.1): `std::host::reload()` loads the page
+  again from its address, so the program starts again from its bootstrap with the page's
+  storage kept. Only the program the page itself runs may: the browser host declines one in a
+  surface another program opened, and the native host declines it. runtime/browser: the host
+  service `nav/reload`.
+
 ## 0.14.0
 
 - **A server build's rooms run on Cloudflare** (language.md §19.6): `server/cloudflare.js` now

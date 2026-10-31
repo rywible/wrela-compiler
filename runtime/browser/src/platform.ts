@@ -504,6 +504,11 @@ export class BrowserPlatform {
     if (service === "nav/go") {
       location.assign(sameOriginAddress(UTF8.decode(body), location.href)); return new Uint8Array();
     }
+    if (service === "nav/reload") {
+      // The page again from its address: only the page's own program, not one in a surface.
+      if (window.parent !== window) throw new Error("only the page's own program reloads the page");
+      location.reload(); return new Uint8Array();
+    }
     if (service === "keys/find") {
       if (!this.#input) throw new Error("this host has no keys to claim yet");
       this.#input.claimFind(body[0] === 1); return new Uint8Array();
