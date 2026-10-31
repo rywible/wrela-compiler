@@ -226,6 +226,8 @@ class Ticker {
   /** The records the program posted (`std::tick::post`), each stamped with the frames started
    * when it posted it. */
   readonly posts: InputRing;
+  /** Where the posts a full tick can't take pass on their way to `queue`. */
+  readonly #spill = new Uint8Array(InputRing.CAPACITY * EVENT_SIZE);
   /** Test mode: a script's events, by frame and by tick. */
   readonly script: Arrivals;
   /** Events not yet stamped into a tick, oldest first. */
@@ -391,9 +393,8 @@ class Ticker {
   #posted(n: number, frames = Infinity): number {
     if (n < MAX_TICK_RECORDS) n += this.posts.readTicker(this.#bytes, RECORDS + n * EVENT_SIZE, MAX_TICK_RECORDS - n, frames);
     if (n < MAX_TICK_RECORDS) return n;
-    const spill = new Uint8Array(InputRing.CAPACITY * EVENT_SIZE);
-    const m = this.posts.readTicker(spill, 0, InputRing.CAPACITY, frames);
-    for (let i = 0; i < m; i++) this.queue.push(spill.slice(i * EVENT_SIZE, (i + 1) * EVENT_SIZE));
+    const m = this.posts.readTicker(this.#spill, 0, InputRing.CAPACITY, frames);
+    for (let i = 0; i < m; i++) this.queue.push(this.#spill.slice(i * EVENT_SIZE, (i + 1) * EVENT_SIZE));
     return n;
   }
 

@@ -45,8 +45,8 @@ pub struct Posted: Copy + Eq + StateHash + Serialize {
 /// `Ticked.posts`. A tick log keeps it among the tick's records, so a replay gives the ticks the
 /// same records, and a host that replays a log drops what the program posts. So a sim learns
 /// what only the frames know, such as a saved game read from storage after `init`, and its
-/// ticks stay a function of their records. A post made before `start`, or in a program with no
-/// ticker, fails the call's commands. In lockstep (test mode), what frame `i` posts is a record
+/// ticks stay a function of their records. A post in a call that ends with no ticker started
+/// fails the call's commands (the host takes them when the call returns). In lockstep (test mode), what frame `i` posts is a record
 /// of the first tick that runs for frame `i + 1`, before that frame's input.
 ///
 /// ```wrela

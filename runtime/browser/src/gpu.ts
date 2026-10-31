@@ -522,10 +522,12 @@ export function buildPipelines(
   const go = (i: number, counted: boolean) => {
     if (resolvers.has(i)) return launch(i, counted);
     const made = each[i]!;
-    if (!(LAUNCHERS.get(made)?.() ?? false)) return;
+    const launched = LAUNCHERS.get(made)?.() ?? false;
+    // One a command asks for that another build already started still holds back the rest here.
+    if (!launched && counted) return;
+    if (launched) started.push(i);
     if (counted) running++;
     else asked++;
-    started.push(i);
     const done = () => {
       if (counted) running--;
       else asked--;

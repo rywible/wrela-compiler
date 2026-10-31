@@ -1824,7 +1824,7 @@ All three are in std, built on the unsafe core (§6.12), and none of them is spe
   - The host stamps the record into the next tick's records, as it stamps an input event that arrives then. In lockstep (below), what frame i posts is a record of the first tick that runs for frame i + 1, before that frame's input. What `init` posts after `start` is the first tick's.
   - The step reads it in `Ticked.posts`: each a `Posted { tag, a, b }`, oldest first. `tag` says what the record is, and `a` and `b` are two `u64`s whose meaning is the program's.
   - A tick log keeps it among the tick's records, so a replay gives every tick the same input, and a host that replays a log drops what the program posts as it runs again. A tick's state stays a function of the first state and the records.
-  - It is `@client`. A post before `start`, or in a program that started no ticker, fails the call's commands. Its record counts toward a tick's 256: past them, the rest wait for the next tick, in order with the input after them.
+  - It is `@client`. A post in a call that ends with no ticker started fails the call's commands: a host takes a call's commands when it returns, so `start` earlier or later in the same call counts. Its record counts toward a tick's 256: past them, the rest wait for the next tick, in order with the input after them.
 
   ```wrela
   use std::tick::{Ticked, post, start}
