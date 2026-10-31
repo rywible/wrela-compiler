@@ -68,7 +68,7 @@ git tag vX.Y.Z && git push origin vX.Y.Z
 
 The tag starts `.github/workflows/toolchain-release.yml`:
 
-- **build**, on `ubuntu-latest` and `macos-14`: `tools/package.py --version X.Y.Z --target
+- **build**, on `ubuntu-latest` and `macos-15`: `tools/package.py --version X.Y.Z --target
   <triple> --out dist`. It builds `wrela`, `wrela-host` and `wrela-serve` in release mode, with the
   source revision embedded, and adds Binaryen's `wasm-opt`, checked against a pinned SHA-256, and
   the licences.
