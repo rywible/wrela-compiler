@@ -200,11 +200,11 @@ On this host:
 - **No per-call deadline.** JavaScript can't interrupt a WASM call it is running. The bound is the
   Worker's CPU limit per invocation: Workers Paid defaults to 30 s and allows up to 5 minutes
   (`limits.cpu_ms`); Workers Free allows 10 ms
-  ([limits](https://developers.cloudflare.com/workers/platform/limits/)), which can't verify a
-  run. A call past the limit fails the invocation (error 1102) and resets the object; the
+  ([limits](https://developers.cloudflare.com/workers/platform/limits/)), too little to verify a
+  run in one call. A call past the limit fails the invocation (error 1102) and resets the object; the
   requests in flight fail and the store keeps only committed writes. 0.13.0's config set
-  `limits.cpu_ms` to 5000; from 0.14.0 it sets none, which leaves Paid's default of 30 s. Launch
-  is on Workers Paid (below), and a release may set a lower cap (open question 2).
+  `limits.cpu_ms` to 5000; from 0.14.0 it sets none, which leaves Paid's default (open question
+  2).
 - **What the host spends of a call's CPU** (estimates, to be measured on the first deploy):
   - The module compiles once, when the isolate loads the Worker. That counts against startup
     (1 s), not a request.
@@ -215,7 +215,8 @@ On this host:
   - WebCrypto's verify is native: tens to a few hundred microseconds.
   - The rate limit and the RPC from the Worker to the object are I/O.
 
-  The accounts engine plans 200 ticks a call, 2 to 3 ms on a Ryzen 5 5500U.
+  The accounts engine plans 200 ticks a call, 2 to 3 ms on a Ryzen 5 5500U, so a call's own
+  work dwarfs the host's.
 - **Memory.** The instance's cap is 64 MiB, as `wrela-serve`'s. JavaScript can't refuse a
   `memory.grow` inside a call, so the host checks after each call and drops an instance past the
   cap (a host failure). An isolate's hard limit is 128 MB
@@ -224,26 +225,26 @@ On this host:
 **Workers Paid, not Free.** Ryan launches on Workers Paid. Each invocation (a request, a
 WebSocket message, an alarm) gets its own CPU budget
 ([Durable Objects limits](https://developers.cloudflare.com/durable-objects/platform/limits/),
-footnote 4), and on Free that budget is 10 ms. Free would need:
+footnote 4), so on Free each would have to fit 10 ms:
 
-- a turn of one call, not 250 ms of wall time, with the rest left to a fresh alarm. The host
-  counts calls, since a Worker's clock moves only on I/O;
-- a restarted room replaying its journal a slice an alarm, holding new messages meanwhile;
-- each call under about 8 ms, which the host can't split: the verifier checks a run in chunks of
-  about 500 ticks;
-- a fresh instance (`serve_init`) under the limit, which is unmeasured.
+- a turn of one call, counted rather than timed, since a Worker's clock moves only on I/O;
+- the alarm set only when work is left after it;
+- a room's journal read back in slices, which compaction keeps short;
+- each call under about 8 ms, so the verifier checks a run in chunks of about 500 ticks;
+- a fresh instance (`serve_init`), which is unmeasured.
 
-Free's daily limits, account-wide and failing until 00:00 UTC once reached, are the real bound
-([pricing](https://developers.cloudflare.com/durable-objects/platform/pricing/)):
+Free's daily limits, which are account-wide and fail until 00:00 UTC once reached, are the real
+bound ([pricing](https://developers.cloudflare.com/durable-objects/platform/pricing/)):
 
-- 100,000 Durable Object requests a day. Requests include RPC calls and alarms; incoming
-  WebSocket messages count 20 to 1. That's about 23 messages a second over a day, about two
-  players online at all times at 10 messages a second each.
+- 100,000 Durable Object requests a day, counting each RPC call (a room's store reads and
+  commits), each alarm, and incoming WebSocket messages at 20 to 1 (§10). That's at most about
+  23 messages a second over a day, about two players online at all times at 10 a second each.
 - 100,000 SQLite rows written a day, counting each kept record, each store commit and each
-  `setAlarm`.
+  `setAlarm`. A room that keeps a record for every message is held to about one a second.
+- 5 million rows read a day (a journal's read-back reads a row a record) and 13,000 GB-s of
+  duration a day (a hibernated room spends none).
 
-The console's HTTP fits Free. Rooms fit only testing. Free support isn't built, and a release
-could add it for staging and development accounts.
+The console's HTTP fits Free; rooms fit only testing.
 
 **A failed call** (the program's trap, a host limit) drops the instance. Every request open on it
 gets 500 (the program's trap) or 503 (the host's limits), with an empty body. Their state lived
@@ -424,8 +425,7 @@ Built in 0.14.0, its own pull request and release (language.md §19.6).
 
 **0.13.0 (HTTP).** Release files: `server/cloudflare.js` and `server/cloudflare.json` from the
 console's build, placed and merged as §8 says. Deploy commands: none new (`wrangler deploy`). The
-first deploy creates the `WrelaServer` namespace through the migration. Secrets: none new (a Durable Object takes its Worker's permissions, so the deploy's token does). Cloudflare plan: **Workers Paid** ($5 a month).
-Free's 10 ms of CPU an invocation can't verify a run, and Paid allows `cpu_ms`. The accounts
+first deploy creates the `WrelaServer` namespace through the migration. Secrets: none new (a Durable Object takes its Worker's permissions, so the deploy's token does). Cloudflare plan: **Workers Paid** ($5 a month; §5 says why not Free). The accounts
 engine moves challenges and rate counts to the store, uses `Request::time` for its clock, reads
 the session from the `__Host-` cookie, and checks Origin and its CSRF header. The console calls
 `std::http::fetch`. The pin moves to 0.13.0.
@@ -438,8 +438,8 @@ the session from the `__Host-` cookie, and checks Origin and its CSRF header. Th
   (`new_sqlite_classes: ["WrelaRoom"]`), and `/room/*` in `run_worker_first`.
 - A `ratelimits` entry with prefix `/room/` limits upgrades.
 - `net.json` beside the client build names the site, `{"url": "wss://<site>"}`.
-- `limits.cpu_ms` is no longer in `cloudflare.json`, which leaves Paid's default of 30 s.
-- Deploy commands and secrets: as 0.13.0. The plan: Workers Paid (§5 says why Free doesn't fit).
+- `limits.cpu_ms` is no longer in `cloudflare.json` (§5).
+- Deploy commands, secrets and the Cloudflare plan: as 0.13.0.
 
 ## 12. Later, listed but not built
 
@@ -457,8 +457,8 @@ the session from the `__Host-` cookie, and checks Origin and its CSRF header. Th
 1. **`user-agent`.** Left out of what a server sees, since it fingerprints and the privacy policy
    lists what's kept. Does the accounts server want it, say to name a session's device ("Chrome
    on a Mac")? If so, the host could pass a coarse family instead.
-2. **`limits.cpu_ms`.** Launch is on Workers Paid, with no `cpu_ms` (30 s). 5000 would cap what
-   a runaway call costs; measure first.
+2. **`limits.cpu_ms`.** From 0.14.0 none is set. 5000 would cap what a runaway call costs;
+   measure first.
 3. **Isolating a failing request.** Today a trap fails every request open on the instance.
    `wrela-serve` retries a room's events one at a time to find the poisoned one. Is that worth
    doing for HTTP, where one attacker's request could otherwise fail others' concurrent
