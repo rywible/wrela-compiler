@@ -24,6 +24,7 @@ mod grazer;
 mod handover;
 mod hello_field;
 mod herd;
+mod http;
 mod input;
 mod keys;
 mod language;

@@ -232,8 +232,9 @@ const LINES: &str = "game.lines";
 
 /// Whether a build writes a file with this name: `game.wasm` (and a relaxed-SIMD build's
 /// `game.relaxed.wasm`), their trap locations, `manifest.json`, a pipeline's
-/// `pipeline_<n>.wgsl`, a file of the runtime, a server build's `server/game.wasm` or a tool
-/// build's `tool/tool.wasm`.
+/// `pipeline_<n>.wgsl`, a file of the runtime, a server build's `server/game.wasm` and its
+/// Cloudflare host (`server/cloudflare.js`, `server/cloudflare.json`) or a tool build's
+/// `tool/tool.wasm`.
 pub(crate) fn written_by_build(name: &str) -> bool {
     let pipeline = name
         .strip_prefix("pipeline_")
@@ -253,6 +254,8 @@ pub(crate) fn written_by_build(name: &str) -> bool {
         || name == "manifest.json"
         || name == "lift.json"
         || name == wrela_driver::build::SERVER_WASM
+        || name == wrela_driver::build::CLOUDFLARE_JS
+        || name == wrela_driver::build::CLOUDFLARE_JSON
         || name == wrela_driver::build::TOOL_WASM
         || wrela_driver::build::RUNTIME_FILES.iter().any(|(f, _)| *f == name)
 }

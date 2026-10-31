@@ -304,3 +304,20 @@ export const FNV_PRIME = 0x00000100000001b3n;
  * PANIC_CAP bytes). */
 export const PANIC = 4096;
 export const PANIC_CAP = 4092;
+
+/** HTTP's bytes (runtime/abi `http`): what a request's and a response's start with, as u32s. */
+export const HTTP_REQUEST_MAGIC = 827410519;
+export const HTTP_RESPONSE_MAGIC = 827476055;
+export const SERVICE_RESPOND = "http/respond";
+export const SERVICE_FETCH = "http/fetch";
+export const SERVICE_TIME = "time/unix";
+export const MAX_HTTP_REQUEST = 1048576;
+export const RESPOND_WITHIN_MS = 30000;
+export const HTTP_METHODS: readonly string[] = ["GET", "HEAD", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"];
+export const SAFE_METHODS: readonly string[] = ["GET", "HEAD", "OPTIONS"];
+/** A program's own headers, which cross every way. */
+export const OWN_HEADER_PREFIX = "x-wrela-";
+export const SERVER_SEES: readonly string[] = ["accept", "accept-language", "content-type", "cookie", "if-none-match", "origin", "sec-fetch-dest", "sec-fetch-mode", "sec-fetch-site", "sec-fetch-user"];
+export const SERVER_SETS: readonly string[] = ["cache-control", "content-disposition", "content-type", "etag", "last-modified", "location", "retry-after", "set-cookie", "vary", "www-authenticate"];
+export const CLIENT_SETS: readonly string[] = ["accept", "content-type", "if-none-match"];
+export const CLIENT_SEES: readonly string[] = ["cache-control", "content-type", "etag", "location", "retry-after"];

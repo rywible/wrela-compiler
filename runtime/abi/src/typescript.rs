@@ -1,12 +1,19 @@
 //! The browser runtime's copy of the ABI's constants, generated so they're defined once.
 
-use crate::{check, hash, input, manifest, stream};
+use crate::{check, hash, http, input, manifest, stream};
 
 /// The checked-in TypeScript module, relative to the repository root.
 pub const TS_PATH: &str = "runtime/browser/src/abi.gen.ts";
 
 /// The TypeScript module `runtime/browser/src/abi.gen.ts`.
 pub fn typescript() -> String {
+    let mut out = constants();
+    out.push_str(&http_constants());
+    out
+}
+
+/// Everything but HTTP's.
+fn constants() -> String {
     let opcodes: String = stream::Opcode::ALL
         .iter()
         .map(|&op| format!("  {}: {},\n", op.name(), op as u32))
@@ -381,6 +388,45 @@ export const PANIC_CAP = {panic_cap};
         fnv_prime = hash::FNV_PRIME,
         panic = crate::memory::PANIC,
         panic_cap = crate::memory::PANIC_CAP,
+    )
+}
+
+/// HTTP's (language.md §19.5).
+fn http_constants() -> String {
+    let strings = |items: &[&str]| list(items.iter().map(|x| format!("{x:?}")));
+    format!(
+        r#"
+/** HTTP's bytes (runtime/abi `http`): what a request's and a response's start with, as u32s. */
+export const HTTP_REQUEST_MAGIC = {request_magic};
+export const HTTP_RESPONSE_MAGIC = {response_magic};
+export const SERVICE_RESPOND = {respond:?};
+export const SERVICE_FETCH = {fetch:?};
+export const SERVICE_TIME = {time:?};
+export const MAX_HTTP_REQUEST = {max_request};
+export const RESPOND_WITHIN_MS = {respond_within};
+export const HTTP_METHODS: readonly string[] = [{methods}];
+export const SAFE_METHODS: readonly string[] = [{safe}];
+/** A program's own headers, which cross every way. */
+export const OWN_HEADER_PREFIX = {own:?};
+export const SERVER_SEES: readonly string[] = [{server_sees}];
+export const SERVER_SETS: readonly string[] = [{server_sets}];
+export const CLIENT_SETS: readonly string[] = [{client_sets}];
+export const CLIENT_SEES: readonly string[] = [{client_sees}];
+"#,
+        request_magic = u32::from_le_bytes(http::REQUEST_MAGIC),
+        response_magic = u32::from_le_bytes(http::RESPONSE_MAGIC),
+        respond = http::SERVICE_RESPOND,
+        fetch = http::SERVICE_FETCH,
+        time = http::SERVICE_TIME,
+        max_request = http::MAX_REQUEST,
+        respond_within = http::RESPOND_WITHIN_MS,
+        methods = strings(&http::METHODS),
+        safe = strings(&http::SAFE_METHODS),
+        own = http::OWN_PREFIX,
+        server_sees = strings(&http::SERVER_SEES),
+        server_sets = strings(&http::SERVER_SETS),
+        client_sets = strings(&http::CLIENT_SETS),
+        client_sees = strings(&http::CLIENT_SEES),
     )
 }
 

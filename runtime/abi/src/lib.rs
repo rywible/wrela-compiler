@@ -51,6 +51,7 @@
 
 pub mod check;
 pub mod hash;
+pub mod http;
 pub mod input;
 pub mod lines;
 pub mod manifest;

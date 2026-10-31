@@ -45,7 +45,7 @@ SOURCES = ("compiler/std", "compiler/tests/fields", "compiler/tests/math", "comp
 # Clippy and the doc tests hold Cargo's lock and many cores, so they run before the lanes.
 CARGO_STEPS = ("clippy", "doc")
 LIGHT_STEPS = ("rustfmt", "wrela-fmt", "tools", "browser-types", "browser-dist", "browser-size",
-               "browser", "wgsl")
+               "browser", "cloudflare-types", "cloudflare-dist", "cloudflare", "wgsl")
 STEPS = CARGO_STEPS + LIGHT_STEPS
 CONTROLS = ("WRELA_RUN_ONLY", "WRELA_BLESS", "WRELA_FUZZ_WORKER", "WRELA_CONST_CACHE",
             "WRELA_VALIDATOR")
@@ -195,9 +195,9 @@ def browser_test(name, logs, out=None):
     return len(ran)
 
 
-def browser_packages(out=None):
-    """The browser runtime's locked packages (TypeScript, the WebGPU types): a fresh checkout has none."""
-    call(["bun", "install", "--frozen-lockfile", "--silent"], cwd=ROOT / "runtime/browser", **into(out))
+def browser_packages(out=None, package="runtime/browser"):
+    """A host's locked packages (TypeScript, the types it checks against): a fresh checkout has none."""
+    call(["bun", "install", "--frozen-lockfile", "--silent"], cwd=ROOT / package, **into(out))
 
 
 def step(name, wrela, logs, out=None):
@@ -231,6 +231,13 @@ def step(name, wrela, logs, out=None):
         script = {"browser-types": "typecheck", "browser-dist": "check-dist", "browser-size": "size"}[name]
         browser_packages(out)
         call(["bun", "run", script], cwd=ROOT / "runtime/browser", **into(out))
+    elif name == "cloudflare" or name.startswith("cloudflare-"):
+        # The Cloudflare host (runtime/cloudflare) reads the browser host's sources and tests.
+        browser_packages(out)
+        browser_packages(out, "runtime/cloudflare")
+        script = {"cloudflare": ["test"], "cloudflare-types": ["run", "typecheck"],
+                  "cloudflare-dist": ["run", "check-dist"]}[name]
+        call(["bun", *script], cwd=ROOT / "runtime/cloudflare", **into(out))
     else:
         call(commands[name], **into(out))
 

@@ -48,6 +48,7 @@ pub const STD_SOURCES: &[(&str, &str)] = &[
     ("std::net", include_str!("../../std/net.wrela")),
     ("std::store", include_str!("../../std/store.wrela")),
     ("std::crypto", include_str!("../../std/crypto.wrela")),
+    ("std::http", include_str!("../../std/http.wrela")),
     ("std::webauthn", include_str!("../../std/webauthn.wrela")),
     ("std::par", include_str!("../../std/par.wrela")),
     ("std::audio", include_str!("../../std/audio.wrela")),

@@ -1,0 +1,316 @@
+// HTTP for a server and its client (language.md §19.5): a server answers requests to its own
+// origin, and a client asks them, so a page and its server share a first-party cookie.
+//
+// **A request is a short connection.** The host opens connection `conn` (`Event::Connection`,
+// open), gives the request as its one message (`Event::Message`), whose bytes `request` reads, and
+// takes one answer, `respond`'s, carried out once the call's writes are committed, as `send` is.
+// Then it closes the connection, and a later call hears so (`Event::Connection`, closed): when the
+// response went, when the client went away, or after 30 s without a response (a 504).
+//
+// What crosses is allowlisted by the host, so no address reaches a program: a server sees
+// `accept`, `accept-language`, `content-type`, `cookie`, `if-none-match`, `origin` and the
+// `sec-fetch-*` headers, and its own (`x-wrela-*`). It sets `cache-control`,
+// `content-disposition`, `content-type`, `etag`, `last-modified`, `location`, `retry-after`,
+// `set-cookie`, `vary`, `www-authenticate` and its own; another fails the call. A client
+// (`fetch`) sets `accept`, `content-type`, `if-none-match` and its own, and sees
+// `cache-control`, `content-type`, `etag`, `location`, `retry-after` and its own, never
+// `set-cookie`, which its browser keeps.
+//
+// The bytes (runtime/abi `http`): `WHQ1`, the time (a `u64` of Unix milliseconds), the method,
+// path and query (each a `u32` length and UTF-8), the headers (a count, then each name and value),
+// and the body (a length and bytes); a response is `WHR1`, its status, its headers and its body.
+
+use std::abi::{HTTP_REQUEST_MAGIC, HTTP_RESPONSE_MAGIC}
+use std::host::request as host_request
+use std::io::Pending
+use std::serialize::{Reader, Writer}
+
+/// A header: its name, in lower case, and its value.
+pub struct Header: Clone {
+    pub name: String,
+    pub value: String,
+}
+
+/// A request, as a server reads it.
+pub struct Request: Clone {
+    /// Its connection, which `respond` answers.
+    pub conn: u32,
+    /// When the host took it: milliseconds since the Unix epoch, the host's wall clock.
+    pub time: u64,
+    /// `GET`, `HEAD`, `POST`, `PUT`, `PATCH`, `DELETE` or `OPTIONS`.
+    pub method: String,
+    /// The URL's path, as sent: percent-encoding is kept (`/api/me`).
+    pub path: String,
+    /// What follows `?`, without it: empty if nothing does.
+    pub query: String,
+    /// The headers the server sees, in the order sent.
+    pub headers: Vec<Header>,
+    pub body: Vec<u8>,
+}
+
+impl Request {
+    /// The first value of header `name` (in lower case), if it was sent.
+    pub fn header(self, name: str) -> Option<String> {
+        for h in self.headers {
+            if h.name.as_str() == name {
+                return Some(h.value.clone())
+            }
+        }
+        None
+    }
+
+    /// The value of the session cookie `name` that `session_cookie(name, ..)` set: the cookie
+    /// `__Host-<name>`, if one was sent.
+    pub fn session(self, name: str) -> Option<String> {
+        self.cookie(String::from(f"__Host-{name}").as_str())
+    }
+
+    /// The value of cookie `name`, from the `cookie` header (RFC 6265 §4.2): the first of that
+    /// name, if one was sent. A session cookie's name has its prefix: `session` reads it.
+    pub fn cookie(self, name: str) -> Option<String> {
+        for h in self.headers {
+            if h.name.as_str() != "cookie" {
+                continue
+            }
+            let line = h.value.as_str()
+            for (from, to) in line.split(";") {
+                let pair = line.slice(from, to).trim()
+                let Some(eq) = pair.find("=") else { continue }
+                if pair.slice(0, eq).trim() == name {
+                    return Some(String::from(pair.slice(eq + 1, pair.len()).trim()))
+                }
+            }
+        }
+        None
+    }
+}
+
+/// A response: its status (200 to 599: a final one), its headers and its body (none for 204,
+/// 205 and 304).
+pub struct Response: Clone {
+    pub status: u32,
+    pub headers: Vec<Header>,
+    pub body: Vec<u8>,
+}
+
+impl Response {
+    /// A response of `status` with no headers and no body.
+    pub fn new(status: u32) -> Response {
+        Response { status, headers: Vec::new(), body: Vec::new() }
+    }
+
+    /// Adds header `name` (in lower case) with `value`. A header of that name already there stays:
+    /// `set-cookie` may come several times.
+    pub fn set(mut self, name: str, value: str) {
+        self.headers.push(Header { name: String::from(name), value: String::from(value) })
+    }
+
+    /// The first value of header `name`, if it has one.
+    pub fn header(self, name: str) -> Option<String> {
+        for h in self.headers {
+            if h.name.as_str() == name {
+                return Some(h.value.clone())
+            }
+        }
+        None
+    }
+}
+
+/// A response of `status` whose body is `body`, as plain UTF-8 text.
+pub fn text(status: u32, body: str) -> Response {
+    var r = Response::new(status)
+    r.set("content-type", "text/plain; charset=utf-8")
+    r.body.append_text(body)
+    r
+}
+
+/// A response of `status` whose body is `body`, as JSON.
+pub fn json(status: u32, body: str) -> Response {
+    var r = Response::new(status)
+    r.set("content-type", "application/json")
+    r.body.append_text(body)
+    r
+}
+
+/// A response of `status` whose body is `body`, of type `content_type`.
+pub fn bytes(status: u32, body: [u8], content_type: str) -> Response {
+    var r = Response::new(status)
+    r.set("content-type", content_type)
+    r.body = Vec::from(body)
+    r
+}
+
+/// The request in a message's bytes (`payload` of an `Event::Message` on connection `conn`), or
+/// none if they aren't one.
+pub fn request(conn: u32, bytes: [u8]) -> Option<Request> {
+    var r = Reader::new(Vec::from(bytes))
+    if r.read_u32().ok()? != HTTP_REQUEST_MAGIC {
+        return None
+    }
+    let time = r.read_u64().ok()?
+    let method = r.read_string().ok()?
+    let path = r.read_string().ok()?
+    let query = r.read_string().ok()?
+    let headers = read_headers(mut r)?
+    let body = r.read_counted().ok()?
+    if !r.at_end() {
+        return None
+    }
+    Some(Request { conn, time, method, path, query, headers, body })
+}
+
+/// Answers the request on connection `conn` with `response`, once the call's writes are
+/// committed. A request takes one answer: a second, or one that sets a header a server can't,
+/// fails the call.
+///
+/// ```wrela
+/// use std::http::{request, respond, session_cookie, text}
+/// use std::input::{Event, events, payload}
+///
+/// @server
+/// fn answer() {
+///     for e in events() {
+///         let Event::Message { conn, .. } = e else { continue }
+///         let Some(bytes) = payload(e) else { continue }
+///         let Some(r) = request(conn, bytes) else { continue }
+///         var out = if r.method.as_str() == "GET" && r.path.as_str() == "/api/hello" {
+///             text(200, "hello")
+///         } else {
+///             text(404, "no such page")
+///         }
+///         if r.session("visit").is_none() {
+///             out.set("set-cookie", session_cookie("visit", "1", 3600).as_str())
+///         }
+///         respond(conn, out)
+///     }
+/// }
+/// ```
+@server
+pub fn respond(conn: u32, response: Response) {
+    var w = Writer::new()
+    w.write_u32(conn)
+    write_response(mut w, response)
+    let _ = host_request("http/respond", take w.into_bytes())
+}
+
+/// A first-party session cookie for `set-cookie`: `__Host-<name>=<value>`, sent back only to this
+/// origin, over HTTPS, never to a script (`HttpOnly`) and never from another site's page
+/// (`SameSite=Strict`), for `max_age` seconds (0 clears it). `__Host-` makes the browser refuse
+/// it without `Secure` and `Path=/`, or with a `Domain` (RFC 6265bis §4.1.3.2). `value` is the
+/// program's to keep to a cookie's characters (base64url is).
+pub fn session_cookie(name: str, value: str, max_age: u32) -> String {
+    String::from(
+        f"__Host-{name}={value}; Path=/; Max-Age={max_age}; Secure; HttpOnly; SameSite=Strict",
+    )
+}
+
+/// Asks this page's own origin for `path` (absolute: `/api/me`, with a query if it likes) by
+/// `method`, with `headers` and `body`, sending the origin's cookies: `response` reads the
+/// answer. A path that doesn't start with one `/` panics; the request fails if no response came.
+@client
+pub fn fetch(method: str, path: str, headers: [Header], body: [u8]) -> Pending<u8> {
+    assert(path.starts_with("/") && !path.starts_with("//"), "fetch: the path starts with one `/`")
+    let n = path.len()
+    let cut = match path.find("?") {
+        Some(at) => at,
+        None => n,
+    }
+    var w = Writer::new()
+    w.write_u32(HTTP_REQUEST_MAGIC)
+    w.write_u64(0)
+    w.write_str(method)
+    w.write_str(path.slice(0, cut))
+    w.write_str(path.slice(if cut < n { cut + 1 } else { n }, n))
+    w.write_u32(headers.len())
+    for h in headers {
+        w.write_str(h.name.as_str())
+        w.write_str(h.value.as_str())
+    }
+    w.write_counted(body)
+    host_request("http/fetch", take w.into_bytes())
+}
+
+/// The response a `fetch` answered with, or none if the answer isn't one.
+pub fn response(answer: [u8]) -> Option<Response> {
+    var r = Reader::new(Vec::from(answer))
+    if r.read_u32().ok()? != HTTP_RESPONSE_MAGIC {
+        return None
+    }
+    let status = r.read_u32().ok()?
+    let headers = read_headers(mut r)?
+    let body = r.read_counted().ok()?
+    if !r.at_end() || status < 200 || status > 599 {
+        return None
+    }
+    Some(Response { status, headers, body })
+}
+
+fn read_headers(r: mut Reader) -> Option<Vec<Header>> {
+    let n = r.read_u32().ok()?
+    // Each header is at least its two lengths.
+    if n > r.left() / 8 {
+        return None
+    }
+    var out: Vec<Header> = Vec::with_capacity(n)
+    for _ in 0..n {
+        let name = r.read_string().ok()?
+        let value = r.read_string().ok()?
+        out.push(Header { name, value })
+    }
+    Some(out)
+}
+
+fn write_response(w: mut Writer, response: Response) {
+    w.write_u32(HTTP_RESPONSE_MAGIC)
+    w.write_u32(response.status)
+    w.write_u32(response.headers.len())
+    for h in response.headers {
+        w.write_str(h.name.as_str())
+        w.write_str(h.value.as_str())
+    }
+    w.write_counted(response.body)
+}
+
+// ---- tests -------------------------------------------------------------------------------------
+
+@test
+fn a_request_reads_its_headers_and_cookies() {
+    var w = Writer::new()
+    w.write_u32(HTTP_REQUEST_MAGIC)
+    w.write_u64(1793404800123)
+    w.write_str("POST")
+    w.write_str("/api/sign-in")
+    w.write_str("step=2")
+    w.write_u32(2)
+    w.write_str("cookie")
+    w.write_str("theme=dark; __Host-session = abc ; theme=light")
+    w.write_str("x-wrela-csrf")
+    w.write_str("7f")
+    w.write_counted([1, 2, 3])
+    let bytes = take w.into_bytes()
+    let r = request(9, bytes).expect("a request")
+    assert(r.conn == 9 && r.time == 1793404800123 && r.method.as_str() == "POST")
+    assert(r.path.as_str() == "/api/sign-in" && r.query.as_str() == "step=2" && r.body.len() == 3)
+    assert(r.cookie("__Host-session").expect("the session").as_str() == "abc")
+    assert(r.session("session").expect("the session again").as_str() == "abc")
+    assert(r.cookie("theme").expect("the first theme").as_str() == "dark")
+    assert(r.cookie("none").is_none() && r.header("x-wrela-csrf").expect("csrf").as_str() == "7f")
+    assert(request(9, [87, 72, 81, 49, 0]).is_none(), "cut short")
+    assert(request(9, [1, 2, 3, 4]).is_none(), "not a request")
+}
+
+@test
+fn a_response_reads_back_with_its_cookie() {
+    var out = text(201, "made")
+    out.set("set-cookie", session_cookie("session", "abc", 60).as_str())
+    var w = Writer::new()
+    write_response(mut w, out)
+    let r = response(take w.into_bytes()).expect("a response")
+    assert(r.status == 201 && r.body.len() == 4 && r.headers.len() == 2)
+    let cookie = r.header("set-cookie").expect("the cookie")
+    assert(
+        cookie.as_str() ==
+            "__Host-session=abc; Path=/; Max-Age=60; Secure; HttpOnly; SameSite=Strict",
+    )
+    assert(response([87, 72, 82, 49, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]).is_none(), "status 1")
+}

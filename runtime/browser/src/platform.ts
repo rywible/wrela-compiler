@@ -1,5 +1,6 @@
 // Application-host mechanisms. Services transport opaque bytes; the Wrela application
 // owns its catalog, UI, session protocol and save policy.
+import { httpFetch } from "./http.ts";
 import { glyph, type Paper } from "./glyph.ts";
 import type { Listener } from "./listen.ts";
 import type { Bytes } from "./stream.ts";
@@ -420,6 +421,7 @@ export class BrowserPlatform {
       return environment(matchMedia("(prefers-reduced-motion: reduce)").matches, Date.now(), window.devicePixelRatio || 1, performance.getEntriesByType("navigation"), this.#capabilities(), matchMedia("(prefers-color-scheme: light)").matches);
     }
     if (service === "image/decode") return decodeImage(body, browserDecode);
+    if (service === "http/fetch") return httpFetch(body, location.origin);
     if (service === "cursor") {
       // The pointer's shape over the program's canvas: a named CSS cursor, from a short list.
       const name = UTF8.decode(body);

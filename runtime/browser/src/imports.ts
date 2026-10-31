@@ -1,7 +1,7 @@
 // The imports of another thread's instance of the program: a helper's, the ticker's, the voice's.
 // It needs only the ABI, so the audio worklet's small bundle can have it too.
 
-import { HOST_FUNCTIONS, IMPORT_CLOCK, IMPORT_MEMORY, IMPORT_MODULE, IMPORT_PHASE, IMPORT_PRINT } from "./abi.gen.ts";
+import { HOST_FUNCTIONS, IMPORT_CLOCK, IMPORT_MEMORY, IMPORT_MODULE, IMPORT_PHASE, IMPORT_PRINT, PANIC, PANIC_CAP, THREAD_BLOCK_SIZE, THREAD_BLOCKS } from "./abi.gen.ts";
 
 /** A Wasm start function runs while an instance is being made, before the host can safely
  * expose any of its effects. This is the same program-ABI error as the native host reports. */
@@ -137,4 +137,19 @@ export function refusingImports(
       [IMPORT_PHASE]: afterStart(phaseImport(memory)),
     },
   };
+}
+
+/** The message a panic on thread `thread` left before it trapped (its block's `PANIC`), cleared
+ * so a later trap that isn't a panic doesn't repeat it. */
+export function takePanicMessage(memory: WebAssembly.Memory, thread: number): string | null {
+  const at = THREAD_BLOCKS + thread * THREAD_BLOCK_SIZE + PANIC;
+  // A memory too small to hold the block (not a compiled program's) left no message there.
+  if (at + 4 + PANIC_CAP > memory.buffer.byteLength) return null;
+  const view = new DataView(memory.buffer);
+  const count = Math.min(view.getUint32(at, true), PANIC_CAP);
+  if (count === 0) return null;
+  // A copy: TextDecoder doesn't read shared memory.
+  const bytes = new Uint8Array(memory.buffer, at + 4, count).slice();
+  view.setUint32(at, 0, true);
+  return new TextDecoder().decode(bytes);
 }

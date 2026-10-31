@@ -81,7 +81,7 @@ class Selection(unittest.TestCase):
         self.assertEqual([c.args[0] for c in run.call_args_list], ['one', 'two', 'three'])
         text = output.getvalue()
         for shown in ['step output for clippy', 'step output for rustfmt', 'step output for browser',
-                      'program output for one', 'one failed', '4 of 13 checks failed']:
+                      'program output for one', 'one failed', '4 of 16 checks failed']:
             self.assertIn(shown, text)
         self.assertIn('all checks failed', text)
 
@@ -339,6 +339,14 @@ class BrowserPackages(unittest.TestCase):
                 check.step(name, Path('wrela'), Path('logs'))
                 self.assertEqual([c.args[0] for c in run.call_args_list],
                                  [['bun', 'install', '--frozen-lockfile', '--silent'], last])
+        # The Cloudflare host reads the browser host's sources: both packages, then its own step.
+        for name, last in [('cloudflare', ['bun', 'test']),
+                           ('cloudflare-types', ['bun', 'run', 'typecheck']),
+                           ('cloudflare-dist', ['bun', 'run', 'check-dist'])]:
+            with self.subTest(name=name), patch.object(check, 'call') as run:
+                check.step(name, Path('wrela'), Path('logs'))
+                self.assertEqual([c.args[0] for c in run.call_args_list],
+                                 [['bun', 'install', '--frozen-lockfile', '--silent']] * 2 + [last])
         with patch.object(check, 'call') as run, patch.object(check, 'browser_test') as test:
             check.step('browser', Path('wrela'), Path('logs'))
             self.assertEqual(run.call_args.args[0], ['bun', 'install', '--frozen-lockfile', '--silent'])

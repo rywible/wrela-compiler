@@ -56,10 +56,8 @@ import {
   IMPORT_REQUEST_TAKE,
   IMPORT_SUBMIT,
   IMPORT_TICK,
-  PANIC,
   TICK_WANT_HASH,
   TICK_RECORDS,
-  PANIC_CAP,
   REQUEST_FAILED,
   REQUEST_MISSING,
   REQUEST_PENDING,
@@ -69,7 +67,7 @@ import {
 import { type Checker, checkHostRules, CommandError } from "./check.ts";
 import { errorMessage } from "./errors.ts";
 import { StateHash } from "./hash.ts";
-import { CALLED_WHILE_STARTING, clockImport, phaseImport, Phases, printed, refusingImports } from "./imports.ts";
+import { CALLED_WHILE_STARTING, clockImport, phaseImport, Phases, printed, refusingImports, takePanicMessage } from "./imports.ts";
 import { Lines, LINES_SECTION, unlocated, wasmOffsets } from "./lines.ts";
 import { Inbox, type Net } from "./net.ts";
 import { encodeEvent, type Scripted } from "./input.ts";
@@ -1127,17 +1125,3 @@ function describeTrap(e: unknown, lines: Lines | null): string {
   return at ? `${what} at ${at}` : what;
 }
 
-/** The message a panic on thread `thread` left before it trapped (its block's `PANIC`), cleared
- * so a later trap that isn't a panic doesn't repeat it. */
-function takePanicMessage(memory: WebAssembly.Memory, thread: number): string | null {
-  const at = threadBlock(thread) + PANIC;
-  // A memory too small to hold the block (not a compiled program's) left no message there.
-  if (at + 4 + PANIC_CAP > memory.buffer.byteLength) return null;
-  const view = new DataView(memory.buffer);
-  const count = Math.min(view.getUint32(at, true), PANIC_CAP);
-  if (count === 0) return null;
-  // A copy: TextDecoder doesn't read shared memory.
-  const bytes = new Uint8Array(memory.buffer, at + 4, count).slice();
-  view.setUint32(at, 0, true);
-  return new TextDecoder().decode(bytes);
-}

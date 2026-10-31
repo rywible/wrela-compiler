@@ -4,6 +4,12 @@
 /// The allocator's state: std's own words, from here on.
 pub(package) const ALLOC_STATE: u32 = 16
 
+/// What an HTTP request's bytes start with (`std::http`), `WHQ1` as a little-endian word.
+pub(package) const HTTP_REQUEST_MAGIC: u32 = 827410519
+
+/// What an HTTP response's bytes start with, `WHR1`.
+pub(package) const HTTP_RESPONSE_MAGIC: u32 = 827476055
+
 /// Bumped whenever work appears: the helpers wait on it.
 pub(package) const PAR_WAKE: u32 = 256
 
