@@ -124,14 +124,15 @@ test("test mode runs on this machine and on a private network's addresses, never
 });
 
 test("show=1's summary names the intervals, when it was playable, and the adapter", () => {
+  // Frame 0 waited for its pipelines until 1012: the page was playable once it was submitted.
   const lines = summaryLines(
-    { began_ms: [1000, 1016, 1050, 1066], printed: ["hi", "playable"], printed_in: [0, 2], opened_ms: 900, pipelines_ms: 12.5 },
+    { began_ms: [1000, 1016, 1050, 1066], submitted_ms: [1012, 1020, 1060, 1070], printed: ["hi", "playable"], printed_in: [0, 2], opened_ms: 900, pipelines_ms: 12.5 },
     "apple metal-3",
   );
   expect(lines).toEqual([
     "4 frames; intervals p50 16.0 ms, p95 34.0 ms, p99 34.0 ms; over 33 ms: 1",
-    "first frame 100.0 ms after the page opened",
-    "playable 150.0 ms",
+    "first frame 112.0 ms after the page opened",
+    "playable 160.0 ms",
     "pipelines 12.5 ms",
     "apple metal-3",
   ]);

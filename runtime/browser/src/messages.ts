@@ -140,6 +140,9 @@ export interface TickerStart extends TickerOptions {
   clock: SharedArrayBuffer;
   /** The input ring (input.ts), whose ticker reader the render worker has attached. */
   input: SharedArrayBuffer;
+  /** The records the program posts into its ticks (`std::tick::post`): a ring as the input's,
+   * each stamped with the frames started when it was posted in place of a time. */
+  posts: SharedArrayBuffer;
   /** Test mode: a script's events; frame-keyed ones are the ticker's once their frame starts. */
   script: Scripted[];
   /** Frames already started when the ticker was requested: their scripts preceded this ticker. */

@@ -37,6 +37,7 @@ test("the ticker relays prints without mistaking them for its final report", asy
     control: control.buffer,
     clock: VisibleClock.create().buffer,
     input: InputRing.create().buffer,
+    posts: InputRing.create().buffer,
     script: [],
     hashes: false,
     timing: false,
@@ -113,7 +114,7 @@ test("lockstep ticks publish the build origin and preserve the replay origin", a
     const messages: FromTicker[] = [];
     await runTicker({
       module, memory, task: 0, context: 0, hz: 60, control: control.buffer,
-      clock: VisibleClock.create().buffer, input: InputRing.create().buffer,
+      clock: VisibleClock.create().buffer, input: InputRing.create().buffer, posts: InputRing.create().buffer,
       script: [], hashes: false, timing: false, wasmHash: 0n, delay: 0, replayable: false,
       replay: origin === null ? null : { upto: 1, ticks: [], origin },
       framesBeforeStart: 0,
@@ -135,7 +136,7 @@ test("a ticker skips scripts before its start and keeps frames that start while 
     control.runTo(1);
     await runTicker({
       module, memory, task: 0, context: 0, hz: 60, control: control.buffer,
-      clock: VisibleClock.create().buffer, input: InputRing.create().buffer,
+      clock: VisibleClock.create().buffer, input: InputRing.create().buffer, posts: InputRing.create().buffer,
       script: [0, 1, 2, 3].map(frame => ({ at: { frame }, event: textEvent(65 + frame) })),
       hashes: false, timing: false, wasmHash: 0n, delay: 0, replayable: false, replay,
       framesBeforeStart: 2,

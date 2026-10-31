@@ -339,6 +339,13 @@ fn button_of(b: u32) -> Button {
     }
 }
 
+/// A record the program posted into its ticks (`std::tick::post`, kind 16), from its layout: its
+/// tag (where an event has its modifiers), `a` and `b`; `None` for an input event.
+pub(package) fn posted_of(r: RawEvent) -> Option<(u32, u64, u64)> {
+    if r.kind != 16 { return None }
+    Some((r.mods, u64(r.a) | (u64(r.b) << 32), u64(r.c) | (u64(r.d) << 32)))
+}
+
 /// An event from its layout; `None` for a kind this std doesn't know.
 pub(package) fn event_of(r: RawEvent) -> Option<Event> {
     let at = vec2(bitcast_f32(r.a), bitcast_f32(r.b))

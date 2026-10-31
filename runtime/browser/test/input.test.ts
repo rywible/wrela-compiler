@@ -70,6 +70,22 @@ test("detaching a ticker skips events already overwritten while frames fell behi
   expect(ring.write(textEvent(1), 0)).toBe(true);
 });
 
+test("the ticker reads posted records up to a stamp: a frame's posts come before the next frame's events", () => {
+  // The posts ring (worker.ts): each record stamped with the frames started when it was posted.
+  const posts = InputRing.create();
+  posts.attachTicker();
+  for (const [char, frames] of [[97, 0], [98, 1], [99, 1], [100, 3]] as const) posts.write(textEvent(char), frames);
+  const out = new Uint8Array(4 * EVENT_SIZE);
+  const char = (i: number) => new DataView(out.buffer).getUint32(i * EVENT_SIZE + 8, true);
+  expect(posts.readTicker(out, 0, 4, 0)).toBe(1);
+  expect(char(0)).toBe(97);
+  expect(posts.readTicker(out, 0, 4, 2)).toBe(2);
+  expect([char(0), char(1)]).toEqual([98, 99]);
+  expect(posts.readTicker(out, 0, 4, 2)).toBe(0);
+  expect(posts.readTicker(out, 0, 4)).toBe(1);
+  expect(char(0)).toBe(100);
+});
+
 test("text is characters: a lone surrogate is refused, as the native host refuses it", () => {
   expect(parseScript('[{"frame": 0, "type": "text", "text": "a\\ud83d\\ude00"}]').length).toBe(2);
   expect(() => parseScript('[{"frame": 0, "type": "text", "text": "\\ud800"}]')).toThrow("lone surrogate");

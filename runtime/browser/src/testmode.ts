@@ -1,8 +1,10 @@
 // Test mode: `index.html#test&frames=60&width=1920&height=1080&fps=60&workers=4&audio=750` runs a
 // fixed number of frames at fixed times and canvas size, its parallel jobs on a fixed number of
 // threads (the program's own included), then saves the last frame, the state hash, the lines
-// the program printed (`log.txt`), each frame's CPU time, when it began, the phases it timed
-// (`std::time::phase`, ms by name) and the frame each printed line came in (`frames.json`), and
+// the program printed (`log.txt`), each frame's CPU time, when it began, when its commands had
+// all run and were submitted (`submitted_ms`: later than its start when one waited for a
+// pipeline being built), the phases it timed (`std::time::phase`, ms by name) and the frame each
+// printed line came in (`frames.json`), and
 // what the executor did each frame below the stream (`counters.json`: passes, dispatches, draws
 // and draw calls, buffer and texture writes, bind groups and pipelines set), and the adapter and
 // the features the program saw (`device.json`) to `results/` for
@@ -45,8 +47,8 @@
 // interval is its CPU time and its GPU time). With `snap=n` (and `snapfrom=i`), the screen every
 // n frames from frame i (0 unless given), as `snap-<frame>.png`. With `salt=n`, each pipeline's entry points
 // store n first, so no cache serves its pipelines (worker.ts `salt`), and `pipelines.json` has how
-// long creating them all, at once, took (#42 AC4's cold pipelines). `load.json` has when the page opened
-// and each file it loaded; `memory.json` the bytes of the program's GPU buffers and textures (at
+// long creating them all, at once, took (#42 AC4's cold pipelines). `load.json` has when the page opened,
+// when its first frame began and was submitted (`first_frame_ms`, `first_submitted_ms`), and each file it loaded; `memory.json` the bytes of the program's GPU buffers and textures (at
 // the end, and at most) and of its WASM memory (reserved, and grown to). It's part of the shipped bundle, so the agreement test runs
 // the exact bytes a game ships, but only a page served from this machine (the test servers all
 // bind 127.0.0.1) enters it: a game's public URL ignores `#test`.
@@ -169,11 +171,12 @@ function percentile(xs: number[], p: number): number {
 }
 
 /** A run's summary, as `show=1` draws it: the frames' intervals (their 50th, 95th and 99th
- * percentiles, and how many were over 33 ms), when the page was first playable (its program's
- * first line that says `playable`) and its first frame, how long its pipelines took, and the
- * adapter. */
+ * percentiles, and how many were over 33 ms), when the page was first playable (the frame of its
+ * program's first line that says `playable` submitted: a frame that waited for its pipelines
+ * wasn't playable when it began) and its first frame submitted, how long its pipelines took,
+ * and the adapter. */
 export function summaryLines(
-  run: { began_ms: number[]; printed: string[]; printed_in: number[]; opened_ms: number; pipelines_ms: number | null },
+  run: { began_ms: number[]; submitted_ms: number[]; printed: string[]; printed_in: number[]; opened_ms: number; pipelines_ms: number | null },
   adapter: string,
 ): string[] {
   const intervals = run.began_ms.slice(1).map((t, i) => t - run.began_ms[i]!);
@@ -181,10 +184,10 @@ export function summaryLines(
   const lines = [
     `${intervals.length + 1} frames; intervals p50 ${ms(percentile(intervals, 50))}, p95 ${ms(percentile(intervals, 95))}, p99 ${ms(percentile(intervals, 99))}; over 33 ms: ${intervals.filter((x) => x > 33).length}`,
   ];
-  const first = run.began_ms[0];
+  const first = run.submitted_ms[0];
   if (first !== undefined) lines.push(`first frame ${ms(first - run.opened_ms)} after the page opened`);
   const said = run.printed.findIndex((l) => l.includes("playable"));
-  const at = said < 0 ? undefined : run.began_ms[run.printed_in[said]!];
+  const at = said < 0 ? undefined : run.submitted_ms[run.printed_in[said]!];
   lines.push(at === undefined ? "playable: not said" : `playable ${ms(at - run.opened_ms)}`);
   if (run.pipelines_ms !== null) lines.push(`pipelines ${ms(run.pipelines_ms)}`);
   lines.push(adapter || "an unnamed adapter");
