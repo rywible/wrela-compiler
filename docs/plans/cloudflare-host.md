@@ -76,7 +76,8 @@ header before the Durable Object is called): `accept`, `accept-language`, `conte
 address: not `cf-connecting-ip`, `cf-connecting-ipv6`, `x-forwarded-for`, `x-real-ip`,
 `true-client-ip`, nor `cf-ipcountry`, `cf-ray` or `user-agent` (open question 1).
 
-**A response** (`std::http::Response`): a status (100–599), headers, a body.
+**A response** (`std::http::Response`): a final status (200–599), headers, a body (none for
+204, 205 and 304: the Workers runtime refuses one, as it refuses a status below 200).
 
 - The headers a server may set, also an allowlist: `cache-control`, `content-type`,
   `content-disposition`, `etag`, `last-modified`, `location`, `retry-after`, `set-cookie`

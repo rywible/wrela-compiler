@@ -14,7 +14,7 @@
 import { DurableObject } from "cloudflare:workers";
 import { HTTP_METHODS, MAX_HTTP_REQUEST, SAFE_METHODS } from "../../browser/src/abi.gen.ts";
 import { Out, seenByServer } from "../../browser/src/http.ts";
-import { bare, decodeResponse, encodeRequest, type Header, HOST_HEADERS, Server } from "./host.ts";
+import { bare, decodeResponse, encodeRequest, type Header, HOST_HEADERS, NO_BODY, Server } from "./host.ts";
 
 /** A Workers Rate Limiting binding (`ratelimits` in the Wrangler configuration). */
 export interface RateLimit {
@@ -168,7 +168,7 @@ export async function api(request: Request, env: Env, options: ApiOptions = {}):
   const s = decodeResponse(answer);
   const out = new Headers();
   for (const [n, v] of s.headers) out.append(n, v);
-  const empty = method === "HEAD" || s.status === 204 || s.status === 304;
+  const empty = method === "HEAD" || NO_BODY.includes(s.status);
   const response = new Response(empty ? null : (s.body.slice() as Uint8Array<ArrayBuffer>), { status: s.status, headers: out });
   if (cache !== undefined && key !== null && shareable(response)) {
     const kept = cache.put(key, response.clone());

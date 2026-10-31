@@ -79,7 +79,8 @@ impl Request {
     }
 }
 
-/// A response: its status (100 to 599), its headers and its body.
+/// A response: its status (200 to 599: a final one), its headers and its body (none for 204,
+/// 205 and 304).
 pub struct Response: Clone {
     pub status: u32,
     pub headers: Vec<Header>,
@@ -232,7 +233,7 @@ pub fn response(answer: [u8]) -> Option<Response> {
     let status = r.read_u32().ok()?
     let headers = read_headers(mut r)?
     let body = r.read_counted().ok()?
-    if !r.at_end() || status < 100 || status > 599 {
+    if !r.at_end() || status < 200 || status > 599 {
         return None
     }
     Some(Response { status, headers, body })

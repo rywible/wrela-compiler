@@ -2605,7 +2605,7 @@ A server build also answers HTTP requests to its page's own origin, so a page an
 
 1. `Event::Connection` opens connection `conn`: a request came.
 2. One `Event::Message` on `conn` carries the request. `std::http::request(conn, bytes)` reads it from its payload (`None` for bytes that aren't a request): its method, path, query, headers, body, and `time`, the host's wall clock in Unix milliseconds when it took the request.
-3. The program answers once, with `std::http::respond(conn, response)`, a status (100 to 599), headers and a body. The response is a command, carried out once the call's writes are committed, as `send` is (§19.4).
+3. The program answers once, with `std::http::respond(conn, response)`, a final status (200 to 599), headers and a body (none for 204, 205 and 304). The response is a command, carried out once the call's writes are committed, as `send` is (§19.4).
 4. The connection closes on a later call (`Event::Connection`, closed): when the response went, the client went away, or 30 s passed without a response (the client gets 504).
 
 A second response, a header a server can't set, and `send`, `close`, `tag`, `keep` or `compact` on this host fail the call as the program's. A response is one host request, at most 1 MiB less its headers, so a program pages a larger body.

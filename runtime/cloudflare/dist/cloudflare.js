@@ -233,8 +233,8 @@ function decodeResponse(bytes) {
   if (r.word() !== HTTP_RESPONSE_MAGIC)
     throw new Error("not a response");
   const status = r.word();
-  if (status < 100 || status > 599)
-    throw new Error(`status ${status} isn't 100 to 599`);
+  if (status < 200 || status > 599)
+    throw new Error(`status ${status} isn't 200 to 599`);
   const s = { status, headers: r.headers(), body: r.chunk() };
   r.end("response");
   return s;
@@ -859,7 +859,7 @@ var MAX_KEY = 1024;
 var MAX_VALUE = 1020 << 10;
 var MAX_SCAN = 1 << 20;
 var MAX_RANDOM = 1024;
-var LIMITS = { memory: 64 << 20, commands: 16 << 20, turn: 250 };
+var LIMITS = { memory: 64 << 20, commands: 16 << 20, turn: 250, open: 256, queued: 32 << 20 };
 
 class Failure extends Error {
   program;
@@ -868,10 +868,13 @@ class Failure extends Error {
     this.program = program;
   }
 }
+var NO_BODY = [204, 205, 304];
 var HEADER_NAME = /^[a-z0-9!#$%&'*+.^_`|~-]+$/;
 var HEADER_VALUE = /^[^\r\n\0]*$/;
 function checkResponse(bytes) {
   const s = decodeResponse(bytes);
+  if (NO_BODY.includes(s.status) && s.body.length > 0)
+    throw new Error(`a ${s.status} has no body`);
   for (const [n, v] of s.headers) {
     if (!HEADER_NAME.test(n))
       throw new Error(`\`${n}\` isn't a header's name in lower case`);
@@ -1156,6 +1159,7 @@ class Instance {
     new Uint8Array(this.memory.buffer, at, bytes.length).set(bytes);
   }
 }
+var RECOVER_MS = 1000;
 var POISONED = 2 ** 31;
 
 class Server {
@@ -1173,6 +1177,8 @@ class Server {
   lastClock = 0;
   pumping = false;
   woken = false;
+  leftover = false;
+  alarmAt = 0;
   now;
   constructor(module, storage, options = {}) {
     this.module = module;
@@ -1183,6 +1189,8 @@ class Server {
     this.started = this.now();
   }
   request(bytes) {
+    if (this.open.size >= this.limits.open || this.queue.held + bytes.length > this.limits.queued)
+      return Promise.resolve(bare(503));
     const conn = this.nextConn++;
     if (this.nextConn >= POISONED)
       this.nextConn = 1;
@@ -1197,11 +1205,12 @@ class Server {
     return answer;
   }
   async alarm() {
+    this.alarmAt = 0;
     this.woken = true;
     await this.pump();
   }
   due() {
-    return this.fresh || this.woken || (this.instance?.arriving.length ?? 0) > 0;
+    return this.fresh || this.leftover || this.woken || (this.instance?.arriving.length ?? 0) > 0;
   }
   async pump() {
     if (this.pumping)
@@ -1212,7 +1221,8 @@ class Server {
       while (this.due()) {
         await this.once();
         if (this.open.size === 0 && this.due() && this.now() - began >= this.limits.turn) {
-          this.options.setAlarm?.(this.now());
+          this.alarmAt = this.now();
+          this.options.setAlarm?.(this.alarmAt);
           return;
         }
         await new Promise((r) => setTimeout(r, 0));
@@ -1240,8 +1250,14 @@ class Server {
     instance.commandBytes = 0;
     try {
       const time = Math.fround((this.now() - this.started) / 1000);
+      const before = this.queue.length;
       instance.call(() => instance.serve(time));
+      this.leftover = this.queue.length > 0 && this.queue.length < before;
       this.carryOut(instance.commands);
+      if (this.due() && this.alarmAt < this.now()) {
+        this.alarmAt = this.now() + RECOVER_MS;
+        this.options.setAlarm?.(this.alarmAt);
+      }
     } catch (e) {
       this.fail(e);
     }
@@ -1249,14 +1265,17 @@ class Server {
   ready() {
     if (this.instance !== null)
       return Promise.resolve(this.instance);
-    this.starting ??= Instance.start(this, this.module).then((i) => {
-      this.instance = i;
-      this.starting = null;
-      return i;
-    }, (e) => {
-      this.starting = null;
-      throw e;
-    });
+    this.starting ??= (async () => {
+      try {
+        const i = await Instance.start(this, this.module);
+        this.carryOut(i.commands);
+        i.commands = [];
+        this.instance = i;
+        return i;
+      } finally {
+        this.starting = null;
+      }
+    })();
     return this.starting;
   }
   carryOut(commands) {
@@ -1285,6 +1304,7 @@ class Server {
     this.instance = null;
     this.woken = false;
     this.fresh = false;
+    this.leftover = false;
     this.queue = new Inbox;
     for (const conn of [...this.open.keys()])
       this.finish(conn, bare(f.program ? 500 : 503));
@@ -1501,7 +1521,7 @@ async function api(request, env, options = {}) {
   const out = new Headers;
   for (const [n, v] of s.headers)
     out.append(n, v);
-  const empty = method === "HEAD" || s.status === 204 || s.status === 304;
+  const empty = method === "HEAD" || NO_BODY.includes(s.status);
   const response = new Response(empty ? null : s.body.slice(), { status: s.status, headers: out });
   if (cache !== undefined && key !== null && shareable(response)) {
     const kept = cache.put(key, response.clone());

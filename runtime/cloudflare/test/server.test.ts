@@ -6,7 +6,8 @@ import { Database } from "bun:sqlite";
 import { expect, test } from "bun:test";
 import { Encoder } from "../../browser/test/encoder.ts";
 import { buildModule, op, SUBMIT } from "../../browser/test/wasm-builder.ts";
-import { decodeResponse, encodeRequest, Server, type Storage } from "../src/host.ts";
+import { Out } from "../../browser/src/http.ts";
+import { decodeResponse, encodeRequest, LIMITS, Server, type Storage, Store } from "../src/host.ts";
 
 function storage(): Storage {
   const db = new Database(":memory:");
@@ -62,9 +63,42 @@ test("work no request waits on goes on in the object's alarm", async () => {
     buildModule({ imports: [SUBMIT], memory: 1, ownMemory: true, data: [{ offset: 64, bytes: batch }], funcs: [{ type: SERVE, body, export: "serve" }] }),
   );
   const alarms: number[] = [];
-  const s = new Server(module, storage(), { setAlarm: (at) => alarms.push(at), limits: { memory: 64 << 20, commands: 1 << 20, turn: 0 } });
+  let now = 1000;
+  const s = new Server(module, storage(), { now: () => now, setAlarm: (at) => alarms.push(at), limits: { ...LIMITS, turn: 0 } });
   await s.alarm();
-  expect(alarms.length).toBe(1);
+  // The turn is over at once: the alarm, now, goes on with the rest.
+  expect(alarms.at(-1)).toBe(1000);
+  now = 2000;
+  const set = alarms.length;
   await s.alarm();
-  expect(alarms.length).toBe(2);
+  expect(alarms.length).toBeGreaterThan(set);
+  expect(alarms.at(-1)).toBe(2000);
+});
+
+test("what serve_init writes is committed before the first serve", async () => {
+  const write = new Out().push(new Uint8Array([1])).chunk(new Uint8Array([7])).chunk(new Uint8Array([8, 9])).bytes();
+  const batch = new Encoder().hostRequest(1, "store/write", write).finish();
+  const init = [...op.i32(64), ...op.i32(batch.length), ...op.call(0)];
+  const module = new WebAssembly.Module(
+    buildModule({
+      imports: [SUBMIT],
+      memory: 1,
+      ownMemory: true,
+      data: [{ offset: 64, bytes: batch }],
+      funcs: [
+        { type: { params: [], results: [] }, body: init, export: "serve_init" },
+        { type: SERVE, body: [], export: "serve" },
+      ],
+    }),
+  );
+  const store = storage();
+  const s = new Server(module, store);
+  await s.alarm();
+  expect(new Store(store).get(new Uint8Array([7]))).toEqual(new Uint8Array([1, 8, 9]));
+});
+
+test("a request past what the object may hold is turned away before it's queued", async () => {
+  const module = new WebAssembly.Module(buildModule({ memory: 1, ownMemory: true, funcs: [{ type: SERVE, body: [], export: "serve" }] }));
+  const s = new Server(module, storage(), { limits: { ...LIMITS, queued: 16 } });
+  expect(await status(s)).toBe(503);
 });

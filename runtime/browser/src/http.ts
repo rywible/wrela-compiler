@@ -132,7 +132,7 @@ export function decodeResponse(bytes: Uint8Array): HttpResponse {
   const r = new In(bytes);
   if (r.word() !== HTTP_RESPONSE_MAGIC) throw new Error("not a response");
   const status = r.word();
-  if (status < 100 || status > 599) throw new Error(`status ${status} isn't 100 to 599`);
+  if (status < 200 || status > 599) throw new Error(`status ${status} isn't 200 to 599`);
   const s = { status, headers: r.headers(), body: r.chunk() };
   r.end("response");
   return s;
