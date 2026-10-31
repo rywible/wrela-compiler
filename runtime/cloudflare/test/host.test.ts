@@ -7,6 +7,7 @@ import { readFileSync } from "node:fs";
 import { join } from "node:path";
 import { Out } from "../../browser/src/http.ts";
 import { checkResponse, decodeRequest, decodeResponse, derToRaw, encodeRequest, encodeResponse, MAX_SCAN, random, Store, verify } from "../src/host.ts";
+import { sqliteBindings } from "./sqlite.ts";
 
 const hex = (s: string) => new Uint8Array((s.match(/../g) ?? []).map((b) => parseInt(b, 16)));
 const vectors = JSON.parse(readFileSync(join(import.meta.dir, "../../abi/vectors.json"), "utf8")).http;
@@ -16,7 +17,7 @@ function store(): [Store, Database] {
   const s = new Store({
     sql: {
       exec(query: string, ...bindings: unknown[]) {
-        const rows = db.query(query).all(...(bindings as never[])) as Record<string, unknown>[];
+        const rows = db.query(query).all(...(sqliteBindings(bindings) as never[])) as Record<string, unknown>[];
         return Object.assign(rows[Symbol.iterator](), { toArray: () => rows });
       },
     },

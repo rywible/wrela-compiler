@@ -59,8 +59,14 @@ impl Request {
         None
     }
 
+    /// The value of the session cookie `name` that `session_cookie(name, ..)` set: the cookie
+    /// `__Host-<name>`, if one was sent.
+    pub fn session(self, name: str) -> Option<String> {
+        self.cookie(String::from(f"__Host-{name}").as_str())
+    }
+
     /// The value of cookie `name`, from the `cookie` header (RFC 6265 §4.2): the first of that
-    /// name, if one was sent.
+    /// name, if one was sent. A session cookie's name has its prefix: `session` reads it.
     pub fn cookie(self, name: str) -> Option<String> {
         for h in self.headers {
             if h.name.as_str() != "cookie" {
@@ -172,7 +178,7 @@ pub fn request(conn: u32, bytes: [u8]) -> Option<Request> {
 ///         } else {
 ///             text(404, "no such page")
 ///         }
-///         if r.cookie("__Host-visit").is_none() {
+///         if r.session("visit").is_none() {
 ///             out.set("set-cookie", session_cookie("visit", "1", 3600).as_str())
 ///         }
 ///         respond(conn, out)
@@ -286,6 +292,7 @@ fn a_request_reads_its_headers_and_cookies() {
     assert(r.conn == 9 && r.time == 1793404800123 && r.method.as_str() == "POST")
     assert(r.path.as_str() == "/api/sign-in" && r.query.as_str() == "step=2" && r.body.len() == 3)
     assert(r.cookie("__Host-session").expect("the session").as_str() == "abc")
+    assert(r.session("session").expect("the session again").as_str() == "abc")
     assert(r.cookie("theme").expect("the first theme").as_str() == "dark")
     assert(r.cookie("none").is_none() && r.header("x-wrela-csrf").expect("csrf").as_str() == "7f")
     assert(request(9, [87, 72, 81, 49, 0]).is_none(), "cut short")

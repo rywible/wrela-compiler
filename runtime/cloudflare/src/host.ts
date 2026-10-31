@@ -23,6 +23,7 @@
 
 import {
   EVENT_SIZE,
+  EventKind,
   EXPORT_MEMORY,
   IMPORT_CLOCK,
   IMPORT_INPUT,
@@ -150,6 +151,9 @@ export const bare = (status: number): Uint8Array => encodeResponse(withHostHeade
 // ---- the store (wrela_host::services) ---------------------------------------------------------
 
 const asBytes = (v: unknown): Uint8Array => (v instanceof Uint8Array ? v : new Uint8Array(v as ArrayBuffer));
+/** Bytes bound as a BLOB: an ArrayBuffer of exactly them, as the SQLite storage API takes one. */
+const blob = (b: Uint8Array): ArrayBuffer =>
+  b.byteOffset === 0 && b.byteLength === b.buffer.byteLength && b.buffer instanceof ArrayBuffer ? b.buffer : (b.slice().buffer as ArrayBuffer);
 
 /** The server's store: one table of keys and values, both bytes, as `store.sqlite` on
  * `wrela-serve`. */
@@ -161,7 +165,7 @@ export class Store {
   /** `store/get`: the key → 1 then the value, or 0. */
   get(body: Uint8Array): Uint8Array {
     if (body.length > MAX_KEY) throw new Error(`a key is longer than ${MAX_KEY} bytes`);
-    const rows = this.storage.sql.exec("SELECT value FROM kv WHERE key = ?", body).toArray();
+    const rows = this.storage.sql.exec("SELECT value FROM kv WHERE key = ?", blob(body)).toArray();
     if (rows.length === 0) return new Uint8Array([0]);
     return new Out().push(new Uint8Array([1])).push(asBytes(rows[0]!["value"])).bytes();
   }
@@ -179,8 +183,8 @@ export class Store {
     const order = down ? "DESC" : "ASC";
     const rows =
       to.length === 0
-        ? this.storage.sql.exec(`SELECT key, value FROM kv WHERE key >= ? ORDER BY key ${order} LIMIT ?`, from, limit)
-        : this.storage.sql.exec(`SELECT key, value FROM kv WHERE key >= ? AND key < ? ORDER BY key ${order} LIMIT ?`, from, to, limit);
+        ? this.storage.sql.exec(`SELECT key, value FROM kv WHERE key >= ? ORDER BY key ${order} LIMIT ?`, blob(from), limit)
+        : this.storage.sql.exec(`SELECT key, value FROM kv WHERE key >= ? AND key < ? ORDER BY key ${order} LIMIT ?`, blob(from), blob(to), limit);
     const out = new Out();
     let count = 0;
     let bytes = 0;
@@ -220,8 +224,8 @@ export class Store {
     if (ops.length === 0) return;
     this.storage.transactionSync(() => {
       for (const [k, v] of ops) {
-        if (v === null) this.storage.sql.exec("DELETE FROM kv WHERE key = ?", k);
-        else this.storage.sql.exec("INSERT OR REPLACE INTO kv (key, value) VALUES (?, ?)", k, v);
+        if (v === null) this.storage.sql.exec("DELETE FROM kv WHERE key = ?", blob(k));
+        else this.storage.sql.exec("INSERT OR REPLACE INTO kv (key, value) VALUES (?, ?)", blob(k), blob(v));
       }
     });
   }
@@ -438,6 +442,10 @@ class Instance {
 interface Open {
   resolve: (response: Uint8Array) => void;
   timer: ReturnType<typeof setTimeout>;
+  /** Its bytes, for a fresh instance if the one it was queued for failed before reading it, and
+   * whether it was given to one so already (once: a request every instance fails on is failed). */
+  bytes: Uint8Array;
+  retried: boolean;
 }
 
 /** How soon the alarm comes back for work left after a call, in case the object is reset first:
@@ -489,7 +497,7 @@ export class Server {
     if (this.nextConn >= POISONED) this.nextConn = 1;
     const answer = new Promise<Uint8Array>((resolve) => {
       const timer = setTimeout(() => this.finish(conn, bare(504)), RESPOND_WITHIN_MS);
-      this.open.set(conn, { resolve, timer });
+      this.open.set(conn, { resolve, timer, bytes, retried: false });
     });
     this.queue.push(connectionEvent(conn, true));
     this.queue.pushMessage(conn, bytes);
@@ -511,8 +519,8 @@ export class Server {
     return this.fresh || this.leftover || this.woken || (this.instance?.arriving.length ?? 0) > 0;
   }
 
-  /** Calls while a call is due: a turn at a time, yielding between calls. With no request open
-   * past a turn's time, it leaves the rest to the alarm. */
+  /** Calls while a call is due, yielding between calls; past a turn's time, it leaves the rest to
+   * the alarm, so no one invocation runs past its CPU limit. */
   async pump(): Promise<void> {
     // A pump under way sees what came since: it asks `due` after each call.
     if (this.pumping) return;
@@ -521,7 +529,8 @@ export class Server {
       const began = this.now();
       while (this.due()) {
         await this.once();
-        if (this.open.size === 0 && this.due() && this.now() - began >= this.limits.turn) {
+        // Past a turn, the rest goes on in the alarm: its own invocation, and its own CPU time.
+        if (this.due() && this.now() - began >= this.limits.turn) {
           this.alarmAt = this.now();
           this.options.setAlarm?.(this.alarmAt);
           return;
@@ -539,7 +548,7 @@ export class Server {
     try {
       instance = await this.ready();
     } catch (e) {
-      this.fail(e);
+      this.fail(e, false);
       return;
     }
     // Answers arrive before the call that may read them.
@@ -592,30 +601,49 @@ export class Server {
     }
   }
 
-  /** Request `conn` is answered with `response`, and closes for the program. */
-  private finish(conn: number, response: Uint8Array): void {
+  /** Request `conn` is answered with `response`, and closes for the program (unless `tell` is
+   * false: its instance went, and the next never heard of it). */
+  private finish(conn: number, response: Uint8Array, tell = true): void {
     const o = this.open.get(conn);
     if (o === undefined) return;
     clearTimeout(o.timer);
     this.open.delete(conn);
     o.resolve(response);
-    if (this.instance !== null) {
+    if (tell) {
       this.queue.push(connectionEvent(conn, false));
       this.fresh = true;
       void this.pump();
     }
   }
 
-  /** A call failed: the instance goes, and every request open on it with it. */
-  private fail(e: unknown): void {
+  /** A call failed (or, with `started` false, an instance didn't start): the instance goes, and
+   * every request open on it that a call was given with it. One no call has read yet waits for
+   * the next instance, unless none starts. */
+  private fail(e: unknown, started = true): void {
     const f = e instanceof Failure ? e : new Failure(false, String((e as Error)?.message ?? e));
     this.options.log?.(`wrela: the server's call failed: ${f.program ? "the program's: " : "the host's limits: "}${f.message}`);
+    const unread = new Set<number>();
+    if (started) {
+      for (const ev of this.queue.events) {
+        const v = new DataView(ev.buffer, ev.byteOffset, EVENT_SIZE);
+        if (v.getUint32(0, true) === EventKind.Message) unread.add(v.getUint32(8, true));
+      }
+    }
     this.instance = null;
     this.woken = false;
     this.fresh = false;
     this.leftover = false;
     this.queue = new Inbox();
-    for (const conn of [...this.open.keys()]) this.finish(conn, bare(f.program ? 500 : 503));
+    for (const [conn, o] of [...this.open]) {
+      if (unread.has(conn) && !o.retried) {
+        o.retried = true;
+        this.queue.push(connectionEvent(conn, true));
+        this.queue.pushMessage(conn, o.bytes);
+        this.fresh = true;
+      } else {
+        this.finish(conn, bare(f.program ? 500 : 503), false);
+      }
+    }
   }
 
   /** The `wrela` imports, for the instance `me` gives. */

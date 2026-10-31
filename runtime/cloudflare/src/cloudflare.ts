@@ -136,7 +136,14 @@ export async function api(request: Request, env: Env, options: ApiOptions = {}):
   if (!url.pathname.startsWith(prefix)) return null;
   const method = request.method.toUpperCase();
   if (!HTTP_METHODS.includes(method)) return refusal(405, { allow: HTTP_METHODS.join(", ") });
-  const limited = await pastLimit(env, method, url.pathname, request.headers.get("cf-connecting-ip") ?? "unknown");
+  let limited: Limit | null;
+  try {
+    limited = await pastLimit(env, method, url.pathname, request.headers.get("cf-connecting-ip") ?? "unknown");
+  } catch (e) {
+    // The Worker's configuration is wrong (never the client's address, which no error holds).
+    console.error(`wrela: ${(e as Error).message}`);
+    return refusal(503);
+  }
   if (limited !== null) return refusal(429, { "retry-after": String(limited.period ?? 60) });
   // A GET's public answer, kept by its URL alone: it's the same whoever asks.
   const cache = method === "GET" ? (options.cache ?? (globalThis as { caches?: { default?: ResponseCache } }).caches?.default) : undefined;

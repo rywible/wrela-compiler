@@ -8,13 +8,14 @@ import { Encoder } from "../../browser/test/encoder.ts";
 import { buildModule, op, SUBMIT } from "../../browser/test/wasm-builder.ts";
 import { Out } from "../../browser/src/http.ts";
 import { decodeResponse, encodeRequest, LIMITS, Server, type Storage, Store } from "../src/host.ts";
+import { sqliteBindings } from "./sqlite.ts";
 
 function storage(): Storage {
   const db = new Database(":memory:");
   return {
     sql: {
       exec: (q: string, ...b: unknown[]) => {
-        const rows = db.query(q).all(...(b as never[])) as Record<string, unknown>[];
+        const rows = db.query(q).all(...(sqliteBindings(b) as never[])) as Record<string, unknown>[];
         return Object.assign(rows[Symbol.iterator](), { toArray: () => rows });
       },
     },
@@ -34,8 +35,9 @@ test("a trap answers 500, and the next request starts a fresh instance", async (
   const s = new Server(module, storage(), { log: (l) => logged.push(l) });
   expect(await status(s)).toBe(500);
   expect(logged[0]).toContain("the program's: ");
+  // A request the trapping call hadn't read is given once to a fresh instance, which traps too.
   expect(await status(s)).toBe(500);
-  expect(logged.length).toBe(2);
+  expect(logged.length).toBe(4);
 });
 
 test("a module that isn't a server build fails each request as the host's", async () => {

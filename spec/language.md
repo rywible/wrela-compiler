@@ -2683,9 +2683,10 @@ A `GET` whose answer was a 200 with `cache-control: public` and a `max-age` or `
 **Where it differs from `wrela-serve`:**
 
 - **The instance's memory may go between any two requests:** when the object is evicted, a call fails, or a new build is deployed. Only the store lasts.
-- **A call has no deadline,** since JavaScript can't interrupt WASM it runs. Its bound is the Worker's CPU limit, past which the object resets.
+- **A call has no deadline,** since JavaScript can't interrupt WASM it runs. Its bound is the Worker's CPU limit, past which the object resets; past a turn of 250 ms the host goes on in the object's alarm, which has its own.
+- **`serve`'s time counts from the object's start,** so it starts from 0 again after a reset. `Request::time` and `std::time::wall_clock` are the time that lasts.
 - **The memory cap (64 MiB) is checked after each call.**
-- **A failed call fails every request open on the instance,** with 500 for the program's own failure and 503 for the host's limits. The next request starts a fresh instance.
+- **A failed call fails every request open on the instance that a call was given,** with 500 for the program's own failure and 503 for the host's limits. A request no call had read yet goes once to a fresh instance.
 - **Signatures and randomness come from WebCrypto.** Its Ed25519 doesn't promise `wrela-serve`'s refusal of small-order keys.
 
 **A client** asks its page's origin with `std::http::fetch(method, path, headers, body)` (`@client`, a host service, §17.1). The path is absolute (`/api/me`). The browser sends the origin's cookies, follows no redirect and caches nothing, and the request carries only `accept`, `content-type`, `if-none-match` and the program's own headers. Its answer, read with `std::http::response`, carries `cache-control`, `content-type`, `etag`, `location`, `retry-after` and the program's own headers, never `set-cookie`, which the browser keeps. The native host fails it: it has no origin.

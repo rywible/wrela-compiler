@@ -906,6 +906,7 @@ function withHostHeaders(s) {
 }
 var bare = (status) => encodeResponse(withHostHeaders({ status, headers: [], body: new Uint8Array(0) }));
 var asBytes = (v) => v instanceof Uint8Array ? v : new Uint8Array(v);
+var blob = (b) => b.byteOffset === 0 && b.byteLength === b.buffer.byteLength && b.buffer instanceof ArrayBuffer ? b.buffer : b.slice().buffer;
 
 class Store {
   storage;
@@ -916,7 +917,7 @@ class Store {
   get(body) {
     if (body.length > MAX_KEY)
       throw new Error(`a key is longer than ${MAX_KEY} bytes`);
-    const rows = this.storage.sql.exec("SELECT value FROM kv WHERE key = ?", body).toArray();
+    const rows = this.storage.sql.exec("SELECT value FROM kv WHERE key = ?", blob(body)).toArray();
     if (rows.length === 0)
       return new Uint8Array([0]);
     return new Out().push(new Uint8Array([1])).push(asBytes(rows[0]["value"])).bytes();
@@ -931,7 +932,7 @@ class Store {
     if (from.length > MAX_KEY || to.length > MAX_KEY)
       throw new Error(`a key is longer than ${MAX_KEY} bytes`);
     const order = down ? "DESC" : "ASC";
-    const rows = to.length === 0 ? this.storage.sql.exec(`SELECT key, value FROM kv WHERE key >= ? ORDER BY key ${order} LIMIT ?`, from, limit) : this.storage.sql.exec(`SELECT key, value FROM kv WHERE key >= ? AND key < ? ORDER BY key ${order} LIMIT ?`, from, to, limit);
+    const rows = to.length === 0 ? this.storage.sql.exec(`SELECT key, value FROM kv WHERE key >= ? ORDER BY key ${order} LIMIT ?`, blob(from), limit) : this.storage.sql.exec(`SELECT key, value FROM kv WHERE key >= ? AND key < ? ORDER BY key ${order} LIMIT ?`, blob(from), blob(to), limit);
     const out = new Out;
     let count = 0;
     let bytes = 0;
@@ -972,9 +973,9 @@ class Store {
     this.storage.transactionSync(() => {
       for (const [k, v] of ops) {
         if (v === null)
-          this.storage.sql.exec("DELETE FROM kv WHERE key = ?", k);
+          this.storage.sql.exec("DELETE FROM kv WHERE key = ?", blob(k));
         else
-          this.storage.sql.exec("INSERT OR REPLACE INTO kv (key, value) VALUES (?, ?)", k, v);
+          this.storage.sql.exec("INSERT OR REPLACE INTO kv (key, value) VALUES (?, ?)", blob(k), blob(v));
       }
     });
   }
@@ -1203,7 +1204,7 @@ class Server {
       this.nextConn = 1;
     const answer = new Promise((resolve) => {
       const timer = setTimeout(() => this.finish(conn, bare(504)), RESPOND_WITHIN_MS);
-      this.open.set(conn, { resolve, timer });
+      this.open.set(conn, { resolve, timer, bytes, retried: false });
     });
     this.queue.push(connectionEvent(conn, true));
     this.queue.pushMessage(conn, bytes);
@@ -1227,7 +1228,7 @@ class Server {
       const began = this.now();
       while (this.due()) {
         await this.once();
-        if (this.open.size === 0 && this.due() && this.now() - began >= this.limits.turn) {
+        if (this.due() && this.now() - began >= this.limits.turn) {
           this.alarmAt = this.now();
           this.options.setAlarm?.(this.alarmAt);
           return;
@@ -1243,7 +1244,7 @@ class Server {
     try {
       instance = await this.ready();
     } catch (e) {
-      this.fail(e);
+      this.fail(e, false);
       return;
     }
     const arrived = await Promise.all(instance.arriving.splice(0));
@@ -1292,29 +1293,45 @@ class Server {
         this.finish(c.conn, encodeResponse(withHostHeaders(c.response)));
     }
   }
-  finish(conn, response) {
+  finish(conn, response, tell = true) {
     const o = this.open.get(conn);
     if (o === undefined)
       return;
     clearTimeout(o.timer);
     this.open.delete(conn);
     o.resolve(response);
-    if (this.instance !== null) {
+    if (tell) {
       this.queue.push(connectionEvent(conn, false));
       this.fresh = true;
       this.pump();
     }
   }
-  fail(e) {
+  fail(e, started = true) {
     const f = e instanceof Failure ? e : new Failure(false, String(e?.message ?? e));
     this.options.log?.(`wrela: the server's call failed: ${f.program ? "the program's: " : "the host's limits: "}${f.message}`);
+    const unread = new Set;
+    if (started) {
+      for (const ev of this.queue.events) {
+        const v = new DataView(ev.buffer, ev.byteOffset, EVENT_SIZE);
+        if (v.getUint32(0, true) === EventKind.Message)
+          unread.add(v.getUint32(8, true));
+      }
+    }
     this.instance = null;
     this.woken = false;
     this.fresh = false;
     this.leftover = false;
     this.queue = new Inbox;
-    for (const conn of [...this.open.keys()])
-      this.finish(conn, bare(f.program ? 500 : 503));
+    for (const [conn, o] of [...this.open]) {
+      if (unread.has(conn) && !o.retried) {
+        o.retried = true;
+        this.queue.push(connectionEvent(conn, true));
+        this.queue.pushMessage(conn, o.bytes);
+        this.fresh = true;
+      } else {
+        this.finish(conn, bare(f.program ? 500 : 503), false);
+      }
+    }
   }
   imports(me) {
     const host = this;
@@ -1491,7 +1508,13 @@ async function api(request, env, options = {}) {
   const method = request.method.toUpperCase();
   if (!HTTP_METHODS.includes(method))
     return refusal(405, { allow: HTTP_METHODS.join(", ") });
-  const limited = await pastLimit(env, method, url.pathname, request.headers.get("cf-connecting-ip") ?? "unknown");
+  let limited;
+  try {
+    limited = await pastLimit(env, method, url.pathname, request.headers.get("cf-connecting-ip") ?? "unknown");
+  } catch (e) {
+    console.error(`wrela: ${e.message}`);
+    return refusal(503);
+  }
   if (limited !== null)
     return refusal(429, { "retry-after": String(limited.period ?? 60) });
   const cache = method === "GET" ? options.cache ?? globalThis.caches?.default : undefined;
