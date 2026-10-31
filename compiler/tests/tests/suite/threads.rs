@@ -283,31 +283,38 @@ fn the_ticker_in_chrome_agrees_with_the_native_host() {
 
 /// The posted test program's script: a key down before frame 4, which reaches tick 4 after
 /// what frame 3 posted.
-const POSTED_SCRIPT: &str = r#"[{"frame": 4, "type": "keydown", "key": "KeyA"}]"#;
+const POSTED_SCRIPT: &str = r#"[{"frame": 4, "type": "keydown", "key": "KeyA"}, {"frame": 11, "type": "keydown", "key": "KeyB"}]"#;
 
 /// Records a program posts into its ticks (`std::tick::post`): in lockstep, what frame `i`
 /// posts is a record of the first tick that runs for frame `i + 1`, before that frame's input,
-/// in the order posted; the tick log keeps them, so the log replays with any helpers (a replay
-/// drops what the program posts again); a changed post fails at its tick; and the frames see
-/// the sim that took them.
+/// in the order posted, and what `init` posts once the ticker has started is tick 0's; past a
+/// tick's records, the rest wait in order, ahead of the input after them; the tick log keeps
+/// them, so the log replays with any helpers (a replay drops what the program posts again); a
+/// changed post fails at its tick; and the frames see the sim that took them.
 #[test]
 fn posted_records_are_the_next_ticks_and_replay() {
     use wrela_abi::input::Event;
     let script = wrela_host::parse_script(POSTED_SCRIPT).expect("a script");
     let built = CpuBuild::load(built("posted")).expect("load");
-    let frames = 12;
+    let frames = 14;
     let log = built.record_lockstep(frames, 60.0, &script, 1).expect("record");
     assert_eq!(log.ticks.len() as u32, wrela_host::lockstep_ticks(frames - 1, 60, 60.0));
-    let key = wrela_abi::input::Event::key(true, wrela_abi::input::key_code("KeyA"), false, 0);
+    let key = |k| Event::key(true, wrela_abi::input::key_code(k), false, 0).bytes();
     let records = |k: usize| log.ticks[k].records.clone();
-    assert_eq!(records(4), vec![Event::posted(1, 5, 0).bytes(), key.bytes()], "tick 4");
+    assert_eq!(records(0), vec![Event::posted(2, 42, 0).bytes()], "tick 0: init's post");
+    assert_eq!(records(4), vec![Event::posted(1, 5, 0).bytes(), key("KeyA")], "tick 4");
     assert_eq!(
         records(8),
         vec![Event::posted(2, u64::MAX, 1 << 32).bytes(), Event::posted(1, 7, 0).bytes()],
         "tick 8"
     );
-    let others = (0..log.ticks.len()).filter(|&k| k != 4 && k != 8);
-    assert!(others.into_iter().all(|k| records(k).is_empty()), "only ticks 4 and 8 have records");
+    let note = |i: u64| Event::posted(2, i, 0).bytes();
+    let max = wrela_abi::memory::MAX_TICK_RECORDS as u64;
+    assert_eq!(records(11), (0..max).map(note).collect::<Vec<_>>(), "tick 11: a tick's worth");
+    let rest: Vec<_> = (max..300).map(note).chain([key("KeyB")]).collect();
+    assert_eq!(records(12), rest, "tick 12: the rest of the posts, then frame 11's input");
+    let others = (0..log.ticks.len()).filter(|k| ![0, 4, 8, 11, 12].contains(k));
+    assert!(others.into_iter().all(|k| records(k).is_empty()), "no other tick has records");
     let read = replays_with_any_helpers(&built, &log);
     // Frame 7's second post, levels 0 to 2, made levels 1 and 2: tick 8 differs.
     let mut changed = read.clone();
@@ -321,8 +328,8 @@ fn posted_records_are_the_next_ticks_and_replay() {
         host.lockstep_frame(i, 60.0, 64, 64, &script).expect("a frame");
     }
     let [tick, opened, posts] = one_vec3(&mut host, "newest", &[]);
-    assert_eq!((tick, opened, posts), (11.0, 7.0, 3.0));
-    assert_eq!(one_u32(&mut host, "keys", &[]), 1);
+    assert_eq!((tick, opened, posts), (13.0, 7.0, 304.0));
+    assert_eq!(one_u32(&mut host, "keys", &[]), 2);
 }
 
 /// A program that posts into its ticks with no ticker fails its frame's commands.
@@ -359,6 +366,7 @@ fn posted_records_in_chrome_agree_with_the_native_host() {
         assert_eq!(log.first, native.first, "{what}: the first world");
         assert_eq!(log.ticks, native.ticks, "{what}: each tick's records and hash");
         assert!(log.ticks.iter().any(|t| t.records.len() == 2), "{what}: frame 7's posts");
+        assert_eq!(log.ticks[0].records.len(), 1, "{what}: init's post");
         assert_eq!(built.replay(&log, 2).expect("replays") as usize, log.ticks.len(), "{what}");
     }
 }

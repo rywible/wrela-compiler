@@ -385,11 +385,16 @@ class Ticker {
   }
 
   /** Stamps the records the program posted while at most `frames` frames had started into this
-   * tick's records after the first `n`, as many as fit (the rest wait in the ring). Returns how
-   * many records the tick has now. */
+   * tick's records after the first `n`, as many as fit; the rest are queued for the next tick, in
+   * order with what follows them (as the native host's one queue keeps them). Returns how many
+   * records the tick has now. */
   #posted(n: number, frames = Infinity): number {
-    if (n >= MAX_TICK_RECORDS) return n;
-    return n + this.posts.readTicker(this.#bytes, RECORDS + n * EVENT_SIZE, MAX_TICK_RECORDS - n, frames);
+    if (n < MAX_TICK_RECORDS) n += this.posts.readTicker(this.#bytes, RECORDS + n * EVENT_SIZE, MAX_TICK_RECORDS - n, frames);
+    if (n < MAX_TICK_RECORDS) return n;
+    const spill = new Uint8Array(InputRing.CAPACITY * EVENT_SIZE);
+    const m = this.posts.readTicker(spill, 0, InputRing.CAPACITY, frames);
+    for (let i = 0; i < m; i++) this.queue.push(spill.slice(i * EVENT_SIZE, (i + 1) * EVENT_SIZE));
+    return n;
   }
 
   /** Stamps `events` into this tick's records after the first `n`, as many as fit; the rest are

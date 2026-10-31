@@ -1,6 +1,7 @@
 // A ticker that learns what only the frames know through records they post into its ticks
 // (`std::tick::post`), run by compiler/tests/tests/suite/threads.rs: frame 3 posts the levels a
-// saved game opened, frame 7 two more records; each tick folds its posts, with its number, into
+// saved game opened, frame 7 two more records, frame 10 more than a tick holds, and `init` one
+// once its ticker has started; each tick folds its posts, with its number, into
 // its world, and counts its key presses, so the tick that each record reaches is in the hashes.
 
 use std::handoff::{Latest, Publisher, handoff}
@@ -70,6 +71,8 @@ pub fn init() -> Game {
     let (out, latest) = handoff(first)
     let world = World { opened: 1, posts: 0, keys: 0, trail: 0 }
     start(Sim { world, out }, hz: 60, step: step, hash: hash)
+    // Posted once the ticker has started: its first tick's.
+    post(NOTE, a: 42, b: 0)
     Game { latest, newest: first, frames: 0 }
 }
 
@@ -81,6 +84,12 @@ pub fn frame(game: mut Game, time: f32, width: u32, height: u32) {
     if game.frames == 7 {
         post(NOTE, a: 18446744073709551615, b: 4294967296)
         post(OPENED, a: 7, b: 0)
+    }
+    // More than a tick holds: the rest wait, in order, ahead of the next frame's input.
+    if game.frames == 10 {
+        for i in 0..300 {
+            post(NOTE, a: u64(i), b: 0)
+        }
     }
     game.frames += 1
 }

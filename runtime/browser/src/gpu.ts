@@ -443,6 +443,11 @@ export interface Building {
  * one 8.0 s, 6.7 s (two and twelve were each worse at one of the two). */
 export const BUILDS_AT_ONCE = 6;
 
+/** How to start each pipeline's build that hasn't started, by its promise: true if it started it.
+ * A cached promise another build made (a hot reload's, or an identical pipeline's) starts
+ * through its maker. */
+const LAUNCHERS = new WeakMap<Promise<BuiltPipeline>, () => boolean>();
+
 /** Starts building the pipelines, `BUILDS_AT_ONCE` at a time: tier 0's, the biggest first, then
  * tier 1's (those reached only under a runtime condition); one a command needs before its turn
  * (`Building.start`) starts then, beside them, and no other starts until every one a command
@@ -497,14 +502,34 @@ export function buildPipelines(
   const pump = () => {
     if (!released || asked > 0) return;
     while (running < BUILDS_AT_ONCE && queued.length > 0) {
-      const i = queued.shift()!;
-      if (resolvers.has(i)) launch(i, true);
+      go(queued.shift()!, true);
     }
   };
   const queue = (i: number): Promise<BuiltPipeline> => {
     const d = Promise.withResolvers<BuiltPipeline>();
     resolvers.set(i, d);
+    LAUNCHERS.set(d.promise, () => {
+      if (!resolvers.has(i)) return false;
+      launch(i, false);
+      return true;
+    });
     return d.promise;
+  };
+  // Starts pipeline `i`'s build if it hasn't started: here, or through the build that made its
+  // cached promise (an identical pipeline's, or a hot reload's last build's), counted here.
+  const go = (i: number, counted: boolean) => {
+    if (resolvers.has(i)) return launch(i, counted);
+    const made = each[i]!;
+    if (!(LAUNCHERS.get(made)?.() ?? false)) return;
+    if (counted) running++;
+    else asked++;
+    started.push(i);
+    const done = () => {
+      if (counted) running--;
+      else asked--;
+      pump();
+    };
+    made.then(done, done);
   };
   const used: PipelineCache = new Map();
   for (const i of order) {
@@ -516,7 +541,9 @@ export function buildPipelines(
     each[i] = pipeline;
   }
   for (const tier of [false, true]) {
-    for (const i of order) if (resolvers.has(i) && manifest.pipelines[i]!.conditional === tier) queued.push(i);
+    for (const i of order) {
+      if ((resolvers.has(i) || LAUNCHERS.has(each[i]!)) && manifest.pipelines[i]!.conditional === tier) queued.push(i);
+    }
   }
   if (cache) {
     cache.clear();
@@ -526,9 +553,7 @@ export function buildPipelines(
   // A failure fails the program through its own pipeline's promise, not this one.
   tier0.catch(() => {});
   pump();
-  const start = (i: number) => {
-    if (resolvers.has(i)) launch(i, false);
-  };
+  const start = (i: number) => go(i, false);
   const release = () => {
     if (released) return;
     released = true;

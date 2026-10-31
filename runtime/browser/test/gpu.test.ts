@@ -1583,6 +1583,32 @@ describe("the first frame's pipelines first", () => {
     for (let i = 0; i < n; i++) device.let(i);
     await Promise.all(building.each);
   });
+
+  test("held, a pipeline the same as another starts when a command asks for either", async () => {
+    const device = new FakeDevice();
+    const { m, shaders } = many();
+    // Pipelines 0 and 1 the same: 1's promise is 0's, built once.
+    shaders[1] = shaders[0]!;
+    const building = buildPipelines(device.gpu, m, shaders, SCREEN_FORMAT, new Map(), true);
+    expect(building.each[1]).toBe(building.each[0]!);
+    building.start(1);
+    await building.each[1];
+    expect(building.order).toContain(1);
+  });
+
+  test("held, a pipeline a hot reload kept from the last build starts though that build never released", async () => {
+    const device = new FakeDevice();
+    const { m, shaders } = many();
+    const cache: PipelineCache = new Map();
+    const last = buildPipelines(device.gpu, m, shaders, SCREEN_FORMAT, cache, true);
+    const next = buildPipelines(device.gpu, m, shaders, SCREEN_FORMAT, cache, true);
+    expect(next.each[2]).toBe(last.each[2]!);
+    next.start(2);
+    await next.each[2];
+    // And the rest build once the new build releases.
+    next.release();
+    await Promise.all(next.each);
+  });
 });
 
 describe("the screen", () => {

@@ -1821,10 +1821,10 @@ All three are in std, built on the unsafe core (§6.12), and none of them is spe
   - A program has one ticker; a second `start` panics.
   - `std::tick::origin()` is the frame time at which tick 0 was due; a frame uses it to place the newest tick. It is `nondet`: the host moves it when it drops ticks that it couldn't run in time, or when the page was hidden.
 - **`std::tick::post(tag, a:, b:)`** puts a value that only the frames know into the ticks, such as a saved game that the program reads from storage after `init` (§17.1).
-  - The host stamps the record into the next tick's records, as it stamps an input event that arrives then. In lockstep (below), what frame i posts is a record of the first tick that runs for frame i + 1, before that frame's input.
+  - The host stamps the record into the next tick's records, as it stamps an input event that arrives then. In lockstep (below), what frame i posts is a record of the first tick that runs for frame i + 1, before that frame's input. What `init` posts after `start` is the first tick's.
   - The step reads it in `Ticked.posts`: each a `Posted { tag, a, b }`, oldest first. `tag` says what the record is, and `a` and `b` are two `u64`s whose meaning is the program's.
   - A tick log keeps it among the tick's records, so a replay gives every tick the same input, and a host that replays a log drops what the program posts as it runs again. A tick's state stays a function of the first state and the records.
-  - It is `@client`. A post before `start`, or in a program that started no ticker, fails the call's commands. Its record counts toward a tick's 256.
+  - It is `@client`. A post before `start`, or in a program that started no ticker, fails the call's commands. Its record counts toward a tick's 256: past them, the rest wait for the next tick, in order with the input after them.
 
   ```wrela
   use std::tick::{Ticked, post, start}

@@ -61,9 +61,16 @@ let ring: InputRing | null = null;
  * host). */
 const posts = InputRing.create();
 
+/** The records posted while the program's ticker is starting (after `start`, in `init`, whose
+ * commands run before the ticker's thread reads): they go into `posts` once it reads, so its first
+ * tick has them, as on the native host. None while no program is starting a ticker. */
+let postsStarting: [record: Uint8Array, frames: number][] | null = null;
+
 /** Queues a record the program posted for the ticker; throws if too many wait. */
 function postTick(record: Uint8Array): void {
-  if (!posts.write(record, ticker.control.frames)) {
+  if (postsStarting !== null && postsStarting.length < InputRing.CAPACITY) {
+    postsStarting.push([record, ticker.control.frames]);
+  } else if (postsStarting !== null || !posts.write(record, ticker.control.frames)) {
     throw new Error(`${InputRing.CAPACITY} posted records already wait for the ticker`);
   }
 }
@@ -82,6 +89,7 @@ const net = new Net(
 function detachTicker(): void {
   ring?.detachTicker();
   posts.detachTicker();
+  postsStarting = null;
 }
 
 /** Gives the program the events the main thread has written, and what its connections had: it
@@ -231,6 +239,7 @@ function tickerStarter(
   settings: TickSettings,
   replay: Replay | null = null,
 ): (options: TickerOptions, onPrint: PrintSink) => void {
+  postsStarting = [];
   return (options, onPrint) => {
     const framesBeforeStart = ticker.control.frames;
     ticker.memory = options.memory;
@@ -238,6 +247,8 @@ function tickerStarter(
       ring?.attachTicker();
       posts.attachTicker();
     }
+    for (const [record, frames] of postsStarting ?? []) posts.write(record, frames);
+    postsStarting = null;
     const thread = new Thread("wrela sim");
     ticker.thread = thread;
     ticker.report = new Promise((resolve) => {
@@ -835,11 +846,12 @@ async function runTest(canvas: OffscreenCanvas, device: GPUDevice, build: Build,
     });
     // The frame's commands that wait for a pipeline being built run once it is.
     await executor.caughtUp();
-    record.submitted_ms.push(performance.timeOrigin + performance.now());
+    const submitted = () => record.submitted_ms.push(performance.timeOrigin + performance.now());
     if (timing === "serial") {
       // The serial timing mode runs the frame's passes now, one at a time: what they did is
-      // known once they've run.
+      // known, and they're submitted, once they've run.
       draining = draining.then(() => scoped(device, () => executor.drain())).then(() => {
+        submitted();
         record.counters.push(executor.takeCounters());
       });
       draining.catch(fatal);
@@ -847,7 +859,10 @@ async function runTest(canvas: OffscreenCanvas, device: GPUDevice, build: Build,
       // while it runs: each drain takes exactly its own frame's commands, and so its counters.
       drains.push(draining);
       if (drains.length > 1) await drains.shift()!.catch(() => {});
-    } else record.counters.push(executor.takeCounters());
+    } else {
+      submitted();
+      record.counters.push(executor.takeCounters());
+    }
     if (params.saturate > 0 || params.inflight > 0) {
       inFlight.push(device.queue.onSubmittedWorkDone());
       if (inFlight.length > (params.saturate > 0 ? 2 : params.inflight)) await inFlight.shift();
