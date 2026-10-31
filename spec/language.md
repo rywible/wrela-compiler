@@ -2621,9 +2621,10 @@ A second response, a header a server can't set, and `send`, `close`, `tag`, `kee
 
 - a method other than `GET`, `HEAD`, `POST`, `PUT`, `PATCH`, `DELETE` and `OPTIONS` (405);
 - any but `GET`, `HEAD` and `OPTIONS` whose `Origin` isn't one of `WRELA_ORIGINS`, or whose `Sec-Fetch-Site`, when sent, isn't `same-origin` (403);
-- a request past 1 MiB (413).
+- a request past 1 MiB (413);
+- a client past one of its rate limits (429, with `retry-after`). `WRELA_LIMITS` lists them as JSON, each `{ binding, prefix, methods?, period? }` naming a Workers Rate Limiting binding, keyed on the client's address. The address is that key and nothing else: it isn't passed to the object or the program. Cloudflare's counts are approximate and kept per location, so a program keeps its own limits in the store as well.
 
-The host logs no request.
+A `GET` whose answer was a 200 with `cache-control: public` and a `max-age` or `s-maxage`, no `set-cookie` and no `vary` is kept in the Cache API by its URL. A later `GET` of that URL is answered from there without the object, whoever asks. That cache is per data center. The host logs no request.
 
 **The store and the calls.** One SQLite-backed Durable Object holds the store (the same table and order as `wrela-serve`'s `store.sqlite`) and runs the program's instance. The contract of §19.4 holds:
 

@@ -7,7 +7,7 @@ import { Database } from "bun:sqlite";
 import { plugin } from "bun";
 import { beforeAll, describe, expect, test } from "bun:test";
 import { join } from "node:path";
-import type { Env } from "../src/cloudflare.ts";
+import type { ApiOptions, Env, ResponseCache } from "../src/cloudflare.ts";
 import type { Storage } from "../src/host.ts";
 
 const BUILD = process.env["WRELA_HTTP_BUILD"];
@@ -29,13 +29,24 @@ function storage(db: Database, alarms: number[]): Storage & { setAlarm(at: numbe
 }
 
 interface Host {
-  api(request: Request, env: Env): Promise<Response | null>;
+  api(request: Request, env: Env, options?: ApiOptions): Promise<Response | null>;
   WrelaServer: new (ctx: unknown, env: Env) => { request(bytes: Uint8Array): Promise<Uint8Array> };
 }
 
 let host: Host;
 let env: Env;
 let db: Database;
+
+/** The keys a rate limit counted, and how many it lets each have. */
+const counted_keys: string[] = [];
+const SIGN_INS = 2;
+
+/** A cache that keeps what it's given, by URL. */
+const kept = new Map<string, Response>();
+const cache: ResponseCache = {
+  match: async (r) => kept.get(r.url)?.clone(),
+  put: async (r, response) => void kept.set(r.url, response),
+};
 
 beforeAll(async () => {
   if (BUILD === undefined) return;
@@ -65,6 +76,13 @@ beforeAll(async () => {
   const object = { current: null as InstanceType<Host["WrelaServer"]> | null };
   env = {
     WRELA_ORIGINS: `${SITE}, https://other.wrela.dev`,
+    WRELA_LIMITS: JSON.stringify([{ binding: "SIGN_IN", prefix: "/api/sign-in", methods: ["POST"], period: 10 }]),
+    SIGN_IN: {
+      limit: async ({ key }: { key: string }) => {
+        counted_keys.push(key);
+        return { success: counted_keys.filter((k) => k === key).length <= SIGN_INS };
+      },
+    },
     WRELA_SERVER: { getByName: () => ({ request: (bytes) => object.current!.request(bytes) }) },
   };
   object.current = new host.WrelaServer({ storage: storage(db, []) }, env);
@@ -72,7 +90,7 @@ beforeAll(async () => {
 
 /** The API's response to a request of `method` for `path`. */
 async function ask(path: string, init: RequestInit = {}): Promise<Response> {
-  const r = await host.api(new Request(`${SITE}${path}`, init), env);
+  const r = await host.api(new Request(`${SITE}${path}`, init), env, { cache });
   if (r === null) throw new Error(`${path} isn't the API's`);
   return r;
 }
@@ -176,6 +194,28 @@ describe.skipIf(BUILD === undefined)("a server build over HTTP", () => {
     expect((await ask("/api/twice")).status).toBe(500);
     expect((await ask("/api/bad-header")).status).toBe(500);
     expect(await (await ask("/api/count", { headers: { cookie: "__Host-visit=1" } })).text()).toBe("3");
+  });
+
+  test("a client past its rate limit gets 429, keyed on its address alone", async () => {
+    const signIn = (ip: string) => ask("/api/sign-in", { method: "POST", headers: { origin: SITE, "cf-connecting-ip": ip }, body: "x" });
+    expect((await signIn("203.0.113.7")).status).toBe(404);
+    expect((await signIn("203.0.113.7")).status).toBe(404);
+    const third = await signIn("203.0.113.7");
+    expect(third.status).toBe(429);
+    expect(third.headers.get("retry-after")).toBe("10");
+    expect((await signIn("198.51.100.2")).status).toBe(404);
+    // Other paths and methods aren't counted.
+    expect((await ask("/api/sign-in", { headers: { "cf-connecting-ip": "203.0.113.7" } })).status).toBe(404);
+    expect(counted_keys).toEqual(["203.0.113.7", "203.0.113.7", "203.0.113.7", "198.51.100.2"]);
+  });
+
+  test("a public answer is served from the cache without the object", async () => {
+    const first = await ask("/api/public");
+    expect(await first.text()).toBe("1");
+    expect(await (await ask("/api/public", { headers: { cookie: "a=1" } })).text()).toBe("1");
+    expect(await (await ask("/api/public?other")).text()).toBe("2");
+    // An answer that isn't public isn't kept.
+    expect(kept.has(`${SITE}/api/count`)).toBe(false);
   });
 
   test("requests at once are answered each its own", async () => {

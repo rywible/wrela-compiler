@@ -251,7 +251,20 @@ per-path rules (rate limits, WAF) apply to `/api/*`. `server/cloudflare.js` expo
    such a request (Fetch, "append a request `Origin` header"), so a cross-site form or script is
    refused. The program can check again (its CSRF token).
 3. **Size.** A body over 1 MiB is 413, by `Content-Length` and as it's read.
-4. It builds the request's bytes from the allowlisted headers, so no address leaves the Worker,
+4. **Rate limits** (asked for by the accounts server: without a connection, a program can't limit
+   one client, and a global limit lets one attacker lock everyone out of sign-in).
+   `WRELA_LIMITS` lists `{ binding, prefix, methods?, period? }`. Each names a
+   [Workers Rate Limiting](https://developers.cloudflare.com/workers/runtime-apis/bindings/rate-limit/)
+   binding (its own limit, a period of 10 or 60 s), keyed on `cf-connecting-ip`. A client past one
+   gets 429 with `retry-after`. The address is the binding's key only. The counts are approximate and
+   per Cloudflare location (same page), so the program keeps its own limits in the store.
+5. **Public reads from the cache.** A `GET` answered 200 with `cache-control: public` and a lifetime,
+   no `set-cookie` and no `vary`, is put in the
+   [Cache API](https://developers.cloudflare.com/workers/runtime-apis/cache/) by its URL, and a later
+   `GET` of it is answered from there without the object. It is per data center and doesn't read
+   through. Workers Caching would, but it caches the whole Worker's responses, which is the site's
+   decision, not the host's.
+6. It builds the request's bytes from the allowlisted headers, so no address leaves the Worker,
    and calls the server object over RPC (`env.WRELA_SERVER.getByName("server").request(bytes)`).
    RPC carries only those bytes.
 

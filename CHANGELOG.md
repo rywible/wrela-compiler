@@ -15,7 +15,8 @@ detail; `docs/release.md` says how a release is cut.
   `request` reads (method, path, query, the headers a server may see, body, and the time of day),
   and `respond` answers it once; `session_cookie` makes a `__Host-` cookie. The host passes only an
   allowlist of headers, never an address, and refuses a request that changes something from
-  another origin before the program runs.
+  another origin before the program runs, and a client past its rate limits (`WRELA_LIMITS`, Workers
+  Rate Limiting keyed on the client's address). A public `GET` answer is served from the Cache API.
 - **A client asks its page's origin** with `std::http::fetch`, its cookies sent (the browser host).
 - **A server asks the time of day** (`std::time::wall_clock`, read with `unix_ms`), on
   `wrela-serve` and on Cloudflare.

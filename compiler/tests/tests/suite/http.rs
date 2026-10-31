@@ -4,8 +4,9 @@
 //! (runtime/cloudflare/test/e2e.test.ts). It checks the responses and their cookie, a store read
 //! answered on the next call and the write committed before the response, the time of day, random
 //! bytes and a signature checked by WebCrypto, the headers a server sees (never an address), the
-//! refusals before the object, and that a trap or a misused response fails the instance's open
-//! requests and the next starts afresh.
+//! refusals before the object (a rate limit's among them), a public answer served from the cache,
+//! and that a trap or a misused response fails the instance's open requests and the next starts
+//! afresh.
 
 /// The program: each route asks what it names, and answers when the host has.
 const PROGRAM: &str = r#"
@@ -26,10 +27,11 @@ struct Asked {
 pub struct Server {
     asked: Vec<Asked>,
     closed: u32,
+    served: u32,
 }
 
 pub fn serve_init() -> Server {
-    Server { asked: Vec::new(), closed: 0 }
+    Server { asked: Vec::new(), closed: 0, served: 0 }
 }
 
 fn chunk(b: [u8], at: mut u32) -> Vec<u8> {
@@ -93,6 +95,11 @@ fn route(s: mut Server, r: Request) {
         }
         names.push_str(f"{r.time > 1700000000000}")
         respond(conn, text(200, names.as_str()))
+    } else if path == "/api/public" {
+        s.served += 1
+        var out = text(200, f"{s.served}")
+        out.set("cache-control", "public, max-age=60")
+        respond(conn, out)
     } else if path == "/api/closed" {
         respond(conn, text(200, f"{s.closed}"))
     } else if path == "/api/trap" {

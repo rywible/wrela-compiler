@@ -1399,6 +1399,30 @@ async function bodyWithin(request, max) {
   }
   return out;
 }
+function shareable(r) {
+  const control = r.headers.get("cache-control") ?? "";
+  const life = /(?:^|[\s,])(?:s-maxage|max-age)=(\d+)/.exec(control);
+  return r.status === 200 && /(?:^|[\s,])public(?:$|[\s,])/.test(control) && life !== null && Number(life[1]) > 0 && !/(?:^|[\s,])(?:private|no-store|no-cache)/.test(control) && !r.headers.has("set-cookie") && !r.headers.has("vary");
+}
+function limits(env) {
+  const list = JSON.parse(env.WRELA_LIMITS ?? "[]");
+  if (!Array.isArray(list) || !list.every((l) => typeof l?.binding === "string" && typeof l?.prefix === "string")) {
+    throw new Error("WRELA_LIMITS isn't a list of { binding, prefix, methods?, period? }");
+  }
+  return list;
+}
+async function pastLimit(env, method, path, address) {
+  for (const l of limits(env)) {
+    if (!path.startsWith(l.prefix) || l.methods !== undefined && !l.methods.includes(method))
+      continue;
+    const binding = env[l.binding];
+    if (typeof binding?.limit !== "function")
+      throw new Error(`WRELA_LIMITS names \`${l.binding}\`, which isn't a rate limit binding`);
+    if (!(await binding.limit({ key: address })).success)
+      return l;
+  }
+  return null;
+}
 async function api(request, env, options = {}) {
   const url = new URL(request.url);
   const prefix = options.prefix ?? "/api/";
@@ -1407,6 +1431,16 @@ async function api(request, env, options = {}) {
   const method = request.method.toUpperCase();
   if (!HTTP_METHODS.includes(method))
     return refusal(405, { allow: HTTP_METHODS.join(", ") });
+  const limited = await pastLimit(env, method, url.pathname, request.headers.get("cf-connecting-ip") ?? "unknown");
+  if (limited !== null)
+    return refusal(429, { "retry-after": String(limited.period ?? 60) });
+  const cache = options.cache ?? globalThis.caches?.default;
+  const key = new Request(url.href, { method: "GET" });
+  if (method === "GET" && cache !== undefined) {
+    const hit = await cache.match(key);
+    if (hit !== undefined)
+      return hit;
+  }
   if (!SAFE_METHODS.includes(method)) {
     const origins = (env.WRELA_ORIGINS ?? "").split(",").map((o) => o.trim()).filter((o) => o !== "");
     const origin = request.headers.get("origin");
@@ -1435,7 +1469,15 @@ async function api(request, env, options = {}) {
   for (const [n, v] of s.headers)
     out.append(n, v);
   const empty = method === "HEAD" || s.status === 204 || s.status === 304;
-  return new Response(empty ? null : s.body.slice(), { status: s.status, headers: out });
+  const response = new Response(empty ? null : s.body.slice(), { status: s.status, headers: out });
+  if (method === "GET" && cache !== undefined && shareable(response)) {
+    const kept = cache.put(key, response.clone());
+    if (options.ctx !== undefined)
+      options.ctx.waitUntil(kept);
+    else
+      await kept;
+  }
+  return response;
 }
 function serverClass(module) {
   return class WrelaServer extends DurableObject {
