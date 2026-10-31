@@ -72,7 +72,7 @@ import { StateHash } from "./hash.ts";
 import { CALLED_WHILE_STARTING, clockImport, phaseImport, Phases, printed, refusingImports } from "./imports.ts";
 import { Lines, LINES_SECTION, unlocated, wasmOffsets } from "./lines.ts";
 import { Inbox, type Net } from "./net.ts";
-import type { Scripted } from "./input.ts";
+import { encodeEvent, type Scripted } from "./input.ts";
 import { type Bytes, type Command, decode, type OpcodeName, Sequencer } from "./stream.ts";
 import type { TickerOptions, VoiceOptions } from "./messages.ts";
 import type { MemoryLimits, WasmAbi } from "./manifest.ts";
@@ -426,13 +426,16 @@ export interface ProgramOptions {
 /** The record a post's body makes (`std::tick::post`, runtime/abi `input`'s `Event::from_post`):
  * the `Posted` kind, then the body's words. */
 export function postedRecord(body: Uint8Array): Uint8Array<ArrayBuffer> {
+  checkPost(body);
+  const w = (i: number) => new DataView(body.buffer, body.byteOffset, POST_BODY).getUint32(4 * i, true);
+  return encodeEvent(EventKind.Posted, w(0), w(1), w(2), w(3), w(4)) as Uint8Array<ArrayBuffer>;
+}
+
+/** Throws unless `body` is a post's: its tag, `a` and `b`. */
+function checkPost(body: Uint8Array): void {
   if (body.length !== POST_BODY) {
     throw new CommandError("HostRequest", `a post's body is ${POST_BODY} bytes (its tag, \`a\` and \`b\`), not ${body.length}`);
   }
-  const record = new Uint8Array(EVENT_SIZE);
-  new DataView(record.buffer).setUint32(0, EventKind.Posted, true);
-  record.set(body, 4);
-  return record;
 }
 
 /** The pair id in a module's PAIR_SECTION, if it has one. */
@@ -691,7 +694,7 @@ export class Program {
         this.#netCommand(cmd.service, cmd.body, false);
       } else if (cmd.op === "HostRequest" && cmd.service === SERVICE_POST) {
         // Never answered: its record is the ticks'.
-        postedRecord(cmd.body);
+        checkPost(cmd.body);
       } else if ("request" in cmd) {
         this.#requests.reserve(cmd.op, cmd.request);
       }

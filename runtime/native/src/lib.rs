@@ -1213,11 +1213,23 @@ impl CpuBuild {
     /// ticks with `script`'s records (its tick-keyed events), each tick's state hash asked
     /// for: the tick log they make. Parallel work runs on `workers` threads (0 for the default).
     pub fn record_ticks(&self, ticks: u32, script: &[Scripted], workers: u32) -> Result<TickLog> {
+        self.record(workers, |program, log| {
+            for _ in 0..ticks {
+                program.scripted_tick(script, Some(&mut *log))?;
+            }
+            Ok(())
+        })
+    }
+
+    /// The tick log `run` makes on a fresh host whose ticks' state hashes are asked for.
+    fn record(
+        &self,
+        workers: u32,
+        run: impl FnOnce(&mut Program<NoGpu>, &mut TickLog) -> Result<()>,
+    ) -> Result<TickLog> {
         let mut host = self.hashing_host(workers)?;
         let mut log = host.program.tick_log(self.wasm_hash)?;
-        for _ in 0..ticks {
-            host.program.scripted_tick(script, Some(&mut log))?;
-        }
+        run(&mut host.program, &mut log)?;
         Ok(log)
     }
 
@@ -1232,12 +1244,12 @@ impl CpuBuild {
         script: &[Scripted],
         workers: u32,
     ) -> Result<TickLog> {
-        let mut host = self.hashing_host(workers)?;
-        let mut log = host.program.tick_log(self.wasm_hash)?;
-        for i in 0..frames {
-            host.program.lockstep_frame(i, fps, 64, 64, script, Some(&mut log))?;
-        }
-        Ok(log)
+        self.record(workers, |program, log| {
+            for i in 0..frames {
+                program.lockstep_frame(i, fps, 64, 64, script, Some(&mut *log))?;
+            }
+            Ok(())
+        })
     }
 
     /// Replays a tick log (`wrela-host --replay`): `init`, then each of the log's ticks

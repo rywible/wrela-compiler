@@ -941,7 +941,8 @@ export class GpuExecutor {
   set frame(i: number) {
     // A frame begins only once the last one's commands have run: the pipelines it needed are
     // built.
-    if (this.#begun++ > 0) this.#release();
+    if (this.#begun) this.#release();
+    this.#begun = true;
     this.#frame = i;
     this.#generation++;
     if (this.#asked.length > 0) this.#answerTimes();
@@ -975,8 +976,8 @@ export class GpuExecutor {
    * frame's commands have all run (`caughtUp`, after it), or the next frame begins. Not when
    * `init`'s commands catch up after a frame has begun: that frame may not have asked yet. */
   readonly #release: () => void;
-  /** How many frames have begun (`frame`). */
-  #begun = 0;
+  /** Whether a frame has begun (`frame`). */
+  #begun = false;
   /** A frame's commands wait: `#release` once they've run. */
   #releaseCaughtUp = false;
   /** When each pipeline was built (`performance.now()`), or null if it was built before the
@@ -1232,10 +1233,10 @@ export class GpuExecutor {
   caughtUp(): Promise<void> {
     if (this.#failed !== null) return Promise.reject(this.#failed);
     if (this.#waitingAt === this.#waiting.length) {
-      if (this.#begun > 0) this.#release();
+      if (this.#begun) this.#release();
       return Promise.resolve();
     }
-    if (this.#begun > 0) this.#releaseCaughtUp = true;
+    if (this.#begun) this.#releaseCaughtUp = true;
     this.#idle ??= Promise.withResolvers<void>();
     return this.#idle.promise;
   }

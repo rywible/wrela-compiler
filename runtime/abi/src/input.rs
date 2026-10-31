@@ -439,8 +439,10 @@ impl Event {
                 body.len()
             ));
         }
-        let w = |i: usize| u32::from_le_bytes(body[4 * i..4 * i + 4].try_into().expect("4 bytes"));
-        Ok(Event { kind: EventKind::Posted, modifiers: w(0), words: [w(1), w(2), w(3), w(4)] })
+        let tag = u32::from_le_bytes(body[..4].try_into().expect("4 bytes"));
+        let a = u64::from_le_bytes(body[4..12].try_into().expect("8 bytes"));
+        let b = u64::from_le_bytes(body[12..].try_into().expect("8 bytes"));
+        Ok(Event::posted(tag, a, b))
     }
 
     pub fn pad_button(pad: u32, button: u32, value: f32, pressed: bool) -> Event {

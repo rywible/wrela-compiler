@@ -181,7 +181,8 @@ fn run_tick<S, F: @deterministic fn(mut S, Ticked), H: @deterministic fn(S) -> u
     k: u32,
     t: mut Ticker<S, F, H>,
 ) {
-    let ticked = Ticked { tick: k, dt: 1.0 / f32(t.hz), records: records(), posts: posts() }
+    let (records, posts) = records()
+    let ticked = Ticked { tick: k, dt: 1.0 / f32(t.hz), records, posts }
     borrow step = t.step
     step(mut t.state, ticked)
     unsafe {
@@ -192,33 +193,22 @@ fn run_tick<S, F: @deterministic fn(mut S, Ticked), H: @deterministic fn(S) -> u
     }
 }
 
-/// The records of the tick about to run: the host wrote them.
-fn records() -> Vec<Event> {
+/// The records of the tick about to run, which the host wrote: its input, and what the program
+/// posted (`post`).
+fn records() -> (Vec<Event>, Vec<Posted>) {
     unsafe {
         let n = min(load_u32(TICK_RECORDS), MAX_TICK_RECORDS)
-        var out: Vec<Event> = Vec::with_capacity(n)
+        var events: Vec<Event> = Vec::with_capacity(n)
+        var posts: Vec<Posted> = Vec::new()
         for i in 0..n {
-            if let Some(e) = event_of(read::<RawEvent>(TICK_RECORDS + 4 + EVENT_SIZE * i)) {
-                out.push(e)
+            let r = read::<RawEvent>(TICK_RECORDS + 4 + EVENT_SIZE * i)
+            if let Some((tag, a, b)) = posted_of(r) {
+                posts.push(Posted { tag, a, b })
+            } else if let Some(e) = event_of(r) {
+                events.push(e)
             }
         }
-        out
-    }
-}
-
-/// The records of the tick about to run that the program posted (`post`).
-fn posts() -> Vec<Posted> {
-    unsafe {
-        let n = min(load_u32(TICK_RECORDS), MAX_TICK_RECORDS)
-        var out: Vec<Posted> = Vec::new()
-        for i in 0..n {
-            if let Some((tag, a, b)) = posted_of(
-                read::<RawEvent>(TICK_RECORDS + 4 + EVENT_SIZE * i),
-            ) {
-                out.push(Posted { tag, a, b })
-            }
-        }
-        out
+        (events, posts)
     }
 }
 

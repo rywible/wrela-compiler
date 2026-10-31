@@ -714,14 +714,13 @@ impl<E: Executor> State<E> {
             }
             // A record posted into the ticks (runtime/abi `input`): never answered.
             Command::HostRequest { service, body, .. } if *service == SERVICE_POST => {
-                let no_ticker =
-                    "it posts into its ticks (`std::tick::post`) but has started no ticker";
-                let record = match self.ticker {
-                    Some(_) => Event::from_post(body),
-                    None => Err(no_ticker.to_string()),
-                };
-                let record = record
-                    .map_err(|why| Error::Command(CommandError { opcode: cmd.opcode(), why }))?;
+                let record = if self.ticker.is_none() {
+                    Err("it posts into its ticks (`std::tick::post`) but has started no ticker"
+                        .into())
+                } else {
+                    Event::from_post(body)
+                }
+                .map_err(|why| Error::Command(CommandError { opcode: cmd.opcode(), why }))?;
                 self.posted.push(record.bytes());
             }
             Command::StorageRead { .. }

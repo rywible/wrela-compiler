@@ -438,8 +438,11 @@ export class InputRing {
   readTicker(out: Uint8Array, at: number, cap: number, upto = Infinity): number {
     const read = Atomics.load(this.#counts, 2) >>> 0;
     let n = Math.min(((Atomics.load(this.#counts, 0) >>> 0) - read) >>> 0, cap);
-    for (let i = 0; i < n; i++) {
-      if (this.#view.getFloat64(this.#slot(read + i) + EVENT_SIZE, true) > upto) n = i;
+    for (let i = 0; upto !== Infinity && i < n; i++) {
+      if (this.#view.getFloat64(this.#slot(read + i) + EVENT_SIZE, true) > upto) {
+        n = i;
+        break;
+      }
     }
     this.#copy(read, n, out, at);
     Atomics.store(this.#counts, 2, read + n);
