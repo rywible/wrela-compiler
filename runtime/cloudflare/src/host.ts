@@ -104,6 +104,11 @@ export class Failure extends Error {
   ) {
     super(why);
   }
+
+  /** `e` as a failure: itself if it is one, else the host's (or, with `program`, the program's). */
+  static of(e: unknown, program = false): Failure {
+    return e instanceof Failure ? e : new Failure(program, e instanceof Error ? e.message : String(e));
+  }
 }
 
 // ---- HTTP's bytes (runtime/abi `http`) ----------------------------------------------------------
@@ -152,7 +157,7 @@ export const bare = (status: number): Uint8Array => encodeResponse(withHostHeade
 
 const asBytes = (v: unknown): Uint8Array => (v instanceof Uint8Array ? v : new Uint8Array(v as ArrayBuffer));
 /** Bytes bound as a BLOB: an ArrayBuffer of exactly them, as the SQLite storage API takes one. */
-const blob = (b: Uint8Array): ArrayBuffer =>
+export const blob = (b: Uint8Array): ArrayBuffer =>
   b.byteOffset === 0 && b.byteLength === b.buffer.byteLength && b.buffer instanceof ArrayBuffer ? b.buffer : (b.slice().buffer as ArrayBuffer);
 
 /** The server's store: one table of keys and values, both bytes, as `store.sqlite` on
@@ -160,6 +165,14 @@ const blob = (b: Uint8Array): ArrayBuffer =>
 export class Store {
   constructor(readonly storage: Storage) {
     storage.sql.exec("CREATE TABLE IF NOT EXISTS kv (key BLOB PRIMARY KEY, value BLOB NOT NULL) WITHOUT ROWID");
+  }
+
+  /** A read of the store (`store/get`, `store/scan`), answered from what's committed: null if it
+   * failed, or isn't one. */
+  answer(service: string, body: Uint8Array): Uint8Array | null {
+    if (service === "store/get") return answerOf(() => this.get(body));
+    if (service === "store/scan") return answerOf(() => this.scan(body));
+    return null;
   }
 
   /** `store/get`: the key → 1 then the value, or 0. */
@@ -203,24 +216,7 @@ export class Store {
   /** Commits writes (`store/write` bodies) in one transaction, all or none. A malformed body is
    * the program's, and commits nothing. */
   commit(batches: Uint8Array[]): void {
-    const ops: [Uint8Array, Uint8Array | null][] = [];
-    for (const b of batches) {
-      const r = new In(b);
-      while (r.left() > 0) {
-        const kind = r.byte();
-        const k = r.chunk();
-        if (k.length > MAX_KEY) throw new Failure(true, `a key is longer than ${MAX_KEY} bytes`);
-        if (kind === 1) {
-          const v = r.chunk();
-          if (v.length > MAX_VALUE) throw new Failure(true, `a value is longer than ${MAX_VALUE} bytes`);
-          ops.push([k, v]);
-        } else if (kind === 2) {
-          ops.push([k, null]);
-        } else {
-          throw new Failure(true, `a store write of kind ${kind}`);
-        }
-      }
-    }
+    const ops = writes(batches);
     if (ops.length === 0) return;
     this.storage.transactionSync(() => {
       for (const [k, v] of ops) {
@@ -229,6 +225,34 @@ export class Store {
       }
     });
   }
+}
+
+/** The writes `store/write` bodies make, each a key and its new value (null: deleted), in order;
+ * a malformed body, or a key or a value too long, is the program's failure. */
+export function writes(batches: Uint8Array[]): [Uint8Array, Uint8Array | null][] {
+  const ops: [Uint8Array, Uint8Array | null][] = [];
+  try {
+    for (const b of batches) {
+      const r = new In(b);
+      while (r.left() > 0) {
+        const kind = r.byte();
+        const k = r.chunk();
+        if (k.length > MAX_KEY) throw new Error(`a key is longer than ${MAX_KEY} bytes`);
+        if (kind === 1) {
+          const v = r.chunk();
+          if (v.length > MAX_VALUE) throw new Error(`a value is longer than ${MAX_VALUE} bytes`);
+          ops.push([k, v]);
+        } else if (kind === 2) {
+          ops.push([k, null]);
+        } else {
+          throw new Error(`a store write of kind ${kind}`);
+        }
+      }
+    }
+  } catch (e) {
+    throw Failure.of(e, true);
+  }
+  return ops;
 }
 
 // ---- cryptography (WebCrypto) -----------------------------------------------------------------
@@ -330,7 +354,7 @@ export async function verify(body: Uint8Array): Promise<Uint8Array> {
 // ---- an instance ------------------------------------------------------------------------------
 
 /** What `f` answers, or null (a failed request) if it throws. */
-function now(f: () => Uint8Array): Uint8Array | null {
+function answerOf(f: () => Uint8Array): Uint8Array | null {
   try {
     return f();
   } catch {
@@ -344,22 +368,33 @@ const LINES = new TextDecoder();
 /** A call's command the host carries out after it returns. */
 type Command = { kind: "write"; body: Uint8Array } | { kind: "respond"; conn: number; response: HttpResponse };
 
-/** One instance of the server build, and the host's part of it. */
-class Instance {
+/** What runs an instance: the HTTP server here, a room (room.ts). It holds the events the program
+ * hasn't read, and takes the requests the program makes (`submit`): a command `C` for after the
+ * call, or a request answered for the next. */
+export interface Owner<C> {
+  readonly queue: Inbox;
+  readonly limits: Limits;
+  /** Where a printed line goes; none, nowhere. */
+  readonly print: ((line: string) => void) | undefined;
+  /** Seconds on the host's clock, never going back. */
+  clock(): number;
+  submit(self: Instance<C>, id: number, service: string, body: Uint8Array): void;
+}
+
+/** One instance of the server build, and the host's part of it: its owner's commands are `C`. */
+export class Instance<C> {
   readonly memory: WebAssembly.Memory;
   readonly serve: (time: number) => void;
   /** Answers the program may read, and those made during this call (read from the next). */
   answered = new Map<number, Uint8Array | null>();
   arriving: Promise<[number, Uint8Array | null]>[] = [];
-  commands: Command[] = [];
+  commands: C[] = [];
   commandBytes = 0;
   /** Why the host refused what the program asked, in this call. */
   refused: string | null = null;
-  /** Connections responded to, in this call. */
-  responding = new Set<number>();
 
   private constructor(
-    readonly host: Server,
+    readonly owner: Owner<C>,
     instance: WebAssembly.Instance,
   ) {
     const exports = instance.exports;
@@ -371,20 +406,20 @@ class Instance {
     this.serve = serve as (time: number) => void;
   }
 
-  static async start(host: Server, module: WebAssembly.Module): Promise<Instance> {
-    let self: Instance | null = null;
+  static async start<C>(owner: Owner<C>, module: WebAssembly.Module): Promise<Instance<C>> {
+    let self: Instance<C> | null = null;
     const me = () => {
       if (self === null) throw new Error("the instance isn't started");
       return self;
     };
-    const imports = { [IMPORT_MODULE]: host.imports(me) };
+    const imports = { [IMPORT_MODULE]: imports_(owner, me) };
     let instance: WebAssembly.Instance;
     try {
       instance = await WebAssembly.instantiate(module, imports);
     } catch (e) {
       throw new Failure(false, `instantiating the server build: ${(e as Error).message}`);
     }
-    self = new Instance(host, instance);
+    self = new Instance(owner, instance);
     const init = instance.exports[EXPORT_SERVE_INIT];
     if (init !== undefined) {
       if (typeof init !== "function" || (init as Function).length !== 0) throw new Failure(false, "`serve_init` isn't `serve_init()`");
@@ -396,15 +431,16 @@ class Instance {
   /** Runs `f` as a call: what it asked is answered after it, and its failure classified. */
   call(f: () => void): void {
     this.refused = null;
-    this.responding.clear();
+    this.commands = [];
+    this.commandBytes = 0;
     try {
       f();
     } catch (e) {
       throw this.classify(e);
     } finally {
-      this.host.queue.endCall();
+      this.owner.queue.endCall();
     }
-    if (this.memory.buffer.byteLength > this.host.limits.memory) {
+    if (this.memory.buffer.byteLength > this.owner.limits.memory) {
       throw new Failure(false, "the program asked for more memory than its instance has");
     }
   }
@@ -436,6 +472,96 @@ class Instance {
     if (at + bytes.length > this.memory.buffer.byteLength) this.refuse(`${what} reaches past the end of the program's memory`);
     new Uint8Array(this.memory.buffer, at, bytes.length).set(bytes);
   }
+
+  /** A command for after the call, of `bytes` toward the call's limit. */
+  command(c: C, bytes: number): void {
+    this.commandBytes += bytes;
+    if (this.commandBytes > this.owner.limits.commands) this.refuse(`a call's commands past ${this.owner.limits.commands} bytes`, true);
+    this.commands.push(c);
+  }
+
+  /** Request `id`'s answer (null: it failed), which the next call reads. */
+  answer(id: number, a: Uint8Array | null | Promise<Uint8Array | null>): void {
+    this.arriving.push(Promise.resolve(a).then((x) => [id, x] as [number, Uint8Array | null]));
+  }
+
+  /** The answers its last call's requests got, readable from its next call. */
+  async settle(): Promise<void> {
+    for (const [id, a] of await Promise.all(this.arriving.splice(0))) this.answered.set(id, a);
+  }
+}
+
+/** The answer to a request a host gives the same way wherever it runs a server build: random
+ * bytes, a signature's check and the time of day (`now`, Unix milliseconds); null (a failed
+ * request) for a service it doesn't give. */
+export function commonAnswer(service: string, body: Uint8Array, now: number): Uint8Array | null | Promise<Uint8Array | null> {
+  switch (service) {
+    case "crypto/random":
+      return answerOf(() => random(body));
+    case "crypto/verify":
+      return verify(body).catch(() => null);
+    case SERVICE_TIME:
+      return body.length === 0 ? new Out().u64(BigInt(Math.floor(now))).bytes() : null;
+    default:
+      return null;
+  }
+}
+
+/** The `wrela` imports, for the instance `me` gives, which `owner` runs. */
+function imports_<C>(owner: Owner<C>, me: () => Instance<C>): WebAssembly.ModuleImports {
+  return {
+    [IMPORT_SUBMIT](at: number, len: number) {
+      const self: Instance<C> = me();
+      let commands: ReturnType<typeof decode>;
+      try {
+        commands = decode(self.read(at, len));
+      } catch (e) {
+        self.refuse(`a malformed command batch: ${(e as Error).message}`);
+      }
+      for (const c of commands) {
+        if (c.op !== "HostRequest") self.refuse(`a server host can't carry out ${c.op}`);
+        owner.submit(self, c.request, c.service, c.body);
+      }
+    },
+    [IMPORT_REQUEST_STATUS](id: number): number {
+      const self = me();
+      if (!self.answered.has(id)) return REQUEST_PENDING;
+      const a = self.answered.get(id);
+      return a === null || a === undefined ? REQUEST_FAILED : a.length;
+    },
+    [IMPORT_REQUEST_TAKE](id: number, at: number) {
+      const self = me();
+      if (!self.answered.has(id)) self.refuse(`request_take(${id}): the request isn't answered`);
+      const a = self.answered.get(id) ?? new Uint8Array(0);
+      self.write(at, a, `request_take(${id}, ${at})`);
+      self.answered.delete(id);
+    },
+    [IMPORT_LIMIT]: () => 0,
+    [IMPORT_PRINT](at: number, len: number) {
+      const print = owner.print;
+      if (print !== undefined) print(LINES.decode(me().read(at, len)));
+    },
+    [IMPORT_INPUT](at: number, cap: number): number {
+      const self = me();
+      // A copy that doesn't fit fails the call, and its events go with its instance.
+      const events = owner.queue.take(cap);
+      events.forEach((e, i) => self.write(at + i * EVENT_SIZE, e, `input(${at}, ${cap})`));
+      return events.length;
+    },
+    [IMPORT_PAYLOAD](lo: number, hi: number, at: number, cap: number): number {
+      const self = me();
+      const bytes = owner.queue.payload((lo >>> 0) + (hi >>> 0) * 2 ** 32);
+      if (bytes === undefined) return -1;
+      self.write(at, bytes.subarray(0, Math.min(cap, bytes.length)), `payload(.., ${at}, ${cap})`);
+      return bytes.length;
+    },
+    [IMPORT_CLOCK](at: number) {
+      const b = new Uint8Array(8);
+      new DataView(b.buffer).setFloat64(0, owner.clock(), true);
+      me().write(at, b, `clock(${at})`);
+    },
+    [IMPORT_PHASE]: () => {},
+  };
 }
 
 /** A request waiting for its response. */
@@ -453,17 +579,19 @@ interface Open {
 const RECOVER_MS = 1000;
 
 /** The highest connection number, past which `std::net::POISONED` marks a message. */
-const POISONED = 2 ** 31;
+export const POISONED = 2 ** 31;
 
 /** A server build's HTTP instance, its store and its requests. */
-export class Server {
+export class Server implements Owner<Command> {
   readonly limits: Limits;
   readonly store: Store;
   /** The events the program hasn't read, and whether any came since its last call. */
   queue = new Inbox();
   private fresh = false;
-  private instance: Instance | null = null;
-  private starting: Promise<Instance> | null = null;
+  private instance: Instance<Command> | null = null;
+  private starting: Promise<Instance<Command>> | null = null;
+  /** Connections responded to, in the current call. */
+  private readonly responding = new Set<number>();
   private readonly open = new Map<number, Open>();
   private nextConn = 1;
   private readonly started: number;
@@ -487,6 +615,16 @@ export class Server {
     this.now = options.now ?? Date.now;
     this.store = new Store(storage);
     this.started = this.now();
+  }
+
+  get print(): ((line: string) => void) | undefined {
+    return this.options.print;
+  }
+
+  /** Seconds since the host started, never going back. */
+  clock(): number {
+    this.lastClock = Math.max(this.lastClock, (this.now() - this.started) / 1000);
+    return this.lastClock;
   }
 
   /** Answers a request's bytes (`encodeRequest`) with a response's (`encodeResponse`). */
@@ -544,7 +682,7 @@ export class Server {
 
   /** One call: the answers its last call's requests got, then `serve`, then its commands. */
   private async once(): Promise<void> {
-    let instance: Instance;
+    let instance: Instance<Command>;
     try {
       instance = await this.ready();
     } catch (e) {
@@ -552,13 +690,11 @@ export class Server {
       return;
     }
     // Answers arrive before the call that may read them.
-    const arrived = await Promise.all(instance.arriving.splice(0));
-    for (const [id, answer] of arrived) instance.answered.set(id, answer);
+    await instance.settle();
     if (instance !== this.instance) return;
     this.fresh = false;
     this.woken = false;
-    instance.commands = [];
-    instance.commandBytes = 0;
+    this.responding.clear();
     try {
       const time = Math.fround((this.now() - this.started) / 1000);
       const before = this.queue.length;
@@ -576,14 +712,13 @@ export class Server {
   }
 
   /** The instance, started if it isn't (with `serve_init`). */
-  private ready(): Promise<Instance> {
+  private ready(): Promise<Instance<Command>> {
     if (this.instance !== null) return Promise.resolve(this.instance);
     this.starting ??= (async () => {
       try {
-        const i = await Instance.start(this, this.module);
+        const i = await Instance.start<Command>(this, this.module);
         // What `serve_init` wrote commits before its first `serve`.
         this.carryOut(i.commands);
-        i.commands = [];
         this.instance = i;
         return i;
       } finally {
@@ -620,7 +755,7 @@ export class Server {
    * every request open on it that a call was given with it. One no call has read yet waits for
    * the next instance, unless none starts. */
   private fail(e: unknown, started = true): void {
-    const f = e instanceof Failure ? e : new Failure(false, String((e as Error)?.message ?? e));
+    const f = Failure.of(e);
     this.options.log?.(`wrela: the server's call failed: ${f.program ? "the program's: " : "the host's limits: "}${f.message}`);
     const unread = new Set<number>();
     if (started) {
@@ -646,93 +781,25 @@ export class Server {
     }
   }
 
-  /** The `wrela` imports, for the instance `me` gives. */
-  imports(me: () => Instance): WebAssembly.ModuleImports {
-    const host = this;
-    return {
-      [IMPORT_SUBMIT](at: number, len: number) {
-        const self: Instance = me();
-        let commands: ReturnType<typeof decode>;
-        try {
-          commands = decode(self.read(at, len));
-        } catch (e) {
-          self.refuse(`a malformed command batch: ${(e as Error).message}`);
-        }
-        for (const c of commands) {
-          if (c.op !== "HostRequest") self.refuse(`a server host can't carry out ${c.op}`);
-          host.submit(self, c.request, c.service, c.body);
-        }
-      },
-      [IMPORT_REQUEST_STATUS](id: number): number {
-        const self = me();
-        if (!self.answered.has(id)) return REQUEST_PENDING;
-        const a = self.answered.get(id);
-        return a === null || a === undefined ? REQUEST_FAILED : a.length;
-      },
-      [IMPORT_REQUEST_TAKE](id: number, at: number) {
-        const self = me();
-        if (!self.answered.has(id)) self.refuse(`request_take(${id}): the request isn't answered`);
-        const a = self.answered.get(id) ?? new Uint8Array(0);
-        self.write(at, a, `request_take(${id}, ${at})`);
-        self.answered.delete(id);
-      },
-      [IMPORT_LIMIT]: () => 0,
-      [IMPORT_PRINT](at: number, len: number) {
-        const print = host.options.print;
-        if (print !== undefined) print(LINES.decode(me().read(at, len)));
-      },
-      [IMPORT_INPUT](at: number, cap: number): number {
-        const self = me();
-        // A copy that doesn't fit fails the call, and its events go with its instance.
-        const events = host.queue.take(cap);
-        events.forEach((e, i) => self.write(at + i * EVENT_SIZE, e, `input(${at}, ${cap})`));
-        return events.length;
-      },
-      [IMPORT_PAYLOAD](lo: number, hi: number, at: number, cap: number): number {
-        const self = me();
-        const bytes = host.queue.payload((lo >>> 0) + (hi >>> 0) * 2 ** 32);
-        if (bytes === undefined) return -1;
-        self.write(at, bytes.subarray(0, Math.min(cap, bytes.length)), `payload(.., ${at}, ${cap})`);
-        return bytes.length;
-      },
-      [IMPORT_CLOCK](at: number) {
-        // Seconds since the host started, never going back.
-        host.lastClock = Math.max(host.lastClock, (host.now() - host.started) / 1000);
-        const b = new Uint8Array(8);
-        new DataView(b.buffer).setFloat64(0, host.lastClock, true);
-        me().write(at, b, `clock(${at})`);
-      },
-      [IMPORT_PHASE]: () => {},
-    };
-  }
-
   /** A host request the program made: a command for after the call, or a request answered for
    * the next. */
-  submit(self: Instance, id: number, service: string, body: Uint8Array): void {
-    const command = (c: Command, bytes: number): void => {
-      self.commandBytes += bytes;
-      if (self.commandBytes > this.limits.commands) self.refuse(`a call's commands past ${this.limits.commands} bytes`, true);
-      self.commands.push(c);
-    };
-    const answer = (a: Uint8Array | null | Promise<Uint8Array | null>): void => {
-      self.arriving.push(Promise.resolve(a).then((x) => [id, x] as [number, Uint8Array | null]));
-    };
+  submit(self: Instance<Command>, id: number, service: string, body: Uint8Array): void {
     switch (service) {
       case "store/write":
-        return command({ kind: "write", body }, body.length);
+        return self.command({ kind: "write", body }, body.length);
       case SERVICE_RESPOND: {
         if (body.length < 4) self.refuse("`http/respond` needs a connection's number");
         const conn = new DataView(body.buffer, body.byteOffset).getUint32(0, true);
         if (!this.open.has(conn)) return; // the client went, or it timed out: nowhere to go
-        if (self.responding.has(conn)) self.refuse(`request ${conn} takes one response`);
+        if (this.responding.has(conn)) self.refuse(`request ${conn} takes one response`);
         let response: HttpResponse;
         try {
           response = checkResponse(body.subarray(4));
         } catch (e) {
           self.refuse(`\`http/respond\`: ${(e as Error).message}`);
         }
-        self.responding.add(conn);
-        return command({ kind: "respond", conn, response }, body.length);
+        this.responding.add(conn);
+        return self.command({ kind: "respond", conn, response }, body.length);
       }
       case "net/send":
       case "net/close":
@@ -741,17 +808,10 @@ export class Server {
       case "net/compact":
         return self.refuse(`\`${service}\`: an HTTP server's connections take one response (\`std::http::respond\`)`);
       case "store/get":
-        return answer(now(() => this.store.get(body)));
       case "store/scan":
-        return answer(now(() => this.store.scan(body)));
-      case "crypto/random":
-        return answer(now(() => random(body)));
-      case SERVICE_TIME:
-        return answer(body.length === 0 ? new Out().u64(BigInt(Math.floor(this.now()))).bytes() : null);
-      case "crypto/verify":
-        return answer(verify(body).catch(() => null));
+        return self.answer(id, this.store.answer(service, body));
       default:
-        return answer(null);
+        return self.answer(id, commonAnswer(service, body, this.now()));
     }
   }
 }

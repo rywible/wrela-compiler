@@ -1598,7 +1598,7 @@ Three hosts run builds, from the same ABI (`runtime/abi`), and the native host h
 | The browser host | A page in Chrome, on WebGPU (`runtime/browser`) | A client build |
 | The native host | `wrela-host`, on wgpu and wasmtime (`runtime/native`) | A client build, on the machine's GPU; or its CPU alone (`--no-gpu`, and the frame tests of §13.2), which checks commands but runs no shaders |
 | The server host | `wrela-serve` (`wrela_host::server`) | A server build's rooms (§15.3, §19) |
-| The Cloudflare host | A Durable Object and the site's Worker (`runtime/cloudflare`), which `wrela build` writes beside a server build | A server build's HTTP requests (§19.5) |
+| The Cloudflare host | Durable Objects and the site's Worker (`runtime/cloudflare`), which `wrela build` writes beside a server build | A server build's HTTP requests (§19.5) and its rooms over WebSockets (§19.6) |
 | The native host's tool profile | `wrela tool` (`wrela_host::tool`), on wasmtime | A tool build, with what its command line grants (§15.5) |
 
 Where this spec says "both hosts", it means the browser host and the native host: a program gives the same results, and the same command stream, on both.
@@ -2646,7 +2646,7 @@ Each is `@server`. `wrela-serve` and `wrela run` open the store in their data di
 
 ### 19.5 A server over HTTP
 
-A server build also answers HTTP requests to its page's own origin, so a page and its server share a first-party cookie, and the site's protections apply to the server's paths. The Cloudflare host serves them: `wrela build` writes it beside the server's module as `server/cloudflare.js`, with the Wrangler settings it needs in `server/cloudflare.json` (a Durable Object binding `WRELA_SERVER` of class `WrelaServer`, its SQLite migration, the module rule for `game.wasm`, a CPU limit, and `WRELA_ORIGINS` for the release to fill). The site's Worker exports `WrelaServer` and calls `api(request, env)` first in its `fetch`: it answers a request under `/api/` and gives `null` for any other.
+A server build also answers HTTP requests to its page's own origin, so a page and its server share a first-party cookie, and the site's protections apply to the server's paths. The Cloudflare host serves them: `wrela build` writes it beside the server's module as `server/cloudflare.js`, with the Wrangler settings it needs in `server/cloudflare.json` (a Durable Object binding `WRELA_SERVER` of class `WrelaServer`, its SQLite migration, the module rule for `game.wasm`, and `WRELA_ORIGINS` and `WRELA_LIMITS` for the release to fill; no CPU limit, which a release on Workers Paid may add as `limits.cpu_ms`). The site's Worker exports `WrelaServer` and calls `api(request, env)` first in its `fetch`: it answers a request under `/api/` and gives `null` for any other.
 
 **A request is a short connection** (`std::http`). The events are the ones a room's connection gives (§17.2):
 
@@ -2690,6 +2690,23 @@ A `GET` whose answer was a 200 with `cache-control: public` and a `max-age` or `
 - **Signatures and randomness come from WebCrypto.** Its Ed25519 doesn't promise `wrela-serve`'s refusal of small-order keys.
 
 **A client** asks its page's origin with `std::http::fetch(method, path, headers, body)` (`@client`, a host service, §17.1). The path is absolute (`/api/me`). The browser sends the origin's cookies, follows no redirect and caches nothing, and the request carries only `accept`, `content-type`, `if-none-match` and the program's own headers. Its answer, read with `std::http::response`, carries `cache-control`, `content-type`, `etag`, `location`, `retry-after` and the program's own headers, never `set-cookie`, which the browser keeps. The native host fails it: it has no origin.
+
+### 19.6 Rooms on Cloudflare
+
+The Cloudflare host also runs a server build's rooms, each in a Durable Object of its own (`WrelaRoom`), with its peers' connections as WebSockets that the object holds through the Hibernation API. `server/cloudflare.json` binds `WRELA_ROOM` with its SQLite migration. The site's Worker exports `WrelaRoom` and calls `rooms(request, env)` in its `fetch`, beside `api`: it answers a request under `/room/` and gives `null` for any other. A client finds such a server in `net.json` as a `wss:` URL (`{"url": "wss://<site>"}`; `ws:` only to a loopback address), and the browser host opens each connection as a WebSocket in place of a WebTransport session.
+
+- **A connection is a WebSocket** at `/room/<name>?pair=<id>` (§19.3). Each binary message is one frame, with no varint. A frame is at most 64 KiB, and 64 bytes less from a client. A text message from a peer, or a longer one, closes its connection (1003, 1009), and so do more than 1 MiB waiting for the room, each message counted with 64 bytes more, and a message that would take what all the room's connections hold waiting past 32 MiB (1008).
+- **Before a room's object is billed,** `rooms` refuses what isn't a WebSocket upgrade (426), a name that isn't a room's (404), a pair id other than the build's (403), an `Origin` that isn't one of `WRELA_ORIGINS` (403; a client with none isn't a browser, and the room's protocol decides), and a client past its rate limits (429, `WRELA_LIMITS` as in §19.5, the address the key and nothing else). Only the handshake reaches the object (`Upgrade`, `Connection` and the `Sec-WebSocket-*` headers): no address, and no other header.
+- **Each build's rooms are its own:** a room's object is named by the pair id, a hash of both modules, and the room's name. A deploy gives a hibernated object the new build's code with the old build's sockets and journal: the object keeps the pair id of the build that made it, and one of another build reads nothing back, closing its sockets (1012) so that their peers come back to the new build's rooms.
+- **The contract of §19.2 holds.** A call's store writes commit in the server's object (`WrelaServer`, §19.5), then its records are kept in the room's SQLite in one transaction, then its sends, closes and tags go. A room that starts reads its journal back from connection 0, then hears of its open connections again, with their tags. A failed call's events are taken again one at a time on a fresh instance: the message the program traps on alone comes back poisoned, and a trap on that, or on the journal, quarantines the room. A quarantined room stays so in its storage, and closes its connections and each new one (1011). An event past the host's limits waits, with those after it, for the object's alarm (250 ms), however much comes meanwhile; after three failures in a row the room's peers are let go (1013), to come back. A socket that fails once a call's records are kept closes (1011), and the call isn't taken again.
+- **An idle room costs nothing in memory:** its object leaves memory with its peers still connected, each socket's attachment holding its connection's number and tag. An object that wakes, after eviction or a deploy, starts the room again from its journal, and its peers stay connected.
+
+**Where it differs from `wrela-serve`:**
+
+- **A room's time counts from the room's first start,** kept in its storage, so it goes on across restarts and deploys.
+- **A call has no deadline** (§19.5). Its bound is the Worker's CPU limit. Past a turn of 250 ms, the room goes on in its alarm, and what comes meanwhile waits for it.
+- **A peer isn't closed for being idle,** since a hibernated socket costs nothing. An object holds at most 32,768 sockets, and no host bound of §19.3 on sessions or rooms running applies.
+- **A journal's records carry no CRC-32C,** since a transaction in the object's SQLite is kept whole or not at all.
 
 ## 20. The stdlib boundary
 

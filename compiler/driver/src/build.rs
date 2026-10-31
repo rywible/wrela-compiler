@@ -23,17 +23,24 @@ pub const CLOUDFLARE_JS: &str = "server/cloudflare.js";
 pub const CLOUDFLARE_JSON: &str = "server/cloudflare.json";
 
 /// The Wrangler members the Cloudflare host needs, for a release to merge into its Worker's
-/// configuration: the Durable Object, its SQLite migration, the module rule for `game.wasm`, the
-/// CPU limit, the origins to fill, and the API's path run before the assets.
+/// configuration: the Durable Objects (the server's and its rooms'), their SQLite migrations, the
+/// module rule for `game.wasm`, the origins and limits to fill, and the API's and the rooms'
+/// paths run before the assets. It sets no CPU limit: Workers Free takes none, and a release on
+/// Workers Paid may add `limits.cpu_ms`.
 pub fn cloudflare_json() -> String {
     let config = serde_json::json!({
-        "comment": "The Wrangler members a server build's Cloudflare host needs (language.md §19.5): merge them into the Worker's configuration, fill WRELA_ORIGINS with the page origins (comma-separated) and WRELA_LIMITS with the rate limits (a JSON list of { binding, prefix, methods?, period? }, each naming a ratelimits binding), and import { WrelaServer, api } from ./cloudflare.js in the Worker's script.",
-        "durable_objects": { "bindings": [{ "name": "WRELA_SERVER", "class_name": "WrelaServer" }] },
-        "migrations": [{ "tag": "wrela-server-1", "new_sqlite_classes": ["WrelaServer"] }],
+        "comment": "The Wrangler members a server build's Cloudflare host needs (language.md §19.5, §19.6): merge them into the Worker's configuration, fill WRELA_ORIGINS with the page origins (comma-separated) and WRELA_LIMITS with the rate limits (a JSON list of { binding, prefix, methods?, period? }, each naming a ratelimits binding), and import { WrelaServer, WrelaRoom, api, rooms } from ./cloudflare.js in the Worker's script (export both classes; its fetch tries `api`, then `rooms`).",
+        "durable_objects": { "bindings": [
+            { "name": "WRELA_SERVER", "class_name": "WrelaServer" },
+            { "name": "WRELA_ROOM", "class_name": "WrelaRoom" },
+        ] },
+        "migrations": [
+            { "tag": "wrela-server-1", "new_sqlite_classes": ["WrelaServer"] },
+            { "tag": "wrela-room-1", "new_sqlite_classes": ["WrelaRoom"] },
+        ],
         "rules": [{ "type": "CompiledWasm", "globs": ["**/*.wasm"], "fallthrough": true }],
-        "limits": { "cpu_ms": 5000 },
         "vars": { "WRELA_ORIGINS": "", "WRELA_LIMITS": "[]" },
-        "assets": { "run_worker_first": ["/api/*"] },
+        "assets": { "run_worker_first": ["/api/*", "/room/*"] },
     });
     let mut out = serde_json::to_string_pretty(&config).expect("the configuration serializes");
     out.push('\n');

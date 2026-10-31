@@ -176,3 +176,96 @@ fn a_server_answers_http_through_its_cloudflare_host() {
     assert!(run.status.success(), "the end-to-end test failed:\n{said}");
     assert!(said.contains(" 0 fail") && !said.contains("skip"), "every case ran:\n{said}");
 }
+
+/// A server build's rooms through its Cloudflare host (language.md §19.6), end to end: the suite's
+/// rooms program (rooms.rs), built with its host, driven in Bun through the room's Durable Object
+/// and the router (runtime/cloudflare/test/rooms-run.ts). A peer joins, proposes and is refused one;
+/// the object is reset and reads its journal back, its peer still connected; a second peer catches
+/// up and both hear the next commit; a text message closes its connection; and the router lets
+/// only this build's pair, a room's name and an allowed page in.
+#[test]
+fn a_room_runs_on_its_cloudflare_host_and_reads_its_journal_back() {
+    use super::rooms::{Down, down, hello, propose};
+    let root = super::scratch("rooms-cloudflare");
+    let pkg = root.join("pkg");
+    super::write_package(&pkg, "rooms", super::rooms::PROGRAM);
+    let out = root.join("build");
+    wrela_tests::must_build(&pkg, &out);
+    let wasm = std::fs::read(out.join("server/game.wasm")).expect("the server build");
+    let pair = format!("{:016x}", wrela_abi::read_pair(&wasm).expect("a pair id"));
+    let hex = |b: Vec<u8>| b.iter().map(|x| format!("{x:02x}")).collect::<String>();
+    let send = |peer: &str, b: Vec<u8>| serde_json::json!({ "send": peer, "hex": hex(b) });
+    let scenario = serde_json::json!([
+        { "connect": "a" },
+        send("a", hello(5, 1, 0, 0)),
+        send("a", propose(1, 1, 1, 10)),
+        send("a", propose(1, 1, 2, 14)),
+        { "restart": true },
+        { "connect": "b" },
+        send("b", hello(6, 1, 0, 0)),
+        send("a", propose(1, 1, 3, 11)),
+        { "connect": "c" },
+        { "text": "c" },
+        { "route": format!("/room/a?pair={pair}") },
+        { "route": "/room/a?pair=0000000000000001" },
+        { "route": format!("/room/A?pair={pair}") },
+        { "route": format!("/room/a?pair={pair}"), "origin": "https://evil.example" },
+        { "route": "/elsewhere" },
+    ]);
+    let path = root.join("scenario.json");
+    std::fs::write(&path, scenario.to_string()).expect("the scenario");
+    let host = wrela_tests::repo_root().join("runtime/cloudflare");
+    let run = std::process::Command::new("bun")
+        .arg("test/rooms-run.ts")
+        .arg(&out)
+        .arg(&path)
+        .current_dir(&host)
+        .output()
+        .expect("bun runs runtime/cloudflare/test/rooms-run.ts");
+    let stdout = String::from_utf8_lossy(&run.stdout);
+    assert!(run.status.success(), "{stdout}{}", String::from_utf8_lossy(&run.stderr));
+    let result: serde_json::Value =
+        serde_json::from_str(stdout.lines().last().expect("a result")).expect("JSON");
+    let got = |peer: &str| -> Vec<Down> {
+        let bytes = |h: &str| {
+            (0..h.len())
+                .step_by(2)
+                .map(|i| u8::from_str_radix(&h[i..i + 2], 16).unwrap())
+                .collect::<Vec<u8>>()
+        };
+        result["sent"][peer]
+            .as_array()
+            .expect("sent")
+            .iter()
+            .map(|h| down(&bytes(h.as_str().unwrap())))
+            .collect()
+    };
+    let a = got("a");
+    assert_eq!(
+        a[..3],
+        [
+            Down::Welcome { peer: 1, seq: 0 },
+            Down::Committed { seq: 1, counter: 1, value: 10 },
+            Down::Rejected { counter: 2, reason: 7 }
+        ],
+        "{a:?}"
+    );
+    assert!(
+        matches!(a.last(), Some(Down::Committed { counter: 3, value: 11, .. })),
+        "a hears its commit after the restart: {a:?}"
+    );
+    let b = got("b");
+    assert!(matches!(b.first(), Some(Down::Welcome { peer: 2, .. })), "{b:?}");
+    let values: Vec<u32> = b
+        .iter()
+        .filter_map(|d| if let Down::Committed { value, .. } = d { Some(*value) } else { None })
+        .collect();
+    assert_eq!(
+        values,
+        [10, 11],
+        "b catches up from the journal read back, then hears a's commit: {b:?}"
+    );
+    assert_eq!(result["closed"]["c"], 1003, "a text message closes its connection");
+    assert_eq!(result["closed"]["a"], serde_json::Value::Null, "a's connection outlives the reset");
+    assert_eq!(result["routes"], serde_json::json!([101, 403, 404, 403, 0]));
+}

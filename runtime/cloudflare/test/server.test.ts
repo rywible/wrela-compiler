@@ -2,26 +2,12 @@
 // a host limit (the memory cap) with 503, and the next request starts a fresh instance; a module
 // that isn't a server build is the host's failure.
 
-import { Database } from "bun:sqlite";
 import { expect, test } from "bun:test";
 import { Encoder } from "../../browser/test/encoder.ts";
 import { buildModule, op, SUBMIT } from "../../browser/test/wasm-builder.ts";
 import { Out } from "../../browser/src/http.ts";
-import { decodeResponse, encodeRequest, LIMITS, Server, type Storage, Store } from "../src/host.ts";
-import { sqliteBindings } from "./sqlite.ts";
-
-function storage(): Storage {
-  const db = new Database(":memory:");
-  return {
-    sql: {
-      exec: (q: string, ...b: unknown[]) => {
-        const rows = db.query(q).all(...(sqliteBindings(b) as never[])) as Record<string, unknown>[];
-        return Object.assign(rows[Symbol.iterator](), { toArray: () => rows });
-      },
-    },
-    transactionSync: <T>(fn: () => T): T => db.transaction(fn)(),
-  };
-}
+import { decodeResponse, encodeRequest, LIMITS, Server, Store } from "../src/host.ts";
+import { storage } from "./fakes.ts";
 
 const SERVE = { params: ["f32" as const], results: [] };
 const request = encodeRequest({ time: 0n, method: "GET", path: "/api/x", query: "", headers: [], body: new Uint8Array(0) });

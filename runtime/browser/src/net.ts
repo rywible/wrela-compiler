@@ -1,11 +1,13 @@
 // The network (language.md §19): the events a program reads, with messages' bytes, and its
-// connections to its server's rooms over WebTransport. A connection is one session at
-// `/room/<name>?pair=<id>` of the server that `net.json` beside the build names, with one
-// bidirectional stream; each message on it is a frame: its length (a varint, at most MAX_FRAME),
-// then its bytes. What a connection holds is bounded: past HELD bytes waiting for the program,
-// or past PENDING bytes waiting to be written, it's closed, and its peer comes back.
+// connections to its server's rooms. A connection is to `/room/<name>?pair=<id>` of the server
+// that `net.json` beside the build names. To an `https:` server (`wrela-serve`) it's a
+// WebTransport session with one bidirectional stream, each message on it a frame: its length (a
+// varint, at most MAX_FRAME), then its bytes. To a `wss:` server (the Cloudflare host) it's a
+// WebSocket, each binary message a frame. What a connection holds is bounded: past HELD bytes
+// waiting for the program, or past PENDING bytes waiting to be written, it's closed, and its peer
+// comes back.
 
-import { EVENT_SIZE, EventKind, PAYLOAD_PER_CALL } from "./abi.gen.ts";
+import { EVENT_SIZE, EventKind, PAIR_SECTION, PAYLOAD_PER_CALL } from "./abi.gen.ts";
 import { errorMessage } from "./errors.ts";
 import { connectionEvent, isNetwork, messageEvent } from "./input.ts";
 
@@ -29,8 +31,9 @@ export const PENDING = 1 << 20;
 export class Inbox {
   readonly #events: Uint8Array[] = [];
   readonly #payloads = new Map<number, Uint8Array>();
-  /** The serials of the messages the current call was given. */
-  #delivered: number[] = [];
+  /** The serials of the messages the current call was given, and their bytes. */
+  #delivered = new Set<number>();
+  #given = 0;
   #serial = 0;
   /** The bytes its messages hold, each counted with OVERHEAD more. */
   #held = 0;
@@ -68,30 +71,29 @@ export class Inbox {
   /** Up to `cap` events, oldest first; the rest stay queued. Messages stop once the call's bytes
    * reach PAYLOAD_PER_CALL (the first is given whatever its size). */
   take(cap: number): Uint8Array[] {
-    let given = 0;
-    for (const s of this.#delivered) given += this.#payloads.get(s)?.length ?? 0;
     let n = 0;
     for (; n < cap && n < this.#events.length; n++) {
       const view = new DataView(this.#events[n]!.buffer, this.#events[n]!.byteOffset, EVENT_SIZE);
       if (view.getUint32(0, true) !== EventKind.Message) continue;
       const length = view.getUint32(20, true);
-      if (given > 0 && given + length > PAYLOAD_PER_CALL) break;
-      given += length;
+      if (!withinCall(this.#given, length)) break;
+      this.#given += length;
       // Words 3 and 4: the serial's low and high words.
-      this.#delivered.push(view.getUint32(12, true) + view.getUint32(16, true) * 2 ** 32);
+      this.#delivered.add(view.getUint32(12, true) + view.getUint32(16, true) * 2 ** 32);
     }
     return this.#events.splice(0, n);
   }
 
   /** The bytes of message `serial`, if the current call was given it. */
   payload(serial: number): Uint8Array | undefined {
-    return this.#delivered.includes(serial) ? this.#payloads.get(serial) : undefined;
+    return this.#delivered.has(serial) ? this.#payloads.get(serial) : undefined;
   }
 
   /** The call has returned (or trapped): the bytes of the messages it was given go. */
   endCall(): void {
     for (const s of this.#delivered) this.#drop(s);
-    this.#delivered = [];
+    this.#delivered.clear();
+    this.#given = 0;
   }
 
   #drop(serial: number): void {
@@ -108,7 +110,8 @@ export class Inbox {
     const changed = this.#pair !== undefined && this.#pair !== pair;
     if (changed) {
       for (let i = this.#events.length - 1; i >= 0; i--) if (isNetwork(this.#events[i]!)) this.#events.splice(i, 1);
-      this.#delivered = [];
+      this.#delivered.clear();
+      this.#given = 0;
       this.#payloads.clear();
       this.#held = 0;
     }
@@ -116,6 +119,10 @@ export class Inbox {
     return changed;
   }
 }
+
+/** Whether a call given `given` bytes of messages may be given a message of `length` more: the
+ * first, whatever its size, and then up to PAYLOAD_PER_CALL (`wrela_abi::input::within_call`). */
+export const withinCall = (given: number, length: number) => given === 0 || given + length <= PAYLOAD_PER_CALL;
 
 /** Whether `name` names a room: 1 to 64 of a-z, 0-9, `-` and `_`, as the server takes them. */
 export const roomName = (name: string) => /^[a-z0-9_-]{1,64}$/.test(name);
@@ -194,14 +201,19 @@ export function parseServer(text: string): Server {
   const v: unknown = JSON.parse(text);
   if (typeof v !== "object" || v === null) throw new Error("net.json isn't an object");
   const { url, certificateHash } = v as Record<string, unknown>;
-  if (typeof url !== "string") throw new Error("net.json's `url` isn't an https URL");
+  if (typeof url !== "string") throw new Error("net.json's `url` isn't an https or wss URL");
   let address: URL;
   try { address = new URL(url); }
-  catch { throw new Error("net.json's `url` isn't an https URL"); }
-  if (address.protocol !== "https:" || address.username || address.password || url.includes("?") || url.includes("#")) {
-    throw new Error("net.json's `url` isn't an https URL without credentials, query or fragment");
+  catch { throw new Error("net.json's `url` isn't an https or wss URL"); }
+  // `https:`: WebTransport (wrela-serve); `wss:`: a WebSocket a connection (the Cloudflare host),
+  // and `ws:` only to a loopback development server.
+  const loopback = ["localhost", "127.0.0.1", "[::1]"].includes(address.hostname);
+  const scheme = address.protocol === "https:" || address.protocol === "wss:" || (address.protocol === "ws:" && loopback);
+  if (!scheme || address.username || address.password || url.includes("?") || url.includes("#")) {
+    throw new Error("net.json's `url` isn't an https or wss URL without credentials, query or fragment");
   }
   if (certificateHash === undefined) return { url };
+  if (address.protocol !== "https:") throw new Error("net.json's `certificateHash` is for an https (WebTransport) server");
   const whole = Array.isArray(certificateHash) && certificateHash.length === 32 && certificateHash.every((x) => Number.isInteger(x) && x >= 0 && x < 256);
   if (!whole) throw new Error("net.json's `certificateHash` isn't 32 bytes");
   return { url, certificateHash: certificateHash as number[] };
@@ -211,6 +223,7 @@ export function parseServer(text: string): Server {
  * to be written on it. */
 interface Session {
   transport: WebTransport | null;
+  socket: WebSocket | null;
   writer: WritableStreamDefaultWriter<Uint8Array> | null;
   closed: boolean;
   pending: number;
@@ -218,6 +231,20 @@ interface Session {
 
 /** The pair id in a session's path: 16 hex digits. */
 export const pairParam = (pair: bigint) => pair.toString(16).padStart(16, "0");
+
+/** The pair id in a module's PAIR_SECTION, if it has one. */
+export function pairOf(module: WebAssembly.Module): bigint | null {
+  const [section] = WebAssembly.Module.customSections(module, PAIR_SECTION);
+  if (section === undefined || section.byteLength !== 8) return null;
+  return new DataView(section).getBigUint64(0, true);
+}
+
+/** What a message of `n` bytes adds to what waits to be written on a connection: on a WebSocket
+ * its bytes, as its `bufferedAmount` counts them; on WebTransport its frame (the varint prefix is
+ * one, two or three bytes, MAX_UP being below 2^21) and OVERHEAD. */
+const costOf = (socket: boolean, n: number) => (socket ? n : n + (n < 128 ? 1 : n < 16384 ? 2 : 3) + OVERHEAD);
+/** What waits to be written on a connection. */
+const pendingOf = (s: Session) => (s.socket !== null ? s.socket.bufferedAmount : s.pending);
 
 /**
  * A program's connections (`std::net`'s `open`, `send`, `close`). Each opened connection
@@ -242,12 +269,17 @@ export class Net {
   /** Checks one export's commands without opening, sending or closing anything. A send can
    * close a connection at its byte limits, so later opens see that same planned lifetime. */
   plan(): Pick<Net, "open" | "send" | "close"> {
-    const sessions = new Map<number, { open: boolean; writer: boolean; pending: number }>();
+    const sessions = new Map<number, { open: boolean; writer: boolean; socket: boolean; pending: number }>();
     const state = (conn: number) => {
       let planned = sessions.get(conn);
       if (planned === undefined) {
         const session = this.#sessions.get(conn);
-        planned = { open: session !== undefined && !session.closed, writer: session?.writer != null, pending: session?.pending ?? 0 };
+        planned = {
+          open: session !== undefined && !session.closed,
+          writer: session?.writer != null || session?.socket?.readyState === WebSocket.OPEN,
+          socket: session?.socket != null,
+          pending: session === undefined ? 0 : pendingOf(session),
+        };
         sessions.set(conn, planned);
       }
       return planned;
@@ -258,13 +290,13 @@ export class Net {
         if (session.open) throw new Error(`connection ${conn} is open`);
         session.open = roomName(room) && pair !== null;
         session.writer = false;
+        session.socket = false;
         session.pending = 0;
       },
       send(conn, bytes) {
         const session = state(conn);
         if (!session.open || !session.writer) return;
-        // The frame's varint prefix is one, two or three bytes (MAX_UP is below 2^21).
-        const cost = bytes.length + (bytes.length < 128 ? 1 : bytes.length < 16384 ? 2 : 3) + OVERHEAD;
+        const cost = costOf(session.socket, bytes.length);
         if (bytes.length > MAX_UP || session.pending + cost > PENDING) session.open = false;
         else session.pending += cost;
       },
@@ -294,7 +326,7 @@ export class Net {
    * can't join a room). A number already open is the program's mistake. */
   open(conn: number, room: string, pair: bigint | null): void {
     if (this.#sessions.has(conn)) throw new Error(`connection ${conn} is open`);
-    const session: Session = { transport: null, writer: null, closed: false, pending: 0 };
+    const session: Session = { transport: null, socket: null, writer: null, closed: false, pending: 0 };
     this.#sessions.set(conn, session);
     if (!roomName(room)) {
       this.print(`connection ${conn}: \`${room}\` isn't a room's name`);
@@ -313,11 +345,13 @@ export class Net {
     try {
       const server = await this.#fetchServer();
       if (session.closed) return;
+      const url = `${server.url.replace(/\/$/, "")}/room/${room}`;
+      if (!server.url.startsWith("https:")) return this.#socket(conn, url, session);
       const options: WebTransportOptions = {};
       if (server.certificateHash) {
         options.serverCertificateHashes = [{ algorithm: "sha-256", value: new Uint8Array(server.certificateHash) }];
       }
-      const transport = new WebTransport(`${server.url.replace(/\/$/, "")}/room/${room}`, options);
+      const transport = new WebTransport(url, options);
       session.transport = transport;
       // Its end, however it comes, ends the connection.
       transport.closed.then(
@@ -345,11 +379,45 @@ export class Net {
     this.#end(conn, session);
   }
 
+  /** Connection `conn` as a WebSocket at `url`: each binary message is one frame, so none is
+   * framed; what it holds waiting to be written is its `bufferedAmount`. */
+  #socket(conn: number, url: string, session: Session): void {
+    const socket = new WebSocket(url);
+    socket.binaryType = "arraybuffer";
+    session.socket = socket;
+    socket.onopen = () => {
+      if (!session.closed) this.arrived.push({ conn, open: true });
+    };
+    socket.onmessage = (e: MessageEvent<unknown>) => {
+      if (session.closed) return;
+      if (!(e.data instanceof ArrayBuffer) || e.data.byteLength > MAX_FRAME || this.#held + e.data.byteLength + OVERHEAD > HELD) {
+        this.print(`connection ${conn}: a message that isn't a frame, or past what may wait for the program`);
+        this.#end(conn, session);
+        return;
+      }
+      const bytes = new Uint8Array(e.data);
+      this.#held += bytes.length + OVERHEAD;
+      this.arrived.push({ conn, bytes });
+    };
+    socket.onclose = () => this.#end(conn, session);
+    socket.onerror = () => this.#end(conn, session);
+  }
+
   /** Sends `bytes` on connection `conn`: nothing if it isn't open (it may have closed since the
    * program last heard). A message past MAX_UP closes it, and so does one past PENDING bytes
    * not yet written. */
   send(conn: number, bytes: Uint8Array): void {
     const session = this.#sessions.get(conn);
+    if (session?.socket && !session.closed) {
+      if (session.socket.readyState !== WebSocket.OPEN) return;
+      if (bytes.length > MAX_UP || pendingOf(session) + costOf(true, bytes.length) > PENDING) {
+        this.print(`connection ${conn}: a message of ${bytes.length} bytes, past ${MAX_UP} or past ${PENDING} waiting to be written`);
+        this.close(conn);
+        return;
+      }
+      session.socket.send(bytes.slice());
+      return;
+    }
     if (!session?.writer || session.closed) return;
     if (bytes.length > MAX_UP) {
       this.print(`connection ${conn}: a message of ${bytes.length} bytes, past ${MAX_UP}`);
@@ -390,6 +458,7 @@ export class Net {
     if (this.#sessions.get(conn) === session) this.#sessions.delete(conn);
     try {
       session.transport?.close();
+      session.socket?.close(1000);
     } catch {
       // It's closed already.
     }

@@ -1,4 +1,4 @@
-# Plan: a Cloudflare host for server builds (HTTP in 0.13.0, WebSockets next)
+# Plan: a Cloudflare host for server builds (HTTP in 0.13.0, WebSockets in 0.14.0)
 
 Ryan decided on 2026-10-31 to run every Wrela server on Cloudflare Workers and Durable Objects
 instead of Fly.io: Cloudflare's protection (floods, firewall and rate rules, bot checks, no
@@ -17,11 +17,11 @@ store; on this host both move (§1, §4).
 Scopes, each its own pull request and release (AGENTS.md rule 1):
 
 1. **HTTP** (this plan's §1–§9; toolchain 0.13.0). The plan itself lands with it.
-2. **WebSockets for rooms** (§10; the release after).
+2. **WebSockets for rooms** (§10; toolchain 0.14.0).
 
 Constraints for both: **no IP address is ever stored or logged**, by the host or by anything it
 gives a program. rywible/wrela is not edited here; what it must change is listed per release
-(§11). Ryan merges.
+(§11). Each release merged after its review pipeline, as Ryan authorized.
 
 ## 0. Where the pieces live
 
@@ -202,8 +202,21 @@ On this host:
   (`limits.cpu_ms`); Workers Free allows 10 ms
   ([limits](https://developers.cloudflare.com/workers/platform/limits/)), which can't verify a
   run. A call past the limit fails the invocation (error 1102) and resets the object; the
-  requests in flight fail and the store keeps only committed writes. Release config sets
-  `limits.cpu_ms` to 5000 (open question 2).
+  requests in flight fail and the store keeps only committed writes. 0.13.0's config set
+  `limits.cpu_ms` to 5000; from 0.14.0 it sets none, since Ryan launches on Workers Free, which
+  takes none, and a release on Paid may add it (open question 2).
+- **What the host spends of a call's CPU** (estimates, to be measured on the first deploy):
+  - The module compiles once, when the isolate loads the Worker. That counts against startup
+    (1 s), not a request.
+  - A fresh instance (`serve_init`, the program's own) comes only after eviction, a deploy or a
+    failure. The host's part is well under 1 ms.
+  - A store read or write is in-process SQLite, microseconds a key.
+  - Encoding a request and checking its response takes tens of microseconds for small bodies.
+  - WebCrypto's verify is native: tens to a few hundred microseconds.
+  - The rate limit and the RPC from the Worker to the object are I/O.
+
+  On Free, a program keeps each call well under 10 ms (the accounts engine plans 200 ticks a call,
+  2 to 3 ms on a Ryzen 5 5500U).
 - **Memory.** The instance's cap is 64 MiB, as `wrela-serve`'s. JavaScript can't refuse a
   `memory.grow` inside a call, so the host checks after each call and drops an instance past the
   cap (a host failure). An isolate's hard limit is 128 MB
@@ -286,7 +299,6 @@ Nothing is logged: the host has no `console.log` of a request, a path or a heade
   "durable_objects": { "bindings": [{ "name": "WRELA_SERVER", "class_name": "WrelaServer" }] },
   "migrations": [{ "tag": "wrela-server-1", "new_sqlite_classes": ["WrelaServer"] }],
   "rules": [{ "type": "CompiledWasm", "globs": ["**/*.wasm"], "fallthrough": true }],
-  "limits": { "cpu_ms": 5000 },
   "vars": { "WRELA_ORIGINS": "" },
   "assets": { "run_worker_first": ["/api/*"] }
 }
@@ -336,31 +348,54 @@ the server module is the program's.
   first deploy is the check of the glue that only workerd runs: `cloudflare:workers`, RPC and
   alarms. That is open question 5.
 
-## 10. Then WebSockets for rooms (the next scope)
+## 10. WebSockets for rooms (0.14.0)
 
-Not built in 0.13.0; its own pull request and release.
+Built in 0.14.0, its own pull request and release (language.md §19.6).
 
-- **One room, one Durable Object**, named by the room (`getByName("room:" + name)`), in its own
-  class (`WrelaRoom`), each with its journal in its own SQLite table: records, each with its
-  CRC-32C as on `wrela-serve`, and the snapshot of a compaction in one transaction with the
-  journal's truncation.
-- **The same call contract as `wrela-serve`** (`wrela_host::rooms`): a call's records are kept
-  (`transactionSync`) and its store writes committed (RPC to the server object, awaited) before
-  its sends go. Poisoned messages, quarantine, three failures and the room's time follow §19.2.
-  One WebSocket binary message is one frame, so the varint framing is dropped; the bounds of
-  §19.3 (64 KiB frames, 64 bytes less up, 1 MiB waiting for the room) are kept.
-- **The Hibernation API** (`ctx.acceptWebSocket`): idle sockets cost nothing while the object
-  is out of memory, and "WebSocket messages routed through a Worker do not count as requests"
-  ([pricing](https://developers.cloudflare.com/workers/platform/pricing/)). Each socket's
-  attachment (`serializeAttachment`, at most 16 KiB) holds its connection number and tag, so a
-  woken object rebuilds the room from its journal and tells the program of its connections, as
-  `wrela-serve` does after a restart. At most 32,768 sockets an object
+- **One room, one Durable Object** (`WrelaRoom`), named `<pair hex>:<room name>`. The pair id
+  hashes both modules (language.md §15), so each build's rooms are their own, as `wrela-serve`
+  keeps them under the build's hash. Its journal is a SQLite table (`journal`), and its `meta`
+  table keeps the next connection's number, the room's time origin, a quarantine, and the pair
+  id of the build that made it. A deploy gives a hibernated object the new code with the old
+  build's sockets and journal
+  ([code updates](https://developers.cloudflare.com/durable-objects/deployments/durable-objects-code-updates/));
+  an object of another build closes them (1012) and reads nothing back. A record
+  carries no CRC-32C: SQLite's transaction keeps it whole or not at all.
+- **The same call contract as `wrela-serve`** (`wrela_host::rooms`, ported in
+  `runtime/cloudflare/src/room.ts`):
+  - A call's store writes commit first, in the server object over RPC (`commit`, awaited), then
+    its records in one `transactionSync`, then its tags, sends and closes.
+  - Store reads go to the server object over RPC (`answer`).
+  - A fresh instance reads the journal back from connection 0, then hears of its open
+    connections again with their tags.
+  - A failed call is taken again one event at a time. The poisoned retry and the quarantine are
+    kept in storage. Failures at the host's limits wait for the alarm (250 ms), and after
+    `RETRIES` (3) in a row the peers are let go.
+- **Framing:** one binary message is one frame, so the varint framing is dropped. The bounds of
+  §19.3 are kept: 64 KiB frames, 64 bytes less up, and 1 MiB waiting for the room. A text message,
+  or one past `MAX_UP`, closes its connection (1003, 1009).
+- **The Hibernation API** (`ctx.acceptWebSocket`): an idle room's object leaves memory while its
+  sockets stay connected. Each socket's attachment holds `{ conn, tag }`; an attachment is at
+  most 16,384 bytes. A woken object rebuilds the room from its journal and tells the program of
+  its connections ([WebSockets](https://developers.cloudflare.com/durable-objects/best-practices/websockets/)).
+  An object takes at most 32,768 sockets
   ([state API](https://developers.cloudflare.com/durable-objects/api/state/)).
-- **Checks in the Worker before an object is billed:** the path `/room/<name>?pair=<16 hex>`, the
-  pair equal to the server build's (`wrela.pair`, read at build time into `cloudflare.json`'s
-  host), the Upgrade header, and the Origin against `WRELA_ORIGINS`.
-- **The browser:** `std::net::open` uses a WebSocket where `net.json` says the server is one
-  (`"transport": "websocket"`), and WebTransport otherwise.
+  - Opening a socket is a request. Outgoing messages are free, and incoming ones are billed 20 to
+    1 ([pricing](https://developers.cloudflare.com/durable-objects/platform/pricing/)).
+  - Each handler awaits the room's work, since work neither awaited nor passed to `waitUntil` can
+    be cancelled when the invocation ends
+    ([context](https://developers.cloudflare.com/workers/runtime-apis/context/)).
+  - `webSocketClose` closes its end, which compatibility dates before 2026-04-07 need.
+- **Checks in the Worker before an object is billed** (`rooms`):
+  - the upgrade header (426);
+  - the room's name (404);
+  - the pair equal to the module's `wrela.pair`, read when the Worker loads (403);
+  - an Origin, when sent, in `WRELA_ORIGINS` (403);
+  - `WRELA_LIMITS` (429).
+
+  Only the upgrade crosses to the object.
+- **The browser:** a `wss:` URL in `net.json` (`ws:` to loopback only) makes each connection a
+  WebSocket. `https:` stays WebTransport.
 
 ## 11. What rywible/wrela must change, per release
 
@@ -372,7 +407,17 @@ engine moves challenges and rate counts to the store, uses `Request::time` for i
 the session from the `__Host-` cookie, and checks Origin and its CSRF header. The console calls
 `std::http::fetch`. The pin moves to 0.13.0.
 
-**WebSockets release.** Its own list when it's cut.
+**0.14.0 (WebSockets).**
+- Release files: the same two, rebuilt.
+- The Worker's script exports `WrelaRoom` beside `WrelaServer` and imports `rooms`. Its `fetch`
+  tries `api`, then `rooms`, then the assets.
+- The configuration merges the new members: the `WRELA_ROOM` binding, the migration `wrela-room-1`
+  (`new_sqlite_classes: ["WrelaRoom"]`), and `/room/*` in `run_worker_first`.
+- A `ratelimits` entry with prefix `/room/` limits upgrades.
+- `net.json` beside the client build names the site, `{"url": "wss://<site>"}`.
+- `limits.cpu_ms` is no longer in `cloudflare.json` (Workers Free takes none).
+- Deploy commands and secrets: as 0.13.0. The plan: Workers Free at launch, Paid only if calls
+  come near the 10 ms limit.
 
 ## 12. Later, listed but not built
 
@@ -390,8 +435,8 @@ the session from the `__Host-` cookie, and checks Origin and its CSRF header. Th
 1. **`user-agent`.** Left out of what a server sees, since it fingerprints and the privacy policy
    lists what's kept. Does the accounts server want it, say to name a session's device ("Chrome
    on a Mac")? If so, the host could pass a coarse family instead.
-2. **`limits.cpu_ms`.** 5000 is a guess: enough for a call that verifies a slow run, and a cap on
-   what a runaway call costs. It should be measured on the first deploy.
+2. **`limits.cpu_ms`.** Launch is on Workers Free (10 ms, no `cpu_ms`), with Paid only if
+   calls come near it. On Paid, 5000 would cap what a runaway call costs; measure first.
 3. **Isolating a failing request.** Today a trap fails every request open on the instance.
    `wrela-serve` retries a room's events one at a time to find the poisoned one. Is that worth
    doing for HTTP, where one attacker's request could otherwise fail others' concurrent
@@ -399,6 +444,14 @@ the session from the `__Host-` cookie, and checks Origin and its CSRF header. Th
 4. **Past one object.** Sharding the store, if a server ever needs more than about 1,000 requests a
    second or 10 GB.
 5. **workerd in the checks.** The glue that only workerd runs (RPC, alarms, `transactionSync`'s
-   real behaviour) is tested against fakes. Should a check run `wrangler dev` where Node is on the
-   machine?
+   real behaviour, the Hibernation API and the forwarded WebSocket handshake) is tested against
+   fakes. Should a check run `wrangler dev` where Node is on the machine? One question for it: a
+   room's events that wait for a call live in the object's memory, so if a reset (past the CPU
+   limit) keeps its hibernated sockets, the messages waiting are lost while their peers stay
+   connected, and the room would have to close its sockets when it starts again with work it
+   can't account for.
 6. **The prefix.** `/api/` is the default. Does the console want another?
+7. **An old build's rooms.** A deploy makes a new pair id, so the old build's room objects keep
+   their journals, billed as stored data, with no build to read them. Should a room clear its
+   storage (`deleteAll`) once its last peer leaves and its build isn't the deployed one? The
+   object can't tell that alone; the release could list the old pair to clear.

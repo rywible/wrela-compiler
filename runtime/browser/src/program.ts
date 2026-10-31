@@ -43,7 +43,6 @@ import {
   IMPORT_AUDIO,
   IMPORT_INPUT,
   IMPORT_PAYLOAD,
-  PAIR_SECTION,
   IMPORT_KEEP,
   IMPORT_KEPT,
   IMPORT_CLOCK,
@@ -69,7 +68,7 @@ import { errorMessage } from "./errors.ts";
 import { StateHash } from "./hash.ts";
 import { CALLED_WHILE_STARTING, clockImport, phaseImport, Phases, printed, refusingImports, takePanicMessage } from "./imports.ts";
 import { Lines, LINES_SECTION, unlocated, wasmOffsets } from "./lines.ts";
-import { Inbox, type Net } from "./net.ts";
+import { Inbox, type Net, pairOf } from "./net.ts";
 import { encodeEvent, type Scripted } from "./input.ts";
 import { type Bytes, type Command, decode, type OpcodeName, Sequencer } from "./stream.ts";
 import type { TickerOptions, VoiceOptions } from "./messages.ts";
@@ -434,13 +433,6 @@ function checkPost(body: Uint8Array): void {
   if (body.length !== POST_BODY) {
     throw new CommandError("HostRequest", `a post's body is ${POST_BODY} bytes (its tag, \`a\` and \`b\`), not ${body.length}`);
   }
-}
-
-/** The pair id in a module's PAIR_SECTION, if it has one. */
-export function pairOf(module: WebAssembly.Module): bigint | null {
-  const [section] = WebAssembly.Module.customSections(module, PAIR_SECTION);
-  if (section === undefined || section.byteLength !== 8) return null;
-  return new DataView(section).getBigUint64(0, true);
 }
 
 /** A connection's number: the first word of a `net/` request's body. */

@@ -3,6 +3,22 @@
 Each release's changes a program or a tool can see. The pull request of each release holds the
 detail; `docs/release.md` says how a release is cut.
 
+## 0.14.0
+
+- **A server build's rooms run on Cloudflare** (language.md §19.6): `server/cloudflare.js` now
+  also has `WrelaRoom`, a Durable Object a room, and `rooms` for the site's Worker, and
+  `server/cloudflare.json` binds it (`WRELA_ROOM`, its migration, `/room/*` before the assets).
+  A peer's connection is a WebSocket, held through the Hibernation API, so an idle room leaves
+  memory with its peers connected. Each binary message is one frame. The room keeps
+  `wrela-serve`'s contract: its journal in its own SQLite, read back when it starts; its store
+  writes committed in the server's object before its records and sends; poisoned messages,
+  quarantine and three failures at the host's limits. `rooms` refuses an upgrade from another
+  build, another origin or a client past its rate limits before the room's object runs.
+- **`server/cloudflare.json` sets no CPU limit**, so it deploys on Workers Free; a release on
+  Paid may add `limits.cpu_ms`.
+- **The browser host opens a room over a WebSocket** when `net.json` names a `wss:` server (`ws:`
+  only to a loopback address); an `https:` server is still WebTransport.
+
 ## 0.13.0
 
 - **A server build runs on Cloudflare** (language.md §19.5): `wrela build` writes its host beside

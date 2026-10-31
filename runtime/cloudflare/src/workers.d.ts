@@ -11,6 +11,23 @@ declare module "cloudflare:workers" {
 
 interface DurableObjectState {
   storage: import("./host.ts").Storage & { setAlarm(at: number): Promise<void> };
+  /** The Hibernation API: a WebSocket the object holds while it's out of memory. */
+  acceptWebSocket(ws: WebSocket): void;
+  getWebSockets(): WebSocket[];
+}
+
+interface WebSocket {
+  serializeAttachment(value: unknown): void;
+  deserializeAttachment(): unknown;
+}
+
+declare class WebSocketPair {
+  0: WebSocket;
+  1: WebSocket;
+}
+
+interface ResponseInit {
+  webSocket?: WebSocket;
 }
 
 declare module "*.wasm" {
