@@ -86,12 +86,21 @@ function onPixelRatioChange(f: () => void): void {
 
 /** The page's audio context, made for the first voice, and the voice playing in it: a build
  * handed over to plays its voice in the same context (a browser starts a context only after the
- * person interacts with the page, so a new one would be silent). */
-const audio: { context: Promise<AudioContext> | null; node: AudioWorkletNode | null; generation: number } = {
+ * person interacts with the page, so a new one would be silent). The voice plays through `out`,
+ * silent while `muted` (the program is underlaid). */
+const audio: { context: Promise<AudioContext> | null; out: GainNode | null; muted: boolean; node: AudioWorkletNode | null; generation: number } = {
   context: null,
+  out: null,
+  muted: false,
   node: null,
   generation: 0,
 };
+
+/** Mutes the page's voice, or plays it again. */
+function muteVoice(on: boolean): void {
+  audio.muted = on;
+  if (audio.out) audio.out.gain.value = on ? 0 : 1;
+}
 
 /** Disconnects the voice currently playing. */
 function disconnectVoice(): void {
@@ -117,6 +126,7 @@ async function playVoice(voice: VoiceOptions, test: TestParams | null, worker: W
   const node = (
     ctx: BaseAudioContext,
     quanta: number | null,
+    out: AudioNode = ctx.destination,
   ): { node: AudioWorkletNode; rendered: Promise<void>; failed: Promise<Error> } => {
     const rendered = quanta === null ? null : Promise.withResolvers<void>();
     const failed = Promise.withResolvers<Error>();
@@ -150,7 +160,7 @@ async function playVoice(voice: VoiceOptions, test: TestParams | null, worker: W
         rendered?.resolve();
       }
     };
-    n.connect(ctx.destination);
+    n.connect(out);
     return { node: n, rendered: rendered?.promise ?? Promise.resolve(), failed: failed.promise };
   };
   if (test && test.live > 0) {
@@ -214,6 +224,9 @@ async function playVoice(voice: VoiceOptions, test: TestParams | null, worker: W
   audio.context ??= (async () => {
     const ctx = new AudioContext({ sampleRate: AUDIO_SAMPLE_RATE, latencyHint: "interactive" });
     await ctx.audioWorklet.addModule(url);
+    audio.out = ctx.createGain();
+    audio.out.gain.value = audio.muted ? 0 : 1;
+    audio.out.connect(ctx.destination);
     // A browser starts audio only after the person interacts with the page.
     if (ctx.state !== "running") {
       const resume = () => void ctx.resume();
@@ -225,7 +238,7 @@ async function playVoice(voice: VoiceOptions, test: TestParams | null, worker: W
   const ctx = await audio.context;
   if (generation !== audio.generation) return;
   disconnectVoice();
-  audio.node = node(ctx, null).node;
+  audio.node = node(ctx, null, audio.out ?? ctx.destination).node;
 }
 
 /** Test mode, `latency`: `n` pointer moves sent through the DOM at random times over `ms`. */
@@ -338,7 +351,12 @@ function start(): void {
     const workerUrl = "worker.js";
     const worker = new Worker(new URL(workerUrl, import.meta.url), { type: "module", name: "wrela render" });
     const ring = InputRing.create();
-    const platform = new BrowserPlatform(canvas, visible => worker.postMessage({ type: "visibility", visible: visible && document.visibilityState === "visible" } satisfies ToWorker));
+    const platform = new BrowserPlatform(
+      canvas,
+      visible => worker.postMessage({ type: "visibility", visible: visible && document.visibilityState === "visible" } satisfies ToWorker),
+      on => worker.postMessage({ type: "see-through", on } satisfies ToWorker),
+    );
+    platform.onUnderlaid = muteVoice;
     const clip = new Clip();
     let maxScreen = Infinity;
     // The render worker's threads (the ticker's, the helpers): started here, since a worker
@@ -428,7 +446,7 @@ function start(): void {
     const overlay = new Semantics(canvas, (e) => ring.write(e, epochNow()), () => ({ rect: canvas.getBoundingClientRect(), ...sized }));
     platform.attach(listen(canvas, ring, epochNow, () => sized, overlay), overlay);
     // A test's input is its script: a pad on the machine that runs it isn't heard.
-    if (!test) pollPads(ring, epochNow, () => platform.active && document.visibilityState === "visible" && document.hasFocus());
+    if (!test) pollPads(ring, epochNow, () => platform.active && !platform.underlaid && document.visibilityState === "visible" && document.hasFocus());
     // `wrela run` serves the page with this mark: it sends new literals and builds (hot reload).
     const mark = document.querySelector<HTMLMetaElement>('meta[name="wrela-live"]');
     const live = mark === null ? null : Number(mark.content ?? "0") || 0;

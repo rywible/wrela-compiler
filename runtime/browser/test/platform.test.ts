@@ -317,6 +317,108 @@ test("only the page's own program reloads the page", async () => {
   }
 });
 
+test("an underlaid program shows behind the canvas, muted and without input, until it's shown", async () => {
+  const oldWindow = Object.getOwnPropertyDescriptor(globalThis, "window");
+  const oldDocument = Object.getOwnPropertyDescriptor(globalThis, "document");
+  const ports: MessagePort[] = [];
+  type Frame = { style: { visibility?: string }; inert: boolean; heard: unknown[]; onload: (() => void) | null; onerror: (() => void) | null; contentWindow: unknown; remove: () => void };
+  const frames: Frame[] = [];
+  const makeFrame = (): Frame => {
+    const frame: Frame = {
+      style: {},
+      inert: false,
+      heard: [],
+      onload: null,
+      onerror: null,
+      contentWindow: {
+        postMessage: (_message: unknown, _origin: string, transferred: MessagePort[]) => {
+          const port = transferred[0]!;
+          ports.push(port);
+          port.onmessage = ({ data }) => frame.heard.push(data);
+          port.postMessage({ type: "connected" });
+        },
+        focus: () => {},
+      },
+      remove: () => {},
+    };
+    frames.push(frame);
+    return frame;
+  };
+  Object.defineProperty(globalThis, "window", { configurable: true, value: { parent: {}, addEventListener: () => {} } });
+  Object.defineProperty(globalThis, "document", { configurable: true, value: {
+    baseURI: "https://console.example/",
+    createElement: makeFrame,
+    body: { append: () => { const frame = frames.at(-1)!; queueMicrotask(() => frame.onload?.()); } },
+  } });
+  const canvas = { style: {}, tabIndex: -1, focus: () => {} } as HTMLCanvasElement;
+  const seeThrough: boolean[] = [];
+  const platform = new BrowserPlatform(canvas, () => {}, on => seeThrough.push(on));
+  const underlay = (handle: Uint8Array, on: boolean) => platform.request("surface/underlay", new Writer().raw(handle).u8(on ? 1 : 0).bytes());
+  const heard = async (frame: Frame) => { await new Promise(r => setTimeout(r, 0)); return frame.heard; };
+  try {
+    const game = await platform.request("surface/open", new TextEncoder().encode("https://game.example/attract/"));
+    const other = await platform.request("surface/open", new TextEncoder().encode("https://game.example/other/"));
+    const [behind, beside] = [frames[0]!, frames[1]!];
+    await expect(platform.request("surface/underlay", game)).rejects.toThrow("invalid underlay");
+    await underlay(game, true);
+    // The canvas lets it through; it takes no input and is told it's underlaid; the other hides.
+    expect(seeThrough).toEqual([true]);
+    expect(behind.inert).toBe(true);
+    expect(behind.style.visibility).toBe("");
+    expect(beside.style.visibility).toBe("hidden");
+    expect(await heard(behind)).toEqual([{ type: "underlay" }]);
+    // Off for one that isn't underlaid changes nothing.
+    await underlay(other, false);
+    expect(seeThrough).toEqual([true]);
+    // Shown in the console's place, it's no longer underlaid.
+    await platform.request("surface/show", game);
+    expect(seeThrough).toEqual([true, false]);
+    expect(behind.inert).toBe(false);
+    expect(beside.style.visibility).toBe("");
+    expect(await heard(behind)).toEqual([{ type: "underlay" }, { type: "underlay-end" }]);
+    await expect(underlay(game, true)).rejects.toThrow("shown in this one's place");
+    // Underlaid again and closed: the canvas is opaque again.
+    await underlay(other, true);
+    expect(seeThrough).toEqual([true, false, true]);
+    await platform.request("surface/close", other);
+    expect(seeThrough).toEqual([true, false, true, false]);
+  } finally {
+    platform.dispose();
+    for (const port of ports) port.close();
+    for (const [name, old] of [["window", oldWindow], ["document", oldDocument]] as const) {
+      if (old) Object.defineProperty(globalThis, name, old); else Reflect.deleteProperty(globalThis, name);
+    }
+  }
+});
+
+test("a program its opener underlays hears so, and hears when it no longer is", async () => {
+  const oldWindow = Object.getOwnPropertyDescriptor(globalThis, "window");
+  const oldDocument = Object.getOwnPropertyDescriptor(globalThis, "document");
+  const listeners = new Map<string, (event: unknown) => void>();
+  const parent = {};
+  Object.defineProperty(globalThis, "window", { configurable: true, value: { parent, addEventListener: (type: string, listener: (event: unknown) => void) => listeners.set(type, listener) } });
+  Object.defineProperty(globalThis, "document", { configurable: true, value: { referrer: "https://console.example/" } });
+  const platform = new BrowserPlatform({ style: {}, tabIndex: -1 } as HTMLCanvasElement, () => {});
+  const told: boolean[] = [];
+  platform.onUnderlaid = on => told.push(on);
+  const channel = new MessageChannel();
+  try {
+    listeners.get("message")!({ source: parent, origin: "https://console.example", data: { type: "wrela-connect" }, ports: [channel.port2] });
+    channel.port1.postMessage({ type: "underlay" });
+    await new Promise(r => setTimeout(r, 0));
+    expect(platform.underlaid).toBe(true);
+    channel.port1.postMessage({ type: "underlay-end" });
+    await new Promise(r => setTimeout(r, 0));
+    expect(platform.underlaid).toBe(false);
+    expect(told).toEqual([true, false]);
+  } finally {
+    platform.dispose(); channel.port1.close(); channel.port2.close();
+    for (const [name, old] of [["window", oldWindow], ["document", oldDocument]] as const) {
+      if (old) Object.defineProperty(globalThis, name, old); else Reflect.deleteProperty(globalThis, name);
+    }
+  }
+});
+
 test("a shown program is named in the address, and Back asks it to return", async () => {
   const oldWindow = Object.getOwnPropertyDescriptor(globalThis, "window");
   const oldDocument = Object.getOwnPropertyDescriptor(globalThis, "document");

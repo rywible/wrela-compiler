@@ -141,6 +141,21 @@ pub fn show(id: u32, name: str) -> Pending<u8> {
     request("surface/show", body)
 }
 
+/// Shows the program in surface `id` (which this one opened) behind this one, or with `on` false
+/// hides it again: this program's screen is then composited with its alpha, premultiplied, so it
+/// shows the program behind wherever it's clear (a screen pass cleared to `vec4(0.0)` and drawn
+/// over with `Blend::Premultiplied`). The program behind plays no sound and hears no input (the
+/// pointer, keys and pads are this one's), and keeps its own frame rate. One program is underlaid
+/// at a time: underlaying another hides it, as does showing it in this one's place (`show`). A
+/// host without surfaces (the native host) declines; nothing waits on the answer.
+@client
+pub fn underlay(id: u32, on: bool) -> Pending<u8> {
+    var w = Writer::new()
+    w.write_u32(id)
+    w.write_u8(if on { 1 } else { 0 })
+    request("surface/underlay", take w.into_bytes())
+}
+
 /// Calls the program in surface `id` with `bytes`, on its parent channel: the answer is its reply
 /// (`reply`), and fails if it replied that it failed or it closed first.
 @client
