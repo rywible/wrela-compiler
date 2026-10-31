@@ -32,6 +32,9 @@ export type ToWorker =
   | { type: "file"; url: string; bytes: Uint8Array<ArrayBuffer> | null }
   | { type: "resize"; width: number; height: number }
   | { type: "visibility"; visible: boolean }
+  /** A program is underlaid behind the canvas (`surface/underlay`): it's composited with its
+   * alpha, premultiplied, not opaque. */
+  | { type: "see-through"; on: boolean }
   | { type: "host-reply"; id: number; bytes: Uint8Array<ArrayBuffer>; error: string | null }
   /** To a thread the main thread started for the render worker: its channel to the render
    * worker, on which its work comes and its answers go. */

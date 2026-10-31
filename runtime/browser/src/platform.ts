@@ -221,7 +221,7 @@ export class PortRpc {
     port.onmessage = ({ data }: MessageEvent<unknown>) => {
       if (!data || typeof data !== "object" || !("type" in data)) return;
       const m = data as { type: unknown; id?: unknown; body?: unknown; ok?: unknown };
-      if (m.type === "frame" || m.type === "ready" || m.type === "return" || m.type === "failed" || m.type === "leave") { this.event(m.type); return; }
+      if (m.type === "frame" || m.type === "ready" || m.type === "return" || m.type === "failed" || m.type === "leave" || m.type === "underlay" || m.type === "underlay-end") { this.event(m.type); return; }
       if (!Number.isSafeInteger(m.id) || Number(m.id) <= 0) return;
       if (m.type === "call") {
         try { this.receive(Number(m.id), checked(m.body).slice()); } catch { this.reply(Number(m.id), new Uint8Array(), false); }
@@ -253,7 +253,7 @@ export class PortRpc {
     checked(body);
     this.port.postMessage({ type: "reply", id, body: body.slice(), ok });
   }
-  signal(type: "frame" | "ready" | "return" | "failed" | "leave"): void { if (!this.#closed) this.port.postMessage({ type }); }
+  signal(type: "frame" | "ready" | "return" | "failed" | "leave" | "underlay" | "underlay-end"): void { if (!this.#closed) this.port.postMessage({ type }); }
   close(): void {
     if (this.#closed) return;
     this.#closed = true;
@@ -295,6 +295,13 @@ export class BrowserPlatform {
   #inbox: Bytes[] = [];
   #receiving: { resolve: (b: Bytes) => void; reject: (e: Error) => void } | null = null;
   #shown: number | null = null;
+  // The surface shown behind this program's canvas (`surface/underlay`), and whether this program
+  // is itself one, underlaid by the program that opened it.
+  #underlaid: number | null = null;
+  #under = false;
+  /** Told when the program that opened this one underlays it (true) or no longer does: the page
+   * mutes its voice while it's underlaid. */
+  onUnderlaid: (on: boolean) => void = () => {};
   #input: Listener | null = null;
   #overlay: Semantics | null = null;
   /** Where glyphs are drawn: the page's OffscreenCanvas, unless a test gives its own. */
@@ -309,7 +316,7 @@ export class BrowserPlatform {
   // that it changed before any waited.
   #navigating = new Set<() => void>();
   #navigated = false;
-  constructor(readonly canvas: HTMLCanvasElement, readonly visible: (v: boolean) => void) {
+  constructor(readonly canvas: HTMLCanvasElement, readonly visible: (v: boolean) => void, readonly seeThrough: (on: boolean) => void = () => {}) {
     canvas.style.position = "relative"; canvas.style.zIndex = "1"; canvas.style.outline = "none"; canvas.tabIndex = 0;
     // A touch's moves are the program's: the browser doesn't pan or zoom the page under it.
     canvas.style.touchAction = "none";
@@ -323,6 +330,9 @@ export class BrowserPlatform {
         else if (this.#inbox.length < 32) this.#inbox.push(b);
         else this.#parent?.reply(id, new Uint8Array(), false);
       }, kind => {
+        if (kind === "underlay" || kind === "underlay-end") {
+          this.#under = kind === "underlay"; this.onUnderlaid(this.#under); return;
+        }
         if (kind !== "leave") return;
         if (this.#leaving.size === 0) this.#asked = true;
         for (const resolve of this.#leaving) resolve();
@@ -355,6 +365,22 @@ export class BrowserPlatform {
     void s.closed.then(() => clearTimeout(timer));
   }
   get active(): boolean { return this.#shown === null; }
+  /** This program is underlaid by the one that opened it: it hears no input. */
+  get underlaid(): boolean { return this.#under; }
+  /** Shows surface `id` behind this program's canvas, or none: the canvas is see-through where
+   * the program draws nothing, the other surfaces stay hidden, and the one behind is inert (no
+   * pointer, keys or focus) and told it's underlaid, so it plays no sound and reads no pads. */
+  #underlay(id: number | null): void {
+    const before = this.#underlaid;
+    if (before === id) return;
+    const was = before === null ? undefined : this.#surfaces.get(before);
+    if (was) { was.frame.inert = false; was.rpc.signal("underlay-end"); }
+    this.#underlaid = id;
+    for (const [k, s] of this.#surfaces) if (k !== this.#shown) s.frame.style.visibility = id === null || k === id ? "" : "hidden";
+    const s = id === null ? undefined : this.#surfaces.get(id);
+    if (s) { s.frame.inert = true; s.rpc.signal("underlay"); }
+    if ((before === null) !== (id === null)) this.seeThrough(id !== null);
+  }
   /** The input services (listen.ts) and the semantic overlay (semantics.ts), once there. */
   attach(input: Listener, overlay: Semantics | null): void { this.#input = input; this.#overlay = overlay; }
   #capabilities(): number {
@@ -378,6 +404,8 @@ export class BrowserPlatform {
     frame.allow = "cross-origin-isolated; autoplay; gamepad; fullscreen";
     frame.referrerPolicy = "origin";
     frame.style.cssText = "position:fixed;inset:0;width:100%;height:100%;border:0;z-index:0;pointer-events:none";
+    // Behind the canvas, under the surface that's underlaid, if one is: hidden from it.
+    if (this.#underlaid !== null) frame.style.visibility = "hidden";
     const connection = new MessageChannel();
     let resolveFrame!: () => void, resolveClosed!: () => void;
     const firstFrame = new Promise<void>(r => { resolveFrame = r; });
@@ -392,6 +420,7 @@ export class BrowserPlatform {
       if (removed) return; removed = true;
       frame.onload = null; frame.onerror = null;
       rpc.close(); frame.remove(); this.#surfaces.delete(id); resolveClosed();
+      if (this.#underlaid === id) this.#underlay(null);
       if (this.#shown === id) {
         this.#shown = null; this.canvas.style.visibility = "visible"; this.visible(true); this.canvas.focus();
         if (window.parent === window && typeof history !== "undefined" && history.state?.wrela === id) history.back();
@@ -533,8 +562,20 @@ export class BrowserPlatform {
       if (service === "surface/show") {
         if (this.#shown !== null) throw new Error("a program surface is already shown");
         const name = shownName(body);
-        this.#shown = wordAt(body); s.frame.style.zIndex = "2"; s.frame.style.pointerEvents = "auto"; this.canvas.style.visibility = "hidden"; this.visible(false); s.frame.contentWindow?.focus();
+        // Shown in this program's place, it's no longer behind it.
+        if (this.#underlaid === wordAt(body)) this.#underlay(null);
+        this.#shown = wordAt(body); s.frame.style.visibility = ""; s.frame.style.zIndex = "2"; s.frame.style.pointerEvents = "auto"; this.canvas.style.visibility = "hidden"; this.visible(false); s.frame.contentWindow?.focus();
         if (name && window.parent === window && typeof history !== "undefined") history.pushState({ wrela: this.#shown }, "", addressPath({ pathname: location.pathname, search: location.search, hash: `#${name}` }));
+        return new Uint8Array();
+      }
+      if (service === "surface/underlay") {
+        // On (1) or off (0): off hides only the surface that's underlaid.
+        if (body.length !== 5) throw new Error("invalid underlay request");
+        const id = wordAt(body);
+        if (body[4] === 1) {
+          if (this.#shown === id) throw new Error("the program surface is shown in this one's place");
+          this.#underlay(id);
+        } else if (this.#underlaid === id) this.#underlay(null);
         return new Uint8Array();
       }
       if (service === "surface/close") { s.close(); return new Uint8Array(); }

@@ -141,11 +141,27 @@ function requestHost(service: string, bytes: Uint8Array<ArrayBuffer>): Promise<U
   });
 }
 
+/** The canvas's context as it was last configured, and whether it's see-through: a program the
+ * page's opened is underlaid behind it (`see-through`), so it's composited with its alpha,
+ * premultiplied, not opaque. */
+const canvasShown: { ctx: GPUCanvasContext | null; config: Omit<GPUCanvasConfiguration, "alphaMode"> | null; seeThrough: boolean } = {
+  ctx: null,
+  config: null,
+  seeThrough: false,
+};
+
+/** Configures `ctx` as `config` says, opaque unless it's see-through. */
+function configure(ctx: GPUCanvasContext, config: Omit<GPUCanvasConfiguration, "alphaMode">): void {
+  ctx.configure({ ...config, alphaMode: canvasShown.seeThrough ? "premultiplied" : "opaque" });
+  canvasShown.ctx = ctx;
+  canvasShown.config = config;
+}
+
 /** The canvas's WebGPU context, configured in `format`. */
 function context(canvas: OffscreenCanvas, device: GPUDevice, format: GPUTextureFormat, usage: number): GPUCanvasContext {
   const ctx = canvas.getContext("webgpu");
   if (!ctx) throw new GpuError("the canvas has no WebGPU context");
-  ctx.configure({ device, format, alphaMode: "opaque", usage });
+  configure(ctx, { device, format, usage });
   return ctx;
 }
 
@@ -154,11 +170,10 @@ function context(canvas: OffscreenCanvas, device: GPUDevice, format: GPUTextureF
  * whether the browser took it. */
 function showCanvas(ctx: GPUCanvasContext, device: GPUDevice, usage: number, format: GPUTextureFormat, hdr: boolean, gamut: number): boolean {
   try {
-    ctx.configure({
+    configure(ctx, {
       device,
       format,
       usage,
-      alphaMode: "opaque",
       colorSpace: gamut === 1 ? "display-p3" : "srgb",
       toneMapping: { mode: hdr ? "extended" : "standard" },
     });
@@ -1086,6 +1101,11 @@ function receive(msg: ToWorker, reply: (message: FromTicker | FromHelper) => voi
       clock.setVisible(msg.visible, epochNow());
       // The ticker's thread sleeps while the page is hidden.
       ticker.control.wake();
+      return;
+    case "see-through":
+      canvasShown.seeThrough = msg.on;
+      // Between frames, as a change of the screen's format is.
+      if (canvasShown.ctx && canvasShown.config) configure(canvasShown.ctx, canvasShown.config);
       return;
   }
 }

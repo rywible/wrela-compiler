@@ -31,6 +31,7 @@ interface Page {
   mediaListeners: (() => void)[];
   visibilityListeners: (() => void)[];
   canvasEvents: Map<string, (event: unknown) => void>;
+  windowEvents: Map<string, (event: unknown) => void>;
   worker: { onmessage: ((event: MessageEvent<FromWorker>) => void) | null } | null;
   /** The page's own text, when a test gives it one: what happened to it. */
   text: string[];
@@ -41,8 +42,8 @@ let loads = 0;
 
 /** Loads main.ts on a page at `url`, hidden or not, whose ResizeObserver may lack
  * `device-pixel-content-box` (as Safari's does). */
-async function load(url: string, options: { hidden?: boolean; devicePixelBox?: boolean; focused?: boolean; gpu?: boolean; alternate?: string; links?: { href: string; text: string }[]; text?: boolean; preload?: string[]; refuseThreads?: boolean } = {}): Promise<Page> {
-  const page: Page = { posted: [], puts: [], shown: [], observed: [], mediaListeners: [], visibilityListeners: [], canvasEvents: new Map(), worker: null, text: [], classes: [] };
+async function load(url: string, options: { hidden?: boolean; devicePixelBox?: boolean; focused?: boolean; gpu?: boolean; alternate?: string; links?: { href: string; text: string }[]; text?: boolean; preload?: string[]; refuseThreads?: boolean; opener?: { parent: object; referrer: string } } = {}): Promise<Page> {
+  const page: Page = { posted: [], puts: [], shown: [], observed: [], mediaListeners: [], visibilityListeners: [], canvasEvents: new Map(), windowEvents: new Map(), worker: null, text: [], classes: [] };
   // The page's own text records a box put before it, and its removal.
   const own = options.text ? {
     before: (el: { textContent: string; className?: string }) => page.text.push(`before: ${el.className ? `[${el.className}] ` : ""}${el.textContent.split("\n")[0]}`),
@@ -58,9 +59,11 @@ async function load(url: string, options: { hidden?: boolean; devicePixelBox?: b
   };
   const u = new URL(url);
   fake("location", { hostname: u.hostname, hash: u.hash });
-  fake("window", { devicePixelRatio: 2, addEventListener: () => {} });
+  // A page another program opened (`opener`) has that program's window as its parent.
+  fake("window", { devicePixelRatio: 2, parent: options.opener?.parent, addEventListener: (name: string, listener: (event: unknown) => void) => page.windowEvents.set(name, listener) });
   fake("document", {
     baseURI: `${u.origin}${u.pathname}`,
+    referrer: options.opener?.referrer ?? "",
     visibilityState: options.hidden ? "hidden" : "visible",
     hasFocus: () => options.focused ?? true,
     // The canvas, or the page's Markdown alternate when a test gives one.
@@ -268,6 +271,7 @@ test("audio print messages are relayed to the render worker and traps still fail
     class {
       readonly audioWorklet = { addModule: async () => {} };
       readonly destination = {};
+      createGain() { return { gain: { value: 1 }, connect() {} }; }
       readonly state = "running";
     },
   );
@@ -294,6 +298,36 @@ test("audio print messages are relayed to the render worker and traps still fail
   expect(page.posted.at(-1)).toEqual({ type: "audio-failed", message: "boom" });
 });
 
+test("a program its opener underlays plays its voice silently until it no longer is", async () => {
+  const gain = { value: 1 };
+  fake("AudioContext", class {
+    readonly audioWorklet = { addModule: async () => {} };
+    readonly destination = {};
+    createGain() { return { gain, connect() {} }; }
+    readonly state = "running";
+  });
+  fake("AudioWorkletNode", class {
+    readonly port = { onmessage: null };
+    connect() {}
+    disconnect() {}
+  });
+  const opener = {};
+  const page = await load("https://example.com/game/", { opener: { parent: opener, referrer: "https://example.com/console/" } });
+  const channel = new MessageChannel();
+  try {
+    page.windowEvents.get("message")!({ source: opener, origin: "https://example.com", data: { type: "wrela-connect" }, ports: [channel.port2] });
+    channel.port1.postMessage({ type: "underlay" });
+    await Bun.sleep(1);
+    // Muted before its voice starts, and its voice starts muted.
+    page.worker!.onmessage!(new MessageEvent("message", { data: { type: "audio", voice: {} as VoiceOptions } satisfies FromWorker }));
+    await Bun.sleep(1);
+    expect(gain.value).toBe(0);
+    channel.port1.postMessage({ type: "underlay-end" });
+    await Bun.sleep(1);
+    expect(gain.value).toBe(1);
+  } finally { channel.port1.close(); channel.port2.close(); }
+});
+
 test("stopping a voice while its worklet loads keeps it from starting later", async () => {
   const moduleReady = Promise.withResolvers<void>();
   let nodes = 0;
@@ -302,6 +336,7 @@ test("stopping a voice while its worklet loads keeps it from starting later", as
     class {
       readonly audioWorklet = { addModule: () => moduleReady.promise };
       readonly destination = {};
+      createGain() { return { gain: { value: 1 }, connect() {} }; }
       readonly state = "running";
     },
   );
@@ -334,6 +369,7 @@ test("a fatal render worker error stops the voice already playing", async () => 
   fake("AudioContext", class {
     readonly audioWorklet = { addModule: async () => {} };
     readonly destination = {};
+    createGain() { return { gain: { value: 1 }, connect() {} }; }
     readonly state = "running";
   });
   fake("AudioWorkletNode", class {
@@ -357,6 +393,7 @@ test("a fatal render worker error keeps a loading voice from starting later", as
   fake("AudioContext", class {
     readonly audioWorklet = { addModule: () => loaded.promise };
     readonly destination = {};
+    createGain() { return { gain: { value: 1 }, connect() {} }; }
     readonly state = "running";
   });
   fake("AudioWorkletNode", class {
@@ -381,6 +418,7 @@ test("stopping test audio while its worklet loads keeps it from starting later",
     const Context = class {
       readonly audioWorklet = { addModule: () => loaded.promise };
       readonly destination = {};
+      createGain() { return { gain: { value: 1 }, connect() {} }; }
       readonly state = "running";
       async resume() {}
       async close() {}
@@ -410,6 +448,7 @@ test("a fatal worker error stops live test audio and prevents a successful audio
   fake("AudioContext", class {
     readonly audioWorklet = { addModule: async () => {} };
     readonly destination = {};
+    createGain() { return { gain: { value: 1 }, connect() {} }; }
     readonly state = "running";
     async resume() {}
     async close() {}
@@ -437,6 +476,7 @@ test("offline audio waits for the worklet's print marker before reporting it ren
     class {
       readonly audioWorklet = { addModule: async () => {} };
       readonly destination = {};
+      createGain() { return { gain: { value: 1 }, connect() {} }; }
       async startRendering() {
         voicePort!.onmessage!(new MessageEvent("message", { data: { type: "print", line: "offline voice" } satisfies FromVoice }));
         voicePort!.onmessage!(new MessageEvent("message", { data: { type: "rendered" } satisfies FromVoice }));
@@ -468,6 +508,7 @@ test("an offline audio trap fails the render worker without waiting for a render
     class {
       readonly audioWorklet = { addModule: async () => {} };
       readonly destination = {};
+      createGain() { return { gain: { value: 1 }, connect() {} }; }
       async startRendering() {
         voicePort!.onmessage!(new MessageEvent("message", { data: { type: "trap", message: "offline boom" } satisfies FromVoice }));
         return { getChannelData: () => new Float32Array(128) };
@@ -500,6 +541,7 @@ test("an audio processor construction error fails an offline render instead of l
     class {
       readonly audioWorklet = { addModule: async () => {} };
       readonly destination = {};
+      createGain() { return { gain: { value: 1 }, connect() {} }; }
       async startRendering() {
         processorError!(new Event("processorerror"));
         return { getChannelData: () => new Float32Array(128) };

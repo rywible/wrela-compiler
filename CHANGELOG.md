@@ -3,6 +3,16 @@
 Each release's changes a program or a tool can see. The pull request of each release holds the
 detail; `docs/release.md` says how a release is cut.
 
+## 0.16.0
+
+- **A program shows another playing behind it** (language.md §17.1): `std::host::underlay(id,
+  on)` shows the program in a surface this one opened behind this one's canvas, which is then
+  composited with its alpha (premultiplied) wherever its screen pass clears to `vec4(0.0)`. The
+  program behind is muted, hears no input and keeps its own frame rate; `on` false hides it, as
+  `show` and `close` do. The native host declines it. runtime/browser: the host service
+  `surface/underlay`, the parent's signals `underlay` and `underlay-end` to the program behind,
+  and the canvas reconfigured `alphaMode: "premultiplied"` while one is underlaid.
+
 ## 0.15.0
 
 - **A program reloads its page** (language.md §17.1): `std::host::reload()` loads the page
