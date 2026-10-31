@@ -158,6 +158,8 @@ describe("connections", () => {
     expect(parseServer('{"url": "wss://wrela.dev"}')).toEqual({ url: "wss://wrela.dev" });
     expect(parseServer('{"url": "ws://localhost:8787"}')).toEqual({ url: "ws://localhost:8787" });
     expect(() => parseServer('{"url": "ws://wrela.dev"}')).toThrow("isn't an https or wss URL");
+    // A development certificate's hash is WebTransport's alone.
+    expect(() => parseServer(JSON.stringify({ url: "wss://wrela.dev", certificateHash: new Array(32).fill(0) }))).toThrow("is for an https");
   });
 
   test("a wss server's connection is a WebSocket, each binary message a frame", async () => {

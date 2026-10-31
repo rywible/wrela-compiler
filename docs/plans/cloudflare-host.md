@@ -444,8 +444,12 @@ the session from the `__Host-` cookie, and checks Origin and its CSRF header. Th
 4. **Past one object.** Sharding the store, if a server ever needs more than about 1,000 requests a
    second or 10 GB.
 5. **workerd in the checks.** The glue that only workerd runs (RPC, alarms, `transactionSync`'s
-   real behaviour) is tested against fakes. Should a check run `wrangler dev` where Node is on the
-   machine?
+   real behaviour, the Hibernation API and the forwarded WebSocket handshake) is tested against
+   fakes. Should a check run `wrangler dev` where Node is on the machine? One question for it: a
+   room's events that wait for a call live in the object's memory, so if a reset (past the CPU
+   limit) keeps its hibernated sockets, the messages waiting are lost while their peers stay
+   connected, and the room would have to close its sockets when it starts again with work it
+   can't account for.
 6. **The prefix.** `/api/` is the default. Does the console want another?
 7. **An old build's rooms.** A deploy makes a new pair id, so the old build's room objects keep
    their journals, billed as stored data, with no build to read them. Should a room clear its

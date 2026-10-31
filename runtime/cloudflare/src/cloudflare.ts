@@ -14,7 +14,7 @@
 import { DurableObject } from "cloudflare:workers";
 import { HTTP_METHODS, MAX_HTTP_REQUEST, SAFE_METHODS } from "../../browser/src/abi.gen.ts";
 import { Out, seenByServer } from "../../browser/src/http.ts";
-import { pairParam, roomName } from "../../browser/src/net.ts";
+import { pairOf, pairParam, roomName } from "../../browser/src/net.ts";
 import { bare, decodeResponse, encodeRequest, type Header, HOST_HEADERS, NO_BODY, Server } from "./host.ts";
 import { Room, type StoreClient } from "./room.ts";
 
@@ -250,7 +250,7 @@ export function serverClass(module: WebAssembly.Module) {
 export async function rooms(request: Request, env: Env, pair: bigint | null): Promise<Response | null> {
   const url = new URL(request.url);
   if (!url.pathname.startsWith("/room/")) return null;
-  if (request.headers.get("upgrade")?.toLowerCase() !== "websocket") return refusal(426, { upgrade: "websocket" });
+  if (request.method !== "GET" || request.headers.get("upgrade")?.toLowerCase() !== "websocket") return refusal(426, { upgrade: "websocket" });
   const name = url.pathname.slice("/room/".length);
   if (!roomName(name)) return refusal(404);
   const hex = pair === null ? null : pairParam(pair);
@@ -260,12 +260,15 @@ export async function rooms(request: Request, env: Env, pair: bigint | null): Pr
   const limited = await gate(env, request, "GET", url.pathname);
   if (limited !== null) return limited;
   if (env.WRELA_ROOM === undefined) return refusal(404);
-  // Only the upgrade crosses: no address, and no header the room doesn't read.
-  return env.WRELA_ROOM.getByName(`${hex}:${name}`).fetch(new Request(url.href, { headers: { upgrade: "websocket" } }));
+  // Only the handshake crosses: no address, and no header the room doesn't read.
+  const handshake = new Headers();
+  for (const [n, v] of request.headers) if (n === "upgrade" || n === "connection" || n.startsWith("sec-websocket-")) handshake.set(n, v);
+  return env.WRELA_ROOM.getByName(`${hex}:${name}`).fetch(new Request(url.href, { headers: handshake }));
 }
 
 /** Makes the Durable Object class of a server build's rooms. */
 export function roomClass(module: WebAssembly.Module) {
+  const pair = pairOf(module);
   return class WrelaRoom extends DurableObject<Env> {
     readonly room: Room;
 
@@ -273,6 +276,7 @@ export function roomClass(module: WebAssembly.Module) {
       super(ctx, env);
       const server = env.WRELA_SERVER.getByName(SERVER_OBJECT);
       this.room = new Room(module, ctx.storage, server, ctx.getWebSockets(), {
+        pair,
         log: (line) => console.error(line),
         ...(env.WRELA_PRINT === "1" ? { print: (line: string) => console.log(line) } : {}),
       });

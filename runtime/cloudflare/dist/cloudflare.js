@@ -1492,6 +1492,11 @@ var CONN_IN = 1 << 20;
 var RETRY_MS = 250;
 var UNREAD = "`serve` returned without reading all its events";
 var attached = (socket) => socket.deserializeAttachment();
+function shut(socket, code, why) {
+  try {
+    socket.close(code, why);
+  } catch {}
+}
 var word = (b, at) => new DataView(b.buffer, b.byteOffset).getUint32(at, true);
 
 class Room {
@@ -1506,8 +1511,10 @@ class Room {
   sockets = new Map;
   incoming = [];
   waiting = new Map;
+  held = 0;
   failures = 0;
   retryAt = 0;
+  handedOn = false;
   quarantined;
   replaced;
   lastConn;
@@ -1535,7 +1542,7 @@ class Room {
     this.quarantined = typeof q === "string" ? q : null;
     const last = meta.get("conn");
     this.lastConn = typeof last === "number" ? last : JOURNAL;
-    const pair = pairOf(module);
+    const pair = options.pair !== undefined ? options.pair : pairOf(module);
     const build = pair === null ? "none" : pairParam(pair);
     const kept = meta.get("pair");
     if (kept === undefined)
@@ -1544,7 +1551,7 @@ class Room {
     if (this.replaced) {
       this.options.log?.("wrela: a room's storage is another build's, and it serves nothing");
       for (const socket of open)
-        socket.close(1012, "the room's build was replaced");
+        shut(socket, 1012, "the room's build was replaced");
       return;
     }
     for (const socket of open) {
@@ -1564,7 +1571,7 @@ class Room {
   }
   connect(socket) {
     if (this.replaced || this.quarantined !== null) {
-      socket.close(this.replaced ? 1012 : 1011, "the room is closed");
+      shut(socket, this.replaced ? 1012 : 1011, "the room is closed");
       return;
     }
     const conn = this.nextConn();
@@ -1582,10 +1589,14 @@ class Room {
       return this.cut(conn, 1003, "a room takes binary messages");
     if (data.byteLength > MAX_UP)
       return this.cut(conn, 1009, `a message past ${MAX_UP} bytes`);
-    const waiting = (this.waiting.get(conn) ?? 0) + data.byteLength + OVERHEAD;
+    const cost = data.byteLength + OVERHEAD;
+    const waiting = (this.waiting.get(conn) ?? 0) + cost;
     if (waiting > CONN_IN)
       return this.cut(conn, 1008, `more than ${CONN_IN} bytes wait for the room`);
+    if (this.held + cost > this.limits.queued)
+      return this.cut(conn, 1008, `more than ${this.limits.queued} bytes wait for the room`);
     this.waiting.set(conn, waiting);
+    this.held += cost;
     this.incoming.push({ kind: "message", conn, bytes: new Uint8Array(data) });
     this.wake();
   }
@@ -1611,29 +1622,41 @@ class Room {
   disconnect(conn) {
     if (!this.sockets.delete(conn))
       return;
-    this.waiting.delete(conn);
+    this.forget(conn);
     this.incoming.push({ kind: "closed", conn });
     this.wake();
   }
+  forget(conn) {
+    this.held -= this.waiting.get(conn) ?? 0;
+    this.waiting.delete(conn);
+  }
   cut(conn, code, why) {
-    try {
-      this.sockets.get(conn)?.close(code, why);
-    } catch {}
+    const socket = this.sockets.get(conn);
+    if (socket !== undefined)
+      shut(socket, code, why);
     this.disconnect(conn);
   }
   closeAll(code, why) {
     this.incoming = [];
     this.waiting.clear();
+    this.held = 0;
     for (const socket of this.sockets.values())
-      socket.close(code, why);
+      shut(socket, code, why);
     this.sockets.clear();
   }
+  count(e, sign) {
+    if (e.kind !== "message")
+      return;
+    const w = this.waiting.get(e.conn);
+    if (w === undefined)
+      return;
+    const cost = sign * (e.bytes.length + OVERHEAD);
+    this.waiting.set(e.conn, w + cost);
+    this.held += cost;
+  }
   requeue(events) {
-    for (const e of events) {
-      const w = e.kind === "message" ? this.waiting.get(e.conn) : undefined;
-      if (w !== undefined && e.kind === "message")
-        this.waiting.set(e.conn, w + e.bytes.length + OVERHEAD);
-    }
+    for (const e of events)
+      this.count(e, 1);
     this.incoming.unshift(...events);
   }
   quarantine(why) {
@@ -1665,8 +1688,11 @@ class Room {
   async wakeNow(alarm) {
     if (this.replaced || this.quarantined !== null)
       return;
-    if (!alarm && this.now() < this.retryAt)
+    if (!alarm && (this.handedOn || this.now() < this.retryAt))
       return;
+    if (alarm)
+      this.handedOn = false;
+    const began = this.now();
     for (;; ) {
       if (this.instance === null) {
         const f = await this.restart();
@@ -1680,8 +1706,15 @@ class Room {
         return;
       const batch = this.nextBatch();
       const r = await this.call(batch);
-      if (r === null)
+      if (r === null) {
+        const more = this.incoming.length > 0 || this.instance.arriving.length > 0;
+        if (more && this.now() - began > this.limits.turn) {
+          this.handedOn = true;
+          this.storage.setAlarm(this.now());
+          return;
+        }
         continue;
+      }
       if ("journal" in r)
         return;
       if (batch.length === 1 && !r.room.program) {
@@ -1703,9 +1736,7 @@ class Room {
       if (!withinCall(given, e.bytes.length))
         break;
       given += e.bytes.length;
-      const w = this.waiting.get(e.conn);
-      if (w !== undefined)
-        this.waiting.set(e.conn, w - e.bytes.length - OVERHEAD);
+      this.count(e, -1);
     }
     return this.incoming.splice(0, n);
   }
@@ -1855,7 +1886,7 @@ class Room {
           s.send(c.bytes);
         else if (c.kind === "close") {
           this.sockets.delete(c.conn);
-          this.waiting.delete(c.conn);
+          this.forget(c.conn);
           s.close(1000, "");
         }
       } catch {
@@ -2056,7 +2087,7 @@ async function rooms(request, env, pair) {
   const url = new URL(request.url);
   if (!url.pathname.startsWith("/room/"))
     return null;
-  if (request.headers.get("upgrade")?.toLowerCase() !== "websocket")
+  if (request.method !== "GET" || request.headers.get("upgrade")?.toLowerCase() !== "websocket")
     return refusal(426, { upgrade: "websocket" });
   const name = url.pathname.slice("/room/".length);
   if (!roomName(name))
@@ -2072,15 +2103,21 @@ async function rooms(request, env, pair) {
     return limited;
   if (env.WRELA_ROOM === undefined)
     return refusal(404);
-  return env.WRELA_ROOM.getByName(`${hex}:${name}`).fetch(new Request(url.href, { headers: { upgrade: "websocket" } }));
+  const handshake = new Headers;
+  for (const [n, v] of request.headers)
+    if (n === "upgrade" || n === "connection" || n.startsWith("sec-websocket-"))
+      handshake.set(n, v);
+  return env.WRELA_ROOM.getByName(`${hex}:${name}`).fetch(new Request(url.href, { headers: handshake }));
 }
 function roomClass(module) {
+  const pair = pairOf(module);
   return class WrelaRoom extends DurableObject {
     room;
     constructor(ctx, env) {
       super(ctx, env);
       const server = env.WRELA_SERVER.getByName(SERVER_OBJECT);
       this.room = new Room(module, ctx.storage, server, ctx.getWebSockets(), {
+        pair,
         log: (line) => console.error(line),
         ...env.WRELA_PRINT === "1" ? { print: (line) => console.log(line) } : {}
       });

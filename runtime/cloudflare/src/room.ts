@@ -18,7 +18,8 @@
 //
 // Each WebSocket binary message is one frame (no varint), at most `MAX_UP` bytes from a peer; a
 // text message, or a longer one, closes its connection. A connection with more than `CONN_IN`
-// bytes waiting for the room is closed too.
+// bytes waiting for the room is closed too, and so is one whose message would take what all wait
+// past `Limits.queued`. Past a turn (`Limits.turn`), the room goes on in its alarm.
 //
 // A room's storage is its build's: the object's name holds the build's pair id, but a deploy
 // gives a hibernated object the new build's code with the old build's sockets and journal. Such an
@@ -57,6 +58,8 @@ export interface StoreClient {
 
 export interface RoomOptions {
   limits?: Limits;
+  /** The build's pair id, if its module was read already (default: read from it). */
+  pair?: bigint | null;
   now?: () => number;
   print?: (line: string) => void;
   log?: (line: string) => void;
@@ -68,6 +71,15 @@ interface Attached {
   tag: number;
 }
 const attached = (socket: Socket) => socket.deserializeAttachment() as Attached | null;
+
+/** Closes `socket`, if it isn't closed already. */
+function shut(socket: Socket, code: number, why: string): void {
+  try {
+    socket.close(code, why);
+  } catch {
+    // It's closed already.
+  }
+}
 
 /** A room's network command (`std::net`), carried out once the call returns. */
 type Net =
@@ -95,11 +107,14 @@ export class Room implements Owner<Net> {
   /** Its open connections' sockets; each socket's attachment says its connection and tag. */
   private readonly sockets = new Map<number, Socket>();
   private incoming: Incoming[] = [];
-  /** The bytes each open connection's messages hold in `incoming`. */
+  /** The bytes each open connection's messages hold in `incoming`, and all of them. */
   private readonly waiting = new Map<number, number>();
+  private held = 0;
   private failures = 0;
   /** When a room that failed at the host's limits tries again (0: whenever it's woken). */
   private retryAt = 0;
+  /** Whether a turn ended with work left, which the alarm goes on with. */
+  private handedOn = false;
   private quarantined: string | null;
   /** Whether its storage is another build's (a deploy since): it serves nothing. */
   private readonly replaced: boolean;
@@ -132,14 +147,14 @@ export class Room implements Owner<Net> {
     this.quarantined = typeof q === "string" ? q : null;
     const last = meta.get("conn");
     this.lastConn = typeof last === "number" ? last : JOURNAL;
-    const pair = pairOf(module);
+    const pair = options.pair !== undefined ? options.pair : pairOf(module);
     const build = pair === null ? "none" : pairParam(pair);
     const kept = meta.get("pair");
     if (kept === undefined) sql.exec("INSERT INTO meta (key, value) VALUES ('pair', ?)", build);
     this.replaced = kept !== undefined && kept !== build;
     if (this.replaced) {
       this.options.log?.("wrela: a room's storage is another build's, and it serves nothing");
-      for (const socket of open) socket.close(1012, "the room's build was replaced");
+      for (const socket of open) shut(socket, 1012, "the room's build was replaced");
       return;
     }
     // Its sockets outlive the object: each says which connection it is.
@@ -165,7 +180,7 @@ export class Room implements Owner<Net> {
   /** A peer connected on `socket`. A quarantined room closes it. */
   connect(socket: Socket): void {
     if (this.replaced || this.quarantined !== null) {
-      socket.close(this.replaced ? 1012 : 1011, "the room is closed");
+      shut(socket, this.replaced ? 1012 : 1011, "the room is closed");
       return;
     }
     const conn = this.nextConn();
@@ -182,9 +197,12 @@ export class Room implements Owner<Net> {
     if (conn === null) return;
     if (typeof data === "string") return this.cut(conn, 1003, "a room takes binary messages");
     if (data.byteLength > MAX_UP) return this.cut(conn, 1009, `a message past ${MAX_UP} bytes`);
-    const waiting = (this.waiting.get(conn) ?? 0) + data.byteLength + OVERHEAD;
+    const cost = data.byteLength + OVERHEAD;
+    const waiting = (this.waiting.get(conn) ?? 0) + cost;
     if (waiting > CONN_IN) return this.cut(conn, 1008, `more than ${CONN_IN} bytes wait for the room`);
+    if (this.held + cost > this.limits.queued) return this.cut(conn, 1008, `more than ${this.limits.queued} bytes wait for the room`);
     this.waiting.set(conn, waiting);
+    this.held += cost;
     this.incoming.push({ kind: "message", conn, bytes: new Uint8Array(data) });
     this.wake();
   }
@@ -205,8 +223,8 @@ export class Room implements Owner<Net> {
     return this.running;
   }
 
-  /** Whatever came, taken in order, one wake at a time; while a failure at the host's limits
-   * waits for the alarm (`alarm`), only the alarm's. */
+  /** Whatever came, taken in order, one wake at a time; while a failure at the host's limits, or
+   * a turn's end, waits for the alarm (`alarm`), only the alarm's. */
   wake(alarm = false): Promise<void> {
     this.running = this.running.then(
       () => this.wakeNow(alarm),
@@ -222,18 +240,21 @@ export class Room implements Owner<Net> {
 
   private disconnect(conn: number): void {
     if (!this.sockets.delete(conn)) return;
-    this.waiting.delete(conn);
+    this.forget(conn);
     this.incoming.push({ kind: "closed", conn });
     this.wake();
   }
 
+  /** Connection `conn` is gone: its messages that wait count toward nothing. */
+  private forget(conn: number): void {
+    this.held -= this.waiting.get(conn) ?? 0;
+    this.waiting.delete(conn);
+  }
+
   /** Closes connection `conn`'s socket, and the room hears it closed. */
   private cut(conn: number, code: number, why: string): void {
-    try {
-      this.sockets.get(conn)?.close(code, why);
-    } catch {
-      // It's closed already.
-    }
+    const socket = this.sockets.get(conn);
+    if (socket !== undefined) shut(socket, code, why);
     this.disconnect(conn);
   }
 
@@ -241,16 +262,24 @@ export class Room implements Owner<Net> {
   private closeAll(code: number, why: string): void {
     this.incoming = [];
     this.waiting.clear();
-    for (const socket of this.sockets.values()) socket.close(code, why);
+    this.held = 0;
+    for (const socket of this.sockets.values()) shut(socket, code, why);
     this.sockets.clear();
+  }
+
+  /** Counts `e`'s bytes (`sign` 1) toward what waits for the room, or no longer (-1). */
+  private count(e: Incoming, sign: 1 | -1): void {
+    if (e.kind !== "message") return;
+    const w = this.waiting.get(e.conn);
+    if (w === undefined) return;
+    const cost = sign * (e.bytes.length + OVERHEAD);
+    this.waiting.set(e.conn, w + cost);
+    this.held += cost;
   }
 
   /** `events` wait again, before what came since. */
   private requeue(events: Incoming[]): void {
-    for (const e of events) {
-      const w = e.kind === "message" ? this.waiting.get(e.conn) : undefined;
-      if (w !== undefined && e.kind === "message") this.waiting.set(e.conn, w + e.bytes.length + OVERHEAD);
-    }
+    for (const e of events) this.count(e, 1);
     this.incoming.unshift(...events);
   }
 
@@ -287,7 +316,9 @@ export class Room implements Owner<Net> {
   /** The room's events, a call's worth at a time, until none waits and no answer is due. */
   private async wakeNow(alarm: boolean): Promise<void> {
     if (this.replaced || this.quarantined !== null) return;
-    if (!alarm && this.now() < this.retryAt) return;
+    if (!alarm && (this.handedOn || this.now() < this.retryAt)) return;
+    if (alarm) this.handedOn = false;
+    const began = this.now();
     for (;;) {
       if (this.instance === null) {
         const f = await this.restart();
@@ -299,7 +330,16 @@ export class Room implements Owner<Net> {
       if (this.incoming.length === 0 && this.instance!.arriving.length === 0) return;
       const batch = this.nextBatch();
       const r = await this.call(batch);
-      if (r === null) continue;
+      if (r === null) {
+        // Past a turn, the rest goes on in the alarm, so no one invocation runs past its CPU.
+        const more = this.incoming.length > 0 || this.instance!.arriving.length > 0;
+        if (more && this.now() - began > this.limits.turn) {
+          this.handedOn = true;
+          void this.storage.setAlarm(this.now());
+          return;
+        }
+        continue;
+      }
       if ("journal" in r) return;
       if (batch.length === 1 && !r.room.program) {
         // The host's limits on one event: nothing was kept or sent, and it waits.
@@ -320,8 +360,7 @@ export class Room implements Owner<Net> {
       if (e.kind !== "message") continue;
       if (!withinCall(given, e.bytes.length)) break;
       given += e.bytes.length;
-      const w = this.waiting.get(e.conn);
-      if (w !== undefined) this.waiting.set(e.conn, w - e.bytes.length - OVERHEAD);
+      this.count(e, -1);
     }
     return this.incoming.splice(0, n);
   }
@@ -471,7 +510,7 @@ export class Room implements Owner<Net> {
         else if (c.kind === "send") s.send(c.bytes);
         else if (c.kind === "close") {
           this.sockets.delete(c.conn);
-          this.waiting.delete(c.conn);
+          this.forget(c.conn);
           s.close(1000, "");
         }
       } catch {

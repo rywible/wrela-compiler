@@ -1,7 +1,7 @@
-// A room's host on hand-built modules: what a peer may send and hold waiting, a room whose program
-// fails on every message quarantined for good, a socket that fails after a call is settled, the
-// wait for the alarm after a failure at the host's limits, and a room whose storage is another
-// build's.
+// A room's host on hand-built modules: what a peer may send and hold waiting, and all its peers, a
+// room whose program fails on every message quarantined for good, a socket that fails after a
+// call is settled, the wait for the alarm after a failure at the host's limits, a turn's end, and
+// a room whose storage is another build's.
 
 import { Database } from "bun:sqlite";
 import { expect, test } from "bun:test";
@@ -138,4 +138,37 @@ test("a room whose storage is another build's reads nothing back and closes its 
   again.connect(b);
   expect(b.closed).toBe(1012);
   expect(db.query("SELECT count(*) AS n FROM journal").get()).toEqual({ n: 1 });
+});
+
+test("what all a room's peers hold waiting is bounded too", () => {
+  const room = new Room(program(), storage(), store, [], { limits: { ...LIMITS, queued: 1000 } });
+  const a = new FakeSocket();
+  const b = new FakeSocket();
+  room.connect(a);
+  room.connect(b);
+  room.message(a, new ArrayBuffer(900));
+  room.message(b, new ArrayBuffer(100));
+  expect([a.closed, b.closed]).toEqual([null, 1008]);
+});
+
+test("past a turn, a room goes on in its alarm", async () => {
+  const alarms: number[] = [];
+  const logs: string[] = [];
+  const room = new Room(program(), storage(new Database(":memory:"), (at) => alarms.push(at)), store, [], {
+    now: () => 1000,
+    limits: { ...LIMITS, turn: -1 },
+    log: (l) => logs.push(l),
+  });
+  const a = new FakeSocket();
+  const b = new FakeSocket();
+  room.connect(a);
+  room.connect(b);
+  // 1.2 MiB of messages: more than a call is given, so two calls.
+  for (const peer of [a, b]) for (let i = 0; i < 10; i++) room.message(peer, new ArrayBuffer(60 * 1024));
+  await room.settled;
+  expect(alarms).toEqual([1000]);
+  expect((room as unknown as { incoming: unknown[] }).incoming.length).toBeGreaterThan(0);
+  await room.alarm();
+  expect((room as unknown as { incoming: unknown[] }).incoming.length).toBe(0);
+  expect([alarms, logs, a.closed, b.closed]).toEqual([[1000], [], null, null]);
 });

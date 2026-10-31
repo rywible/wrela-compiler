@@ -213,6 +213,7 @@ export function parseServer(text: string): Server {
     throw new Error("net.json's `url` isn't an https or wss URL without credentials, query or fragment");
   }
   if (certificateHash === undefined) return { url };
+  if (address.protocol !== "https:") throw new Error("net.json's `certificateHash` is for an https (WebTransport) server");
   const whole = Array.isArray(certificateHash) && certificateHash.length === 32 && certificateHash.every((x) => Number.isInteger(x) && x >= 0 && x < 256);
   if (!whole) throw new Error("net.json's `certificateHash` isn't 32 bytes");
   return { url, certificateHash: certificateHash as number[] };
