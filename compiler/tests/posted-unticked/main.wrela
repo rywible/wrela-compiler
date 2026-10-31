@@ -1,0 +1,13 @@
+// A program that posts into its ticks (`std::tick::post`) but starts no ticker, run by
+// compiler/tests/tests/suite/threads.rs: its frame's commands fail.
+
+use std::tick::post
+
+pub fn init() -> u32 {
+    0
+}
+
+pub fn frame(n: mut u32, time: f32, width: u32, height: u32) {
+    post(1, a: 2, b: 3)
+    n += 1
+}

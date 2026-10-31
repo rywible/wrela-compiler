@@ -106,7 +106,8 @@ var EventKind = {
   Assist: 12,
   Message: 13,
   Connection: 14,
-  Field: 15
+  Field: 15,
+  Posted: 16
 };
 var KEYS = ["Unknown", "KeyA", "KeyB", "KeyC", "KeyD", "KeyE", "KeyF", "KeyG", "KeyH", "KeyI", "KeyJ", "KeyK", "KeyL", "KeyM", "KeyN", "KeyO", "KeyP", "KeyQ", "KeyR", "KeyS", "KeyT", "KeyU", "KeyV", "KeyW", "KeyX", "KeyY", "KeyZ", "Digit0", "Digit1", "Digit2", "Digit3", "Digit4", "Digit5", "Digit6", "Digit7", "Digit8", "Digit9", "Enter", "Escape", "Backspace", "Tab", "Space", "ArrowLeft", "ArrowRight", "ArrowUp", "ArrowDown", "Home", "End", "PageUp", "PageDown", "Insert", "Delete", "ShiftLeft", "ShiftRight", "ControlLeft", "ControlRight", "AltLeft", "AltRight", "MetaLeft", "MetaRight", "CapsLock", "Minus", "Equal", "BracketLeft", "BracketRight", "Backslash", "Semicolon", "Quote", "Backquote", "Comma", "Period", "Slash", "F1", "F2", "F3", "F4", "F5", "F6", "F7", "F8", "F9", "F10", "F11", "F12", "NumpadEnter", "NumpadAdd", "NumpadSubtract", "NumpadMultiply", "NumpadDivide", "NumpadDecimal"];
 var THREAD_MAIN = 0;
@@ -233,8 +234,8 @@ function decodeResponse(bytes) {
   if (r.word() !== HTTP_RESPONSE_MAGIC)
     throw new Error("not a response");
   const status = r.word();
-  if (status < 100 || status > 599)
-    throw new Error(`status ${status} isn't 100 to 599`);
+  if (status < 200 || status > 599)
+    throw new Error(`status ${status} isn't 200 to 599`);
   const s = { status, headers: r.headers(), body: r.chunk() };
   r.end("response");
   return s;
@@ -319,9 +320,15 @@ class InputRing {
     Atomics.store(this.#counts, 1, read + n);
     return { events, times };
   }
-  readTicker(out, at, cap) {
+  readTicker(out, at, cap, upto = Infinity) {
     const read = Atomics.load(this.#counts, 2) >>> 0;
-    const n = Math.min((Atomics.load(this.#counts, 0) >>> 0) - read >>> 0, cap);
+    let n = Math.min((Atomics.load(this.#counts, 0) >>> 0) - read >>> 0, cap);
+    for (let i = 0;upto !== Infinity && i < n; i++) {
+      if (this.#view.getFloat64(this.#slot(read + i) + EVENT_SIZE, true) > upto) {
+        n = i;
+        break;
+      }
+    }
     this.#copy(read, n, out, at);
     Atomics.store(this.#counts, 2, read + n);
     return n;
@@ -859,7 +866,7 @@ var MAX_KEY = 1024;
 var MAX_VALUE = 1020 << 10;
 var MAX_SCAN = 1 << 20;
 var MAX_RANDOM = 1024;
-var LIMITS = { memory: 64 << 20, commands: 16 << 20, turn: 250 };
+var LIMITS = { memory: 64 << 20, commands: 16 << 20, turn: 250, open: 256, queued: 32 << 20 };
 
 class Failure extends Error {
   program;
@@ -868,10 +875,13 @@ class Failure extends Error {
     this.program = program;
   }
 }
+var NO_BODY = [204, 205, 304];
 var HEADER_NAME = /^[a-z0-9!#$%&'*+.^_`|~-]+$/;
 var HEADER_VALUE = /^[^\r\n\0]*$/;
 function checkResponse(bytes) {
   const s = decodeResponse(bytes);
+  if (NO_BODY.includes(s.status) && s.body.length > 0)
+    throw new Error(`a ${s.status} has no body`);
   for (const [n, v] of s.headers) {
     if (!HEADER_NAME.test(n))
       throw new Error(`\`${n}\` isn't a header's name in lower case`);
@@ -896,6 +906,7 @@ function withHostHeaders(s) {
 }
 var bare = (status) => encodeResponse(withHostHeaders({ status, headers: [], body: new Uint8Array(0) }));
 var asBytes = (v) => v instanceof Uint8Array ? v : new Uint8Array(v);
+var blob = (b) => b.byteOffset === 0 && b.byteLength === b.buffer.byteLength && b.buffer instanceof ArrayBuffer ? b.buffer : b.slice().buffer;
 
 class Store {
   storage;
@@ -906,7 +917,7 @@ class Store {
   get(body) {
     if (body.length > MAX_KEY)
       throw new Error(`a key is longer than ${MAX_KEY} bytes`);
-    const rows = this.storage.sql.exec("SELECT value FROM kv WHERE key = ?", body).toArray();
+    const rows = this.storage.sql.exec("SELECT value FROM kv WHERE key = ?", blob(body)).toArray();
     if (rows.length === 0)
       return new Uint8Array([0]);
     return new Out().push(new Uint8Array([1])).push(asBytes(rows[0]["value"])).bytes();
@@ -921,7 +932,7 @@ class Store {
     if (from.length > MAX_KEY || to.length > MAX_KEY)
       throw new Error(`a key is longer than ${MAX_KEY} bytes`);
     const order = down ? "DESC" : "ASC";
-    const rows = to.length === 0 ? this.storage.sql.exec(`SELECT key, value FROM kv WHERE key >= ? ORDER BY key ${order} LIMIT ?`, from, limit) : this.storage.sql.exec(`SELECT key, value FROM kv WHERE key >= ? AND key < ? ORDER BY key ${order} LIMIT ?`, from, to, limit);
+    const rows = to.length === 0 ? this.storage.sql.exec(`SELECT key, value FROM kv WHERE key >= ? ORDER BY key ${order} LIMIT ?`, blob(from), limit) : this.storage.sql.exec(`SELECT key, value FROM kv WHERE key >= ? AND key < ? ORDER BY key ${order} LIMIT ?`, blob(from), blob(to), limit);
     const out = new Out;
     let count = 0;
     let bytes = 0;
@@ -962,9 +973,9 @@ class Store {
     this.storage.transactionSync(() => {
       for (const [k, v] of ops) {
         if (v === null)
-          this.storage.sql.exec("DELETE FROM kv WHERE key = ?", k);
+          this.storage.sql.exec("DELETE FROM kv WHERE key = ?", blob(k));
         else
-          this.storage.sql.exec("INSERT OR REPLACE INTO kv (key, value) VALUES (?, ?)", k, v);
+          this.storage.sql.exec("INSERT OR REPLACE INTO kv (key, value) VALUES (?, ?)", blob(k), blob(v));
       }
     });
   }
@@ -1156,6 +1167,7 @@ class Instance {
     new Uint8Array(this.memory.buffer, at, bytes.length).set(bytes);
   }
 }
+var RECOVER_MS = 1000;
 var POISONED = 2 ** 31;
 
 class Server {
@@ -1173,6 +1185,8 @@ class Server {
   lastClock = 0;
   pumping = false;
   woken = false;
+  leftover = false;
+  alarmAt = 0;
   now;
   constructor(module, storage, options = {}) {
     this.module = module;
@@ -1183,12 +1197,14 @@ class Server {
     this.started = this.now();
   }
   request(bytes) {
+    if (this.open.size >= this.limits.open || this.queue.held + bytes.length > this.limits.queued)
+      return Promise.resolve(bare(503));
     const conn = this.nextConn++;
     if (this.nextConn >= POISONED)
       this.nextConn = 1;
     const answer = new Promise((resolve) => {
       const timer = setTimeout(() => this.finish(conn, bare(504)), RESPOND_WITHIN_MS);
-      this.open.set(conn, { resolve, timer });
+      this.open.set(conn, { resolve, timer, bytes, retried: false });
     });
     this.queue.push(connectionEvent(conn, true));
     this.queue.pushMessage(conn, bytes);
@@ -1197,11 +1213,12 @@ class Server {
     return answer;
   }
   async alarm() {
+    this.alarmAt = 0;
     this.woken = true;
     await this.pump();
   }
   due() {
-    return this.fresh || this.woken || (this.instance?.arriving.length ?? 0) > 0;
+    return this.fresh || this.leftover || this.woken || (this.instance?.arriving.length ?? 0) > 0;
   }
   async pump() {
     if (this.pumping)
@@ -1211,8 +1228,9 @@ class Server {
       const began = this.now();
       while (this.due()) {
         await this.once();
-        if (this.open.size === 0 && this.due() && this.now() - began >= this.limits.turn) {
-          this.options.setAlarm?.(this.now());
+        if (this.due() && this.now() - began >= this.limits.turn) {
+          this.alarmAt = this.now();
+          this.options.setAlarm?.(this.alarmAt);
           return;
         }
         await new Promise((r) => setTimeout(r, 0));
@@ -1226,7 +1244,7 @@ class Server {
     try {
       instance = await this.ready();
     } catch (e) {
-      this.fail(e);
+      this.fail(e, false);
       return;
     }
     const arrived = await Promise.all(instance.arriving.splice(0));
@@ -1240,8 +1258,14 @@ class Server {
     instance.commandBytes = 0;
     try {
       const time = Math.fround((this.now() - this.started) / 1000);
+      const before = this.queue.length;
       instance.call(() => instance.serve(time));
+      this.leftover = this.queue.length > 0 && this.queue.length < before;
       this.carryOut(instance.commands);
+      if (this.due() && this.alarmAt < this.now()) {
+        this.alarmAt = this.now() + RECOVER_MS;
+        this.options.setAlarm?.(this.alarmAt);
+      }
     } catch (e) {
       this.fail(e);
     }
@@ -1249,14 +1273,17 @@ class Server {
   ready() {
     if (this.instance !== null)
       return Promise.resolve(this.instance);
-    this.starting ??= Instance.start(this, this.module).then((i) => {
-      this.instance = i;
-      this.starting = null;
-      return i;
-    }, (e) => {
-      this.starting = null;
-      throw e;
-    });
+    this.starting ??= (async () => {
+      try {
+        const i = await Instance.start(this, this.module);
+        this.carryOut(i.commands);
+        i.commands = [];
+        this.instance = i;
+        return i;
+      } finally {
+        this.starting = null;
+      }
+    })();
     return this.starting;
   }
   carryOut(commands) {
@@ -1266,28 +1293,45 @@ class Server {
         this.finish(c.conn, encodeResponse(withHostHeaders(c.response)));
     }
   }
-  finish(conn, response) {
+  finish(conn, response, tell = true) {
     const o = this.open.get(conn);
     if (o === undefined)
       return;
     clearTimeout(o.timer);
     this.open.delete(conn);
     o.resolve(response);
-    if (this.instance !== null) {
+    if (tell) {
       this.queue.push(connectionEvent(conn, false));
       this.fresh = true;
       this.pump();
     }
   }
-  fail(e) {
+  fail(e, started = true) {
     const f = e instanceof Failure ? e : new Failure(false, String(e?.message ?? e));
     this.options.log?.(`wrela: the server's call failed: ${f.program ? "the program's: " : "the host's limits: "}${f.message}`);
+    const unread = new Set;
+    if (started) {
+      for (const ev of this.queue.events) {
+        const v = new DataView(ev.buffer, ev.byteOffset, EVENT_SIZE);
+        if (v.getUint32(0, true) === EventKind.Message)
+          unread.add(v.getUint32(8, true));
+      }
+    }
     this.instance = null;
     this.woken = false;
     this.fresh = false;
+    this.leftover = false;
     this.queue = new Inbox;
-    for (const conn of [...this.open.keys()])
-      this.finish(conn, bare(f.program ? 500 : 503));
+    for (const [conn, o] of [...this.open]) {
+      if (unread.has(conn) && !o.retried) {
+        o.retried = true;
+        this.queue.push(connectionEvent(conn, true));
+        this.queue.pushMessage(conn, o.bytes);
+        this.fresh = true;
+      } else {
+        this.finish(conn, bare(f.program ? 500 : 503), false);
+      }
+    }
   }
   imports(me) {
     const host = this;
@@ -1464,7 +1508,13 @@ async function api(request, env, options = {}) {
   const method = request.method.toUpperCase();
   if (!HTTP_METHODS.includes(method))
     return refusal(405, { allow: HTTP_METHODS.join(", ") });
-  const limited = await pastLimit(env, method, url.pathname, request.headers.get("cf-connecting-ip") ?? "unknown");
+  let limited;
+  try {
+    limited = await pastLimit(env, method, url.pathname, request.headers.get("cf-connecting-ip") ?? "unknown");
+  } catch (e) {
+    console.error(`wrela: ${e.message}`);
+    return refusal(503);
+  }
   if (limited !== null)
     return refusal(429, { "retry-after": String(limited.period ?? 60) });
   const cache = method === "GET" ? options.cache ?? globalThis.caches?.default : undefined;
@@ -1501,7 +1551,7 @@ async function api(request, env, options = {}) {
   const out = new Headers;
   for (const [n, v] of s.headers)
     out.append(n, v);
-  const empty = method === "HEAD" || s.status === 204 || s.status === 304;
+  const empty = method === "HEAD" || NO_BODY.includes(s.status);
   const response = new Response(empty ? null : s.body.slice(), { status: s.status, headers: out });
   if (cache !== undefined && key !== null && shareable(response)) {
     const kept = cache.put(key, response.clone());

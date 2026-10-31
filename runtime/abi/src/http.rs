@@ -214,8 +214,8 @@ impl Response {
             return Err("not a response".into());
         }
         let status = r.word()?;
-        if !(100..=599).contains(&status) {
-            return Err(format!("status {status} isn't 100 to 599"));
+        if !(200..=599).contains(&status) {
+            return Err(format!("status {status} isn't 200 to 599"));
         }
         let headers = r.headers()?;
         let n = r.word()? as usize;

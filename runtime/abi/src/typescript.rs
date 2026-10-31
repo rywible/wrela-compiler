@@ -174,6 +174,10 @@ export const IMPORT_PHASE = {import_phase:?};
 export const EVENT_SIZE = {event_size};
 export const EventKind = {{
 {event_kinds}}} as const;
+/** The host service a program posts a record into its ticks with (`EventKind.Posted`), and its
+ * body's bytes: the record's words 1 to 5. */
+export const SERVICE_POST = {service_post:?};
+export const POST_BODY = {post_body};
 export const MODIFIER_SHIFT = {shift};
 export const MODIFIER_CONTROL = {control};
 export const MODIFIER_ALT = {alt};
@@ -315,6 +319,8 @@ export const PANIC_CAP = {panic_cap};
         import_input = input::IMPORT_INPUT,
         import_payload = input::IMPORT_PAYLOAD,
         payload_per_call = input::PAYLOAD_PER_CALL,
+        service_post = input::SERVICE_POST,
+        post_body = input::POST_BODY,
         pair_section = crate::PAIR_SECTION,
         import_tick = crate::IMPORT_TICK,
         export_tick = crate::EXPORT_TICK,

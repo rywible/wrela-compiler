@@ -337,6 +337,7 @@ impl Scene {
     Context { first: "use std::field::{Surface, cuboid, round_cone}", ..NONE },
     // §16.2's examples are whole programs.
     Context { first: "use std::tick::{Ticked, start}", ..NONE },
+    Context { first: "use std::tick::{Ticked, post, start}", ..NONE },
     Context { first: "use std::handoff::{Latest, Publisher, handoff}", ..NONE },
     Context { first: "use std::par::spawn", ..NONE },
     Context {

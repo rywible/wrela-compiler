@@ -281,6 +281,96 @@ fn the_ticker_in_chrome_agrees_with_the_native_host() {
     }
 }
 
+/// The posted test program's script: a key down before frame 4, which reaches tick 4 after
+/// what frame 3 posted.
+const POSTED_SCRIPT: &str = r#"[{"frame": 4, "type": "keydown", "key": "KeyA"}, {"frame": 11, "type": "keydown", "key": "KeyB"}]"#;
+
+/// Records a program posts into its ticks (`std::tick::post`): in lockstep, what frame `i`
+/// posts is a record of the first tick that runs for frame `i + 1`, before that frame's input,
+/// in the order posted, and what `init` posts once the ticker has started is tick 0's; past a
+/// tick's records, the rest wait in order, ahead of the input after them; the tick log keeps
+/// them, so the log replays with any helpers (a replay drops what the program posts again); a
+/// changed post fails at its tick; and the frames see the sim that took them.
+#[test]
+fn posted_records_are_the_next_ticks_and_replay() {
+    use wrela_abi::input::Event;
+    let script = wrela_host::parse_script(POSTED_SCRIPT).expect("a script");
+    let built = CpuBuild::load(built("posted")).expect("load");
+    let frames = 14;
+    let log = built.record_lockstep(frames, 60.0, &script, 1).expect("record");
+    assert_eq!(log.ticks.len() as u32, wrela_host::lockstep_ticks(frames - 1, 60, 60.0));
+    let key = |k| Event::key(true, wrela_abi::input::key_code(k), false, 0).bytes();
+    let records = |k: usize| log.ticks[k].records.clone();
+    assert_eq!(records(0), vec![Event::posted(2, 42, 0).bytes()], "tick 0: init's post");
+    assert_eq!(records(4), vec![Event::posted(1, 5, 0).bytes(), key("KeyA")], "tick 4");
+    assert_eq!(
+        records(8),
+        vec![Event::posted(2, u64::MAX, 1 << 32).bytes(), Event::posted(1, 7, 0).bytes()],
+        "tick 8"
+    );
+    let note = |i: u64| Event::posted(2, i, 0).bytes();
+    let max = wrela_abi::memory::MAX_TICK_RECORDS as u64;
+    assert_eq!(records(11), (0..max).map(note).collect::<Vec<_>>(), "tick 11: a tick's worth");
+    let rest: Vec<_> = (max..300).map(note).chain([key("KeyB")]).collect();
+    assert_eq!(records(12), rest, "tick 12: the rest of the posts, then frame 11's input");
+    let others = (0..log.ticks.len()).filter(|k| ![0, 4, 8, 11, 12].contains(k));
+    assert!(others.into_iter().all(|k| records(k).is_empty()), "no other tick has records");
+    let read = replays_with_any_helpers(&built, &log);
+    // Frame 7's second post, levels 0 to 2, made levels 1 and 2: tick 8 differs.
+    let mut changed = read.clone();
+    changed.ticks[8].records[1] = Event::posted(1, 6, 0).bytes();
+    match built.replay(&changed, 2) {
+        Err(wrela_host::ReplayError::Tick { tick, .. }) => assert_eq!(tick, 8),
+        other => panic!("expected tick 8 to differ: {other:?}"),
+    }
+    let mut host = built.start_with(2).expect("start");
+    for i in 0..frames {
+        host.lockstep_frame(i, 60.0, 64, 64, &script).expect("a frame");
+    }
+    let [tick, opened, posts] = one_vec3(&mut host, "newest", &[]);
+    assert_eq!((tick, opened, posts), (13.0, 7.0, 304.0));
+    assert_eq!(one_u32(&mut host, "keys", &[]), 2);
+}
+
+/// A program that posts into its ticks with no ticker fails its frame's commands.
+#[test]
+fn a_post_without_a_ticker_fails() {
+    let built = CpuBuild::load(built("posted-unticked")).expect("load");
+    let mut host = built.start_with(1).expect("start");
+    let e = host.frame(0.0, 64, 64).expect_err("no ticker");
+    assert!(e.to_string().contains("has started no ticker"), "{e}");
+}
+
+/// What a program posts into its ticks in Chrome (runtime/browser: the render worker's posts
+/// ring, which the ticker's thread reads) reaches the same ticks as on the native host, in
+/// lockstep at 30 and 60 frames a second, with 1 and 4 threads: Chrome's tick log is the
+/// native host's, records and hashes, and replays natively.
+#[test]
+#[ignore = "needs the runtime"]
+fn posted_records_in_chrome_agree_with_the_native_host() {
+    let (dir, rel) = wrela_tests::page("compiler/tests/posted", "posted-chrome");
+    let script = wrela_host::parse_script(POSTED_SCRIPT).expect("a script");
+    let built = CpuBuild::load(&dir).expect("load");
+    let frames = 20;
+    for (fps, workers) in [(60.0, 4), (30.0, 1)] {
+        let native = built.record_lockstep(frames, fps, &script, 2).expect("native ticks");
+        let run = wrela_tests::ChromeRun {
+            workers,
+            saturate: true,
+            script: Some(POSTED_SCRIPT.to_string()),
+            ..wrela_tests::ChromeRun::new(frames, 16, 16, fps)
+        };
+        let chrome = wrela_tests::run_in_chrome_with(&rel, run);
+        let log = chrome.ticks.expect("the ticker's ticks").log.expect("a tick log");
+        let what = format!("{fps} fps, {workers} threads");
+        assert_eq!(log.first, native.first, "{what}: the first world");
+        assert_eq!(log.ticks, native.ticks, "{what}: each tick's records and hash");
+        assert!(log.ticks.iter().any(|t| t.records.len() == 2), "{what}: frame 7's posts");
+        assert_eq!(log.ticks[0].records.len(), 1, "{what}: init's post");
+        assert_eq!(built.replay(&log, 2).expect("replays") as usize, log.ticks.len(), "{what}");
+    }
+}
+
 /// Memory grown by one thread is usable by all helpers. A 4 MiB initialization overlaps helper
 /// startup; one helper holds 12 MiB while parallel rows write beyond it, then the main thread
 /// writes every page of 16 MiB. Both hosts must report the same contents.

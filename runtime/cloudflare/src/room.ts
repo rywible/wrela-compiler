@@ -20,10 +20,10 @@
 // text message, or a longer one, closes its connection. A connection with more than `CONN_IN`
 // bytes waiting for the room is closed too.
 
-import { EventKind } from "../../browser/src/abi.gen.ts";
+import { EventKind, SERVICE_RESPOND } from "../../browser/src/abi.gen.ts";
 import { encodeEvent } from "../../browser/src/input.ts";
 import { Inbox } from "../../browser/src/net.ts";
-import { commonAnswer, Failure, Instance, LIMITS, type Limits, type Owner, SERVICE_RESPOND, type Storage, writes } from "./host.ts";
+import { blob, commonAnswer, Failure, Instance, LIMITS, type Limits, type Owner, type Storage, writes } from "./host.ts";
 
 /** The connection a room's journal comes from (`std::net::JOURNAL`). */
 export const JOURNAL = 0;
@@ -301,7 +301,7 @@ export class Room implements Owner<Net> {
         const unread = records.slice(records.length - this.queue.length);
         this.storage.transactionSync(() => {
           sql.exec("DELETE FROM journal");
-          for (const r of [c.bytes, ...unread]) sql.exec("INSERT INTO journal (record) VALUES (?)", r);
+          for (const r of [c.bytes, ...unread]) sql.exec("INSERT INTO journal (record) VALUES (?)", blob(r));
         });
       }
     }
@@ -395,10 +395,10 @@ export class Room implements Owner<Net> {
       if (batches.length > 0) await this.store.commit(batches);
       this.storage.transactionSync(() => {
         for (const c of commands) {
-          if (c.kind === "keep") sql.exec("INSERT INTO journal (record) VALUES (?)", c.bytes);
+          if (c.kind === "keep") sql.exec("INSERT INTO journal (record) VALUES (?)", blob(c.bytes));
           if (c.kind === "compact") {
             sql.exec("DELETE FROM journal");
-            sql.exec("INSERT INTO journal (record) VALUES (?)", c.bytes);
+            sql.exec("INSERT INTO journal (record) VALUES (?)", blob(c.bytes));
           }
         }
       });

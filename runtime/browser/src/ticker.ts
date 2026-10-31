@@ -223,6 +223,11 @@ const NONE: readonly Scripted[] = [];
 class Ticker {
   readonly clock: VisibleClock;
   readonly ring: InputRing;
+  /** The records the program posted (`std::tick::post`), each stamped with the frames started
+   * when it posted it. */
+  readonly posts: InputRing;
+  /** Where the posts a full tick can't take pass on their way to `queue`. */
+  readonly #spill = new Uint8Array(InputRing.CAPACITY * EVENT_SIZE);
   /** Test mode: a script's events, by frame and by tick. */
   readonly script: Arrivals;
   /** Events not yet stamped into a tick, oldest first. */
@@ -253,6 +258,7 @@ class Ticker {
   ) {
     this.clock = new VisibleClock(start.clock);
     this.ring = new InputRing(start.input);
+    this.posts = new InputRing(start.posts);
     this.script = arrivals(start.script);
     this.#view = new DataView(start.memory.buffer);
     this.#bytes = new Uint8Array(start.memory.buffer);
@@ -333,7 +339,8 @@ class Ticker {
 
   /** Runs the next tick with the events that have arrived, at most MAX_TICK_RECORDS (the rest
    * wait for the next tick). They're written straight into its records, in order: what earlier
-   * ticks left, a script's events of the frames started since, the input ring's, then a
+   * ticks left, a script's events of the frames started since (each frame's after what the
+   * program posted before it began), what the program posted since, the input ring's, then a
    * script's records of this tick. */
   runTick(): void {
     const { start, control, queue } = this;
@@ -351,8 +358,10 @@ class Ticker {
       for (let i = 0; i < n; i++) this.#bytes.set(queue[i]!, RECORDS + i * EVENT_SIZE);
       if (n > 0) queue.splice(0, n);
       for (const frames = control.frames; this.framesQueued < frames; this.framesQueued++) {
+        n = this.#posted(n, this.framesQueued);
         n = this.#stamp(this.script.frames.get(this.framesQueued) ?? NONE, n);
       }
+      n = this.#posted(n);
       if (n < MAX_TICK_RECORDS) n += this.ring.readTicker(this.#bytes, RECORDS + n * EVENT_SIZE, MAX_TICK_RECORDS - n);
       n = this.#stamp(this.script.ticks.get(k) ?? NONE, n);
     }
@@ -375,6 +384,18 @@ class Ticker {
     if (this.log) this.log.push(records!, this.#view.getBigUint64(TICK_HASH, true));
     this.next = k + 1;
     control.ran(this.next);
+  }
+
+  /** Stamps the records the program posted while at most `frames` frames had started into this
+   * tick's records after the first `n`, as many as fit; the rest are queued for the next tick, in
+   * order with what follows them (as the native host's one queue keeps them). Returns how many
+   * records the tick has now. */
+  #posted(n: number, frames = Infinity): number {
+    if (n < MAX_TICK_RECORDS) n += this.posts.readTicker(this.#bytes, RECORDS + n * EVENT_SIZE, MAX_TICK_RECORDS - n, frames);
+    if (n < MAX_TICK_RECORDS) return n;
+    const m = this.posts.readTicker(this.#spill, 0, InputRing.CAPACITY, frames);
+    for (let i = 0; i < m; i++) this.queue.push(this.#spill.slice(i * EVENT_SIZE, (i + 1) * EVENT_SIZE));
+    return n;
   }
 
   /** Stamps `events` into this tick's records after the first `n`, as many as fit; the rest are

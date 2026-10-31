@@ -9,6 +9,7 @@ import { beforeAll, describe, expect, test } from "bun:test";
 import { join } from "node:path";
 import type { ApiOptions, Env, ResponseCache } from "../src/cloudflare.ts";
 import type { Storage } from "../src/host.ts";
+import { sqliteBindings } from "./sqlite.ts";
 
 const BUILD = process.env["WRELA_HTTP_BUILD"];
 const SITE = "https://wrela.dev";
@@ -19,7 +20,7 @@ function storage(db: Database, alarms: number[]): Storage & { setAlarm(at: numbe
   return {
     sql: {
       exec(query: string, ...bindings: unknown[]) {
-        const rows = db.query(query).all(...(bindings as never[])) as Record<string, unknown>[];
+        const rows = db.query(query).all(...(sqliteBindings(bindings) as never[])) as Record<string, unknown>[];
         return Object.assign(rows[Symbol.iterator](), { toArray: () => rows });
       },
     },

@@ -23,6 +23,7 @@
 
 import {
   EVENT_SIZE,
+  EventKind,
   EXPORT_MEMORY,
   IMPORT_CLOCK,
   IMPORT_INPUT,
@@ -65,9 +66,12 @@ export interface Limits {
   commands: number;
   /** How long one turn of calls may run before it yields to the alarm, in milliseconds. */
   turn: number;
+  /** The requests open at once, and the bytes of the requests that wait for the program. */
+  open: number;
+  queued: number;
 }
 
-export const LIMITS: Limits = { memory: 64 << 20, commands: 16 << 20, turn: 250 };
+export const LIMITS: Limits = { memory: 64 << 20, commands: 16 << 20, turn: 250, open: 256, queued: 32 << 20 };
 
 /** The rows of a query, as `ctx.storage.sql.exec` gives them, one at a time. */
 export interface Cursor extends Iterable<Record<string, unknown>> {
@@ -106,6 +110,9 @@ export class Failure extends Error {
 
 export { decodeRequest, decodeResponse, encodeRequest, encodeResponse, type Header, type HttpRequest, type HttpResponse } from "../../browser/src/http.ts";
 
+/** The statuses whose responses have no body. */
+export const NO_BODY: readonly number[] = [204, 205, 304];
+
 /** A header a program wrote is a token in lower case, and its value has no line break or NUL. */
 const HEADER_NAME = /^[a-z0-9!#$%&'*+.^_`|~-]+$/;
 const HEADER_VALUE = /^[^\r\n\0]*$/;
@@ -113,6 +120,7 @@ const HEADER_VALUE = /^[^\r\n\0]*$/;
 /** A program's response, checked: why not, if it isn't one a server may send. */
 export function checkResponse(bytes: Uint8Array): HttpResponse {
   const s = decodeResponse(bytes);
+  if (NO_BODY.includes(s.status) && s.body.length > 0) throw new Error(`a ${s.status} has no body`);
   for (const [n, v] of s.headers) {
     if (!HEADER_NAME.test(n)) throw new Error(`\`${n}\` isn't a header's name in lower case`);
     if (!setByServer(n)) throw new Error(`a server can't set header \`${n}\``);
@@ -143,6 +151,9 @@ export const bare = (status: number): Uint8Array => encodeResponse(withHostHeade
 // ---- the store (wrela_host::services) ---------------------------------------------------------
 
 const asBytes = (v: unknown): Uint8Array => (v instanceof Uint8Array ? v : new Uint8Array(v as ArrayBuffer));
+/** Bytes bound as a BLOB: an ArrayBuffer of exactly them, as the SQLite storage API takes one. */
+export const blob = (b: Uint8Array): ArrayBuffer =>
+  b.byteOffset === 0 && b.byteLength === b.buffer.byteLength && b.buffer instanceof ArrayBuffer ? b.buffer : (b.slice().buffer as ArrayBuffer);
 
 /** The server's store: one table of keys and values, both bytes, as `store.sqlite` on
  * `wrela-serve`. */
@@ -154,7 +165,7 @@ export class Store {
   /** `store/get`: the key → 1 then the value, or 0. */
   get(body: Uint8Array): Uint8Array {
     if (body.length > MAX_KEY) throw new Error(`a key is longer than ${MAX_KEY} bytes`);
-    const rows = this.storage.sql.exec("SELECT value FROM kv WHERE key = ?", body).toArray();
+    const rows = this.storage.sql.exec("SELECT value FROM kv WHERE key = ?", blob(body)).toArray();
     if (rows.length === 0) return new Uint8Array([0]);
     return new Out().push(new Uint8Array([1])).push(asBytes(rows[0]!["value"])).bytes();
   }
@@ -172,8 +183,8 @@ export class Store {
     const order = down ? "DESC" : "ASC";
     const rows =
       to.length === 0
-        ? this.storage.sql.exec(`SELECT key, value FROM kv WHERE key >= ? ORDER BY key ${order} LIMIT ?`, from, limit)
-        : this.storage.sql.exec(`SELECT key, value FROM kv WHERE key >= ? AND key < ? ORDER BY key ${order} LIMIT ?`, from, to, limit);
+        ? this.storage.sql.exec(`SELECT key, value FROM kv WHERE key >= ? ORDER BY key ${order} LIMIT ?`, blob(from), limit)
+        : this.storage.sql.exec(`SELECT key, value FROM kv WHERE key >= ? AND key < ? ORDER BY key ${order} LIMIT ?`, blob(from), blob(to), limit);
     const out = new Out();
     let count = 0;
     let bytes = 0;
@@ -196,8 +207,8 @@ export class Store {
     if (ops.length === 0) return;
     this.storage.transactionSync(() => {
       for (const [k, v] of ops) {
-        if (v === null) this.storage.sql.exec("DELETE FROM kv WHERE key = ?", k);
-        else this.storage.sql.exec("INSERT OR REPLACE INTO kv (key, value) VALUES (?, ?)", k, v);
+        if (v === null) this.storage.sql.exec("DELETE FROM kv WHERE key = ?", blob(k));
+        else this.storage.sql.exec("INSERT OR REPLACE INTO kv (key, value) VALUES (?, ?)", blob(k), blob(v));
       }
     });
   }
@@ -540,7 +551,15 @@ function imports_<C>(owner: Owner<C>, me: () => Instance<C>): WebAssembly.Module
 interface Open {
   resolve: (response: Uint8Array) => void;
   timer: ReturnType<typeof setTimeout>;
+  /** Its bytes, for a fresh instance if the one it was queued for failed before reading it, and
+   * whether it was given to one so already (once: a request every instance fails on is failed). */
+  bytes: Uint8Array;
+  retried: boolean;
 }
+
+/** How soon the alarm comes back for work left after a call, in case the object is reset first:
+ * a call that finishes it sets the alarm again, so it comes only to an object that lost it. */
+const RECOVER_MS = 1000;
 
 /** The highest connection number, past which `std::net::POISONED` marks a message. */
 const POISONED = 2 ** 31;
@@ -563,6 +582,11 @@ export class Server implements Owner<Command> {
   private pumping = false;
   /** Whether the alarm asked for a call though nothing came. */
   private woken = false;
+  /** Whether the last call left events it was given a call's worth short of (its payload bytes),
+   * and read some: the next call takes the rest. */
+  private leftover = false;
+  /** When the alarm this object set is due (0: none it knows of). */
+  private alarmAt = 0;
   private readonly now: () => number;
 
   constructor(
@@ -588,11 +612,13 @@ export class Server implements Owner<Command> {
 
   /** Answers a request's bytes (`encodeRequest`) with a response's (`encodeResponse`). */
   request(bytes: Uint8Array): Promise<Uint8Array> {
+    // What the object holds is bounded: past it, a request is turned away before it's queued.
+    if (this.open.size >= this.limits.open || this.queue.held + bytes.length > this.limits.queued) return Promise.resolve(bare(503));
     const conn = this.nextConn++;
     if (this.nextConn >= POISONED) this.nextConn = 1;
     const answer = new Promise<Uint8Array>((resolve) => {
       const timer = setTimeout(() => this.finish(conn, bare(504)), RESPOND_WITHIN_MS);
-      this.open.set(conn, { resolve, timer });
+      this.open.set(conn, { resolve, timer, bytes, retried: false });
     });
     this.queue.push(connectionEvent(conn, true));
     this.queue.pushMessage(conn, bytes);
@@ -604,17 +630,18 @@ export class Server implements Owner<Command> {
   /** The object's alarm: the work that no request waits on. An object woken from eviction starts
    * its instance and calls it once, so a program that keeps its queue in the store goes on. */
   async alarm(): Promise<void> {
+    this.alarmAt = 0;
     this.woken = true;
     await this.pump();
   }
 
   /** Whether a call is due. */
   private due(): boolean {
-    return this.fresh || this.woken || (this.instance?.arriving.length ?? 0) > 0;
+    return this.fresh || this.leftover || this.woken || (this.instance?.arriving.length ?? 0) > 0;
   }
 
-  /** Calls while a call is due: a turn at a time, yielding between calls. With no request open
-   * past a turn's time, it leaves the rest to the alarm. */
+  /** Calls while a call is due, yielding between calls; past a turn's time, it leaves the rest to
+   * the alarm, so no one invocation runs past its CPU limit. */
   async pump(): Promise<void> {
     // A pump under way sees what came since: it asks `due` after each call.
     if (this.pumping) return;
@@ -623,8 +650,10 @@ export class Server implements Owner<Command> {
       const began = this.now();
       while (this.due()) {
         await this.once();
-        if (this.open.size === 0 && this.due() && this.now() - began >= this.limits.turn) {
-          this.options.setAlarm?.(this.now());
+        // Past a turn, the rest goes on in the alarm: its own invocation, and its own CPU time.
+        if (this.due() && this.now() - began >= this.limits.turn) {
+          this.alarmAt = this.now();
+          this.options.setAlarm?.(this.alarmAt);
           return;
         }
         await new Promise((r) => setTimeout(r, 0));
@@ -640,7 +669,7 @@ export class Server implements Owner<Command> {
     try {
       instance = await this.ready();
     } catch (e) {
-      this.fail(e);
+      this.fail(e, false);
       return;
     }
     // Answers arrive before the call that may read them.
@@ -651,8 +680,15 @@ export class Server implements Owner<Command> {
     this.responding.clear();
     try {
       const time = Math.fround((this.now() - this.started) / 1000);
+      const before = this.queue.length;
       instance.call(() => instance.serve(time));
+      this.leftover = this.queue.length > 0 && this.queue.length < before;
       this.carryOut(instance.commands);
+      // Work left (an answer due, events left) survives an eviction: the alarm brings it back.
+      if (this.due() && this.alarmAt < this.now()) {
+        this.alarmAt = this.now() + RECOVER_MS;
+        this.options.setAlarm?.(this.alarmAt);
+      }
     } catch (e) {
       this.fail(e);
     }
@@ -661,17 +697,18 @@ export class Server implements Owner<Command> {
   /** The instance, started if it isn't (with `serve_init`). */
   private ready(): Promise<Instance<Command>> {
     if (this.instance !== null) return Promise.resolve(this.instance);
-    this.starting ??= Instance.start<Command>(this, this.module).then(
-      (i) => {
+    this.starting ??= (async () => {
+      try {
+        const i = await Instance.start<Command>(this, this.module);
+        // What `serve_init` wrote commits before its first `serve`.
+        this.carryOut(i.commands);
+        i.commands = [];
         this.instance = i;
-        this.starting = null;
         return i;
-      },
-      (e) => {
+      } finally {
         this.starting = null;
-        throw e;
-      },
-    );
+      }
+    })();
     return this.starting;
   }
 
@@ -683,29 +720,49 @@ export class Server implements Owner<Command> {
     }
   }
 
-  /** Request `conn` is answered with `response`, and closes for the program. */
-  private finish(conn: number, response: Uint8Array): void {
+  /** Request `conn` is answered with `response`, and closes for the program (unless `tell` is
+   * false: its instance went, and the next never heard of it). */
+  private finish(conn: number, response: Uint8Array, tell = true): void {
     const o = this.open.get(conn);
     if (o === undefined) return;
     clearTimeout(o.timer);
     this.open.delete(conn);
     o.resolve(response);
-    if (this.instance !== null) {
+    if (tell) {
       this.queue.push(connectionEvent(conn, false));
       this.fresh = true;
       void this.pump();
     }
   }
 
-  /** A call failed: the instance goes, and every request open on it with it. */
-  private fail(e: unknown): void {
+  /** A call failed (or, with `started` false, an instance didn't start): the instance goes, and
+   * every request open on it that a call was given with it. One no call has read yet waits for
+   * the next instance, unless none starts. */
+  private fail(e: unknown, started = true): void {
     const f = e instanceof Failure ? e : new Failure(false, String((e as Error)?.message ?? e));
     this.options.log?.(`wrela: the server's call failed: ${f.program ? "the program's: " : "the host's limits: "}${f.message}`);
+    const unread = new Set<number>();
+    if (started) {
+      for (const ev of this.queue.events) {
+        const v = new DataView(ev.buffer, ev.byteOffset, EVENT_SIZE);
+        if (v.getUint32(0, true) === EventKind.Message) unread.add(v.getUint32(8, true));
+      }
+    }
     this.instance = null;
     this.woken = false;
     this.fresh = false;
+    this.leftover = false;
     this.queue = new Inbox();
-    for (const conn of [...this.open.keys()]) this.finish(conn, bare(f.program ? 500 : 503));
+    for (const [conn, o] of [...this.open]) {
+      if (unread.has(conn) && !o.retried) {
+        o.retried = true;
+        this.queue.push(connectionEvent(conn, true));
+        this.queue.pushMessage(conn, o.bytes);
+        this.fresh = true;
+      } else {
+        this.finish(conn, bare(f.program ? 500 : 503), false);
+      }
+    }
   }
 
   /** A host request the program made: a command for after the call, or a request answered for
