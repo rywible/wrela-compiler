@@ -239,8 +239,9 @@ bound ([pricing](https://developers.cloudflare.com/durable-objects/platform/pric
 - 100,000 Durable Object requests a day, counting each RPC call (a room's store reads and
   commits), each alarm, and incoming WebSocket messages at 20 to 1 (§10). That's at most about
   23 messages a second over a day, about two players online at all times at 10 a second each.
-- 100,000 SQLite rows written a day, counting each kept record, each store commit and each
-  `setAlarm`. A room that keeps a record for every message is held to about one a second.
+- 100,000 SQLite rows written a day, counting each kept record, each key a store commit
+  changes, each `setAlarm` and each row deleted. A room that keeps a record for every message is
+  held to under one a second, and to about half that once compaction deletes them.
 - 5 million rows read a day (a journal's read-back reads a row a record) and 13,000 GB-s of
   duration a day (a hibernated room spends none).
 
