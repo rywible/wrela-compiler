@@ -480,6 +480,8 @@ export function buildPipelines(
   const launch = (i: number, counted: boolean) => {
     const d = resolvers.get(i)!;
     resolvers.delete(i);
+    // Started: its launcher (which holds this build) has nothing more to do.
+    LAUNCHERS.delete(d.promise);
     if (counted) running++;
     else asked++;
     started.push(i);

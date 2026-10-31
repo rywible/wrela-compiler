@@ -247,8 +247,11 @@ function tickerStarter(
       ring?.attachTicker();
       posts.attachTicker();
     }
-    for (const [record, frames] of postsStarting ?? []) posts.write(record, frames);
+    const starting = postsStarting ?? [];
     postsStarting = null;
+    for (const [record, frames] of starting) {
+      if (!posts.write(record, frames)) throw new Error(`${InputRing.CAPACITY} posted records already wait for the ticker`);
+    }
     const thread = new Thread("wrela sim");
     ticker.thread = thread;
     ticker.report = new Promise((resolve) => {
