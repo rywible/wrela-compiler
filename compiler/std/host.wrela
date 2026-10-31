@@ -85,7 +85,9 @@ pub fn icon(rel: str, size: u32, path: str) -> Pending<u8> {
 
 /// Opens the program at `url` (relative to this build) in a surface of its own, hidden until it's
 /// shown (`show`), at most four at a time. The answer is the surface's id (`read_surface`); it
-/// fails if the program can't be opened.
+/// fails if the program can't be opened. `url` may end in a fragment (`capybara/#attract`), which
+/// the opened program reads as part of its `address`; it may not have a query or credentials, or
+/// a fragment that asks for test mode (`#test`).
 @client
 pub fn open(url: str) -> Pending<u8> {
     request("surface/open", utf8(url))
@@ -448,7 +450,8 @@ fn utf8(text: str) -> Vec<u8> {
 
 // ---- the page's address and links (runtime/browser: platform.ts) ------------------------------
 
-/// The page's address: its path, query and fragment (`/v0.1/#std/io`), as UTF-8.
+/// The page's address: its path, query and fragment (`/v0.1/#std/io`), as UTF-8. A program that
+/// another opened (`open`) has the address it was opened at, its fragment kept (`/capybara/#attract`).
 @client
 pub fn address() -> Pending<u8> {
     request("nav/location", [u8(0); 0])

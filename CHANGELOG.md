@@ -3,6 +3,16 @@
 Each release's changes a program or a tool can see. The pull request of each release holds the
 detail; `docs/release.md` says how a release is cut.
 
+## 0.17.0
+
+- **A program is opened at an address with a fragment** (language.md §17.1):
+  `std::host::open("capybara/#attract")` opens the build at `capybara/`, and the opened
+  program's `std::host::address` is `/capybara/#attract`, so one build can start in another way
+  without a second build. Its page and files are fetched and cached without the fragment.
+  runtime/browser: `programUrl` (`surface/open`, `prefetch`) allows a fragment, except one that
+  asks for test mode (`#test`), and still refuses credentials and queries, now an empty query
+  (`/?`) too; `prefetch` fetches a URL without its fragment.
+
 ## 0.16.0
 
 - **A program shows another playing behind it** (language.md §17.1): `std::host::underlay(id,

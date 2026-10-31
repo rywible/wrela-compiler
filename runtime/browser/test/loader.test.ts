@@ -23,6 +23,14 @@ function server(files: Record<string, string> = {}): { fetch: Fetch; requested: 
   return { fetch, requested };
 }
 
+test("a build's files resolve without the page's fragment", async () => {
+  const { fetch, requested } = server();
+  await loadBuild(`${BASE}#attract`, fetch);
+  expect(requested.sort()).toEqual(
+    ["/game/fill.wgsl", "/game/first-light.wgsl", "/game/game.wasm", "/game/manifest.json"].sort(),
+  );
+});
+
 test("loads a build's manifest, WASM and shaders", async () => {
   const { fetch, requested } = server();
   const build = await loadBuild(BASE, fetch);
