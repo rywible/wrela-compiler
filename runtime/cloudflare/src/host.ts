@@ -604,6 +604,13 @@ export class Server implements Owner<Command> {
     return this.options.print;
   }
 
+  /** A room's read of the store: answered from what's committed (null: it failed). */
+  storeAnswer(service: string, body: Uint8Array): Uint8Array | null {
+    if (service === "store/get") return answerOf(() => this.store.get(body));
+    if (service === "store/scan") return answerOf(() => this.store.scan(body));
+    return null;
+  }
+
   /** Seconds since the host started, never going back. */
   clock(): number {
     this.lastClock = Math.max(this.lastClock, (this.now() - this.started) / 1000);

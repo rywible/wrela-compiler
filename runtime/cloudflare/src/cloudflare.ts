@@ -12,9 +12,10 @@
 // the address is a rate limit's key and nothing else.
 
 import { DurableObject } from "cloudflare:workers";
-import { HTTP_METHODS, MAX_HTTP_REQUEST, SAFE_METHODS } from "../../browser/src/abi.gen.ts";
+import { HTTP_METHODS, MAX_HTTP_REQUEST, PAIR_SECTION, SAFE_METHODS } from "../../browser/src/abi.gen.ts";
 import { Out, seenByServer } from "../../browser/src/http.ts";
 import { bare, decodeResponse, encodeRequest, type Header, HOST_HEADERS, NO_BODY, Server } from "./host.ts";
+import { MAX_UP, Room, type Socket, type StoreClient } from "./room.ts";
 
 /** A Workers Rate Limiting binding (`ratelimits` in the Wrangler configuration). */
 export interface RateLimit {
@@ -33,7 +34,9 @@ export interface Limit {
 
 /** What the Worker's configuration gives the host (server/cloudflare.json). */
 export interface Env {
-  WRELA_SERVER: { getByName(name: string): { request(bytes: Uint8Array): Promise<Uint8Array> } };
+  WRELA_SERVER: { getByName(name: string): { request(bytes: Uint8Array): Promise<Uint8Array> } & StoreClient };
+  /** The rooms' objects, one a room (`rooms`). */
+  WRELA_ROOM?: { getByName(name: string): { fetch(request: Request): Promise<Response> } };
   /** The page origins whose requests may change something, comma-separated. */
   WRELA_ORIGINS?: string;
   /** The rate limits, as JSON: a list of `Limit`s. */
@@ -204,8 +207,102 @@ export function serverClass(module: WebAssembly.Module) {
       return this.server.request(bytes instanceof Uint8Array ? bytes : new Uint8Array(bytes));
     }
 
+    /** A room's read of the store (RPC from a room's object): answered from what's committed. */
+    async answer(service: string, body: Uint8Array): Promise<Uint8Array | null> {
+      return this.server.storeAnswer(service, new Uint8Array(body));
+    }
+
+    /** A room's call's writes, committed in one transaction (RPC from a room's object). */
+    async commit(batches: Uint8Array[]): Promise<void> {
+      this.server.store.commit(batches.map((b) => new Uint8Array(b)));
+    }
+
     async alarm(): Promise<void> {
       await this.server.alarm();
     }
   };
 }
+
+/** Whether `name` names a room: 1 to 64 of a-z, 0-9, `-` and `_` (`wrela_serve::room_name`). */
+export const roomName = (name: string) => /^[a-z0-9_-]{1,64}$/.test(name);
+
+/** A room's WebSocket: the response to `request` for `/room/<name>?pair=<16 hex digits>`, or null
+ * for a path that isn't a room's. Before the room's object is billed it refuses what isn't an
+ * upgrade (426), a room's name that isn't one (404), another program's pair (403), a page of
+ * another origin (403: a browser's Origin must be one of `WRELA_ORIGINS`; a client with none
+ * isn't a browser, and the room's protocol decides), and a client past its rate limits (429). Each
+ * build's rooms are its own (`<pair>:<name>`), as `wrela-serve` keeps each build's apart. */
+export async function rooms(request: Request, env: Env, pair: bigint | null): Promise<Response | null> {
+  const url = new URL(request.url);
+  if (!url.pathname.startsWith("/room/")) return null;
+  if (request.headers.get("upgrade")?.toLowerCase() !== "websocket") return refusal(426, { upgrade: "websocket" });
+  const name = url.pathname.slice("/room/".length);
+  if (!roomName(name)) return refusal(404);
+  const asked = url.searchParams.get("pair");
+  const hex = pair === null ? null : pair.toString(16).padStart(16, "0");
+  if (hex === null || asked !== hex) return refusal(403);
+  const origin = request.headers.get("origin");
+  const origins = (env.WRELA_ORIGINS ?? "").split(",").map((o) => o.trim()).filter((o) => o !== "");
+  if (origin !== null && !origins.includes(origin)) return refusal(403);
+  let limited: Limit | null;
+  try {
+    limited = await pastLimit(env, "GET", url.pathname, request.headers.get("cf-connecting-ip") ?? "unknown");
+  } catch (e) {
+    console.error(`wrela: ${(e as Error).message}`);
+    return refusal(503);
+  }
+  if (limited !== null) return refusal(429, { "retry-after": String(limited.period ?? 60) });
+  if (env.WRELA_ROOM === undefined) return refusal(404);
+  // Only the upgrade crosses: no address, and no header the room doesn't read.
+  return env.WRELA_ROOM.getByName(`${hex}:${name}`).fetch(new Request(url.href, { headers: { upgrade: "websocket" } }));
+}
+
+/** The pair id in a server build's module (`wrela.pair`), which its clients carry. */
+export function pairOf(module: WebAssembly.Module): bigint | null {
+  const [section] = WebAssembly.Module.customSections(module, PAIR_SECTION);
+  return section !== undefined && section.byteLength === 8 ? new DataView(section).getBigUint64(0, true) : null;
+}
+
+/** Makes the Durable Object class of a server build's rooms. */
+export function roomClass(module: WebAssembly.Module) {
+  return class WrelaRoom extends DurableObject<Env> {
+    readonly room: Room;
+
+    constructor(ctx: DurableObjectState, env: Env) {
+      super(ctx, env);
+      const server = env.WRELA_SERVER.getByName(SERVER_OBJECT);
+      this.room = new Room(module, ctx.storage, server, ctx.getWebSockets() as unknown as Socket[], {
+        log: (line) => console.error(line),
+        ...(env.WRELA_PRINT === "1" ? { print: (line: string) => console.log(line) } : {}),
+      });
+    }
+
+    /** A peer's upgrade, which `rooms` checked. */
+    async fetch(_request: Request): Promise<Response> {
+      const pair = new WebSocketPair();
+      const [client, server] = [pair[0], pair[1]];
+      this.ctx.acceptWebSocket(server);
+      this.room.connect(server as unknown as Socket);
+      return new Response(null, { status: 101, webSocket: client });
+    }
+
+    async webSocketMessage(ws: WebSocket, message: ArrayBuffer | string): Promise<void> {
+      this.room.message(ws as unknown as Socket, message);
+    }
+
+    async webSocketClose(ws: WebSocket): Promise<void> {
+      this.room.closed(ws as unknown as Socket);
+    }
+
+    async webSocketError(ws: WebSocket): Promise<void> {
+      this.room.closed(ws as unknown as Socket);
+    }
+
+    async alarm(): Promise<void> {
+      await this.room.alarm();
+    }
+  };
+}
+
+/** A peer's message is at most this many bytes (`wrela_serve::MAX_UP`). */
+export { MAX_UP };

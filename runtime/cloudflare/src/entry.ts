@@ -6,7 +6,11 @@
 //     export default { async fetch(request, env) { return (await api(request, env)) ?? env.ASSETS.fetch(request); } };
 
 import module from "./game.wasm";
-import { api, serverClass } from "./cloudflare.ts";
+import { api, pairOf, roomClass, rooms as roomsOf, serverClass } from "./cloudflare.ts";
 
 export const WrelaServer = serverClass(module);
+export const WrelaRoom = roomClass(module);
+const pair = pairOf(module);
+/** A room's WebSocket for `/room/<name>?pair=<id>`, or null for another path. */
+export const rooms = (request: Request, env: import("./cloudflare.ts").Env) => roomsOf(request, env, pair);
 export { api };

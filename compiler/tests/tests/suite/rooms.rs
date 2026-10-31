@@ -154,7 +154,7 @@ fn sent_to(out: &[Out], conn: u32) -> Vec<Down> {
 // ---- the server program ------------------------------------------------------------------------
 
 /// A room of tags. A multiple of 7 is refused; 13 traps the reducer, and 99 loops in it.
-const PROGRAM: &str = r#"
+pub(crate) const PROGRAM: &str = r#"
 use std::net::serve_room
 use std::net::{Entry, Reduce, Room, Verdict}
 use std::pack::Pack

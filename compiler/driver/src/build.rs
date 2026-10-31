@@ -27,13 +27,19 @@ pub const CLOUDFLARE_JSON: &str = "server/cloudflare.json";
 /// CPU limit, the origins to fill, and the API's path run before the assets.
 pub fn cloudflare_json() -> String {
     let config = serde_json::json!({
-        "comment": "The Wrangler members a server build's Cloudflare host needs (language.md §19.5): merge them into the Worker's configuration, fill WRELA_ORIGINS with the page origins (comma-separated) and WRELA_LIMITS with the rate limits (a JSON list of { binding, prefix, methods?, period? }, each naming a ratelimits binding), and import { WrelaServer, api } from ./cloudflare.js in the Worker's script.",
-        "durable_objects": { "bindings": [{ "name": "WRELA_SERVER", "class_name": "WrelaServer" }] },
-        "migrations": [{ "tag": "wrela-server-1", "new_sqlite_classes": ["WrelaServer"] }],
+        "comment": "The Wrangler members a server build's Cloudflare host needs (language.md §19.5): merge them into the Worker's configuration, fill WRELA_ORIGINS with the page origins (comma-separated) and WRELA_LIMITS with the rate limits (a JSON list of { binding, prefix, methods?, period? }, each naming a ratelimits binding), and import { WrelaServer, WrelaRoom, api, rooms } from ./cloudflare.js in the Worker's script (export both classes; its fetch tries `api`, then `rooms`).",
+        "durable_objects": { "bindings": [
+            { "name": "WRELA_SERVER", "class_name": "WrelaServer" },
+            { "name": "WRELA_ROOM", "class_name": "WrelaRoom" },
+        ] },
+        "migrations": [
+            { "tag": "wrela-server-1", "new_sqlite_classes": ["WrelaServer"] },
+            { "tag": "wrela-room-1", "new_sqlite_classes": ["WrelaRoom"] },
+        ],
         "rules": [{ "type": "CompiledWasm", "globs": ["**/*.wasm"], "fallthrough": true }],
         "limits": { "cpu_ms": 5000 },
         "vars": { "WRELA_ORIGINS": "", "WRELA_LIMITS": "[]" },
-        "assets": { "run_worker_first": ["/api/*"] },
+        "assets": { "run_worker_first": ["/api/*", "/room/*"] },
     });
     let mut out = serde_json::to_string_pretty(&config).expect("the configuration serializes");
     out.push('\n');

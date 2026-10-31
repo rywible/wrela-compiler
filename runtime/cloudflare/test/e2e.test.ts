@@ -84,7 +84,13 @@ beforeAll(async () => {
         return { success: counted_keys.filter((k) => k === key).length <= SIGN_INS };
       },
     },
-    WRELA_SERVER: { getByName: () => ({ request: (bytes) => object.current!.request(bytes) }) },
+    WRELA_SERVER: {
+      getByName: () => ({
+        request: (bytes: Uint8Array) => object.current!.request(bytes),
+        answer: async () => null,
+        commit: async () => {},
+      }),
+    },
   };
   object.current = new host.WrelaServer({ storage: storage(db, []) }, env);
 });
