@@ -78,8 +78,9 @@ export type At = { frame: number } | { tick: number };
 export const messageEvent = (conn: number, serial: number, length: number) =>
   encodeEvent(EventKind.Message, 0, conn, serial % 2 ** 32, Math.floor(serial / 2 ** 32), length);
 
-/** Connection `conn` opened, or closed. */
-export const connectionEvent = (conn: number, open: boolean) => encodeEvent(EventKind.Connection, 0, conn, open ? 1 : 0, 0, 0);
+/** Connection `conn` opened, or closed; `tag` is the peer a room tagged it with, when its host
+ * tells a room started again of it. */
+export const connectionEvent = (conn: number, open: boolean, tag = 0) => encodeEvent(EventKind.Connection, 0, conn, open ? 1 : 0, tag, 0);
 
 /** Whether an event (its bytes) is a network event: a message or a connection's. */
 export function isNetwork(event: Uint8Array): boolean {

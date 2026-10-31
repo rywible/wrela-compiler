@@ -11,7 +11,8 @@
 //     };
 
 import module from "./game.wasm";
-import { api, pairOf, roomClass, rooms as roomsOf, serverClass } from "./cloudflare.ts";
+import { pairOf } from "../../browser/src/net.ts";
+import { api, roomClass, rooms as roomsOf, serverClass } from "./cloudflare.ts";
 
 export const WrelaServer = serverClass(module);
 export const WrelaRoom = roomClass(module);

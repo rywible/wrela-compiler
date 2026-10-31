@@ -1,9 +1,6 @@
 // src/entry.ts
 import module from "./game.wasm";
 
-// src/cloudflare.ts
-import { DurableObject } from "cloudflare:workers";
-
 // ../browser/src/abi.gen.ts
 var STREAM_VERSION = 13;
 var STREAM_MAGIC = 1396920919;
@@ -131,6 +128,198 @@ var OWN_HEADER_PREFIX = "x-wrela-";
 var SERVER_SEES = ["accept", "accept-language", "content-type", "cookie", "if-none-match", "origin", "sec-fetch-dest", "sec-fetch-mode", "sec-fetch-site", "sec-fetch-user"];
 var SERVER_SETS = ["cache-control", "content-disposition", "content-type", "etag", "last-modified", "location", "retry-after", "set-cookie", "vary", "www-authenticate"];
 
+// ../browser/src/input.ts
+function encodeEvent(kind, modifiers, a, b, c, d) {
+  const out = new Uint8Array(EVENT_SIZE);
+  const view = new DataView(out.buffer);
+  [kind, modifiers, a, b, c, d].forEach((w, i) => view.setUint32(4 * i, w >>> 0, true));
+  return out;
+}
+var F32 = new Float32Array(1);
+var U32 = new Uint32Array(F32.buffer);
+var KEY_CODES = new Map(KEYS.map((k, i) => [k, i]));
+var messageEvent = (conn, serial, length) => encodeEvent(EventKind.Message, 0, conn, serial % 2 ** 32, Math.floor(serial / 2 ** 32), length);
+var connectionEvent = (conn, open, tag = 0) => encodeEvent(EventKind.Connection, 0, conn, open ? 1 : 0, tag, 0);
+function isNetwork(event) {
+  const kind = new DataView(event.buffer, event.byteOffset, 4).getUint32(0, true);
+  return kind === EventKind.Message || kind === EventKind.Connection;
+}
+var NO_EVENTS = Object.freeze({
+  events: new Uint8Array(0),
+  times: Object.freeze([])
+});
+
+class InputRing {
+  buffer;
+  static CAPACITY = 1024;
+  static SLOT = EVENT_SIZE + 8;
+  static HEADER = 16;
+  #counts;
+  #bytes;
+  #view;
+  constructor(buffer) {
+    this.buffer = buffer;
+    this.#counts = new Int32Array(buffer, 0, 4);
+    this.#bytes = new Uint8Array(buffer, InputRing.HEADER);
+    this.#view = new DataView(buffer, InputRing.HEADER);
+  }
+  static create() {
+    return new InputRing(new SharedArrayBuffer(InputRing.HEADER + InputRing.CAPACITY * InputRing.SLOT));
+  }
+  write(event, time) {
+    return this.writeAll([event], time);
+  }
+  writeAll(events, time) {
+    const written = Atomics.load(this.#counts, 0) >>> 0;
+    const slowest = (Atomics.load(this.#counts, 3) !== 0 ? Atomics.load(this.#counts, 2) : Atomics.load(this.#counts, 1)) >>> 0;
+    if ((written - slowest >>> 0) + events.length > InputRing.CAPACITY)
+      return false;
+    events.forEach((event, i) => {
+      const at = this.#slot(written + i);
+      this.#bytes.set(event, at);
+      this.#view.setFloat64(at + EVENT_SIZE, time, true);
+    });
+    Atomics.store(this.#counts, 0, written + events.length);
+    return true;
+  }
+  attachTicker() {
+    Atomics.store(this.#counts, 2, Atomics.load(this.#counts, 0));
+    Atomics.store(this.#counts, 3, 1);
+  }
+  detachTicker() {
+    Atomics.store(this.#counts, 3, 0);
+  }
+  read() {
+    const written = Atomics.load(this.#counts, 0) >>> 0;
+    let read = Atomics.load(this.#counts, 1) >>> 0;
+    const room = InputRing.CAPACITY - (Atomics.load(this.#counts, 3) !== 0 ? 64 : 0);
+    if (written - read >>> 0 > room)
+      read = written - room >>> 0;
+    const n = written - read >>> 0;
+    if (n === 0)
+      return NO_EVENTS;
+    const events = new Uint8Array(n * EVENT_SIZE);
+    this.#copy(read, n, events, 0);
+    const times = Array.from({ length: n }, (_, i) => this.#view.getFloat64(this.#slot(read + i) + EVENT_SIZE, true));
+    Atomics.store(this.#counts, 1, read + n);
+    return { events, times };
+  }
+  readTicker(out, at, cap, upto = Infinity) {
+    const read = Atomics.load(this.#counts, 2) >>> 0;
+    let n = Math.min((Atomics.load(this.#counts, 0) >>> 0) - read >>> 0, cap);
+    for (let i = 0;upto !== Infinity && i < n; i++) {
+      if (this.#view.getFloat64(this.#slot(read + i) + EVENT_SIZE, true) > upto) {
+        n = i;
+        break;
+      }
+    }
+    this.#copy(read, n, out, at);
+    Atomics.store(this.#counts, 2, read + n);
+    return n;
+  }
+  #slot(i) {
+    return i % InputRing.CAPACITY * InputRing.SLOT;
+  }
+  #copy(from, n, out, at) {
+    for (let i = 0;i < n; i++) {
+      const slot = this.#slot(from + i);
+      out.set(this.#bytes.subarray(slot, slot + EVENT_SIZE), at + i * EVENT_SIZE);
+    }
+  }
+}
+
+// ../browser/src/net.ts
+var MAX_FRAME = 64 * 1024;
+var MAX_UP = MAX_FRAME - 64;
+var OVERHEAD = 64;
+var HELD = 16 << 20;
+var PENDING = 1 << 20;
+
+class Inbox {
+  #events = [];
+  #payloads = new Map;
+  #delivered = new Set;
+  #given = 0;
+  #serial = 0;
+  #held = 0;
+  #pair = undefined;
+  push(event) {
+    this.#events.push(event);
+  }
+  pushMessage(conn, bytes) {
+    const serial = ++this.#serial;
+    this.#events.push(messageEvent(conn, serial, bytes.length));
+    this.#payloads.set(serial, bytes);
+    this.#held += bytes.length + OVERHEAD;
+    return serial;
+  }
+  get held() {
+    return this.#held;
+  }
+  get length() {
+    return this.#events.length;
+  }
+  get events() {
+    return this.#events;
+  }
+  take(cap) {
+    let n = 0;
+    for (;n < cap && n < this.#events.length; n++) {
+      const view = new DataView(this.#events[n].buffer, this.#events[n].byteOffset, EVENT_SIZE);
+      if (view.getUint32(0, true) !== EventKind.Message)
+        continue;
+      const length = view.getUint32(20, true);
+      if (!withinCall(this.#given, length))
+        break;
+      this.#given += length;
+      this.#delivered.add(view.getUint32(12, true) + view.getUint32(16, true) * 2 ** 32);
+    }
+    return this.#events.splice(0, n);
+  }
+  payload(serial) {
+    return this.#delivered.has(serial) ? this.#payloads.get(serial) : undefined;
+  }
+  endCall() {
+    for (const s of this.#delivered)
+      this.#drop(s);
+    this.#delivered.clear();
+    this.#given = 0;
+  }
+  #drop(serial) {
+    const bytes = this.#payloads.get(serial);
+    if (bytes === undefined)
+      return;
+    this.#held -= bytes.length + OVERHEAD;
+    this.#payloads.delete(serial);
+  }
+  forBuild(pair) {
+    const changed = this.#pair !== undefined && this.#pair !== pair;
+    if (changed) {
+      for (let i = this.#events.length - 1;i >= 0; i--)
+        if (isNetwork(this.#events[i]))
+          this.#events.splice(i, 1);
+      this.#delivered.clear();
+      this.#given = 0;
+      this.#payloads.clear();
+      this.#held = 0;
+    }
+    this.#pair = pair;
+    return changed;
+  }
+}
+var withinCall = (given, length) => given === 0 || given + length <= PAYLOAD_PER_CALL;
+var roomName = (name) => /^[a-z0-9_-]{1,64}$/.test(name);
+var pairParam = (pair) => pair.toString(16).padStart(16, "0");
+function pairOf(module) {
+  const [section] = WebAssembly.Module.customSections(module, PAIR_SECTION);
+  if (section === undefined || section.byteLength !== 8)
+    return null;
+  return new DataView(section).getBigUint64(0, true);
+}
+
+// src/cloudflare.ts
+import { DurableObject } from "cloudflare:workers";
+
 // ../browser/src/http.ts
 var UTF8 = new TextDecoder("utf-8", { fatal: true });
 var ENCODER = new TextEncoder;
@@ -244,186 +433,6 @@ function decodeResponse(bytes) {
 var listed = (list, name) => name.startsWith(OWN_HEADER_PREFIX) || list.includes(name);
 var seenByServer = (name) => listed(SERVER_SEES, name);
 var setByServer = (name) => listed(SERVER_SETS, name);
-
-// ../browser/src/input.ts
-function encodeEvent(kind, modifiers, a, b, c, d) {
-  const out = new Uint8Array(EVENT_SIZE);
-  const view = new DataView(out.buffer);
-  [kind, modifiers, a, b, c, d].forEach((w, i) => view.setUint32(4 * i, w >>> 0, true));
-  return out;
-}
-var F32 = new Float32Array(1);
-var U32 = new Uint32Array(F32.buffer);
-var KEY_CODES = new Map(KEYS.map((k, i) => [k, i]));
-var messageEvent = (conn, serial, length) => encodeEvent(EventKind.Message, 0, conn, serial % 2 ** 32, Math.floor(serial / 2 ** 32), length);
-var connectionEvent = (conn, open) => encodeEvent(EventKind.Connection, 0, conn, open ? 1 : 0, 0, 0);
-function isNetwork(event) {
-  const kind = new DataView(event.buffer, event.byteOffset, 4).getUint32(0, true);
-  return kind === EventKind.Message || kind === EventKind.Connection;
-}
-var NO_EVENTS = Object.freeze({
-  events: new Uint8Array(0),
-  times: Object.freeze([])
-});
-
-class InputRing {
-  buffer;
-  static CAPACITY = 1024;
-  static SLOT = EVENT_SIZE + 8;
-  static HEADER = 16;
-  #counts;
-  #bytes;
-  #view;
-  constructor(buffer) {
-    this.buffer = buffer;
-    this.#counts = new Int32Array(buffer, 0, 4);
-    this.#bytes = new Uint8Array(buffer, InputRing.HEADER);
-    this.#view = new DataView(buffer, InputRing.HEADER);
-  }
-  static create() {
-    return new InputRing(new SharedArrayBuffer(InputRing.HEADER + InputRing.CAPACITY * InputRing.SLOT));
-  }
-  write(event, time) {
-    return this.writeAll([event], time);
-  }
-  writeAll(events, time) {
-    const written = Atomics.load(this.#counts, 0) >>> 0;
-    const slowest = (Atomics.load(this.#counts, 3) !== 0 ? Atomics.load(this.#counts, 2) : Atomics.load(this.#counts, 1)) >>> 0;
-    if ((written - slowest >>> 0) + events.length > InputRing.CAPACITY)
-      return false;
-    events.forEach((event, i) => {
-      const at = this.#slot(written + i);
-      this.#bytes.set(event, at);
-      this.#view.setFloat64(at + EVENT_SIZE, time, true);
-    });
-    Atomics.store(this.#counts, 0, written + events.length);
-    return true;
-  }
-  attachTicker() {
-    Atomics.store(this.#counts, 2, Atomics.load(this.#counts, 0));
-    Atomics.store(this.#counts, 3, 1);
-  }
-  detachTicker() {
-    Atomics.store(this.#counts, 3, 0);
-  }
-  read() {
-    const written = Atomics.load(this.#counts, 0) >>> 0;
-    let read = Atomics.load(this.#counts, 1) >>> 0;
-    const room = InputRing.CAPACITY - (Atomics.load(this.#counts, 3) !== 0 ? 64 : 0);
-    if (written - read >>> 0 > room)
-      read = written - room >>> 0;
-    const n = written - read >>> 0;
-    if (n === 0)
-      return NO_EVENTS;
-    const events = new Uint8Array(n * EVENT_SIZE);
-    this.#copy(read, n, events, 0);
-    const times = Array.from({ length: n }, (_, i) => this.#view.getFloat64(this.#slot(read + i) + EVENT_SIZE, true));
-    Atomics.store(this.#counts, 1, read + n);
-    return { events, times };
-  }
-  readTicker(out, at, cap, upto = Infinity) {
-    const read = Atomics.load(this.#counts, 2) >>> 0;
-    let n = Math.min((Atomics.load(this.#counts, 0) >>> 0) - read >>> 0, cap);
-    for (let i = 0;upto !== Infinity && i < n; i++) {
-      if (this.#view.getFloat64(this.#slot(read + i) + EVENT_SIZE, true) > upto) {
-        n = i;
-        break;
-      }
-    }
-    this.#copy(read, n, out, at);
-    Atomics.store(this.#counts, 2, read + n);
-    return n;
-  }
-  #slot(i) {
-    return i % InputRing.CAPACITY * InputRing.SLOT;
-  }
-  #copy(from, n, out, at) {
-    for (let i = 0;i < n; i++) {
-      const slot = this.#slot(from + i);
-      out.set(this.#bytes.subarray(slot, slot + EVENT_SIZE), at + i * EVENT_SIZE);
-    }
-  }
-}
-
-// ../browser/src/net.ts
-var MAX_FRAME = 64 * 1024;
-var MAX_UP = MAX_FRAME - 64;
-var OVERHEAD = 64;
-var HELD = 16 << 20;
-var PENDING = 1 << 20;
-
-class Inbox {
-  #events = [];
-  #payloads = new Map;
-  #delivered = [];
-  #serial = 0;
-  #held = 0;
-  #pair = undefined;
-  push(event) {
-    this.#events.push(event);
-  }
-  pushMessage(conn, bytes) {
-    const serial = ++this.#serial;
-    this.#events.push(messageEvent(conn, serial, bytes.length));
-    this.#payloads.set(serial, bytes);
-    this.#held += bytes.length + OVERHEAD;
-    return serial;
-  }
-  get held() {
-    return this.#held;
-  }
-  get length() {
-    return this.#events.length;
-  }
-  get events() {
-    return this.#events;
-  }
-  take(cap) {
-    let given = 0;
-    for (const s of this.#delivered)
-      given += this.#payloads.get(s)?.length ?? 0;
-    let n = 0;
-    for (;n < cap && n < this.#events.length; n++) {
-      const view = new DataView(this.#events[n].buffer, this.#events[n].byteOffset, EVENT_SIZE);
-      if (view.getUint32(0, true) !== EventKind.Message)
-        continue;
-      const length = view.getUint32(20, true);
-      if (given > 0 && given + length > PAYLOAD_PER_CALL)
-        break;
-      given += length;
-      this.#delivered.push(view.getUint32(12, true) + view.getUint32(16, true) * 2 ** 32);
-    }
-    return this.#events.splice(0, n);
-  }
-  payload(serial) {
-    return this.#delivered.includes(serial) ? this.#payloads.get(serial) : undefined;
-  }
-  endCall() {
-    for (const s of this.#delivered)
-      this.#drop(s);
-    this.#delivered = [];
-  }
-  #drop(serial) {
-    const bytes = this.#payloads.get(serial);
-    if (bytes === undefined)
-      return;
-    this.#held -= bytes.length + OVERHEAD;
-    this.#payloads.delete(serial);
-  }
-  forBuild(pair) {
-    const changed = this.#pair !== undefined && this.#pair !== pair;
-    if (changed) {
-      for (let i = this.#events.length - 1;i >= 0; i--)
-        if (isNetwork(this.#events[i]))
-          this.#events.splice(i, 1);
-      this.#delivered = [];
-      this.#payloads.clear();
-      this.#held = 0;
-    }
-    this.#pair = pair;
-    return changed;
-  }
-}
 
 // ../browser/src/imports.ts
 function takePanicMessage(memory, thread) {
@@ -875,6 +884,9 @@ class Failure extends Error {
     super(why);
     this.program = program;
   }
+  static of(e, program = false) {
+    return e instanceof Failure ? e : new Failure(program, e instanceof Error ? e.message : String(e));
+  }
 }
 var NO_BODY = [204, 205, 304];
 var HEADER_NAME = /^[a-z0-9!#$%&'*+.^_`|~-]+$/;
@@ -914,6 +926,13 @@ class Store {
   constructor(storage) {
     this.storage = storage;
     storage.sql.exec("CREATE TABLE IF NOT EXISTS kv (key BLOB PRIMARY KEY, value BLOB NOT NULL) WITHOUT ROWID");
+  }
+  answer(service, body) {
+    if (service === "store/get")
+      return answerOf(() => this.get(body));
+    if (service === "store/scan")
+      return answerOf(() => this.scan(body));
+    return null;
   }
   get(body) {
     if (body.length > MAX_KEY)
@@ -964,24 +983,28 @@ class Store {
 }
 function writes(batches) {
   const ops = [];
-  for (const b of batches) {
-    const r = new In(b);
-    while (r.left() > 0) {
-      const kind = r.byte();
-      const k = r.chunk();
-      if (k.length > MAX_KEY)
-        throw new Failure(true, `a key is longer than ${MAX_KEY} bytes`);
-      if (kind === 1) {
-        const v = r.chunk();
-        if (v.length > MAX_VALUE)
-          throw new Failure(true, `a value is longer than ${MAX_VALUE} bytes`);
-        ops.push([k, v]);
-      } else if (kind === 2) {
-        ops.push([k, null]);
-      } else {
-        throw new Failure(true, `a store write of kind ${kind}`);
+  try {
+    for (const b of batches) {
+      const r = new In(b);
+      while (r.left() > 0) {
+        const kind = r.byte();
+        const k = r.chunk();
+        if (k.length > MAX_KEY)
+          throw new Error(`a key is longer than ${MAX_KEY} bytes`);
+        if (kind === 1) {
+          const v = r.chunk();
+          if (v.length > MAX_VALUE)
+            throw new Error(`a value is longer than ${MAX_VALUE} bytes`);
+          ops.push([k, v]);
+        } else if (kind === 2) {
+          ops.push([k, null]);
+        } else {
+          throw new Error(`a store write of kind ${kind}`);
+        }
       }
     }
+  } catch (e) {
+    throw Failure.of(e, true);
   }
   return ops;
 }
@@ -1194,7 +1217,7 @@ function commonAnswer(service, body, now) {
     case SERVICE_TIME:
       return body.length === 0 ? new Out().u64(BigInt(Math.floor(now))).bytes() : null;
     default:
-      return;
+      return null;
   }
 }
 function imports_(owner, me) {
@@ -1289,13 +1312,6 @@ class Server {
   get print() {
     return this.options.print;
   }
-  storeAnswer(service, body) {
-    if (service === "store/get")
-      return answerOf(() => this.store.get(body));
-    if (service === "store/scan")
-      return answerOf(() => this.store.scan(body));
-    return null;
-  }
   clock() {
     this.lastClock = Math.max(this.lastClock, (this.now() - this.started) / 1000);
     return this.lastClock;
@@ -1378,7 +1394,6 @@ class Server {
       try {
         const i = await Instance.start(this, this.module);
         this.carryOut(i.commands);
-        i.commands = [];
         this.instance = i;
         return i;
       } finally {
@@ -1408,7 +1423,7 @@ class Server {
     }
   }
   fail(e, started = true) {
-    const f = e instanceof Failure ? e : new Failure(false, String(e?.message ?? e));
+    const f = Failure.of(e);
     this.options.log?.(`wrela: the server's call failed: ${f.program ? "the program's: " : "the host's limits: "}${f.message}`);
     const unread = new Set;
     if (started) {
@@ -1435,11 +1450,9 @@ class Server {
     }
   }
   submit(self, id, service, body) {
-    const command = (c, bytes) => self.command(c, bytes);
-    const answer = (a) => self.answer(id, a);
     switch (service) {
       case "store/write":
-        return command({ kind: "write", body }, body.length);
+        return self.command({ kind: "write", body }, body.length);
       case SERVICE_RESPOND: {
         if (body.length < 4)
           self.refuse("`http/respond` needs a connection's number");
@@ -1455,7 +1468,7 @@ class Server {
           self.refuse(`\`http/respond\`: ${e.message}`);
         }
         this.responding.add(conn);
-        return command({ kind: "respond", conn, response }, body.length);
+        return self.command({ kind: "respond", conn, response }, body.length);
       }
       case "net/send":
       case "net/close":
@@ -1464,25 +1477,21 @@ class Server {
       case "net/compact":
         return self.refuse(`\`${service}\`: an HTTP server's connections take one response (\`std::http::respond\`)`);
       case "store/get":
-        return answer(answerOf(() => this.store.get(body)));
       case "store/scan":
-        return answer(answerOf(() => this.store.scan(body)));
+        return self.answer(id, this.store.answer(service, body));
       default:
-        return answer(commonAnswer(service, body, this.now()) ?? null);
+        return self.answer(id, commonAnswer(service, body, this.now()));
     }
   }
 }
 
 // src/room.ts
 var JOURNAL = 0;
-var POISONED2 = 2 ** 31;
 var RETRIES = 3;
-var MAX_FRAME2 = 64 * 1024;
-var MAX_UP2 = MAX_FRAME2 - 64;
 var CONN_IN = 1 << 20;
 var RETRY_MS = 250;
 var UNREAD = "`serve` returned without reading all its events";
-var connection = (conn, open, tag) => encodeEvent(EventKind.Connection, 0, conn, open ? 1 : 0, tag, 0);
+var attached = (socket) => socket.deserializeAttachment();
 var word = (b, at) => new DataView(b.buffer, b.byteOffset).getUint32(at, true);
 
 class Room {
@@ -1496,8 +1505,10 @@ class Room {
   instance = null;
   sockets = new Map;
   incoming = [];
+  waiting = new Map;
   failures = 0;
   quarantined;
+  lastConn;
   origin;
   lastClock = 0;
   running = Promise.resolve();
@@ -1513,17 +1524,19 @@ class Room {
     const sql = storage.sql;
     sql.exec("CREATE TABLE IF NOT EXISTS journal (seq INTEGER PRIMARY KEY AUTOINCREMENT, record BLOB NOT NULL)");
     sql.exec("CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value)");
-    const meta = (key) => sql.exec("SELECT value FROM meta WHERE key = ?", key).toArray()[0]?.["value"];
-    const origin = meta("origin");
+    const meta = new Map(sql.exec("SELECT key, value FROM meta").toArray().map((r) => [r["key"], r["value"]]));
+    const origin = meta.get("origin");
     this.origin = typeof origin === "number" ? origin : this.now();
     if (origin === undefined)
       sql.exec("INSERT INTO meta (key, value) VALUES ('origin', ?)", this.origin);
-    const q = meta("quarantined");
+    const q = meta.get("quarantined");
     this.quarantined = typeof q === "string" ? q : null;
+    const last = meta.get("conn");
+    this.lastConn = typeof last === "number" ? last : JOURNAL;
     for (const socket of open) {
-      const a = socket.deserializeAttachment();
-      if (a !== null && typeof a?.conn === "number")
-        this.sockets.set(a.conn, { socket, tag: a.tag });
+      const a = attached(socket);
+      if (typeof a?.conn === "number")
+        this.sockets.set(a.conn, socket);
     }
   }
   clock() {
@@ -1531,12 +1544,9 @@ class Room {
     return this.lastClock;
   }
   nextConn() {
-    const sql = this.storage.sql;
-    const row = sql.exec("SELECT value FROM meta WHERE key = 'conn'").toArray()[0];
-    const last = typeof row?.["value"] === "number" ? row["value"] : JOURNAL;
-    const conn = last + 1 >= POISONED2 ? 1 : last + 1;
-    sql.exec("INSERT OR REPLACE INTO meta (key, value) VALUES ('conn', ?)", conn);
-    return conn;
+    this.lastConn = this.lastConn + 1 >= POISONED ? 1 : this.lastConn + 1;
+    this.storage.sql.exec("INSERT OR REPLACE INTO meta (key, value) VALUES ('conn', ?)", this.lastConn);
+    return this.lastConn;
   }
   connect(socket) {
     if (this.quarantined !== null) {
@@ -1545,7 +1555,8 @@ class Room {
     }
     const conn = this.nextConn();
     socket.serializeAttachment({ conn, tag: 0 });
-    this.sockets.set(conn, { socket, tag: 0 });
+    this.sockets.set(conn, socket);
+    this.waiting.set(conn, 0);
     this.incoming.push({ kind: "opened", conn });
     this.wake();
   }
@@ -1555,14 +1566,12 @@ class Room {
       return;
     if (typeof data === "string")
       return this.cut(conn, 1003, "a room takes binary messages");
-    if (data.byteLength > MAX_UP2)
-      return this.cut(conn, 1009, `a message past ${MAX_UP2} bytes`);
-    let waiting = data.byteLength;
-    for (const e of this.incoming)
-      if (e.kind === "message" && e.conn === conn)
-        waiting += e.bytes.length;
+    if (data.byteLength > MAX_UP)
+      return this.cut(conn, 1009, `a message past ${MAX_UP} bytes`);
+    const waiting = (this.waiting.get(conn) ?? 0) + data.byteLength;
     if (waiting > CONN_IN)
       return this.cut(conn, 1008, `more than ${CONN_IN} bytes wait for the room`);
+    this.waiting.set(conn, waiting);
     this.incoming.push({ kind: "message", conn, bytes: new Uint8Array(data) });
     this.wake();
   }
@@ -1582,37 +1591,42 @@ class Room {
     return this.running;
   }
   connOf(socket) {
-    for (const [conn, s] of this.sockets)
-      if (s.socket === socket)
-        return conn;
-    return null;
+    const conn = attached(socket)?.conn;
+    return conn !== undefined && this.sockets.get(conn) === socket ? conn : null;
   }
   disconnect(conn) {
     if (!this.sockets.delete(conn))
       return;
+    this.waiting.delete(conn);
     this.incoming.push({ kind: "closed", conn });
     this.wake();
   }
   cut(conn, code, why) {
-    this.sockets.get(conn)?.socket.close(code, why);
+    this.sockets.get(conn)?.close(code, why);
     this.disconnect(conn);
   }
   closeAll(code, why) {
     this.incoming = [];
-    for (const { socket } of this.sockets.values())
+    this.waiting.clear();
+    for (const socket of this.sockets.values())
       socket.close(code, why);
     this.sockets.clear();
   }
+  requeue(events) {
+    for (const e of events) {
+      const w = e.kind === "message" ? this.waiting.get(e.conn) : undefined;
+      if (w !== undefined && e.kind === "message")
+        this.waiting.set(e.conn, w + e.bytes.length);
+    }
+    this.incoming.unshift(...events);
+  }
   quarantine(why) {
-    this.instance = null;
     this.quarantined = why;
     this.storage.sql.exec("INSERT OR REPLACE INTO meta (key, value) VALUES ('quarantined', ?)", why);
     this.options.log?.(`wrela: the room is quarantined: ${why}`);
     this.closeAll(1011, "the room is closed");
   }
   failAtLimits(f) {
-    this.instance = null;
-    this.queue = new Inbox;
     this.failures++;
     this.options.log?.(`wrela: a room's call failed at the host's limits: ${f.message}`);
     if (this.failures >= RETRIES) {
@@ -1622,22 +1636,27 @@ class Room {
       this.storage.setAlarm(this.now() + RETRY_MS);
     }
   }
+  async restart() {
+    try {
+      await this.start();
+      return null;
+    } catch (e) {
+      return Failure.of(e);
+    }
+  }
   async wakeNow() {
     if (this.quarantined !== null)
       return;
     for (;; ) {
       if (this.instance === null) {
-        try {
-          await this.start();
-        } catch (e) {
-          const f = e instanceof Failure ? e : new Failure(false, String(e));
+        const f = await this.restart();
+        if (f !== null) {
           if (this.quarantined === null)
             this.failAtLimits(f);
           return;
         }
       }
-      const instance = this.instance;
-      if (this.incoming.length === 0 && instance.arriving.length === 0)
+      if (this.incoming.length === 0 && this.instance.arriving.length === 0)
         return;
       const batch = this.nextBatch();
       const r = await this.call(batch);
@@ -1646,7 +1665,7 @@ class Room {
       if ("journal" in r)
         return;
       if (batch.length === 1 && !r.room.program) {
-        this.incoming.unshift(...batch);
+        this.requeue(batch);
         this.failAtLimits(r.room);
         return;
       }
@@ -1661,9 +1680,12 @@ class Room {
       const e = this.incoming[n];
       if (e.kind !== "message")
         continue;
-      if (given > 0 && given + e.bytes.length > 1 << 20)
+      if (!withinCall(given, e.bytes.length))
         break;
       given += e.bytes.length;
+      const w = this.waiting.get(e.conn);
+      if (w !== undefined)
+        this.waiting.set(e.conn, w - e.bytes.length);
     }
     return this.incoming.splice(0, n);
   }
@@ -1676,6 +1698,7 @@ class Room {
     const fresh = records.length === 0;
     for (const r of records)
       this.queue.pushMessage(JOURNAL, r);
+    let compacted = null;
     while (this.queue.length > 0) {
       const before = this.queue.length;
       try {
@@ -1683,29 +1706,30 @@ class Room {
         if (this.queue.length >= before)
           throw new Failure(true, UNREAD);
       } catch (e) {
-        const f = e instanceof Failure ? e : new Failure(false, String(e));
+        const f = e;
         if (f.program)
           this.quarantine(`its journal traps it: ${f.message}`);
         throw f;
       }
-      for (const c of instance.commands) {
-        if (c.kind !== "compact")
-          continue;
-        const unread = records.slice(records.length - this.queue.length);
-        this.storage.transactionSync(() => {
-          sql.exec("DELETE FROM journal");
-          for (const r of [c.bytes, ...unread])
-            sql.exec("INSERT INTO journal (record) VALUES (?)", blob(r));
-        });
-      }
+      for (const c of instance.commands)
+        if (c.kind === "compact")
+          compacted = { snapshot: c.bytes, unread: this.queue.length };
+    }
+    if (compacted !== null) {
+      const { snapshot, unread } = compacted;
+      this.storage.transactionSync(() => {
+        sql.exec("DELETE FROM journal");
+        for (const r of [snapshot, ...records.slice(records.length - unread)])
+          sql.exec("INSERT INTO journal (record) VALUES (?)", blob(r));
+      });
     }
     if (fresh && instance.commands.length > 0) {
       const r = await this.carryOut(instance.commands);
       if (r !== null)
         throw "room" in r ? r.room : r.journal;
     }
-    for (const [conn, { tag }] of this.sockets)
-      this.queue.push(connection(conn, true, tag));
+    for (const [conn, socket] of this.sockets)
+      this.queue.push(connectionEvent(conn, true, attached(socket)?.tag ?? 0));
     this.instance = instance;
   }
   async call(batch) {
@@ -1715,32 +1739,30 @@ class Room {
       if (e.kind === "message")
         this.queue.pushMessage(e.conn, e.bytes);
       else
-        this.queue.push(connection(e.conn, e.kind === "opened", 0));
+        this.queue.push(connectionEvent(e.conn, e.kind === "opened"));
     }
+    let r;
     try {
       instance.call(() => instance.serve(Math.fround(this.clock())));
       if (this.queue.length > 0)
         throw new Failure(true, UNREAD);
+      r = await this.carryOut(instance.commands);
     } catch (e) {
-      this.instance = null;
-      this.queue = new Inbox;
-      return { room: e instanceof Failure ? e : new Failure(false, String(e)) };
+      r = { room: e };
     }
-    const r = await this.carryOut(instance.commands);
     if (r === null)
       this.failures = 0;
+    else
+      this.instance = null;
     return r;
   }
   async oneByOne(batch) {
     for (let i = 0;i < batch.length; i++) {
-      const e = batch[i];
-      const r = await this.alone(e);
+      const r = await this.alone(batch[i]);
       if (r === null)
         continue;
-      if ("journal" in r)
-        return false;
-      if (this.quarantined === null) {
-        this.incoming.unshift(...batch.slice(i));
+      if ("room" in r && this.quarantined === null) {
+        this.requeue(batch.slice(i));
         this.failAtLimits(r.room);
       }
       return false;
@@ -1748,28 +1770,20 @@ class Room {
     return true;
   }
   async alone(e) {
-    const fresh = async () => {
-      try {
-        await this.start();
-        return null;
-      } catch (f) {
-        return { room: f instanceof Failure ? f : new Failure(false, String(f)) };
-      }
-    };
     if (this.instance === null) {
-      const s = await fresh();
-      if (s !== null)
-        return s;
+      const f = await this.restart();
+      if (f !== null)
+        return { room: f };
     }
     const r = await this.call([e]);
     if (r === null || "journal" in r || !r.room.program)
       return r;
     if (e.kind !== "message")
       return null;
-    const s = await fresh();
-    if (s !== null)
-      return s;
-    const poisoned = await this.call([{ kind: "message", conn: e.conn + POISONED2, bytes: e.bytes }]);
+    const f = await this.restart();
+    if (f !== null)
+      return { room: f };
+    const poisoned = await this.call([{ kind: "message", conn: e.conn + POISONED, bytes: e.bytes }]);
     if (poisoned !== null && "room" in poisoned && poisoned.room.program) {
       this.quarantine(`a poisoned message traps it: ${poisoned.room.message}`);
     }
@@ -1780,15 +1794,18 @@ class Room {
     try {
       writes(batches);
     } catch (e) {
-      this.instance = null;
-      return { room: e instanceof Failure ? e : new Failure(true, String(e)) };
+      return { room: e };
     }
+    let from = 0;
+    for (let i = 0;i < commands.length; i++)
+      if (commands[i].kind === "compact")
+        from = i;
     const sql = this.storage.sql;
     try {
       if (batches.length > 0)
         await this.store.commit(batches);
       this.storage.transactionSync(() => {
-        for (const c of commands) {
+        for (const c of commands.slice(from)) {
           if (c.kind === "keep")
             sql.exec("INSERT INTO journal (record) VALUES (?)", blob(c.bytes));
           if (c.kind === "compact") {
@@ -1798,22 +1815,23 @@ class Room {
         }
       });
     } catch (e) {
-      const f = new Failure(false, `the journal: ${e?.message ?? e}`);
-      this.instance = null;
+      const f = new Failure(false, `the journal: ${Failure.of(e).message}`);
       this.options.log?.(`wrela: a room's records weren't kept: ${f.message}`);
       this.closeAll(1011, "the room's records weren't kept");
       return { journal: f };
     }
     for (const c of commands) {
       const s = "conn" in c ? this.sockets.get(c.conn) : undefined;
-      if (c.kind === "tag" && s !== undefined) {
-        s.tag = c.tag;
-        s.socket.serializeAttachment({ conn: c.conn, tag: c.tag });
-      } else if (c.kind === "send") {
-        s?.socket.send(c.bytes);
-      } else if (c.kind === "close" && s !== undefined) {
-        s.socket.close(1000, "");
+      if (s === undefined)
+        continue;
+      if (c.kind === "tag")
+        s.serializeAttachment({ conn: c.conn, tag: c.tag });
+      else if (c.kind === "send")
+        s.send(c.bytes);
+      else if (c.kind === "close") {
+        s.close(1000, "");
         this.sockets.delete(c.conn);
+        this.waiting.delete(c.conn);
       }
     }
     return null;
@@ -1833,8 +1851,8 @@ class Room {
         return self.command({ kind: "write", body }, body.length);
       case "net/send": {
         const bytes = body.subarray(4);
-        if (bytes.length > MAX_FRAME2)
-          self.refuse(`a message past ${MAX_FRAME2} bytes`);
+        if (bytes.length > MAX_FRAME)
+          self.refuse(`a message past ${MAX_FRAME} bytes`);
         return self.command({ kind: "send", conn: conn(), bytes }, body.length);
       }
       case "net/close":
@@ -1849,7 +1867,7 @@ class Room {
       case "store/scan":
         return self.answer(id, this.store.answer(service, body).catch(() => null));
       default:
-        return self.answer(id, commonAnswer(service, body, this.now()) ?? null);
+        return self.answer(id, commonAnswer(service, body, this.now()));
     }
   }
 }
@@ -1896,6 +1914,23 @@ function limits(env) {
   limitsRead = { text, list };
   return limitsRead.list;
 }
+var originsRead = null;
+function origins(env) {
+  const text = env.WRELA_ORIGINS ?? "";
+  if (originsRead?.text !== text)
+    originsRead = { text, list: text.split(",").map((o) => o.trim()).filter((o) => o !== "") };
+  return originsRead.list;
+}
+async function gate(env, request, method, path) {
+  let limited;
+  try {
+    limited = await pastLimit(env, method, path, request.headers.get("cf-connecting-ip") ?? "unknown");
+  } catch (e) {
+    console.error(`wrela: ${e.message}`);
+    return refusal(503);
+  }
+  return limited === null ? null : refusal(429, { "retry-after": String(limited.period ?? 60) });
+}
 async function pastLimit(env, method, path, address) {
   for (const l of limits(env)) {
     if (!path.startsWith(l.prefix) || l.methods !== undefined && !l.methods.includes(method))
@@ -1916,15 +1951,9 @@ async function api(request, env, options = {}) {
   const method = request.method.toUpperCase();
   if (!HTTP_METHODS.includes(method))
     return refusal(405, { allow: HTTP_METHODS.join(", ") });
-  let limited;
-  try {
-    limited = await pastLimit(env, method, url.pathname, request.headers.get("cf-connecting-ip") ?? "unknown");
-  } catch (e) {
-    console.error(`wrela: ${e.message}`);
-    return refusal(503);
-  }
+  const limited = await gate(env, request, method, url.pathname);
   if (limited !== null)
-    return refusal(429, { "retry-after": String(limited.period ?? 60) });
+    return limited;
   const cache = method === "GET" ? options.cache ?? globalThis.caches?.default : undefined;
   const key = cache === undefined ? null : new Request(url.href, { method: "GET" });
   if (cache !== undefined && key !== null) {
@@ -1933,10 +1962,9 @@ async function api(request, env, options = {}) {
       return hit;
   }
   if (!SAFE_METHODS.includes(method)) {
-    const origins = (env.WRELA_ORIGINS ?? "").split(",").map((o) => o.trim()).filter((o) => o !== "");
     const origin = request.headers.get("origin");
     const site = request.headers.get("sec-fetch-site");
-    if (origin === null || !origins.includes(origin) || site !== null && site !== "same-origin")
+    if (origin === null || !origins(env).includes(origin) || site !== null && site !== "same-origin")
       return refusal(403);
   }
   const body = await bodyWithin(request, MAX_HTTP_REQUEST);
@@ -1970,6 +1998,7 @@ async function api(request, env, options = {}) {
   }
   return response;
 }
+var bytesOf = (b) => b instanceof Uint8Array ? b : new Uint8Array(b);
 function serverClass(module) {
   return class WrelaServer extends DurableObject {
     server;
@@ -1982,20 +2011,19 @@ function serverClass(module) {
       });
     }
     async request(bytes) {
-      return this.server.request(bytes instanceof Uint8Array ? bytes : new Uint8Array(bytes));
+      return this.server.request(bytesOf(bytes));
     }
     async answer(service, body) {
-      return this.server.storeAnswer(service, new Uint8Array(body));
+      return this.server.store.answer(service, bytesOf(body));
     }
     async commit(batches) {
-      this.server.store.commit(batches.map((b) => new Uint8Array(b)));
+      this.server.store.commit(batches.map(bytesOf));
     }
     async alarm() {
       await this.server.alarm();
     }
   };
 }
-var roomName = (name) => /^[a-z0-9_-]{1,64}$/.test(name);
 async function rooms(request, env, pair) {
   const url = new URL(request.url);
   if (!url.pathname.startsWith("/room/"))
@@ -2005,30 +2033,18 @@ async function rooms(request, env, pair) {
   const name = url.pathname.slice("/room/".length);
   if (!roomName(name))
     return refusal(404);
-  const asked = url.searchParams.get("pair");
-  const hex = pair === null ? null : pair.toString(16).padStart(16, "0");
-  if (hex === null || asked !== hex)
+  const hex = pair === null ? null : pairParam(pair);
+  if (hex === null || url.searchParams.get("pair") !== hex)
     return refusal(403);
   const origin = request.headers.get("origin");
-  const origins = (env.WRELA_ORIGINS ?? "").split(",").map((o) => o.trim()).filter((o) => o !== "");
-  if (origin !== null && !origins.includes(origin))
+  if (origin !== null && !origins(env).includes(origin))
     return refusal(403);
-  let limited;
-  try {
-    limited = await pastLimit(env, "GET", url.pathname, request.headers.get("cf-connecting-ip") ?? "unknown");
-  } catch (e) {
-    console.error(`wrela: ${e.message}`);
-    return refusal(503);
-  }
+  const limited = await gate(env, request, "GET", url.pathname);
   if (limited !== null)
-    return refusal(429, { "retry-after": String(limited.period ?? 60) });
+    return limited;
   if (env.WRELA_ROOM === undefined)
     return refusal(404);
   return env.WRELA_ROOM.getByName(`${hex}:${name}`).fetch(new Request(url.href, { headers: { upgrade: "websocket" } }));
-}
-function pairOf(module) {
-  const [section] = WebAssembly.Module.customSections(module, PAIR_SECTION);
-  return section !== undefined && section.byteLength === 8 ? new DataView(section).getBigUint64(0, true) : null;
 }
 function roomClass(module) {
   return class WrelaRoom extends DurableObject {

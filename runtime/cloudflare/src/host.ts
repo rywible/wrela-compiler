@@ -104,6 +104,11 @@ export class Failure extends Error {
   ) {
     super(why);
   }
+
+  /** `e` as a failure: itself if it is one, else the host's (or, with `program`, the program's). */
+  static of(e: unknown, program = false): Failure {
+    return e instanceof Failure ? e : new Failure(program, e instanceof Error ? e.message : String(e));
+  }
 }
 
 // ---- HTTP's bytes (runtime/abi `http`) ----------------------------------------------------------
@@ -162,6 +167,14 @@ export class Store {
     storage.sql.exec("CREATE TABLE IF NOT EXISTS kv (key BLOB PRIMARY KEY, value BLOB NOT NULL) WITHOUT ROWID");
   }
 
+  /** A read of the store (`store/get`, `store/scan`), answered from what's committed: null if it
+   * failed, or isn't one. */
+  answer(service: string, body: Uint8Array): Uint8Array | null {
+    if (service === "store/get") return answerOf(() => this.get(body));
+    if (service === "store/scan") return answerOf(() => this.scan(body));
+    return null;
+  }
+
   /** `store/get`: the key → 1 then the value, or 0. */
   get(body: Uint8Array): Uint8Array {
     if (body.length > MAX_KEY) throw new Error(`a key is longer than ${MAX_KEY} bytes`);
@@ -218,22 +231,26 @@ export class Store {
  * a malformed body, or a key or a value too long, is the program's failure. */
 export function writes(batches: Uint8Array[]): [Uint8Array, Uint8Array | null][] {
   const ops: [Uint8Array, Uint8Array | null][] = [];
-  for (const b of batches) {
-    const r = new In(b);
-    while (r.left() > 0) {
-      const kind = r.byte();
-      const k = r.chunk();
-      if (k.length > MAX_KEY) throw new Failure(true, `a key is longer than ${MAX_KEY} bytes`);
-      if (kind === 1) {
-        const v = r.chunk();
-        if (v.length > MAX_VALUE) throw new Failure(true, `a value is longer than ${MAX_VALUE} bytes`);
-        ops.push([k, v]);
-      } else if (kind === 2) {
-        ops.push([k, null]);
-      } else {
-        throw new Failure(true, `a store write of kind ${kind}`);
+  try {
+    for (const b of batches) {
+      const r = new In(b);
+      while (r.left() > 0) {
+        const kind = r.byte();
+        const k = r.chunk();
+        if (k.length > MAX_KEY) throw new Error(`a key is longer than ${MAX_KEY} bytes`);
+        if (kind === 1) {
+          const v = r.chunk();
+          if (v.length > MAX_VALUE) throw new Error(`a value is longer than ${MAX_VALUE} bytes`);
+          ops.push([k, v]);
+        } else if (kind === 2) {
+          ops.push([k, null]);
+        } else {
+          throw new Error(`a store write of kind ${kind}`);
+        }
       }
     }
+  } catch (e) {
+    throw Failure.of(e, true);
   }
   return ops;
 }
@@ -475,9 +492,9 @@ export class Instance<C> {
 }
 
 /** The answer to a request a host gives the same way wherever it runs a server build: random
- * bytes, a signature's check and the time of day (`now`, Unix milliseconds); undefined for a
- * service it doesn't give so. */
-export function commonAnswer(service: string, body: Uint8Array, now: number): Uint8Array | null | Promise<Uint8Array | null> | undefined {
+ * bytes, a signature's check and the time of day (`now`, Unix milliseconds); null (a failed
+ * request) for a service it doesn't give. */
+export function commonAnswer(service: string, body: Uint8Array, now: number): Uint8Array | null | Promise<Uint8Array | null> {
   switch (service) {
     case "crypto/random":
       return answerOf(() => random(body));
@@ -486,7 +503,7 @@ export function commonAnswer(service: string, body: Uint8Array, now: number): Ui
     case SERVICE_TIME:
       return body.length === 0 ? new Out().u64(BigInt(Math.floor(now))).bytes() : null;
     default:
-      return undefined;
+      return null;
   }
 }
 
@@ -562,7 +579,7 @@ interface Open {
 const RECOVER_MS = 1000;
 
 /** The highest connection number, past which `std::net::POISONED` marks a message. */
-const POISONED = 2 ** 31;
+export const POISONED = 2 ** 31;
 
 /** A server build's HTTP instance, its store and its requests. */
 export class Server implements Owner<Command> {
@@ -602,13 +619,6 @@ export class Server implements Owner<Command> {
 
   get print(): ((line: string) => void) | undefined {
     return this.options.print;
-  }
-
-  /** A room's read of the store: answered from what's committed (null: it failed). */
-  storeAnswer(service: string, body: Uint8Array): Uint8Array | null {
-    if (service === "store/get") return answerOf(() => this.store.get(body));
-    if (service === "store/scan") return answerOf(() => this.store.scan(body));
-    return null;
   }
 
   /** Seconds since the host started, never going back. */
@@ -709,7 +719,6 @@ export class Server implements Owner<Command> {
         const i = await Instance.start<Command>(this, this.module);
         // What `serve_init` wrote commits before its first `serve`.
         this.carryOut(i.commands);
-        i.commands = [];
         this.instance = i;
         return i;
       } finally {
@@ -746,7 +755,7 @@ export class Server implements Owner<Command> {
    * every request open on it that a call was given with it. One no call has read yet waits for
    * the next instance, unless none starts. */
   private fail(e: unknown, started = true): void {
-    const f = e instanceof Failure ? e : new Failure(false, String((e as Error)?.message ?? e));
+    const f = Failure.of(e);
     this.options.log?.(`wrela: the server's call failed: ${f.program ? "the program's: " : "the host's limits: "}${f.message}`);
     const unread = new Set<number>();
     if (started) {
@@ -775,11 +784,9 @@ export class Server implements Owner<Command> {
   /** A host request the program made: a command for after the call, or a request answered for
    * the next. */
   submit(self: Instance<Command>, id: number, service: string, body: Uint8Array): void {
-    const command = (c: Command, bytes: number) => self.command(c, bytes);
-    const answer = (a: Uint8Array | null | Promise<Uint8Array | null>) => self.answer(id, a);
     switch (service) {
       case "store/write":
-        return command({ kind: "write", body }, body.length);
+        return self.command({ kind: "write", body }, body.length);
       case SERVICE_RESPOND: {
         if (body.length < 4) self.refuse("`http/respond` needs a connection's number");
         const conn = new DataView(body.buffer, body.byteOffset).getUint32(0, true);
@@ -792,7 +799,7 @@ export class Server implements Owner<Command> {
           self.refuse(`\`http/respond\`: ${(e as Error).message}`);
         }
         this.responding.add(conn);
-        return command({ kind: "respond", conn, response }, body.length);
+        return self.command({ kind: "respond", conn, response }, body.length);
       }
       case "net/send":
       case "net/close":
@@ -801,11 +808,10 @@ export class Server implements Owner<Command> {
       case "net/compact":
         return self.refuse(`\`${service}\`: an HTTP server's connections take one response (\`std::http::respond\`)`);
       case "store/get":
-        return answer(answerOf(() => this.store.get(body)));
       case "store/scan":
-        return answer(answerOf(() => this.store.scan(body)));
+        return self.answer(id, this.store.answer(service, body));
       default:
-        return answer(commonAnswer(service, body, this.now()) ?? null);
+        return self.answer(id, commonAnswer(service, body, this.now()));
     }
   }
 }

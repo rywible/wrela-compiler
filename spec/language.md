@@ -2646,7 +2646,7 @@ Each is `@server`. `wrela-serve` and `wrela run` open the store in their data di
 
 ### 19.5 A server over HTTP
 
-A server build also answers HTTP requests to its page's own origin, so a page and its server share a first-party cookie, and the site's protections apply to the server's paths. The Cloudflare host serves them: `wrela build` writes it beside the server's module as `server/cloudflare.js`, with the Wrangler settings it needs in `server/cloudflare.json` (a Durable Object binding `WRELA_SERVER` of class `WrelaServer`, its SQLite migration, the module rule for `game.wasm`, a CPU limit, and `WRELA_ORIGINS` for the release to fill). The site's Worker exports `WrelaServer` and calls `api(request, env)` first in its `fetch`: it answers a request under `/api/` and gives `null` for any other.
+A server build also answers HTTP requests to its page's own origin, so a page and its server share a first-party cookie, and the site's protections apply to the server's paths. The Cloudflare host serves them: `wrela build` writes it beside the server's module as `server/cloudflare.js`, with the Wrangler settings it needs in `server/cloudflare.json` (a Durable Object binding `WRELA_SERVER` of class `WrelaServer`, its SQLite migration, the module rule for `game.wasm`, and `WRELA_ORIGINS` and `WRELA_LIMITS` for the release to fill; no CPU limit, which a release on Workers Paid may add as `limits.cpu_ms`). The site's Worker exports `WrelaServer` and calls `api(request, env)` first in its `fetch`: it answers a request under `/api/` and gives `null` for any other.
 
 **A request is a short connection** (`std::http`). The events are the ones a room's connection gives (§17.2):
 

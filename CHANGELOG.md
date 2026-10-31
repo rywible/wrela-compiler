@@ -14,6 +14,8 @@ detail; `docs/release.md` says how a release is cut.
   writes committed in the server's object before its records and sends; poisoned messages,
   quarantine and three failures at the host's limits. `rooms` refuses an upgrade from another
   build, another origin or a client past its rate limits before the room's object runs.
+- **`server/cloudflare.json` sets no CPU limit**, so it deploys on Workers Free; a release on
+  Paid may add `limits.cpu_ms`.
 - **The browser host opens a room over a WebSocket** when `net.json` names a `wss:` server (`ws:`
   only to a loopback address); an `https:` server is still WebTransport.
 

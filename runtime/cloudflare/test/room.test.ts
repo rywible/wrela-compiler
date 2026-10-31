@@ -1,46 +1,14 @@
 // A room's host on hand-built modules: what a peer may send, and a room whose program fails on
 // every message is quarantined, and stays so in its storage.
 
-import { Database } from "bun:sqlite";
 import { expect, test } from "bun:test";
+import { MAX_UP } from "../../browser/src/net.ts";
 import { buildModule, op } from "../../browser/test/wasm-builder.ts";
-import { MAX_UP, Room, type Socket } from "../src/room.ts";
-import { sqliteBindings } from "./sqlite.ts";
+import { Room } from "../src/room.ts";
+import { FakeSocket, storage } from "./fakes.ts";
 
 const INPUT = { module: "wrela", name: "input", kind: "func" as const, type: { params: ["i32" as const, "i32" as const], results: ["i32" as const] } };
 const SERVE = { params: ["f32" as const], results: [] };
-
-function storage(db = new Database(":memory:")) {
-  return {
-    db,
-    sql: {
-      exec(q: string, ...b: unknown[]) {
-        const rows = db.query(q).all(...(sqliteBindings(b) as never[])) as Record<string, unknown>[];
-        return Object.assign(rows[Symbol.iterator](), { toArray: () => rows });
-      },
-    },
-    transactionSync: <T>(fn: () => T): T => db.transaction(fn)(),
-    setAlarm: () => {},
-  };
-}
-
-class FakeSocket implements Socket {
-  sent: Uint8Array[] = [];
-  closed: number | null = null;
-  attachment: unknown = null;
-  send(b: Uint8Array) {
-    this.sent.push(b);
-  }
-  close(code = 1000) {
-    this.closed ??= code;
-  }
-  serializeAttachment(v: unknown) {
-    this.attachment = v;
-  }
-  deserializeAttachment() {
-    return this.attachment;
-  }
-}
 
 const store = { answer: async () => null, commit: async () => {} };
 

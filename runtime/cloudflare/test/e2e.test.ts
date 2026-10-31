@@ -4,30 +4,13 @@
 // alone, it has nothing to test and skips.
 
 import { Database } from "bun:sqlite";
-import { plugin } from "bun";
 import { beforeAll, describe, expect, test } from "bun:test";
 import { join } from "node:path";
 import type { ApiOptions, Env, ResponseCache } from "../src/cloudflare.ts";
-import type { Storage } from "../src/host.ts";
-import { sqliteBindings } from "./sqlite.ts";
+import { storage, workers } from "./fakes.ts";
 
 const BUILD = process.env["WRELA_HTTP_BUILD"];
 const SITE = "https://wrela.dev";
-
-/** A Durable Object's storage on bun:sqlite: `exec`'s rows, `transactionSync`, and the alarms
- * asked for. */
-function storage(db: Database, alarms: number[]): Storage & { setAlarm(at: number): Promise<void> } {
-  return {
-    sql: {
-      exec(query: string, ...bindings: unknown[]) {
-        const rows = db.query(query).all(...(sqliteBindings(bindings) as never[])) as Record<string, unknown>[];
-        return Object.assign(rows[Symbol.iterator](), { toArray: () => rows });
-      },
-    },
-    transactionSync: <T>(fn: () => T): T => db.transaction(fn)(),
-    setAlarm: async (at: number) => void alarms.push(at),
-  };
-}
 
 interface Host {
   api(request: Request, env: Env, options?: ApiOptions): Promise<Response | null>;
@@ -51,27 +34,7 @@ const cache: ResponseCache = {
 
 beforeAll(async () => {
   if (BUILD === undefined) return;
-  // What Wrangler gives the bundle: `cloudflare:workers`, and `game.wasm` compiled.
-  plugin({
-    name: "workers",
-    setup(build) {
-      build.module("cloudflare:workers", () => ({
-        exports: {
-          DurableObject: class {
-            constructor(
-              readonly ctx: unknown,
-              readonly env: unknown,
-            ) {}
-          },
-        },
-        loader: "object",
-      }));
-      build.onLoad({ filter: /\.wasm$/ }, async (args) => ({
-        exports: { default: new WebAssembly.Module(await Bun.file(args.path).arrayBuffer()) },
-        loader: "object",
-      }));
-    },
-  });
+  workers();
   host = (await import(join(BUILD, "server/cloudflare.js"))) as Host;
   db = new Database(":memory:");
   const object = { current: null as InstanceType<Host["WrelaServer"]> | null };
@@ -92,7 +55,7 @@ beforeAll(async () => {
       }),
     },
   };
-  object.current = new host.WrelaServer({ storage: storage(db, []) }, env);
+  object.current = new host.WrelaServer({ storage: storage(db) }, env);
 });
 
 /** The API's response to a request of `method` for `path`. */

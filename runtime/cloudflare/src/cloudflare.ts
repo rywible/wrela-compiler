@@ -12,10 +12,11 @@
 // the address is a rate limit's key and nothing else.
 
 import { DurableObject } from "cloudflare:workers";
-import { HTTP_METHODS, MAX_HTTP_REQUEST, PAIR_SECTION, SAFE_METHODS } from "../../browser/src/abi.gen.ts";
+import { HTTP_METHODS, MAX_HTTP_REQUEST, SAFE_METHODS } from "../../browser/src/abi.gen.ts";
 import { Out, seenByServer } from "../../browser/src/http.ts";
+import { pairParam, roomName } from "../../browser/src/net.ts";
 import { bare, decodeResponse, encodeRequest, type Header, HOST_HEADERS, NO_BODY, Server } from "./host.ts";
-import { MAX_UP, Room, type Socket, type StoreClient } from "./room.ts";
+import { Room, type StoreClient } from "./room.ts";
 
 /** A Workers Rate Limiting binding (`ratelimits` in the Wrangler configuration). */
 export interface RateLimit {
@@ -120,6 +121,28 @@ function limits(env: Env): Limit[] {
   return limitsRead.list;
 }
 
+/** The page origins from `WRELA_ORIGINS`, read once for each value it has. */
+let originsRead: { text: string; list: string[] } | null = null;
+function origins(env: Env): string[] {
+  const text = env.WRELA_ORIGINS ?? "";
+  if (originsRead?.text !== text) originsRead = { text, list: text.split(",").map((o) => o.trim()).filter((o) => o !== "") };
+  return originsRead.list;
+}
+
+/** The refusal of a client past one of its rate limits on `method` to `path` (429), or of a
+ * Worker whose `WRELA_LIMITS` is wrong (503); null if neither. */
+async function gate(env: Env, request: Request, method: string, path: string): Promise<Response | null> {
+  let limited: Limit | null;
+  try {
+    limited = await pastLimit(env, method, path, request.headers.get("cf-connecting-ip") ?? "unknown");
+  } catch (e) {
+    // The Worker's configuration is wrong (never the client's address, which no error holds).
+    console.error(`wrela: ${(e as Error).message}`);
+    return refusal(503);
+  }
+  return limited === null ? null : refusal(429, { "retry-after": String(limited.period ?? 60) });
+}
+
 /** The first limit `method` on `path` is past, from this client's address: none if it's past
  * none. The address is each binding's key, and goes nowhere else. */
 async function pastLimit(env: Env, method: string, path: string, address: string): Promise<Limit | null> {
@@ -139,15 +162,8 @@ export async function api(request: Request, env: Env, options: ApiOptions = {}):
   if (!url.pathname.startsWith(prefix)) return null;
   const method = request.method.toUpperCase();
   if (!HTTP_METHODS.includes(method)) return refusal(405, { allow: HTTP_METHODS.join(", ") });
-  let limited: Limit | null;
-  try {
-    limited = await pastLimit(env, method, url.pathname, request.headers.get("cf-connecting-ip") ?? "unknown");
-  } catch (e) {
-    // The Worker's configuration is wrong (never the client's address, which no error holds).
-    console.error(`wrela: ${(e as Error).message}`);
-    return refusal(503);
-  }
-  if (limited !== null) return refusal(429, { "retry-after": String(limited.period ?? 60) });
+  const limited = await gate(env, request, method, url.pathname);
+  if (limited !== null) return limited;
   // A GET's public answer, kept by its URL alone: it's the same whoever asks.
   const cache = method === "GET" ? (options.cache ?? (globalThis as { caches?: { default?: ResponseCache } }).caches?.default) : undefined;
   const key = cache === undefined ? null : new Request(url.href, { method: "GET" });
@@ -156,10 +172,9 @@ export async function api(request: Request, env: Env, options: ApiOptions = {}):
     if (hit !== undefined) return hit;
   }
   if (!SAFE_METHODS.includes(method)) {
-    const origins = (env.WRELA_ORIGINS ?? "").split(",").map((o) => o.trim()).filter((o) => o !== "");
     const origin = request.headers.get("origin");
     const site = request.headers.get("sec-fetch-site");
-    if (origin === null || !origins.includes(origin) || (site !== null && site !== "same-origin")) return refusal(403);
+    if (origin === null || !origins(env).includes(origin) || (site !== null && site !== "same-origin")) return refusal(403);
   }
   const body = await bodyWithin(request, MAX_HTTP_REQUEST);
   if (body === null) return refusal(413);
@@ -188,6 +203,9 @@ export async function api(request: Request, env: Env, options: ApiOptions = {}):
   return response;
 }
 
+/** An RPC's bytes as a Uint8Array (structured clone gives one; anything else is copied). */
+const bytesOf = (b: Uint8Array | ArrayBuffer) => (b instanceof Uint8Array ? b : new Uint8Array(b));
+
 /** Makes the Durable Object class for a server build's module. */
 export function serverClass(module: WebAssembly.Module) {
   return class WrelaServer extends DurableObject<Env> {
@@ -204,17 +222,17 @@ export function serverClass(module: WebAssembly.Module) {
 
     /** A request's bytes, answered with a response's (RPC from `api`). */
     async request(bytes: Uint8Array): Promise<Uint8Array> {
-      return this.server.request(bytes instanceof Uint8Array ? bytes : new Uint8Array(bytes));
+      return this.server.request(bytesOf(bytes));
     }
 
     /** A room's read of the store (RPC from a room's object): answered from what's committed. */
     async answer(service: string, body: Uint8Array): Promise<Uint8Array | null> {
-      return this.server.storeAnswer(service, new Uint8Array(body));
+      return this.server.store.answer(service, bytesOf(body));
     }
 
     /** A room's call's writes, committed in one transaction (RPC from a room's object). */
     async commit(batches: Uint8Array[]): Promise<void> {
-      this.server.store.commit(batches.map((b) => new Uint8Array(b)));
+      this.server.store.commit(batches.map(bytesOf));
     }
 
     async alarm(): Promise<void> {
@@ -222,9 +240,6 @@ export function serverClass(module: WebAssembly.Module) {
     }
   };
 }
-
-/** Whether `name` names a room: 1 to 64 of a-z, 0-9, `-` and `_` (`wrela_serve::room_name`). */
-export const roomName = (name: string) => /^[a-z0-9_-]{1,64}$/.test(name);
 
 /** A room's WebSocket: the response to `request` for `/room/<name>?pair=<16 hex digits>`, or null
  * for a path that isn't a room's. Before the room's object is billed it refuses what isn't an
@@ -238,29 +253,15 @@ export async function rooms(request: Request, env: Env, pair: bigint | null): Pr
   if (request.headers.get("upgrade")?.toLowerCase() !== "websocket") return refusal(426, { upgrade: "websocket" });
   const name = url.pathname.slice("/room/".length);
   if (!roomName(name)) return refusal(404);
-  const asked = url.searchParams.get("pair");
-  const hex = pair === null ? null : pair.toString(16).padStart(16, "0");
-  if (hex === null || asked !== hex) return refusal(403);
+  const hex = pair === null ? null : pairParam(pair);
+  if (hex === null || url.searchParams.get("pair") !== hex) return refusal(403);
   const origin = request.headers.get("origin");
-  const origins = (env.WRELA_ORIGINS ?? "").split(",").map((o) => o.trim()).filter((o) => o !== "");
-  if (origin !== null && !origins.includes(origin)) return refusal(403);
-  let limited: Limit | null;
-  try {
-    limited = await pastLimit(env, "GET", url.pathname, request.headers.get("cf-connecting-ip") ?? "unknown");
-  } catch (e) {
-    console.error(`wrela: ${(e as Error).message}`);
-    return refusal(503);
-  }
-  if (limited !== null) return refusal(429, { "retry-after": String(limited.period ?? 60) });
+  if (origin !== null && !origins(env).includes(origin)) return refusal(403);
+  const limited = await gate(env, request, "GET", url.pathname);
+  if (limited !== null) return limited;
   if (env.WRELA_ROOM === undefined) return refusal(404);
   // Only the upgrade crosses: no address, and no header the room doesn't read.
   return env.WRELA_ROOM.getByName(`${hex}:${name}`).fetch(new Request(url.href, { headers: { upgrade: "websocket" } }));
-}
-
-/** The pair id in a server build's module (`wrela.pair`), which its clients carry. */
-export function pairOf(module: WebAssembly.Module): bigint | null {
-  const [section] = WebAssembly.Module.customSections(module, PAIR_SECTION);
-  return section !== undefined && section.byteLength === 8 ? new DataView(section).getBigUint64(0, true) : null;
 }
 
 /** Makes the Durable Object class of a server build's rooms. */
@@ -271,7 +272,7 @@ export function roomClass(module: WebAssembly.Module) {
     constructor(ctx: DurableObjectState, env: Env) {
       super(ctx, env);
       const server = env.WRELA_SERVER.getByName(SERVER_OBJECT);
-      this.room = new Room(module, ctx.storage, server, ctx.getWebSockets() as unknown as Socket[], {
+      this.room = new Room(module, ctx.storage, server, ctx.getWebSockets(), {
         log: (line) => console.error(line),
         ...(env.WRELA_PRINT === "1" ? { print: (line: string) => console.log(line) } : {}),
       });
@@ -282,19 +283,19 @@ export function roomClass(module: WebAssembly.Module) {
       const pair = new WebSocketPair();
       const [client, server] = [pair[0], pair[1]];
       this.ctx.acceptWebSocket(server);
-      this.room.connect(server as unknown as Socket);
+      this.room.connect(server);
       return new Response(null, { status: 101, webSocket: client });
     }
 
     // Each event lasts until the room has taken it, so the runtime neither cancels nor hibernates
     // the call it started.
     async webSocketMessage(ws: WebSocket, message: ArrayBuffer | string): Promise<void> {
-      this.room.message(ws as unknown as Socket, message);
+      this.room.message(ws, message);
       await this.room.settled;
     }
 
     async webSocketClose(ws: WebSocket): Promise<void> {
-      this.room.closed(ws as unknown as Socket);
+      this.room.closed(ws);
       // Before compatibility date 2026-04-07 the object finishes the close handshake itself.
       try {
         ws.close();
@@ -305,7 +306,7 @@ export function roomClass(module: WebAssembly.Module) {
     }
 
     async webSocketError(ws: WebSocket): Promise<void> {
-      this.room.closed(ws as unknown as Socket);
+      this.room.closed(ws);
       await this.room.settled;
     }
 
@@ -314,6 +315,3 @@ export function roomClass(module: WebAssembly.Module) {
     }
   };
 }
-
-/** A peer's message is at most this many bytes (`wrela_serve::MAX_UP`). */
-export { MAX_UP };

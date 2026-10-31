@@ -192,7 +192,7 @@ describe("connections", () => {
     try {
       const net = new Net(() => "https://wrela.dev/console/", () => {});
       net.open(4, "lobby", 0xabn);
-      for (let i = 0; i < 50 && made.length === 0; i++) await new Promise((r) => setTimeout(r, 5));
+      await settle(() => made.length > 0);
       const socket = made[0]!;
       expect(socket.url).toBe("wss://wrela.dev/room/lobby?pair=00000000000000ab");
       expect(socket.binaryType).toBe("arraybuffer");
@@ -201,6 +201,16 @@ describe("connections", () => {
       socket.onmessage!({ data: new Uint8Array([7, 8]).buffer });
       net.send(4, Uint8Array.of(1, 2, 3));
       expect(socket.sent).toEqual([Uint8Array.of(1, 2, 3)]);
+      // A plan costs a send as the socket does: its bytes, past what it buffers. 16 messages of
+      // MAX_UP fit under PENDING; with that buffered, one more doesn't.
+      const plan = net.plan();
+      for (let i = 0; i < 16; i++) plan.send(4, new Uint8Array(MAX_UP));
+      expect(() => plan.open(4, "lobby", 0xabn)).toThrow("connection 4 is open");
+      socket.bufferedAmount = PENDING - MAX_UP + 1;
+      const full = net.plan();
+      full.send(4, new Uint8Array(MAX_UP));
+      expect(() => full.open(4, "lobby", 0xabn)).not.toThrow();
+      socket.bufferedAmount = 0;
       const inbox = new Inbox();
       net.deliver(inbox);
       expect(inbox.length).toBe(2);

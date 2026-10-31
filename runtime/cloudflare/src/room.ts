@@ -20,20 +20,15 @@
 // text message, or a longer one, closes its connection. A connection with more than `CONN_IN`
 // bytes waiting for the room is closed too.
 
-import { EventKind, SERVICE_RESPOND } from "../../browser/src/abi.gen.ts";
-import { encodeEvent } from "../../browser/src/input.ts";
-import { Inbox } from "../../browser/src/net.ts";
-import { blob, commonAnswer, Failure, Instance, LIMITS, type Limits, type Owner, type Storage, writes } from "./host.ts";
+import { SERVICE_RESPOND } from "../../browser/src/abi.gen.ts";
+import { connectionEvent } from "../../browser/src/input.ts";
+import { Inbox, MAX_FRAME, MAX_UP, withinCall } from "../../browser/src/net.ts";
+import { blob, commonAnswer, Failure, Instance, LIMITS, type Limits, type Owner, POISONED, type Storage, writes } from "./host.ts";
 
 /** The connection a room's journal comes from (`std::net::JOURNAL`). */
 export const JOURNAL = 0;
-/** The bit set on a message's connection when it trapped the room alone (`std::net::POISONED`). */
-export const POISONED = 2 ** 31;
 /** Failures at the host's limits in a row before a room lets its peers go. */
 export const RETRIES = 3;
-/** The largest frame, and the largest a peer sends (`wrela_serve::MAX_FRAME`, `MAX_UP`). */
-export const MAX_FRAME = 64 * 1024;
-export const MAX_UP = MAX_FRAME - 64;
 /** The bytes a connection's messages may hold waiting for the room. */
 export const CONN_IN = 1 << 20;
 /** How soon a room that failed at the host's limits tries again, in milliseconds. */
@@ -61,11 +56,12 @@ export interface RoomOptions {
   log?: (line: string) => void;
 }
 
-/** What the room holds of a socket: its connection, and the tag the program gave it. */
+/** What a socket's attachment holds: its connection, and the tag the program gave it. */
 interface Attached {
   conn: number;
   tag: number;
 }
+const attached = (socket: Socket) => socket.deserializeAttachment() as Attached | null;
 
 /** A room's network command (`std::net`), carried out once the call returns. */
 type Net =
@@ -79,7 +75,6 @@ type Net =
 /** What waits for the room. */
 type Incoming = { kind: "opened" | "closed"; conn: number } | { kind: "message"; conn: number; bytes: Uint8Array };
 
-const connection = (conn: number, open: boolean, tag: number) => encodeEvent(EventKind.Connection, 0, conn, open ? 1 : 0, tag, 0);
 const word = (b: Uint8Array, at: number) => new DataView(b.buffer, b.byteOffset).getUint32(at, true);
 
 /** How a call failed: the room's (its program, or the host's limits), or the journal's. */
@@ -91,10 +86,15 @@ export class Room implements Owner<Net> {
   readonly limits: Limits;
   readonly print: ((line: string) => void) | undefined;
   private instance: Instance<Net> | null = null;
-  private readonly sockets = new Map<number, { socket: Socket; tag: number }>();
+  /** Its open connections' sockets; each socket's attachment says its connection and tag. */
+  private readonly sockets = new Map<number, Socket>();
   private incoming: Incoming[] = [];
+  /** The bytes each open connection's messages hold in `incoming`. */
+  private readonly waiting = new Map<number, number>();
   private failures = 0;
   private quarantined: string | null;
+  /** The last connection number given, kept so none is given twice. */
+  private lastConn: number;
   /** Unix milliseconds the room's time counts from, kept so it goes on after a restart. */
   private readonly origin: number;
   private lastClock = 0;
@@ -114,16 +114,18 @@ export class Room implements Owner<Net> {
     const sql = storage.sql;
     sql.exec("CREATE TABLE IF NOT EXISTS journal (seq INTEGER PRIMARY KEY AUTOINCREMENT, record BLOB NOT NULL)");
     sql.exec("CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value)");
-    const meta = (key: string) => sql.exec("SELECT value FROM meta WHERE key = ?", key).toArray()[0]?.["value"];
-    const origin = meta("origin");
+    const meta = new Map(sql.exec("SELECT key, value FROM meta").toArray().map((r) => [r["key"], r["value"]]));
+    const origin = meta.get("origin");
     this.origin = typeof origin === "number" ? origin : this.now();
     if (origin === undefined) sql.exec("INSERT INTO meta (key, value) VALUES ('origin', ?)", this.origin);
-    const q = meta("quarantined");
+    const q = meta.get("quarantined");
     this.quarantined = typeof q === "string" ? q : null;
+    const last = meta.get("conn");
+    this.lastConn = typeof last === "number" ? last : JOURNAL;
     // Its sockets outlive the object: each says which connection it is.
     for (const socket of open) {
-      const a = socket.deserializeAttachment() as Attached | null;
-      if (a !== null && typeof a?.conn === "number") this.sockets.set(a.conn, { socket, tag: a.tag });
+      const a = attached(socket);
+      if (typeof a?.conn === "number") this.sockets.set(a.conn, socket);
     }
   }
 
@@ -135,12 +137,9 @@ export class Room implements Owner<Net> {
 
   /** The next connection's number: never one used before in this room. */
   private nextConn(): number {
-    const sql = this.storage.sql;
-    const row = sql.exec("SELECT value FROM meta WHERE key = 'conn'").toArray()[0];
-    const last = typeof row?.["value"] === "number" ? row["value"] : JOURNAL;
-    const conn = last + 1 >= POISONED ? 1 : last + 1;
-    sql.exec("INSERT OR REPLACE INTO meta (key, value) VALUES ('conn', ?)", conn);
-    return conn;
+    this.lastConn = this.lastConn + 1 >= POISONED ? 1 : this.lastConn + 1;
+    this.storage.sql.exec("INSERT OR REPLACE INTO meta (key, value) VALUES ('conn', ?)", this.lastConn);
+    return this.lastConn;
   }
 
   /** A peer connected on `socket`. A quarantined room closes it. */
@@ -151,7 +150,8 @@ export class Room implements Owner<Net> {
     }
     const conn = this.nextConn();
     socket.serializeAttachment({ conn, tag: 0 } satisfies Attached);
-    this.sockets.set(conn, { socket, tag: 0 });
+    this.sockets.set(conn, socket);
+    this.waiting.set(conn, 0);
     this.incoming.push({ kind: "opened", conn });
     this.wake();
   }
@@ -162,9 +162,9 @@ export class Room implements Owner<Net> {
     if (conn === null) return;
     if (typeof data === "string") return this.cut(conn, 1003, "a room takes binary messages");
     if (data.byteLength > MAX_UP) return this.cut(conn, 1009, `a message past ${MAX_UP} bytes`);
-    let waiting = data.byteLength;
-    for (const e of this.incoming) if (e.kind === "message" && e.conn === conn) waiting += e.bytes.length;
+    const waiting = (this.waiting.get(conn) ?? 0) + data.byteLength;
     if (waiting > CONN_IN) return this.cut(conn, 1008, `more than ${CONN_IN} bytes wait for the room`);
+    this.waiting.set(conn, waiting);
     this.incoming.push({ kind: "message", conn, bytes: new Uint8Array(data) });
     this.wake();
   }
@@ -195,31 +195,41 @@ export class Room implements Owner<Net> {
   }
 
   private connOf(socket: Socket): number | null {
-    for (const [conn, s] of this.sockets) if (s.socket === socket) return conn;
-    return null;
+    const conn = attached(socket)?.conn;
+    return conn !== undefined && this.sockets.get(conn) === socket ? conn : null;
   }
 
   private disconnect(conn: number): void {
     if (!this.sockets.delete(conn)) return;
+    this.waiting.delete(conn);
     this.incoming.push({ kind: "closed", conn });
     this.wake();
   }
 
   /** Closes connection `conn`'s socket, and the room hears it closed. */
   private cut(conn: number, code: number, why: string): void {
-    this.sockets.get(conn)?.socket.close(code, why);
+    this.sockets.get(conn)?.close(code, why);
     this.disconnect(conn);
   }
 
   /** What waits goes, and every connection closes: its peers come back later. */
   private closeAll(code: number, why: string): void {
     this.incoming = [];
-    for (const { socket } of this.sockets.values()) socket.close(code, why);
+    this.waiting.clear();
+    for (const socket of this.sockets.values()) socket.close(code, why);
     this.sockets.clear();
   }
 
+  /** `events` wait again, before what came since. */
+  private requeue(events: Incoming[]): void {
+    for (const e of events) {
+      const w = e.kind === "message" ? this.waiting.get(e.conn) : undefined;
+      if (w !== undefined && e.kind === "message") this.waiting.set(e.conn, w + e.bytes.length);
+    }
+    this.incoming.unshift(...events);
+  }
+
   private quarantine(why: string): void {
-    this.instance = null;
     this.quarantined = why;
     this.storage.sql.exec("INSERT OR REPLACE INTO meta (key, value) VALUES ('quarantined', ?)", why);
     this.options.log?.(`wrela: the room is quarantined: ${why}`);
@@ -227,8 +237,6 @@ export class Room implements Owner<Net> {
   }
 
   private failAtLimits(f: Failure): void {
-    this.instance = null;
-    this.queue = new Inbox();
     this.failures++;
     this.options.log?.(`wrela: a room's call failed at the host's limits: ${f.message}`);
     if (this.failures >= RETRIES) {
@@ -239,28 +247,35 @@ export class Room implements Owner<Net> {
     }
   }
 
+  /** A fresh instance (`start`): null, or why it didn't start. */
+  private async restart(): Promise<Failure | null> {
+    try {
+      await this.start();
+      return null;
+    } catch (e) {
+      return Failure.of(e);
+    }
+  }
+
   /** The room's events, a call's worth at a time, until none waits and no answer is due. */
   private async wakeNow(): Promise<void> {
     if (this.quarantined !== null) return;
     for (;;) {
       if (this.instance === null) {
-        try {
-          await this.start();
-        } catch (e) {
-          const f = e instanceof Failure ? e : new Failure(false, String(e));
+        const f = await this.restart();
+        if (f !== null) {
           if (this.quarantined === null) this.failAtLimits(f);
           return;
         }
       }
-      const instance = this.instance!;
-      if (this.incoming.length === 0 && instance.arriving.length === 0) return;
+      if (this.incoming.length === 0 && this.instance!.arriving.length === 0) return;
       const batch = this.nextBatch();
       const r = await this.call(batch);
       if (r === null) continue;
       if ("journal" in r) return;
       if (batch.length === 1 && !r.room.program) {
         // The host's limits on one event: nothing was kept or sent, and it waits.
-        this.incoming.unshift(...batch);
+        this.requeue(batch);
         this.failAtLimits(r.room);
         return;
       }
@@ -275,8 +290,10 @@ export class Room implements Owner<Net> {
     for (; n < this.incoming.length; n++) {
       const e = this.incoming[n]!;
       if (e.kind !== "message") continue;
-      if (given > 0 && given + e.bytes.length > 1 << 20) break;
+      if (!withinCall(given, e.bytes.length)) break;
       given += e.bytes.length;
+      const w = this.waiting.get(e.conn);
+      if (w !== undefined) this.waiting.set(e.conn, w - e.bytes.length);
     }
     return this.incoming.splice(0, n);
   }
@@ -290,55 +307,57 @@ export class Room implements Owner<Net> {
     const records = sql.exec("SELECT record FROM journal ORDER BY seq").toArray().map((r) => new Uint8Array(r["record"] as ArrayBuffer));
     const fresh = records.length === 0;
     for (const r of records) this.queue.pushMessage(JOURNAL, r);
+    // Reading back keeps nothing new but a compaction: the last one's snapshot, then what was
+    // still unread when it was made.
+    let compacted: { snapshot: Uint8Array; unread: number } | null = null;
     while (this.queue.length > 0) {
       const before = this.queue.length;
       try {
         instance.call(() => instance.serve(0));
         if (this.queue.length >= before) throw new Failure(true, UNREAD);
       } catch (e) {
-        const f = e instanceof Failure ? e : new Failure(false, String(e));
+        const f = e as Failure;
         if (f.program) this.quarantine(`its journal traps it: ${f.message}`);
         throw f;
       }
-      // Reading back keeps nothing new but a compaction: the snapshot, then what's still unread.
-      for (const c of instance.commands) {
-        if (c.kind !== "compact") continue;
-        const unread = records.slice(records.length - this.queue.length);
-        this.storage.transactionSync(() => {
-          sql.exec("DELETE FROM journal");
-          for (const r of [c.bytes, ...unread]) sql.exec("INSERT INTO journal (record) VALUES (?)", blob(r));
-        });
-      }
+      for (const c of instance.commands) if (c.kind === "compact") compacted = { snapshot: c.bytes, unread: this.queue.length };
+    }
+    if (compacted !== null) {
+      const { snapshot, unread } = compacted;
+      this.storage.transactionSync(() => {
+        sql.exec("DELETE FROM journal");
+        for (const r of [snapshot, ...records.slice(records.length - unread)]) sql.exec("INSERT INTO journal (record) VALUES (?)", blob(r));
+      });
     }
     // A room with nothing to read back carries out what `serve_init` did, as its first call would.
     if (fresh && instance.commands.length > 0) {
       const r = await this.carryOut(instance.commands);
       if (r !== null) throw "room" in r ? r.room : r.journal;
     }
-    for (const [conn, { tag }] of this.sockets) this.queue.push(connection(conn, true, tag));
+    for (const [conn, socket] of this.sockets) this.queue.push(connectionEvent(conn, true, attached(socket)?.tag ?? 0));
     this.instance = instance;
   }
 
   /** One call with `batch`: the answers its last call's requests got, `serve`, then its commands
-   * carried out. Null if it succeeded. */
+   * carried out. Null if it succeeded; if it failed, its instance goes. */
   private async call(batch: Incoming[]): Promise<Fail | null> {
     const instance = this.instance!;
     await instance.settle();
     for (const e of batch) {
       if (e.kind === "message") this.queue.pushMessage(e.conn, e.bytes);
-      else this.queue.push(connection(e.conn, e.kind === "opened", 0));
+      else this.queue.push(connectionEvent(e.conn, e.kind === "opened"));
     }
+    let r: Fail | null;
     try {
       instance.call(() => instance.serve(Math.fround(this.clock())));
       // A call is given the whole batch: one that leaves some unread is the program's failure.
       if (this.queue.length > 0) throw new Failure(true, UNREAD);
+      r = await this.carryOut(instance.commands);
     } catch (e) {
-      this.instance = null;
-      this.queue = new Inbox();
-      return { room: e instanceof Failure ? e : new Failure(false, String(e)) };
+      r = { room: e as Failure };
     }
-    const r = await this.carryOut(instance.commands);
     if (r === null) this.failures = 0;
+    else this.instance = null;
     return r;
   }
 
@@ -347,12 +366,10 @@ export class Room implements Owner<Net> {
    * waits with those after it. Whether the room goes on. */
   private async oneByOne(batch: Incoming[]): Promise<boolean> {
     for (let i = 0; i < batch.length; i++) {
-      const e = batch[i]!;
-      const r = await this.alone(e);
+      const r = await this.alone(batch[i]!);
       if (r === null) continue;
-      if ("journal" in r) return false;
-      if (this.quarantined === null) {
-        this.incoming.unshift(...batch.slice(i));
+      if ("room" in r && this.quarantined === null) {
+        this.requeue(batch.slice(i));
         this.failAtLimits(r.room);
       }
       return false;
@@ -361,24 +378,16 @@ export class Room implements Owner<Net> {
   }
 
   private async alone(e: Incoming): Promise<Fail | null> {
-    const fresh = async (): Promise<Fail | null> => {
-      try {
-        await this.start();
-        return null;
-      } catch (f) {
-        return { room: f instanceof Failure ? f : new Failure(false, String(f)) };
-      }
-    };
     if (this.instance === null) {
-      const s = await fresh();
-      if (s !== null) return s;
+      const f = await this.restart();
+      if (f !== null) return { room: f };
     }
     const r = await this.call([e]);
     if (r === null || "journal" in r || !r.room.program) return r;
     // A trap on a connection's opening or closing, alone, passes: only a message is poisoned.
     if (e.kind !== "message") return null;
-    const s = await fresh();
-    if (s !== null) return s;
+    const f = await this.restart();
+    if (f !== null) return { room: f };
     const poisoned = await this.call([{ kind: "message", conn: e.conn + POISONED, bytes: e.bytes }]);
     if (poisoned !== null && "room" in poisoned && poisoned.room.program) {
       this.quarantine(`a poisoned message traps it: ${poisoned.room.message}`);
@@ -394,14 +403,16 @@ export class Room implements Owner<Net> {
     try {
       writes(batches);
     } catch (e) {
-      this.instance = null;
-      return { room: e instanceof Failure ? e : new Failure(true, String(e)) };
+      return { room: e as Failure };
     }
+    // A compaction replaces what the records before it in the call would have added.
+    let from = 0;
+    for (let i = 0; i < commands.length; i++) if (commands[i]!.kind === "compact") from = i;
     const sql = this.storage.sql;
     try {
       if (batches.length > 0) await this.store.commit(batches);
       this.storage.transactionSync(() => {
-        for (const c of commands) {
+        for (const c of commands.slice(from)) {
           if (c.kind === "keep") sql.exec("INSERT INTO journal (record) VALUES (?)", blob(c.bytes));
           if (c.kind === "compact") {
             sql.exec("DELETE FROM journal");
@@ -410,22 +421,20 @@ export class Room implements Owner<Net> {
         }
       });
     } catch (e) {
-      const f = new Failure(false, `the journal: ${(e as Error)?.message ?? e}`);
-      this.instance = null;
+      const f = new Failure(false, `the journal: ${Failure.of(e).message}`);
       this.options.log?.(`wrela: a room's records weren't kept: ${f.message}`);
       this.closeAll(1011, "the room's records weren't kept");
       return { journal: f };
     }
     for (const c of commands) {
       const s = "conn" in c ? this.sockets.get(c.conn) : undefined;
-      if (c.kind === "tag" && s !== undefined) {
-        s.tag = c.tag;
-        s.socket.serializeAttachment({ conn: c.conn, tag: c.tag } satisfies Attached);
-      } else if (c.kind === "send") {
-        s?.socket.send(c.bytes);
-      } else if (c.kind === "close" && s !== undefined) {
-        s.socket.close(1000, "");
+      if (s === undefined) continue;
+      if (c.kind === "tag") s.serializeAttachment({ conn: c.conn, tag: c.tag } satisfies Attached);
+      else if (c.kind === "send") s.send(c.bytes);
+      else if (c.kind === "close") {
+        s.close(1000, "");
         this.sockets.delete(c.conn);
+        this.waiting.delete(c.conn);
       }
     }
     return null;
@@ -462,7 +471,7 @@ export class Room implements Owner<Net> {
           this.store.answer(service, body).catch(() => null),
         );
       default:
-        return self.answer(id, commonAnswer(service, body, this.now()) ?? null);
+        return self.answer(id, commonAnswer(service, body, this.now()));
     }
   }
 }

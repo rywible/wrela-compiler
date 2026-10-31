@@ -202,8 +202,21 @@ On this host:
   (`limits.cpu_ms`); Workers Free allows 10 ms
   ([limits](https://developers.cloudflare.com/workers/platform/limits/)), which can't verify a
   run. A call past the limit fails the invocation (error 1102) and resets the object; the
-  requests in flight fail and the store keeps only committed writes. Release config sets
-  `limits.cpu_ms` to 5000 (open question 2).
+  requests in flight fail and the store keeps only committed writes. 0.13.0's config set
+  `limits.cpu_ms` to 5000; from 0.14.0 it sets none, since Ryan launches on Workers Free, which
+  takes none, and a release on Paid may add it (open question 2).
+- **What the host spends of a call's CPU** (estimates, to be measured on the first deploy):
+  - The module compiles once, when the isolate loads the Worker. That counts against startup
+    (1 s), not a request.
+  - A fresh instance (`serve_init`, the program's own) comes only after eviction, a deploy or a
+    failure. The host's part is well under 1 ms.
+  - A store read or write is in-process SQLite, microseconds a key.
+  - Encoding a request and checking its response takes tens of microseconds for small bodies.
+  - WebCrypto's verify is native: tens to a few hundred microseconds.
+  - The rate limit and the RPC from the Worker to the object are I/O.
+
+  On Free, a program keeps each call well under 10 ms (the accounts engine plans 200 ticks a call,
+  2 to 3 ms on a Ryzen 5 5500U).
 - **Memory.** The instance's cap is 64 MiB, as `wrela-serve`'s. JavaScript can't refuse a
   `memory.grow` inside a call, so the host checks after each call and drops an instance past the
   cap (a host failure). An isolate's hard limit is 128 MB
@@ -286,7 +299,6 @@ Nothing is logged: the host has no `console.log` of a request, a path or a heade
   "durable_objects": { "bindings": [{ "name": "WRELA_SERVER", "class_name": "WrelaServer" }] },
   "migrations": [{ "tag": "wrela-server-1", "new_sqlite_classes": ["WrelaServer"] }],
   "rules": [{ "type": "CompiledWasm", "globs": ["**/*.wasm"], "fallthrough": true }],
-  "limits": { "cpu_ms": 5000 },
   "vars": { "WRELA_ORIGINS": "" },
   "assets": { "run_worker_first": ["/api/*"] }
 }
@@ -399,7 +411,9 @@ the session from the `__Host-` cookie, and checks Origin and its CSRF header. Th
   (`new_sqlite_classes: ["WrelaRoom"]`), and `/room/*` in `run_worker_first`.
 - A `ratelimits` entry with prefix `/room/` limits upgrades.
 - `net.json` beside the client build names the site, `{"url": "wss://<site>"}`.
-- Deploy commands, secrets and plan: as 0.13.0.
+- `limits.cpu_ms` is no longer in `cloudflare.json` (Workers Free takes none).
+- Deploy commands and secrets: as 0.13.0. The plan: Workers Free at launch, Paid only if calls
+  come near the 10 ms limit.
 
 ## 12. Later, listed but not built
 
@@ -417,8 +431,8 @@ the session from the `__Host-` cookie, and checks Origin and its CSRF header. Th
 1. **`user-agent`.** Left out of what a server sees, since it fingerprints and the privacy policy
    lists what's kept. Does the accounts server want it, say to name a session's device ("Chrome
    on a Mac")? If so, the host could pass a coarse family instead.
-2. **`limits.cpu_ms`.** 5000 is a guess: enough for a call that verifies a slow run, and a cap on
-   what a runaway call costs. It should be measured on the first deploy.
+2. **`limits.cpu_ms`.** Launch is on Workers Free (10 ms, no `cpu_ms`), with Paid only if
+   calls come near it. On Paid, 5000 would cap what a runaway call costs; measure first.
 3. **Isolating a failing request.** Today a trap fails every request open on the instance.
    `wrela-serve` retries a room's events one at a time to find the poisoned one. Is that worth
    doing for HTTP, where one attacker's request could otherwise fail others' concurrent

@@ -12,54 +12,16 @@
 // answer's status). It prints `{ sent: { peer: [hex] }, closed: { peer: code }, routes: [status] }`.
 
 import { Database } from "bun:sqlite";
-import { plugin } from "bun";
 import { readFileSync } from "node:fs";
 import { join } from "node:path";
-import { sqliteBindings } from "./sqlite.ts";
+import { FakeSocket as Socket, storage, workers } from "./fakes.ts";
 
 const [build, scenarioPath] = process.argv.slice(2) as [string, string];
 type Step = { connect?: string; send?: string; hex?: string; text?: string; restart?: boolean; route?: string; origin?: string };
 const steps = JSON.parse(readFileSync(scenarioPath, "utf8")) as Step[];
 
-plugin({
-  name: "workers",
-  setup(b) {
-    b.module("cloudflare:workers", () => ({
-      exports: {
-        DurableObject: class {
-          constructor(
-            readonly ctx: unknown,
-            readonly env: unknown,
-          ) {}
-        },
-      },
-      loader: "object",
-    }));
-    b.onLoad({ filter: /\.wasm$/ }, async (args) => ({
-      exports: { default: new WebAssembly.Module(await Bun.file(args.path).arrayBuffer()) },
-      loader: "object",
-    }));
-  },
-});
+workers();
 
-/** A WebSocket's server end: what it was sent, whether it was closed, and its attachment. */
-class Socket {
-  sent: Uint8Array[] = [];
-  closed: number | null = null;
-  attachment: unknown = null;
-  send(bytes: Uint8Array) {
-    this.sent.push(new Uint8Array(bytes));
-  }
-  close(code = 1000) {
-    this.closed ??= code;
-  }
-  serializeAttachment(v: unknown) {
-    this.attachment = structuredClone(v);
-  }
-  deserializeAttachment() {
-    return this.attachment;
-  }
-}
 Object.assign(globalThis, {
   WebSocketPair: class {
     0 = new Socket();
@@ -77,19 +39,6 @@ Object.assign(globalThis, {
     }
   },
 });
-
-function storage(db: Database) {
-  return {
-    sql: {
-      exec(query: string, ...bindings: unknown[]) {
-        const rows = db.query(query).all(...(sqliteBindings(bindings) as never[])) as Record<string, unknown>[];
-        return Object.assign(rows[Symbol.iterator](), { toArray: () => rows });
-      },
-    },
-    transactionSync: <T>(fn: () => T): T => db.transaction(fn)(),
-    setAlarm: async () => {},
-  };
-}
 
 interface Host {
   WrelaServer: new (ctx: unknown, env: unknown) => unknown;
