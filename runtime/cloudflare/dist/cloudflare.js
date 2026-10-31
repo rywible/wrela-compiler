@@ -1574,6 +1574,9 @@ class Room {
   alarm() {
     return this.wake();
   }
+  get settled() {
+    return this.running;
+  }
   wake() {
     this.running = this.running.then(() => this.wakeNow(), () => this.wakeNow());
     return this.running;
@@ -1759,8 +1762,10 @@ class Room {
         return s;
     }
     const r = await this.call([e]);
-    if (r === null || "journal" in r || !r.room.program || e.kind !== "message")
+    if (r === null || "journal" in r || !r.room.program)
       return r;
+    if (e.kind !== "message")
+      return null;
     const s = await fresh();
     if (s !== null)
       return s;
@@ -2045,12 +2050,18 @@ function roomClass(module) {
     }
     async webSocketMessage(ws, message) {
       this.room.message(ws, message);
+      await this.room.settled;
     }
     async webSocketClose(ws) {
       this.room.closed(ws);
+      try {
+        ws.close();
+      } catch {}
+      await this.room.settled;
     }
     async webSocketError(ws) {
       this.room.closed(ws);
+      await this.room.settled;
     }
     async alarm() {
       await this.room.alarm();

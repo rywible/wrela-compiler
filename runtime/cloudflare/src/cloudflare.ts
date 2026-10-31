@@ -286,16 +286,27 @@ export function roomClass(module: WebAssembly.Module) {
       return new Response(null, { status: 101, webSocket: client });
     }
 
+    // Each event lasts until the room has taken it, so the runtime neither cancels nor hibernates
+    // the call it started.
     async webSocketMessage(ws: WebSocket, message: ArrayBuffer | string): Promise<void> {
       this.room.message(ws as unknown as Socket, message);
+      await this.room.settled;
     }
 
     async webSocketClose(ws: WebSocket): Promise<void> {
       this.room.closed(ws as unknown as Socket);
+      // Before compatibility date 2026-04-07 the object finishes the close handshake itself.
+      try {
+        ws.close();
+      } catch {
+        // It's closed already.
+      }
+      await this.room.settled;
     }
 
     async webSocketError(ws: WebSocket): Promise<void> {
       this.room.closed(ws as unknown as Socket);
+      await this.room.settled;
     }
 
     async alarm(): Promise<void> {

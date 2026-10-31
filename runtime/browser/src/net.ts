@@ -1,9 +1,11 @@
 // The network (language.md §19): the events a program reads, with messages' bytes, and its
-// connections to its server's rooms over WebTransport. A connection is one session at
-// `/room/<name>?pair=<id>` of the server that `net.json` beside the build names, with one
-// bidirectional stream; each message on it is a frame: its length (a varint, at most MAX_FRAME),
-// then its bytes. What a connection holds is bounded: past HELD bytes waiting for the program,
-// or past PENDING bytes waiting to be written, it's closed, and its peer comes back.
+// connections to its server's rooms. A connection is to `/room/<name>?pair=<id>` of the server
+// that `net.json` beside the build names. To an `https:` server (`wrela-serve`) it's a
+// WebTransport session with one bidirectional stream, each message on it a frame: its length (a
+// varint, at most MAX_FRAME), then its bytes. To a `wss:` server (the Cloudflare host) it's a
+// WebSocket, each binary message a frame. What a connection holds is bounded: past HELD bytes
+// waiting for the program, or past PENDING bytes waiting to be written, it's closed, and its peer
+// comes back.
 
 import { EVENT_SIZE, EventKind, PAYLOAD_PER_CALL } from "./abi.gen.ts";
 import { errorMessage } from "./errors.ts";
@@ -194,12 +196,16 @@ export function parseServer(text: string): Server {
   const v: unknown = JSON.parse(text);
   if (typeof v !== "object" || v === null) throw new Error("net.json isn't an object");
   const { url, certificateHash } = v as Record<string, unknown>;
-  if (typeof url !== "string") throw new Error("net.json's `url` isn't an https URL");
+  if (typeof url !== "string") throw new Error("net.json's `url` isn't an https or wss URL");
   let address: URL;
   try { address = new URL(url); }
-  catch { throw new Error("net.json's `url` isn't an https URL"); }
-  if (address.protocol !== "https:" || address.username || address.password || url.includes("?") || url.includes("#")) {
-    throw new Error("net.json's `url` isn't an https URL without credentials, query or fragment");
+  catch { throw new Error("net.json's `url` isn't an https or wss URL"); }
+  // `https:`: WebTransport (wrela-serve); `wss:`: a WebSocket a connection (the Cloudflare host),
+  // and `ws:` only to a loopback development server.
+  const loopback = ["localhost", "127.0.0.1", "[::1]"].includes(address.hostname);
+  const scheme = address.protocol === "https:" || address.protocol === "wss:" || (address.protocol === "ws:" && loopback);
+  if (!scheme || address.username || address.password || url.includes("?") || url.includes("#")) {
+    throw new Error("net.json's `url` isn't an https or wss URL without credentials, query or fragment");
   }
   if (certificateHash === undefined) return { url };
   const whole = Array.isArray(certificateHash) && certificateHash.length === 32 && certificateHash.every((x) => Number.isInteger(x) && x >= 0 && x < 256);
@@ -211,6 +217,7 @@ export function parseServer(text: string): Server {
  * to be written on it. */
 interface Session {
   transport: WebTransport | null;
+  socket: WebSocket | null;
   writer: WritableStreamDefaultWriter<Uint8Array> | null;
   closed: boolean;
   pending: number;
@@ -247,7 +254,8 @@ export class Net {
       let planned = sessions.get(conn);
       if (planned === undefined) {
         const session = this.#sessions.get(conn);
-        planned = { open: session !== undefined && !session.closed, writer: session?.writer != null, pending: session?.pending ?? 0 };
+        const writable = session?.writer != null || session?.socket?.readyState === WebSocket.OPEN;
+        planned = { open: session !== undefined && !session.closed, writer: writable, pending: session?.pending ?? 0 };
         sessions.set(conn, planned);
       }
       return planned;
@@ -294,7 +302,7 @@ export class Net {
    * can't join a room). A number already open is the program's mistake. */
   open(conn: number, room: string, pair: bigint | null): void {
     if (this.#sessions.has(conn)) throw new Error(`connection ${conn} is open`);
-    const session: Session = { transport: null, writer: null, closed: false, pending: 0 };
+    const session: Session = { transport: null, socket: null, writer: null, closed: false, pending: 0 };
     this.#sessions.set(conn, session);
     if (!roomName(room)) {
       this.print(`connection ${conn}: \`${room}\` isn't a room's name`);
@@ -313,6 +321,7 @@ export class Net {
     try {
       const server = await this.#fetchServer();
       if (session.closed) return;
+      if (!server.url.startsWith("https:")) return this.#socket(conn, `${server.url.replace(/\/$/, "")}/room/${room}`, session);
       const options: WebTransportOptions = {};
       if (server.certificateHash) {
         options.serverCertificateHashes = [{ algorithm: "sha-256", value: new Uint8Array(server.certificateHash) }];
@@ -345,11 +354,45 @@ export class Net {
     this.#end(conn, session);
   }
 
+  /** Connection `conn` as a WebSocket at `url`: each binary message is one frame, so none is
+   * framed; what it holds waiting to be written is its `bufferedAmount`. */
+  #socket(conn: number, url: string, session: Session): void {
+    const socket = new WebSocket(url);
+    socket.binaryType = "arraybuffer";
+    session.socket = socket;
+    socket.onopen = () => {
+      if (!session.closed) this.arrived.push({ conn, open: true });
+    };
+    socket.onmessage = (e: MessageEvent<unknown>) => {
+      if (session.closed) return;
+      if (!(e.data instanceof ArrayBuffer) || e.data.byteLength > MAX_FRAME || this.#held + e.data.byteLength + OVERHEAD > HELD) {
+        this.print(`connection ${conn}: a message that isn't a frame, or past what may wait for the program`);
+        this.#end(conn, session);
+        return;
+      }
+      const bytes = new Uint8Array(e.data);
+      this.#held += bytes.length + OVERHEAD;
+      this.arrived.push({ conn, bytes });
+    };
+    socket.onclose = () => this.#end(conn, session);
+    socket.onerror = () => this.#end(conn, session);
+  }
+
   /** Sends `bytes` on connection `conn`: nothing if it isn't open (it may have closed since the
    * program last heard). A message past MAX_UP closes it, and so does one past PENDING bytes
    * not yet written. */
   send(conn: number, bytes: Uint8Array): void {
     const session = this.#sessions.get(conn);
+    if (session?.socket && !session.closed) {
+      if (session.socket.readyState !== WebSocket.OPEN) return;
+      if (bytes.length > MAX_UP || session.socket.bufferedAmount + bytes.length > PENDING) {
+        this.print(`connection ${conn}: a message of ${bytes.length} bytes, past ${MAX_UP} or past ${PENDING} waiting to be written`);
+        this.close(conn);
+        return;
+      }
+      session.socket.send(bytes.slice());
+      return;
+    }
     if (!session?.writer || session.closed) return;
     if (bytes.length > MAX_UP) {
       this.print(`connection ${conn}: a message of ${bytes.length} bytes, past ${MAX_UP}`);
@@ -390,6 +433,7 @@ export class Net {
     if (this.#sessions.get(conn) === session) this.#sessions.delete(conn);
     try {
       session.transport?.close();
+      session.socket?.close(1000);
     } catch {
       // It's closed already.
     }

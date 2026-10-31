@@ -180,6 +180,11 @@ export class Room implements Owner<Net> {
     return this.wake();
   }
 
+  /** Settles once the room has taken what it was given. */
+  get settled(): Promise<void> {
+    return this.running;
+  }
+
   /** Whatever came, taken in order, one wake at a time. */
   wake(): Promise<void> {
     this.running = this.running.then(
@@ -369,7 +374,9 @@ export class Room implements Owner<Net> {
       if (s !== null) return s;
     }
     const r = await this.call([e]);
-    if (r === null || "journal" in r || !r.room.program || e.kind !== "message") return r;
+    if (r === null || "journal" in r || !r.room.program) return r;
+    // A trap on a connection's opening or closing, alone, passes: only a message is poisoned.
+    if (e.kind !== "message") return null;
     const s = await fresh();
     if (s !== null) return s;
     const poisoned = await this.call([{ kind: "message", conn: e.conn + POISONED, bytes: e.bytes }]);

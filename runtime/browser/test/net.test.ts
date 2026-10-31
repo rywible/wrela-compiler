@@ -151,9 +151,64 @@ describe("connections", () => {
     const hash = Array.from({ length: 32 }, (_, i) => i);
     expect(parseServer(JSON.stringify({ url: "https://x", certificateHash: hash })).certificateHash).toEqual(hash);
     for (const url of ["http://x", "https://", "https://trusted.example@attacker.example", "https://x/?redirect=other", "https://x/#room", "https://x/?", "https://x/#"]) {
-      expect(() => parseServer(JSON.stringify({ url }))).toThrow("isn't an https URL");
+      expect(() => parseServer(JSON.stringify({ url }))).toThrow("isn't an https or wss URL");
     }
     expect(() => parseServer('{"url": "https://x", "certificateHash": [1]}')).toThrow("isn't 32 bytes");
+    // A WebSocket's server: wss, or ws to a loopback development server alone.
+    expect(parseServer('{"url": "wss://wrela.dev"}')).toEqual({ url: "wss://wrela.dev" });
+    expect(parseServer('{"url": "ws://localhost:8787"}')).toEqual({ url: "ws://localhost:8787" });
+    expect(() => parseServer('{"url": "ws://wrela.dev"}')).toThrow("isn't an https or wss URL");
+  });
+
+  test("a wss server's connection is a WebSocket, each binary message a frame", async () => {
+    const made: FakeSocket[] = [];
+    class FakeSocket {
+      static readonly OPEN = 1;
+      readyState = 0;
+      binaryType = "blob";
+      bufferedAmount = 0;
+      sent: Uint8Array[] = [];
+      closed = false;
+      onopen: (() => void) | null = null;
+      onmessage: ((e: { data: unknown }) => void) | null = null;
+      onclose: (() => void) | null = null;
+      onerror: (() => void) | null = null;
+      constructor(readonly url: string) {
+        made.push(this);
+      }
+      send(b: Uint8Array) {
+        this.sent.push(b);
+      }
+      close() {
+        this.closed = true;
+      }
+    }
+    const real = globalThis.WebSocket;
+    const fetched = globalThis.fetch;
+    Object.assign(globalThis, {
+      WebSocket: FakeSocket,
+      fetch: async () => new Response('{"url": "wss://wrela.dev"}'),
+    });
+    try {
+      const net = new Net(() => "https://wrela.dev/console/", () => {});
+      net.open(4, "lobby", 0xabn);
+      for (let i = 0; i < 50 && made.length === 0; i++) await new Promise((r) => setTimeout(r, 5));
+      const socket = made[0]!;
+      expect(socket.url).toBe("wss://wrela.dev/room/lobby?pair=00000000000000ab");
+      expect(socket.binaryType).toBe("arraybuffer");
+      socket.readyState = FakeSocket.OPEN;
+      socket.onopen!();
+      socket.onmessage!({ data: new Uint8Array([7, 8]).buffer });
+      net.send(4, Uint8Array.of(1, 2, 3));
+      expect(socket.sent).toEqual([Uint8Array.of(1, 2, 3)]);
+      const inbox = new Inbox();
+      net.deliver(inbox);
+      expect(inbox.length).toBe(2);
+      socket.onclose!();
+      expect(net.arrived).toEqual([{ conn: 4, open: false }]);
+    } finally {
+      Object.assign(globalThis, { WebSocket: real, fetch: fetched });
+    }
   });
 
   test("each open ends in exactly one closed event, however it ends", async () => {
