@@ -102,3 +102,40 @@ test("a request past what the object may hold is turned away before it's queued"
   const s = new Server(module, storage(), { limits: { ...LIMITS, queued: 16 } });
   expect(await status(s)).toBe(503);
 });
+
+test("work a call leaves sets a recovery alarm, and a reset object comes back to it", async () => {
+  // `serve` asks the time on its first call alone (its memory's word 0 says it asked), and prints
+  // each time it's called.
+  const PRINT = { module: "wrela", name: "print", kind: "func" as const, type: { params: ["i32" as const, "i32" as const], results: [] } };
+  const batch = new Encoder().hostRequest(1, "time/unix", new Uint8Array(0)).finish();
+  const line = new TextEncoder().encode("served");
+  const body = [
+    ...op.i32(0), 0x28, 0x02, 0x00, 0x45, 0x04, 0x40, // if memory[0] == 0
+    ...op.i32(64), ...op.i32(batch.length), ...op.call(0), // ask the time
+    ...op.i32(0), ...op.i32(1), 0x36, 0x02, 0x00, // memory[0] = 1
+    0x0b,
+    ...op.i32(200), ...op.i32(line.length), ...op.call(1), // print
+  ];
+  const module = new WebAssembly.Module(
+    buildModule({
+      imports: [SUBMIT, PRINT],
+      memory: 1,
+      ownMemory: true,
+      data: [{ offset: 64, bytes: batch }, { offset: 200, bytes: line }],
+      funcs: [{ type: SERVE, body, export: "serve" }],
+    }),
+  );
+  const store = storage();
+  const alarms: number[] = [];
+  let printed = 0;
+  const now = 5000;
+  const first = new Server(module, store, { now: () => now, setAlarm: (at) => alarms.push(at), print: () => printed++ });
+  await first.alarm();
+  // The first call left an answer due: the recovery alarm, a second ahead, before it was taken.
+  expect(alarms).toEqual([6000]);
+  expect(printed).toBe(2);
+  // The object is reset; its alarm comes to a new one, which starts and calls the program.
+  const second = new Server(module, store, { now: () => now, print: () => printed++ });
+  await second.alarm();
+  expect(printed).toBe(4);
+});
