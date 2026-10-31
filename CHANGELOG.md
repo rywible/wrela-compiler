@@ -21,6 +21,25 @@ detail; `docs/release.md` says how a release is cut.
 - **A server asks the time of day** (`std::time::wall_clock`, read with `unix_ms`), on
   `wrela-serve` and on Cloudflare.
 
+## 0.12.0
+
+- **The browser host builds the first frame's pipelines first** (language.md §18.9): no
+  pipeline that no command asked for starts until the first frame's commands have all run, and
+  then none starts while a command waits for one. 0.11.1 started six at load, the largest first,
+  so a pipeline the first frame needed compiled behind those it didn't. rywible/wrela's capybara
+  (17 pipelines, headless Chrome on Linux, cold, median of 3): its first frame on the screen at
+  2.71 s after the page opened, from 3.56 s; warm, 0.30 s, from 0.28 s (its pipelines from the
+  cache now start when the frame asks, not at load).
+- **Test mode says when each frame was on its way to the screen**: `frames.json`'s
+  `submitted_ms`, when its commands had all run and were submitted (after any that waited for a
+  pipeline), and `load.json`'s `first_submitted_ms`. `show=1`'s summary times the first frame and
+  `playable` by them; `began_ms` is still when each frame began.
+- **`std::tick::post(tag, a:, b:)` puts a value the frames know into the ticks** (§16.2): the
+  host stamps it into the next tick's records, as an input event, so a tick log keeps it and a
+  replay holds; the step reads it in `Ticked`'s new `posts` (`Posted { tag, a, b }`). A replaying
+  host drops what the program posts. runtime/abi: the record kind `Posted` (16), and the host
+  service `tick/post`. A `Ticked` literal names `posts` too.
+
 ## 0.11.1
 
 - **An associated constant made with `&`, `|`, `^`, `<<` or `>>` folds** (language.md §3.4): a
@@ -52,7 +71,7 @@ detail; `docs/release.md` says how a release is cut.
 
 ## 0.10.2
 
-- **The browser host builds six pipelines at a time** (language.md §18's tiers), tier 0's first and
+- **The browser host builds six pipelines at a time** (language.md §18.9), tier 0's first and
   the largest first, then tier 1's; one a command waits for starts at once, beside them. 0.10.1
   asked for all of tier 0's at once (tier 1's once they'd settled): the GPU process compiles a few
   at a time whatever's asked, so a small pipeline a frame needed waited behind every other. On an

@@ -54,6 +54,26 @@ let handed = new Handed([]);
 let failed = false;
 /** Input events from the main thread (input.ts). */
 let ring: InputRing | null = null;
+/** The records the program posts into its ticks (`std::tick::post`), for the ticker's thread:
+ * this thread writes them, and the ticker reads them as it reads the input ring. Each is stamped
+ * with the frames started when it was posted, where an input event has its time, so a frame's
+ * posts are its next tick's records before the next frame's script events (as on the native
+ * host). */
+const posts = InputRing.create();
+
+/** The records posted while the program's ticker is starting (after `start`, in `init`, whose
+ * commands run before the ticker's thread reads): they go into `posts` once it reads, so its first
+ * tick has them, as on the native host. None while no program is starting a ticker. */
+let postsStarting: [record: Uint8Array, frames: number][] | null = null;
+
+/** Queues a record the program posted for the ticker; throws if too many wait. */
+function postTick(record: Uint8Array): void {
+  if (postsStarting !== null && postsStarting.length < InputRing.CAPACITY) {
+    postsStarting.push([record, ticker.control.frames]);
+  } else if (postsStarting !== null || !posts.write(record, ticker.control.frames)) {
+    throw new Error(`${InputRing.CAPACITY} posted records already wait for the ticker`);
+  }
+}
 
 /** The program's connections: one set for the page, which a reload to another program closes.
  * Its server is in `net.json` beside the running build. */
@@ -64,6 +84,13 @@ const net = new Net(
     hostLine?.(line);
   },
 );
+
+/** The running program has no ticker: neither ring keeps what it hasn't read. */
+function detachTicker(): void {
+  ring?.detachTicker();
+  posts.detachTicker();
+  postsStarting = null;
+}
 
 /** Gives the program the events the main thread has written, and what its connections had: it
  * reads them in its next call. A frame shown at `frame` (ms since 1970) gets a held pointer's moves
@@ -212,10 +239,19 @@ function tickerStarter(
   settings: TickSettings,
   replay: Replay | null = null,
 ): (options: TickerOptions, onPrint: PrintSink) => void {
+  postsStarting = [];
   return (options, onPrint) => {
     const framesBeforeStart = ticker.control.frames;
     ticker.memory = options.memory;
-    if (replay === null) ring?.attachTicker();
+    if (replay === null) {
+      ring?.attachTicker();
+      posts.attachTicker();
+    }
+    const starting = postsStarting ?? [];
+    postsStarting = null;
+    for (const [record, frames] of starting) {
+      if (!posts.write(record, frames)) throw new Error(`${InputRing.CAPACITY} posted records already wait for the ticker`);
+    }
     const thread = new Thread("wrela sim");
     ticker.thread = thread;
     ticker.report = new Promise((resolve) => {
@@ -234,6 +270,7 @@ function tickerStarter(
       control: ticker.control.buffer,
       clock: clock.buffer,
       input: ring!.buffer,
+      posts: posts.buffer,
       wasmHash: settings.hashes ? (build.compiled?.hash ?? 0n) : 0n,
       replay,
       framesBeforeStart,
@@ -270,6 +307,7 @@ function programOptions(b: Build, ticks: TickSettings, carried: Carried | null):
     spawnWorker,
     startVoice,
     startTicker: tickerStarter(b, ticks, carried?.replay ?? null),
+    postTick,
     kept: carried?.kept,
     inbox: carried?.inbox,
     net,
@@ -320,7 +358,7 @@ async function swap(old: Program, base: string, frames: number, start: Start): P
   const program = await start(build, await stop(old, frames, true));
   // A ticker may disappear across a reload. Its reader must then stop holding the shared input
   // ring back; a replacement ticker attaches itself during its `init` instead.
-  if (program.ticker === null) ring?.detachTicker();
+  if (program.ticker === null) detachTicker();
   return program;
 }
 
@@ -364,7 +402,7 @@ async function handOver(old: Program, asked: Asked, frames: number, start: Start
   buildBase = asked.base;
   try {
     const program = await start(ready, carried);
-    if (program.ticker === null) ring?.detachTicker();
+    if (program.ticker === null) detachTicker();
     running = ready;
     leftovers = new Map([...before].filter(([key]) => !pipelineCache.has(key)));
     return program;
@@ -382,7 +420,7 @@ async function handOver(old: Program, asked: Asked, frames: number, start: Start
     pipelineCache.clear();
     for (const [key, p] of before) pipelineCache.set(key, p);
     const program = await start(back.build, carried);
-    if (program.ticker === null) ring?.detachTicker();
+    if (program.ticker === null) detachTicker();
     return program;
   }
 }
@@ -571,9 +609,12 @@ interface TestRecord {
   printed: string[];
   printed_in: number[];
   /** Each frame's CPU time (the program's `frame` and its batch's checks and encoding, up to
-   * its submission), and when it began (ms since the epoch): `results/frames.json`. */
+   * its submission), when it began, and when its commands had all run and were submitted, after
+   * any that waited for a pipeline being built (ms since the epoch): `results/frames.json`. A
+   * frame is on the screen once the GPU has drawn it, after it was submitted. */
   cpu: number[];
   began_ms: number[];
+  submitted_ms: number[];
   /** Each frame's phases (`std::time::phase`), ms by name. */
   phases: Record<string, number>[];
   /** What the executor did each frame (`results/counters.json`). */
@@ -651,6 +692,7 @@ async function runTest(canvas: OffscreenCanvas, device: GPUDevice, build: Build,
     printed_in: [],
     cpu: [],
     began_ms: [],
+    submitted_ms: [],
     phases: [],
     counters: [],
     latency: { frames: [], delivered: [] },
@@ -807,10 +849,12 @@ async function runTest(canvas: OffscreenCanvas, device: GPUDevice, build: Build,
     });
     // The frame's commands that wait for a pipeline being built run once it is.
     await executor.caughtUp();
+    const submitted = () => record.submitted_ms.push(performance.timeOrigin + performance.now());
     if (timing === "serial") {
       // The serial timing mode runs the frame's passes now, one at a time: what they did is
-      // known once they've run.
+      // known, and they're submitted, once they've run.
       draining = draining.then(() => scoped(device, () => executor.drain())).then(() => {
+        submitted();
         record.counters.push(executor.takeCounters());
       });
       draining.catch(fatal);
@@ -818,7 +862,10 @@ async function runTest(canvas: OffscreenCanvas, device: GPUDevice, build: Build,
       // while it runs: each drain takes exactly its own frame's commands, and so its counters.
       drains.push(draining);
       if (drains.length > 1) await drains.shift()!.catch(() => {});
-    } else record.counters.push(executor.takeCounters());
+    } else {
+      submitted();
+      record.counters.push(executor.takeCounters());
+    }
     if (params.saturate > 0 || params.inflight > 0) {
       inFlight.push(device.queue.onSubmittedWorkDone());
       if (inFlight.length > (params.saturate > 0 ? 2 : params.inflight)) await inFlight.shift();
@@ -890,7 +937,7 @@ async function saveResults(
     if (params.clipfrom + params.clip >= frames) self.postMessage({ type: "clip-stop" } satisfies FromWorker);
     await clipSaved.promise;
   }
-  const { printed, cpu, began_ms, printed_in, pipelinesMs, tier1Ms } = record;
+  const { printed, cpu, began_ms, submitted_ms, printed_in, pipelinesMs, tier1Ms } = record;
   // With timestamps, each frame's labels and their GPU ms (a label run twice in a frame summed),
   // beside its CPU time and phases: one file a tool reads per frame.
   const timings = timing !== "off" ? await executor.timings() : null;
@@ -903,7 +950,7 @@ async function saveResults(
     putResult(base, "hash.txt", `${hash ? hash.hex() : "none"}\n`),
     putResult(base, "workers.txt", `${program.workerChunks()}\n`),
     putResult(base, "log.txt", printed.map((l) => `${l}\n`).join("")),
-    putResult(base, "frames.json", JSON.stringify({ cpu_ms: cpu, began_ms, printed_in, phases: record.phases, labels })),
+    putResult(base, "frames.json", JSON.stringify({ cpu_ms: cpu, began_ms, submitted_ms, printed_in, phases: record.phases, labels })),
     timings !== null ? putResult(base, "timings.json", JSON.stringify(timings)) : null,
     params.salt > 0 ? putResult(base, "pipelines.json", JSON.stringify({ ms: pipelinesMs, tier1_ms: tier1Ms, count: build.manifest.pipelines.length, tier1: build.manifest.pipelines.filter((p) => p.conditional).length, each })) : null,
     putResult(base, "counters.json", JSON.stringify(record.counters)),
@@ -916,13 +963,13 @@ async function saveResults(
   const resources = [...page.resources, ...loaded(["resource"])];
   // How the WASM compiled: a second open of the same build streams it from the code cache.
   const wasm = compiled ? { compile_ms: compiled.compile_ms, instantiate_ms: compiled.instantiate_ms ?? null, streamed: compiled.streamed } : null;
-  const load = { opened_ms: page.opened_ms, first_frame_ms: began_ms[0] ?? null, wasm, resources };
+  const load = { opened_ms: page.opened_ms, first_frame_ms: began_ms[0] ?? null, first_submitted_ms: submitted_ms[0] ?? null, wasm, resources };
   await putResult(base, "load.json", JSON.stringify(load));
   if (params.show > 0) {
     // Drawn before DONE, so whatever reads the screen after it sees the summary.
     const info = deviceInfo(device);
     const adapter = [info.vendor, info.architecture, info.description].filter((x) => x).join(" ");
-    const run = { began_ms, printed, printed_in, opened_ms: page.opened_ms, pipelines_ms: pipelinesMs };
+    const run = { began_ms, submitted_ms, printed, printed_in, opened_ms: page.opened_ms, pipelines_ms: pipelinesMs };
     self.postMessage({ type: "summary", lines: summaryLines(run, adapter) } satisfies FromWorker);
     await summaryShown.promise;
   }

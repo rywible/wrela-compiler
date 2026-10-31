@@ -1,0 +1,105 @@
+// A ticker that learns what only the frames know through records they post into its ticks
+// (`std::tick::post`), run by compiler/tests/tests/suite/threads.rs: frame 3 posts the levels a
+// saved game opened, frame 7 two more records, frame 10 more than a tick holds, and `init` one
+// once its ticker has started; each tick folds its posts, with its number, into
+// its world, and counts its key presses, so the tick that each record reaches is in the hashes.
+
+use std::handoff::{Latest, Publisher, handoff}
+use std::hash::{StateHash, state_hash}
+use std::input::Event
+use std::tick::{Ticked, post, start}
+
+/// What a saved game opened: a bit for each level.
+const OPENED: u32 = 1
+/// Anything else the frames tell the sim.
+const NOTE: u32 = 2
+
+/// The ticker's world: what's hashed.
+struct World: Clone + StateHash {
+    opened: u64,
+    posts: u32,
+    keys: u32,
+    /// Each post's tag, values and tick, folded in order.
+    trail: u64,
+}
+
+/// What the frames see of the world.
+struct Snap: Copy + Plain {
+    tick: u32,
+    opened: u64,
+    posts: u32,
+    keys: u32,
+}
+
+struct Sim {
+    world: World,
+    out: Publisher<Snap>,
+}
+
+@deterministic
+fn step(sim: mut Sim, t: Ticked) {
+    for p in t.posts {
+        if p.tag == OPENED {
+            sim.world.opened = p.a
+        }
+        sim.world.posts += 1
+        sim.world.trail = sim.world.trail.wrapping_mul(1099511628211) ^
+            p.a.wrapping_add(p.b.wrapping_mul(3)).wrapping_add(u64(p.tag) + u64(t.tick))
+    }
+    for e in t.records {
+        if let Event::KeyDown { .. } = e {
+            sim.world.keys += 1
+        }
+    }
+    let w = sim.world.clone()
+    sim.out.publish(Snap { tick: t.tick, opened: w.opened, posts: w.posts, keys: w.keys })
+}
+
+@deterministic
+fn hash(sim: Sim) -> u64 {
+    state_hash(sim.world)
+}
+
+pub struct Game {
+    latest: Latest<Snap>,
+    newest: Snap,
+    frames: u32,
+}
+
+pub fn init() -> Game {
+    let first = Snap { tick: 0, opened: 0, posts: 0, keys: 0 }
+    let (out, latest) = handoff(first)
+    let world = World { opened: 1, posts: 0, keys: 0, trail: 0 }
+    start(Sim { world, out }, hz: 60, step: step, hash: hash)
+    // Posted once the ticker has started: its first tick's.
+    post(NOTE, a: 42, b: 0)
+    Game { latest, newest: first, frames: 0 }
+}
+
+pub fn frame(game: mut Game, time: f32, width: u32, height: u32) {
+    game.newest = game.latest.read()
+    if game.frames == 3 {
+        post(OPENED, a: 5, b: 0)
+    }
+    if game.frames == 7 {
+        post(NOTE, a: 18446744073709551615, b: 4294967296)
+        post(OPENED, a: 7, b: 0)
+    }
+    // More than a tick holds: the rest wait, in order, ahead of the next frame's input.
+    if game.frames == 10 {
+        for i in 0..300 {
+            post(NOTE, a: u64(i), b: 0)
+        }
+    }
+    game.frames += 1
+}
+
+/// The newest snapshot the frames have read: its tick, the levels opened and the posts so far.
+pub fn newest(game: Game) -> vec3 {
+    vec3(f32(game.newest.tick), f32(game.newest.opened), f32(game.newest.posts))
+}
+
+/// The key presses the newest snapshot counted.
+pub fn keys(game: Game) -> u32 {
+    game.newest.keys
+}

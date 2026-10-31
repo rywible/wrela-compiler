@@ -1816,11 +1816,58 @@ All three are in std, built on the unsafe core (§6.12), and none of them is spe
 #### Ticks
 
 - **`std::tick::start(state, hz:, step:, hash:)`** moves `state` to the **ticker**'s thread. There, `step(mut state, ticked)` runs `hz` times a second. Each run of `step` is a **tick.**
-  - `Ticked` holds the tick's number, its length in seconds and its **records:** the input events that the host stamped at the tick's start, oldest first, at most 256. The rest wait for the next tick.
+  - `Ticked` holds the tick's number, its length in seconds and its **records:** the input events that the host stamped at the tick's start, oldest first, at most 256. The rest wait for the next tick. It holds the records the program posted (below) apart, in `posts`.
   - `step` and `hash` are `@deterministic` functions (§12), or closures that capture only values (E0510), because they move to the ticker's thread too. So a tick's state is a function of the first state and the records.
   - `hash` gives the state's hash. A host asks for it when it records or checks ticks.
   - A program has one ticker; a second `start` panics.
   - `std::tick::origin()` is the frame time at which tick 0 was due; a frame uses it to place the newest tick. It is `nondet`: the host moves it when it drops ticks that it couldn't run in time, or when the page was hidden.
+- **`std::tick::post(tag, a:, b:)`** puts a value that only the frames know into the ticks, such as a saved game that the program reads from storage after `init` (§17.1).
+  - The host stamps the record into the next tick's records, as it stamps an input event that arrives then. In lockstep (below), what frame i posts is a record of the first tick that runs for frame i + 1, before that frame's input. What `init` posts after `start` is the first tick's.
+  - The step reads it in `Ticked.posts`: each a `Posted { tag, a, b }`, oldest first. `tag` says what the record is, and `a` and `b` are two `u64`s whose meaning is the program's.
+  - A tick log keeps it among the tick's records, so a replay gives every tick the same input, and a host that replays a log drops what the program posts as it runs again. A tick's state stays a function of the first state and the records.
+  - It is `@client`. A post in a call that ends with no ticker started fails the call's commands: a host takes a call's commands when it returns, so `start` earlier or later in the same call counts. Its record counts toward a tick's 256: past them, the rest wait for the next tick, in order with the input after them.
+
+  ```wrela
+  use std::tick::{Ticked, post, start}
+
+  /// What the saved game says, posted under this tag: a bit for each level the player opened.
+  const OPENED: u32 = 1
+
+  /// A level map, on the ticker: the levels it lets the player into.
+  struct Map: Clone {
+      open: u64,
+  }
+
+  @deterministic
+  fn step(map: mut Map, t: Ticked) {
+      for p in t.posts {
+          if p.tag == OPENED {
+              map.open = p.a
+          }
+      }
+  }
+
+  @deterministic
+  fn hash(map: Map) -> u64 {
+      map.open
+  }
+
+  pub struct Game {
+      posted: bool,
+  }
+
+  pub fn init() -> Game {
+      start(Map { open: 1 }, hz: 60, step: step, hash: hash)
+      Game { posted: false }
+  }
+
+  pub fn frame(game: mut Game, time: f32, width: u32, height: u32) {
+      if !game.posted {
+          post(OPENED, a: 7, b: 0)   // levels 0, 1 and 2, as the saved game says
+          game.posted = true
+      }
+  }
+  ```
 
   ```wrela
   use std::tick::{Ticked, start}
@@ -1948,11 +1995,11 @@ All three are in std, built on the unsafe core (§6.12), and none of them is spe
   - `LOCK_SPINS`, the tries it spun on that lock.
 
   The native host logs a tick that waited at a join, and reports the counts for each tick.
-- **Per-tick input.** Before each frame, a host queues the input events since the last frame for `std::input::events()`. The same events, except messages and connection events, become the next tick's records. A tick sees only its records, never the frames' input queue, so its state depends on the records alone.
-- **The tick log** (wrela_abi's `ticks`) holds a run's ticks as a host ran them: the build's WASM hash, the rate, the first world's hash, then each tick's records and the state hash that its step gave. The build, the first world and the records fix every hash, so any host can replay a log and check it. Chrome's test mode writes a log (`results/ticks.log`), and so does the native host on request.
+- **Per-tick input.** Before each frame, a host queues the input events since the last frame for `std::input::events()`. The same events, except messages and connection events, become the next tick's records, after what the program posted before that frame (`std::tick::post`). A tick sees only its records, never the frames' input queue, so its state depends on the records alone.
+- **The tick log** (wrela_abi's `ticks`) holds a run's ticks as a host ran them: the build's WASM hash, the rate, the first world's hash, then each tick's records (the posted ones among them) and the state hash that its step gave. The build, the first world and the records fix every hash, so any host can replay a log and check it. Chrome's test mode writes a log (`results/ticks.log`), and so does the native host on request.
 - **The native host without a GPU:**
   - `wrela-host --no-gpu <build> --ticks N` runs the ticker alone, with no frames, and prints each tick's hash. `--log out.ticks` writes the log.
-  - `wrela-host --replay <log> [--no-gpu] <build>` replays a log's records. It fails at the first tick whose hash differs, and names that tick.
+  - `wrela-host --replay <log> [--no-gpu] <build>` replays a log's records. It fails at the first tick whose hash differs, and names that tick. It gives the ticks the log's records alone: what the program posts as it runs again is dropped.
   - A build of `wrela-host` without its `gpu` feature has only these two commands. An x86-64 build under Rosetta checks the sim's bits on x86's code generation.
 - **Test mode's two schedules:**
   - **Lockstep:** before frame i, the ticks up to ⌊(i + 1)·hz/fps⌋ run, and the frame waits for them. Both hosts do the same, so frames and hashes compare across hosts.
@@ -2030,7 +2077,7 @@ cook_again: the light's literals change ──► s.light, s.air reloaded
 
 A program asks its host for IO, GPU readback and other work through requests that it polls, and reads input, prints lines and reads the clock through the host's other services.
 
-The services are `std::host`'s and std's functions over one ABI (`runtime/abi`), which both hosts implement alike. What a program asks of its host is `io` to make, and what it reads back is `nondet` (§8.1), so `@deterministic` code takes the host's answers as data, through a tick's records (§16.2).
+The services are `std::host`'s and std's functions over one ABI (`runtime/abi`), which both hosts implement alike. What a program asks of its host is `io` to make, and what it reads back is `nondet` (§8.1), so `@deterministic` code takes the host's answers as data, through a tick's records (§16.2): the frames put an answer there with `std::tick::post`.
 
 ### 17.1 Requests, not async
 
@@ -2465,7 +2512,7 @@ A pipeline is an entry point compiled for one set of type arguments: a generic k
   - A pipeline is in the build only if a command in the optimized CPU code records it. A pipeline behind a constant branch, such as `if test_build() && counting`, leaves the build with the code that records it. (The `&&` holds its value in a local, which constant folding sees through.) Constants fold again after inlining, so a predicate whose body folds to a constant, `fn on(s: State) -> bool { ON && s.n == 3 }` with `ON` false, is that constant where it's called, and the branch on it folds too; so do `&&` and `||` of values where one side settles them, and a comparison of two integer constants. `wrela pipelines` lists what the build makes: it inlines and folds as a build does.
 - **The number of pipelines in a build isn't limited.** The time to create them counts in the cold start's budget, measured cold in Chrome.
 - **The hosts start the program while they create its pipelines,** the biggest shaders first. A command that needs a pipeline not yet created waits for it, and so do the commands after it.
-- **Pipelines come in two tiers.** A pipeline every site of which runs only under a runtime condition (`(under a condition)` above) is tier 1; any other is tier 0. The manifest marks tier 1 (`"conditional": true`), and `wrela pipelines` prints `tier 1` beside it (in `--json`, `"tier": 0` or `1`). The browser host creates six pipelines at a time (more asked for at once, the GPU process compiles a few at a time all the same, and one a frame needs waits behind the rest): tier 0's first, the largest first, then tier 1's; a command that needs a pipeline before its turn starts its creation at once, beside the six, and waits for it as above. A program can't see the tiers: the test mode's `pipelines.json` reports tier 0's time as `ms` and every pipeline's as `tier1_ms`, so "pipelines ready" means tier 0; its `starts.json` gives, for every run, when each pipeline was built and each time a command waited for one (its frame, the pipeline and when).
+- **Pipelines come in two tiers.** A pipeline every site of which runs only under a runtime condition (`(under a condition)` above) is tier 1; any other is tier 0. The manifest marks tier 1 (`"conditional": true`), and `wrela pipelines` prints `tier 1` beside it (in `--json`, `"tier": 0` or `1`). The browser host creates the pipelines the program's first frame needs first, alone: a command that needs a pipeline not yet built starts its creation at once and waits for it as above, and no other pipeline starts until that frame's commands have all run (the GPU process compiles a few at a time however many are asked for, so one a frame needs would wait behind the rest). Then it creates the rest six at a time: tier 0's first, the largest first, then tier 1's. None of those starts while a pipeline a command asked for is being created. A warm start, whose pipelines the browser's cache holds, is ordered the same way. A program can't see the tiers: the test mode's `pipelines.json` reports tier 0's time as `ms` and every pipeline's as `tier1_ms`, so "pipelines ready" means tier 0; its `starts.json` gives, for every run, when each pipeline was built and each time a command waited for one (its frame, the pipeline and when), and its `frames.json` when each frame's commands had all run and were submitted (`submitted_ms`): a frame that waited for a pipeline is on the screen only after that.
 
 ```wrela
 /// Generic over any field; monomorphized per concrete field type.

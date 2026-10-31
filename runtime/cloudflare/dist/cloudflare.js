@@ -106,7 +106,8 @@ var EventKind = {
   Assist: 12,
   Message: 13,
   Connection: 14,
-  Field: 15
+  Field: 15,
+  Posted: 16
 };
 var KEYS = ["Unknown", "KeyA", "KeyB", "KeyC", "KeyD", "KeyE", "KeyF", "KeyG", "KeyH", "KeyI", "KeyJ", "KeyK", "KeyL", "KeyM", "KeyN", "KeyO", "KeyP", "KeyQ", "KeyR", "KeyS", "KeyT", "KeyU", "KeyV", "KeyW", "KeyX", "KeyY", "KeyZ", "Digit0", "Digit1", "Digit2", "Digit3", "Digit4", "Digit5", "Digit6", "Digit7", "Digit8", "Digit9", "Enter", "Escape", "Backspace", "Tab", "Space", "ArrowLeft", "ArrowRight", "ArrowUp", "ArrowDown", "Home", "End", "PageUp", "PageDown", "Insert", "Delete", "ShiftLeft", "ShiftRight", "ControlLeft", "ControlRight", "AltLeft", "AltRight", "MetaLeft", "MetaRight", "CapsLock", "Minus", "Equal", "BracketLeft", "BracketRight", "Backslash", "Semicolon", "Quote", "Backquote", "Comma", "Period", "Slash", "F1", "F2", "F3", "F4", "F5", "F6", "F7", "F8", "F9", "F10", "F11", "F12", "NumpadEnter", "NumpadAdd", "NumpadSubtract", "NumpadMultiply", "NumpadDivide", "NumpadDecimal"];
 var THREAD_MAIN = 0;
@@ -319,9 +320,15 @@ class InputRing {
     Atomics.store(this.#counts, 1, read + n);
     return { events, times };
   }
-  readTicker(out, at, cap) {
+  readTicker(out, at, cap, upto = Infinity) {
     const read = Atomics.load(this.#counts, 2) >>> 0;
-    const n = Math.min((Atomics.load(this.#counts, 0) >>> 0) - read >>> 0, cap);
+    let n = Math.min((Atomics.load(this.#counts, 0) >>> 0) - read >>> 0, cap);
+    for (let i = 0;upto !== Infinity && i < n; i++) {
+      if (this.#view.getFloat64(this.#slot(read + i) + EVENT_SIZE, true) > upto) {
+        n = i;
+        break;
+      }
+    }
     this.#copy(read, n, out, at);
     Atomics.store(this.#counts, 2, read + n);
     return n;

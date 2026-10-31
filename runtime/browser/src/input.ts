@@ -433,10 +433,17 @@ export class InputRing {
   }
 
   /** Copies the events written and not yet read by the ticker, at most `cap`, oldest first, into
-   * `out` from byte `at`; the rest wait for the next read. Returns how many. */
-  readTicker(out: Uint8Array, at: number, cap: number): number {
+   * `out` from byte `at`; the rest wait for the next read. With `upto`, it stops at the first
+   * stamped later than that. Returns how many. */
+  readTicker(out: Uint8Array, at: number, cap: number, upto = Infinity): number {
     const read = Atomics.load(this.#counts, 2) >>> 0;
-    const n = Math.min(((Atomics.load(this.#counts, 0) >>> 0) - read) >>> 0, cap);
+    let n = Math.min(((Atomics.load(this.#counts, 0) >>> 0) - read) >>> 0, cap);
+    for (let i = 0; upto !== Infinity && i < n; i++) {
+      if (this.#view.getFloat64(this.#slot(read + i) + EVENT_SIZE, true) > upto) {
+        n = i;
+        break;
+      }
+    }
     this.#copy(read, n, out, at);
     Atomics.store(this.#counts, 2, read + n);
     return n;

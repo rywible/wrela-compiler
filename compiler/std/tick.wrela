@@ -4,15 +4,19 @@
 // the host stamped at its start (its records), and nothing else: no clock, and nothing that
 // depends on timing. So given the first state and every tick's records, every tick's state is
 // fixed, on any host. The host can ask for the state's hash after each step: to record
-// a tick log, or to check one.
+// a tick log, or to check one. The frames can put a value into the ticks (`post`): the host
+// stamps it into the next tick's records, as an input event, so a tick log holds it too.
 //
 // The host runs each tick through the thread entry `tick` (wrela_abi's `__tick`), with the
 // tick's records at `TICK_RECORDS`.
 
 use std::abi::{EVENT_SIZE, MAX_TICK_RECORDS, TICK_HASH, TICK_ORIGIN, TICK_RECORDS, TICK_WANT_HASH}
 use std::alloc::place
-use std::input::{Event, RawEvent, event_of}
+use std::hash::StateHash
+use std::host::request
+use std::input::{Event, RawEvent, event_of, posted_of}
 use std::mem::{load_u32, read, run_task, store_u32, task}
+use std::serialize::{Serialize, Writer}
 
 /// One tick, as the step gets it.
 pub struct Ticked: Clone {
@@ -23,6 +27,77 @@ pub struct Ticked: Clone {
     /// The input events the host stamped at its start, oldest first: at most 256 (the host
     /// keeps the rest for the next tick).
     pub records: Vec<Event>,
+    /// The records the program posted (`post`) that the host stamped at its start, oldest
+    /// first. They count toward the 256.
+    pub posts: Vec<Posted>,
+}
+
+/// A record the program posted into its ticks (`post`): its tag, which says what it is, and
+/// two values, whose meaning is the program's.
+pub struct Posted: Copy + Eq + StateHash + Serialize {
+    pub tag: u32,
+    pub a: u64,
+    pub b: u64,
+}
+
+/// Posts a record into the program's own ticks: the host stamps it into the records of the next
+/// tick it runs, as it does an input event that arrives then, and that tick's step gets it in
+/// `Ticked.posts`. A tick log keeps it among the tick's records, so a replay gives the ticks the
+/// same records, and a host that replays a log drops what the program posts. So a sim learns
+/// what only the frames know, such as a saved game read from storage after `init`, and its
+/// ticks stay a function of their records. A post in a call that ends with no ticker started
+/// fails the call's commands (the host takes them when the call returns). In lockstep (test mode), what frame `i` posts is a record
+/// of the first tick that runs for frame `i + 1`, before that frame's input.
+///
+/// ```wrela
+/// use std::tick::{Ticked, post, start}
+///
+/// /// What the saved game says, posted under this tag: a bit for each level the player opened.
+/// const OPENED: u32 = 1
+///
+/// /// A level map, on the ticker: the levels it lets the player into.
+/// struct Map: Clone {
+///     open: u64,
+/// }
+///
+/// @deterministic
+/// fn step(map: mut Map, t: Ticked) {
+///     for p in t.posts {
+///         if p.tag == OPENED {
+///             map.open = p.a
+///         }
+///     }
+/// }
+///
+/// @deterministic
+/// fn hash(map: Map) -> u64 {
+///     map.open
+/// }
+///
+/// pub struct Game {
+///     posted: bool,
+/// }
+///
+/// pub fn init() -> Game {
+///     start(Map { open: 1 }, hz: 60, step: step, hash: hash)
+///     Game { posted: false }
+/// }
+///
+/// pub fn frame(game: mut Game, time: f32, width: u32, height: u32) {
+///     if !game.posted {
+///         post(OPENED, a: 7, b: 0)   // levels 0, 1 and 2, as the saved game says
+///         game.posted = true
+///     }
+/// }
+/// ```
+@client
+pub fn post(tag: u32, a: u64, b: u64) {
+    var w = Writer::new()
+    w.write_u32(tag)
+    w.write_u64(a)
+    w.write_u64(b)
+    // The host answers no post: its record is the ticks'.
+    let _ = request("tick/post", take w.into_bytes())
 }
 
 /// The ticker's state, its step and its hash, and its rate: what its thread owns.
@@ -106,7 +181,8 @@ fn run_tick<S, F: @deterministic fn(mut S, Ticked), H: @deterministic fn(S) -> u
     k: u32,
     t: mut Ticker<S, F, H>,
 ) {
-    let ticked = Ticked { tick: k, dt: 1.0 / f32(t.hz), records: records() }
+    let (records, posts) = records()
+    let ticked = Ticked { tick: k, dt: 1.0 / f32(t.hz), records, posts }
     borrow step = t.step
     step(mut t.state, ticked)
     unsafe {
@@ -117,17 +193,22 @@ fn run_tick<S, F: @deterministic fn(mut S, Ticked), H: @deterministic fn(S) -> u
     }
 }
 
-/// The records of the tick about to run: the host wrote them.
-fn records() -> Vec<Event> {
+/// The records of the tick about to run, which the host wrote: its input, and what the program
+/// posted (`post`).
+fn records() -> (Vec<Event>, Vec<Posted>) {
     unsafe {
         let n = min(load_u32(TICK_RECORDS), MAX_TICK_RECORDS)
-        var out: Vec<Event> = Vec::with_capacity(n)
+        var events: Vec<Event> = Vec::with_capacity(n)
+        var posts: Vec<Posted> = Vec::new()
         for i in 0..n {
-            if let Some(e) = event_of(read::<RawEvent>(TICK_RECORDS + 4 + EVENT_SIZE * i)) {
-                out.push(e)
+            let r = read::<RawEvent>(TICK_RECORDS + 4 + EVENT_SIZE * i)
+            if let Some((tag, a, b)) = posted_of(r) {
+                posts.push(Posted { tag, a, b })
+            } else if let Some(e) = event_of(r) {
+                events.push(e)
             }
         }
-        out
+        (events, posts)
     }
 }
 
