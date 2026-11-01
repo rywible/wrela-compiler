@@ -14,7 +14,7 @@ const SITE = "https://wrela.dev";
 
 interface Host {
   api(request: Request, env: Env, options?: ApiOptions): Promise<Response | null>;
-  WrelaServer: new (ctx: unknown, env: Env) => { request(bytes: Uint8Array): Promise<Uint8Array> };
+  WrelaServer: new (ctx: unknown, env: Env) => { request(name: string, bytes: Uint8Array): Promise<Uint8Array> };
 }
 
 let host: Host;
@@ -49,7 +49,9 @@ beforeAll(async () => {
     },
     WRELA_SERVER: {
       getByName: () => ({
-        request: (bytes: Uint8Array) => object.current!.request(bytes),
+        request: (name: string, bytes: Uint8Array) => object.current!.request(name, bytes),
+        call: async () => null,
+        deliver: async () => false,
         answer: async () => null,
         commit: async () => {},
       }),

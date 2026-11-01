@@ -14,7 +14,9 @@
 // `set-cookie`, `vary`, `www-authenticate` and its own; another fails the call. A client
 // (`fetch`) sets `accept`, `content-type`, `if-none-match` and its own, and sees
 // `cache-control`, `content-type`, `etag`, `location`, `retry-after` and its own, never
-// `set-cookie`, which its browser keeps.
+// `set-cookie`, which its browser keeps. A client reads something public, the same for everyone,
+// with `fetch_public`: a `GET` sent without the origin's cookies, which the browser's HTTP cache
+// may answer, as the server's `cache-control` says.
 //
 // The bytes (runtime/abi `http`): `WHQ1`, the time (a `u64` of Unix milliseconds), the method,
 // path and query (each a `u32` length and UTF-8), the headers (a count, then each name and value),
@@ -209,6 +211,12 @@ pub fn session_cookie(name: str, value: str, max_age: u32) -> String {
 /// answer. A path that doesn't start with one `/` panics; the request fails if no response came.
 @client
 pub fn fetch(method: str, path: str, headers: [Header], body: [u8]) -> Pending<u8> {
+    let asked = fetch_bytes(method, path, headers, body)
+    host_request("http/fetch", asked)
+}
+
+/// A client's request's bytes: `fetch`'s and `fetch_public`'s.
+fn fetch_bytes(method: str, path: str, headers: [Header], body: [u8]) -> Vec<u8> {
     assert(path.starts_with("/") && !path.starts_with("//"), "fetch: the path starts with one `/`")
     let n = path.len()
     let cut = match path.find("?") {
@@ -227,7 +235,18 @@ pub fn fetch(method: str, path: str, headers: [Header], body: [u8]) -> Pending<u
         w.write_str(h.value.as_str())
     }
     w.write_counted(body)
-    host_request("http/fetch", take w.into_bytes())
+    take w.into_bytes()
+}
+
+/// Reads `path` (absolute: `/api/board/c1`) from this page's own origin by `GET`, with
+/// `headers`, as something public: the browser sends none of the origin's cookies, and its HTTP
+/// cache may answer, as the response's `cache-control` allows (a `public, max-age` answer is
+/// kept). `response` reads the answer. A path that doesn't start with one `/` panics; the request
+/// fails if no response came.
+@client
+pub fn fetch_public(path: str, headers: [Header]) -> Pending<u8> {
+    let asked = fetch_bytes("GET", path, headers, [u8(0); 0])
+    host_request("http/fetch-public", asked)
 }
 
 /// The response a `fetch` answered with, or none if the answer isn't one.

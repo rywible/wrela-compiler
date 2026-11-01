@@ -29,6 +29,11 @@ pub(package) fn request(service: str, bytes: [u8]) -> Pending<u8> {
 @intrinsic
 fn host_command(request: u32, service: str, bytes: [u8]) {}
 
+/// Gives the host the commands made so far in this call, so it can answer a request it answers
+/// at once (`std::server::me`) before the program reads it.
+@intrinsic
+pub(package) fn flush_commands() {}
+
 /// The little-endian `u32` at byte `at` of a service's answer, or `None` if fewer than four bytes
 /// are there.
 fn word(bytes: [u8], at: u32 = 0) -> Option<u32> {

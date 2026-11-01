@@ -26,7 +26,7 @@
 // object reads nothing back; it closes its sockets (1012), and their peers come back to the new
 // build's rooms.
 
-import { SERVICE_RESPOND } from "../../browser/src/abi.gen.ts";
+import { SERVER_INSTANCE, SERVICE_ACK, SERVICE_CALL, SERVICE_CALL_BUILD, SERVICE_DISPATCH, SERVICE_ME, SERVICE_REPLY, SERVICE_RESPOND, SERVICE_SEND } from "../../browser/src/abi.gen.ts";
 import { connectionEvent } from "../../browser/src/input.ts";
 import { Inbox, MAX_FRAME, MAX_UP, OVERHEAD, pairOf, pairParam, withinCall } from "../../browser/src/net.ts";
 import { blob, commonAnswer, Failure, Instance, LIMITS, type Limits, type Owner, POISONED, type Storage, writes } from "./host.ts";
@@ -544,6 +544,17 @@ export class Room implements Owner<Net> {
         return self.command({ kind: "tag", conn: conn(), tag: word(body, 4) }, body.length);
       case SERVICE_RESPOND:
         return self.refuse("`http/respond`: a room's connections are its peers', not HTTP requests");
+      case SERVICE_ME:
+        // A room's store is the instance `server`'s, answered at once.
+        self.answered.set(id, new TextEncoder().encode(SERVER_INSTANCE));
+        return;
+      case SERVICE_DISPATCH:
+      case SERVICE_CALL:
+      case SERVICE_REPLY:
+      case SERVICE_SEND:
+      case SERVICE_ACK:
+      case SERVICE_CALL_BUILD:
+        return self.refuse(`\`${service}\`: a room's peers are its connections; calls and messages are an HTTP instance's`);
       case "store/get":
       case "store/scan":
         return self.answer(

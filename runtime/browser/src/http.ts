@@ -1,7 +1,8 @@
 // HTTP's bytes (runtime/abi `http`, language.md §19.5), which the browser host and the Cloudflare
 // host (runtime/cloudflare) share, and the browser's `http/fetch` service: a request to the
 // page's own origin, cookies sent, with only the headers a client may set, answered with the
-// response and only the headers a client may see.
+// response and only the headers a client may see. `http/fetch-public` reads something public: a
+// `GET` with no cookies, which the browser's HTTP cache may answer.
 
 import { CLIENT_SEES, CLIENT_SETS, HTTP_METHODS, HTTP_REQUEST_MAGIC, HTTP_RESPONSE_MAGIC, OWN_HEADER_PREFIX, SERVER_SEES, SERVER_SETS } from "./abi.gen.ts";
 
@@ -147,10 +148,13 @@ export const setByClient = (name: string) => listed(CLIENT_SETS, name);
 export const seenByClient = (name: string) => listed(CLIENT_SEES, name);
 
 /** `http/fetch`: a request's bytes (`std::http::fetch`) → the response's. The path is absolute on
- * the page's origin, so nothing leaves it; a redirect isn't followed, and nothing is cached. */
-export async function httpFetch(body: Uint8Array, origin: string, send: typeof fetch = fetch): Promise<Uint8Array<ArrayBuffer>> {
+ * the page's origin, so nothing leaves it; a redirect isn't followed, and nothing is cached. With
+ * `isPublic` (`http/fetch-public`, `std::http::fetch_public`), it's a `GET` sent without the
+ * origin's cookies, which the browser's HTTP cache may answer as the response allows. */
+export async function httpFetch(body: Uint8Array, origin: string, send: typeof fetch = fetch, isPublic = false): Promise<Uint8Array<ArrayBuffer>> {
   const q = decodeRequest(body);
   if (!HTTP_METHODS.includes(q.method)) throw new Error(`\`${q.method}\` isn't a method a host sends`);
+  if (isPublic && q.method !== "GET") throw new Error("a public read is a `GET`");
   if (!q.path.startsWith("/") || q.path.startsWith("//")) throw new Error("a fetch's path is absolute on the page's origin");
   const headers = new Headers();
   for (const [n, v] of q.headers) {
@@ -164,9 +168,9 @@ export async function httpFetch(body: Uint8Array, origin: string, send: typeof f
     method: q.method,
     headers,
     body: empty ? null : (q.body.slice() as Uint8Array<ArrayBuffer>),
-    credentials: "same-origin",
+    credentials: isPublic ? "omit" : "same-origin",
     redirect: "error",
-    cache: "no-store",
+    cache: isPublic ? "default" : "no-store",
   });
   const seen: Header[] = [];
   for (const [n, v] of r.headers) if (seenByClient(n)) seen.push([n, v]);

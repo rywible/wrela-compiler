@@ -461,6 +461,7 @@ export class BrowserPlatform {
     }
     if (service === "image/decode") return decodeImage(body, browserDecode);
     if (service === "http/fetch") return httpFetch(body, location.origin);
+    if (service === "http/fetch-public") return httpFetch(body, location.origin, fetch, true);
     if (service === "cursor") {
       // The pointer's shape over the program's canvas: a named CSS cursor, from a short list.
       const name = UTF8.decode(body);

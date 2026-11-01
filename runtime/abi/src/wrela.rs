@@ -20,6 +20,16 @@ const NUMBERS: &[(&str, u32, &str)] = &[
         u32::from_le_bytes(crate::http::RESPONSE_MAGIC),
         "What an HTTP response's bytes start with, `WHR1`.",
     ),
+    (
+        "CALL_MAGIC",
+        u32::from_le_bytes(crate::http::CALL_MAGIC),
+        "What a call's bytes start with, as its callee reads them (`std::server`), `WSC1`.",
+    ),
+    (
+        "MESSAGE_MAGIC",
+        u32::from_le_bytes(crate::http::MESSAGE_MAGIC),
+        "What a sent message's bytes start with, as its receiver reads them, `WSM1`.",
+    ),
     ("PAR_WAKE", PAR_WAKE, "Bumped whenever work appears: the helpers wait on it."),
     ("PAR_SHUTDOWN", PAR_SHUTDOWN, "Nonzero once the host wants its helpers to return."),
     ("PAR_HELPED", PAR_HELPED, "How many chunks the helpers have run, ever."),

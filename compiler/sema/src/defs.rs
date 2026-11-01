@@ -234,6 +234,7 @@ macro_rules! lang_items {
                         | Lang::FetchCommand
                         | Lang::PostCommand
                         | Lang::HostCommand
+                        | Lang::FlushCommands
                         | Lang::PrepareCommand
                         | Lang::UnprepareCommand
                         | Lang::HandOverCommand
@@ -576,6 +577,7 @@ lang_items! {
     PhaseCommand = "std::time::phase_command",
     PostCommand = "std::io::post_command",
     HostCommand = "std::host::host_command",
+    FlushCommands = "std::host::flush_commands",
     Shipped = "std::io::Shipped",
     Script = "std::input::Script",
     BrowserScript = "std::tool::browser::Script",

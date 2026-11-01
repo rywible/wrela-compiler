@@ -1,5 +1,11 @@
 // Loads a build (manifest.json, the WASM, each pipeline's WGSL) and assembles a running program:
 // pipelines built up front, then the WASM instantiated against the decoder.
+//
+// A build may ship `addresses.json` beside its manifest (language.md §15.2): the same-origin URLs,
+// under `/b/`, that its payloads are served at, by their paths in the build. A payload is the
+// manifest's WASM (either module), each pipeline's WGSL, their trap locations, and a file the
+// program fetches; a payload the map doesn't name, and everything else (pages, `net.json`,
+// icons), is where the build is. A map that names a URL outside `/b/` fails the load.
 
 import { Checker } from "./check.ts";
 import { deviceLimits } from "./device.ts";
@@ -15,6 +21,8 @@ import { parseScript, type Scripted } from "./input.ts";
 
 export interface Build {
   manifest: Manifest;
+  /** Where its payloads are served, if it ships `addresses.json`. */
+  addresses: Addresses | null;
   /** The WASM: its response, not yet read (it compiles as it streams in), or its bytes. Once
    * compiled, `compiled` holds the module and this isn't read again. */
   wasm: Response | Bytes;
@@ -52,6 +60,80 @@ async function getText(fetchFn: Fetch, url: URL): Promise<string> {
   } catch {
     throw new Error(`${url} isn't UTF-8`);
   }
+}
+
+/** What `addresses.json` starts with: its format's name. */
+export const ADDRESSES_FORMAT = "wrela-addresses-1";
+/** Where a build's payloads may be served. */
+export const ADDRESSES_PREFIX = "/b/";
+
+/** A build's `addresses.json`: `{ "format": "wrela-addresses-1", "files": { <path>: <URL> } }`,
+ * each path one in the build (`pathProblem`'s rules), each URL root-absolute under `/b/`, with no
+ * query, fragment, `.` or `..` part, on the build's own origin. */
+export class Addresses {
+  readonly #files: Map<string, string>;
+
+  private constructor(files: Map<string, string>) {
+    this.#files = files;
+  }
+
+  /** The map in `text`; it throws what's wrong with it. */
+  static parse(text: string): Addresses {
+    let json: unknown;
+    try {
+      json = JSON.parse(text);
+    } catch {
+      throw new Error("addresses.json isn't JSON");
+    }
+    const o = json as { format?: unknown; files?: unknown };
+    if (o === null || typeof o !== "object" || o.format !== ADDRESSES_FORMAT) throw new Error(`addresses.json's format isn't \`${ADDRESSES_FORMAT}\``);
+    if (o.files === null || typeof o.files !== "object" || Array.isArray(o.files)) throw new Error("addresses.json's `files` isn't an object");
+    const files = new Map<string, string>();
+    for (const [path, url] of Object.entries(o.files as Record<string, unknown>)) {
+      const why = pathProblem(path);
+      if (why !== undefined) throw new Error(`addresses.json names \`${path}\`, which ${why}`);
+      if (typeof url !== "string" || !addressed(url)) throw new Error(`addresses.json puts \`${path}\` outside ${ADDRESSES_PREFIX}: \`${String(url)}\``);
+      files.set(path, url);
+    }
+    return new Addresses(files);
+  }
+
+  /** Where payload `path` (a checked path in the build at `base`) is: its address on the build's
+   * origin, or beside the build. */
+  url(base: string, path: string): URL {
+    const at = this.#files.get(path);
+    return at === undefined ? pathUrl(base, path) : new URL(at, new URL(base).origin);
+  }
+}
+
+/** Whether `url` is an address a map may name: `/b/` and parts that are each a name. */
+function addressed(url: string): boolean {
+  if (!url.startsWith(ADDRESSES_PREFIX) || /[\\?#%]/.test(url)) return false;
+  return url.slice(1).split("/").every((p) => p !== "" && p !== "." && p !== "..");
+}
+
+/** Where payload `path` of the build at `base` is, by its map if it has one. */
+export const payloadUrl = (base: string, path: string, addresses: Addresses | null): URL => (addresses === null ? new URL(path, base) : addresses.url(base, path));
+
+/** The build at `base`'s `addresses.json`, or null if it has none (a 404). */
+async function loadAddresses(fetchFn: Fetch, base: string): Promise<Addresses | null> {
+  const url = new URL("addresses.json", base);
+  let response: Response;
+  try {
+    response = await fetchFn(url, { redirect: "manual" });
+  } catch (e) {
+    throw new Error(`can't fetch ${url}: ${errorMessage(e)}`);
+  }
+  if (response.status === 404) return null;
+  if (!response.ok) throw new Error(`can't fetch ${url}: ${response.status} ${response.statusText}`);
+  const bytes = await response.arrayBuffer();
+  let text: string;
+  try {
+    text = UTF8.decode(bytes);
+  } catch {
+    throw new Error(`${url} isn't UTF-8`);
+  }
+  return Addresses.parse(text);
 }
 
 /** Loads a test's input script, with the native host's text and input rules. */
@@ -127,23 +209,29 @@ export function chooseWasm(manifest: Manifest, relaxed: boolean = runsRelaxedSim
   return { ...manifest, wasm: manifest.wasm_relaxed, wasm_abi: manifest.wasm_relaxed_abi };
 }
 
-/** Fetches and validates a build; its files resolve against `base`. */
+/** Fetches and validates a build; its files resolve against `base`, and its payloads by its
+ * `addresses.json` if it ships one (fetched beside the manifest). */
 export async function loadBuild(base: string, fetchFn: Fetch = networkFetch): Promise<Build> {
-  const manifest = chooseWasm(parseManifest(await getText(fetchFn, new URL("manifest.json", base))));
+  // Both at once; the manifest's failure is the one told.
+  const text = getText(fetchFn, new URL("manifest.json", base));
+  const mapped = loadAddresses(fetchFn, base);
+  mapped.catch(() => {});
+  const manifest = chooseWasm(parseManifest(await text));
+  const addresses = await mapped;
   // The WASM's response stays unread: `Program.compile` compiles it as it streams in.
   const [wasm, shaders] = await Promise.all([
-    get(fetchFn, new URL(manifest.wasm, base)),
-    Promise.all(manifest.pipelines.map((p) => getText(fetchFn, new URL(p.shader, base)))),
+    get(fetchFn, payloadUrl(base, manifest.wasm, addresses)),
+    Promise.all(manifest.pipelines.map((p) => getText(fetchFn, payloadUrl(base, p.shader, addresses)))),
   ]);
-  return { manifest, wasm, shaders };
+  return { manifest, addresses, wasm, shaders };
 }
 
-/** An optimized build's trap locations, from beside its WASM (`game.lines` for `game.wasm`);
- * null if it has none or they don't arrive. */
-export async function loadLines(base: string, manifest: Manifest, fetchFn: Fetch = networkFetch): Promise<Lines | null> {
+/** An optimized build's trap locations, from beside its WASM (`game.lines` for `game.wasm`), or
+ * where its map puts them; null if it has none or they don't arrive. */
+export async function loadLines(base: string, manifest: Manifest, fetchFn: Fetch = networkFetch, addresses: Addresses | null = null): Promise<Lines | null> {
   const name = manifest.wasm.replace(/\.wasm$/, "") + "." + LINES_SIDECAR;
   try {
-    return Lines.decode(new Uint8Array(await (await get(fetchFn, new URL(name, base))).arrayBuffer()));
+    return Lines.decode(new Uint8Array(await (await get(fetchFn, payloadUrl(base, name, addresses))).arrayBuffer()));
   } catch {
     return null;
   }
@@ -151,9 +239,10 @@ export async function loadLines(base: string, manifest: Manifest, fetchFn: Fetch
 
 /**
  * Where a program in this browser keeps its requests' bytes: `Fetch` and `Post` use the build
- * at `files` (the page's build, `base`, unless a hot reload swapped another in), and storage is
- * the origin's private file system, under `wrela/` and the page's path (so two games on one
- * origin don't share it). Paths are checked before they get here (`pathProblem`).
+ * at `files` (the page's build, `base`, unless a hot reload swapped another in), a `Fetch` by the
+ * build's `addresses` where they name its file, and storage is the origin's private file system,
+ * under `wrela/` and the page's path (so two games on one origin don't share it). Paths are
+ * checked before they get here (`pathProblem`).
  */
 export function browserIo(
   base: string,
@@ -161,6 +250,7 @@ export function browserIo(
   files: string = base,
   hostRequest?: (service: string, body: Bytes) => Promise<Bytes>,
   storage: string | null = null,
+  addresses: Addresses | null = null,
 ): Io {
   if (storage !== null && pathProblem(storage) !== undefined) throw new Error("invalid storage namespace");
   const parts = storage === null ? new URL(base).pathname.split("/").filter(p => p !== "") : storage.split("/");
@@ -178,7 +268,7 @@ export function browserIo(
   return {
     ...(hostRequest ? { hostRequest } : {}),
     async fetch(url) {
-      const response = await get(fetchFn, pathUrl(files, url));
+      const response = await get(fetchFn, addresses === null ? pathUrl(files, url) : addresses.url(files, url));
       return new Uint8Array(await response.arrayBuffer());
     },
     async storageRead(path) {

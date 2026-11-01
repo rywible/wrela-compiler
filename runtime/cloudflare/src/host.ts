@@ -1,6 +1,8 @@
 // A server build over HTTP (language.md §19.5): one instance of `server/game.wasm`, the store
-// beside it, and the requests it answers. It is the Durable Object's whole job (cloudflare.ts),
-// written against small interfaces (`Storage`, `Options`) so the tests run it on bun:sqlite.
+// beside it, and the requests, calls and messages it answers. A named instance is a Durable
+// Object's whole job (cloudflare.ts); the edge instance, with no store, runs in the Worker in
+// front of them. It is written against small interfaces (`Storage`, `Options`, `Peers`) so the
+// tests run it on bun:sqlite.
 //
 // It mirrors `wrela_host::server` and `wrela_host::rooms` where a room's contract carries over:
 // - **A request is a short connection** (runtime/abi `http`): a `Connection` event opens it, one
@@ -12,6 +14,11 @@
 //   responses go. A call that fails commits nothing and sends nothing.
 // - **A call is made again at once while its requests were answered**, or new events wait,
 //   giving the event loop a turn between calls. With no client waiting, the object's alarm goes on.
+// - **A call to another instance, and a message, is a short connection too**: a `Message` whose
+//   bytes start `WSC1` or `WSM1`, answered by `server/reply` or acknowledged by `server/ack`.
+//   Calls, sends, replies, acknowledgements and dispatches are commands, carried out once the
+//   call's writes are committed. A send is written to the outbox in the same transaction, and
+//   tried until its receiver acknowledges it, with backoff up to an hour.
 //
 // What it can't mirror: a call has no deadline (JavaScript can't interrupt WASM it runs; the
 // Worker's CPU limit is the bound), and the memory cap is checked after each call, not refused
@@ -35,10 +42,23 @@ import {
   IMPORT_REQUEST_STATUS,
   IMPORT_REQUEST_TAKE,
   IMPORT_SUBMIT,
+  CALL_MAGIC,
+  MAX_INSTANCE_NAME,
+  MESSAGE_MAGIC,
   REQUEST_FAILED,
   REQUEST_PENDING,
   RESPOND_WITHIN_MS,
+  RETRY_CAP_MS,
+  SERVER_INSTANCE,
+  SERVICE_ACK,
+  SERVICE_CALL,
+  SERVICE_CALL_BUILD,
+  SERVICE_DISPATCH,
+  SERVICE_HMAC,
+  SERVICE_ME,
+  SERVICE_REPLY,
   SERVICE_RESPOND,
+  SERVICE_SEND,
   SERVICE_TIME,
   THREAD_MAIN,
 } from "../../browser/src/abi.gen.ts";
@@ -84,8 +104,23 @@ export interface Storage {
   transactionSync<T>(fn: () => T): T;
 }
 
+/** The other instances, and the archived builds, as an instance reaches them. Each answers
+ * failure (null, false, a 503) rather than throwing. */
+export interface Peers {
+  /** Instance `name`'s response to a request's bytes. */
+  request(name: string, bytes: Uint8Array): Promise<Uint8Array>;
+  /** Instance `name`'s reply to a call from `from`; null if it failed or didn't reply. */
+  call(name: string, from: string, body: Uint8Array): Promise<Uint8Array | null>;
+  /** Whether instance `name` acknowledged message `id` from `from` once its writes committed. */
+  deliver(name: string, from: string, id: number, body: Uint8Array): Promise<boolean>;
+  /** The archived build at `artifact`'s verifier's reply; null if it failed or isn't there. */
+  callBuild(artifact: string, body: Uint8Array): Promise<Uint8Array | null>;
+}
+
 export interface Options {
   limits?: Limits;
+  /** Where calls, messages and dispatches go; none: each fails. */
+  peers?: Peers;
   /** The wall clock, in Unix milliseconds. */
   now?: () => number;
   /** Asks to be called (`alarm`) at that time: work is left and no request waits. */
@@ -160,11 +195,72 @@ const asBytes = (v: unknown): Uint8Array => (v instanceof Uint8Array ? v : new U
 export const blob = (b: Uint8Array): ArrayBuffer =>
   b.byteOffset === 0 && b.byteLength === b.buffer.byteLength && b.buffer instanceof ArrayBuffer ? b.buffer : (b.slice().buffer as ArrayBuffer);
 
+/** A message waiting in the outbox: where to, its bytes, when it was sent (Unix ms), how many
+ * tries it has had, when it's next due, and whether its age has been logged. */
+export interface Waiting {
+  id: number;
+  dest: string;
+  body: Uint8Array;
+  made: number;
+  tries: number;
+}
+
+/** A message a call sends: where to, and its bytes. */
+export interface Send {
+  to: string;
+  body: Uint8Array;
+}
+
 /** The server's store: one table of keys and values, both bytes, as `store.sqlite` on
- * `wrela-serve`. */
+ * `wrela-serve`; beside it, the instance's outbox and its name. */
 export class Store {
   constructor(readonly storage: Storage) {
     storage.sql.exec("CREATE TABLE IF NOT EXISTS kv (key BLOB PRIMARY KEY, value BLOB NOT NULL) WITHOUT ROWID");
+    // AUTOINCREMENT: an id is never used twice, so a receiver can tell a message come again.
+    storage.sql.exec(
+      "CREATE TABLE IF NOT EXISTS wrela_outbox (id INTEGER PRIMARY KEY AUTOINCREMENT, dest TEXT NOT NULL, body BLOB NOT NULL, made INTEGER NOT NULL, tries INTEGER NOT NULL, due INTEGER NOT NULL, told INTEGER NOT NULL)",
+    );
+    storage.sql.exec("CREATE TABLE IF NOT EXISTS wrela_meta (key TEXT PRIMARY KEY, value TEXT NOT NULL)");
+  }
+
+  /** The instance's name, as its first call, request or message named it; null before. */
+  get name(): string | null {
+    const rows = this.storage.sql.exec("SELECT value FROM wrela_meta WHERE key = 'name'").toArray();
+    return rows.length === 0 ? null : String(rows[0]!["value"]);
+  }
+
+  set name(name: string) {
+    this.storage.sql.exec("INSERT OR REPLACE INTO wrela_meta (key, value) VALUES ('name', ?)", name);
+  }
+
+  /** The messages due at `now`, oldest first, at most `limit`. */
+  due(now: number, limit: number): Waiting[] {
+    return this.storage.sql
+      .exec("SELECT id, dest, body, made, tries FROM wrela_outbox WHERE due <= ? ORDER BY id LIMIT ?", now, limit)
+      .toArray()
+      .map((r) => ({ id: Number(r["id"]), dest: String(r["dest"]), body: asBytes(r["body"]), made: Number(r["made"]), tries: Number(r["tries"]) }));
+  }
+
+  /** When the next message is due; null if none waits. */
+  nextDue(): number | null {
+    const rows = this.storage.sql.exec("SELECT MIN(due) AS at FROM wrela_outbox").toArray();
+    const at = rows[0]?.["at"];
+    return at === null || at === undefined ? null : Number(at);
+  }
+
+  /** Message `id` was acknowledged: it goes. */
+  acknowledged(id: number): void {
+    this.storage.sql.exec("DELETE FROM wrela_outbox WHERE id = ?", id);
+  }
+
+  /** Message `id` wasn't acknowledged: its tries, and when it's next due. Whether it's the first
+   * time it's older than `RETRY_CAP_MS` (`now` is the time). */
+  missed(id: number, tries: number, due: number, now: number): boolean {
+    const old = this.storage.sql.exec("SELECT made, told FROM wrela_outbox WHERE id = ?", id).toArray()[0];
+    if (old === undefined) return false;
+    const tell = Number(old["told"]) === 0 && now - Number(old["made"]) >= RETRY_CAP_MS;
+    this.storage.sql.exec("UPDATE wrela_outbox SET tries = ?, due = ?, told = ? WHERE id = ?", tries, due, tell || Number(old["told"]) === 1 ? 1 : 0, id);
+    return tell;
   }
 
   /** A read of the store (`store/get`, `store/scan`), answered from what's committed: null if it
@@ -213,15 +309,18 @@ export class Store {
     return new Out().word(count).push(out.bytes()).bytes();
   }
 
-  /** Commits writes (`store/write` bodies) in one transaction, all or none. A malformed body is
-   * the program's, and commits nothing. */
-  commit(batches: Uint8Array[]): void {
+  /** Commits writes (`store/write` bodies) and a call's sends, into the outbox, due at `now`,
+   * in one transaction, all or none. A malformed body is the program's, and commits nothing. */
+  commit(batches: Uint8Array[], sends: Send[] = [], now = 0): void {
     const ops = writes(batches);
-    if (ops.length === 0) return;
+    if (ops.length === 0 && sends.length === 0) return;
     this.storage.transactionSync(() => {
       for (const [k, v] of ops) {
         if (v === null) this.storage.sql.exec("DELETE FROM kv WHERE key = ?", blob(k));
         else this.storage.sql.exec("INSERT OR REPLACE INTO kv (key, value) VALUES (?, ?)", blob(k), blob(v));
+      }
+      for (const m of sends) {
+        this.storage.sql.exec("INSERT INTO wrela_outbox (dest, body, made, tries, due, told) VALUES (?, ?, ?, 0, ?, 0)", m.to, blob(m.body), now, now);
       }
     });
   }
@@ -351,6 +450,40 @@ export async function verify(body: Uint8Array): Promise<Uint8Array> {
   }
 }
 
+/** `crypto/hmac`: a key and a message → HMAC-SHA256 of the message under the key, 32 bytes
+ * (RFC 2104). WebCrypto refuses an empty key, which is the same key as 64 zero bytes. */
+export async function hmac(body: Uint8Array): Promise<Uint8Array> {
+  const r = new In(body);
+  const key = r.chunk().slice() as Uint8Array<ArrayBuffer>;
+  const message = r.chunk().slice() as Uint8Array<ArrayBuffer>;
+  r.end("service");
+  const k = await crypto.subtle.importKey("raw", key.length === 0 ? new Uint8Array(64) : key, { name: "HMAC", hash: "SHA-256" }, false, ["sign"]);
+  return new Uint8Array(await crypto.subtle.sign("HMAC", k, message));
+}
+
+// ---- instances' names, calls and messages (runtime/abi `http`) ---------------------------------
+
+/** Whether `name` names an instance: `server`, or a kind and a name (runtime/abi
+ * `instance_name`). */
+export function instanceName(name: string): boolean {
+  return name === SERVER_INSTANCE || (name.includes("/") && artifactPath(name));
+}
+
+/** Whether `path` names an archived build (runtime/abi `artifact_path`). */
+export function artifactPath(path: string): boolean {
+  return path.length > 0 && path.length <= MAX_INSTANCE_NAME && path.split("/").every((p) => p !== "" && p !== "." && p !== ".." && /^[A-Za-z0-9._-]+$/.test(p));
+}
+
+/** A call's bytes, as its callee reads them (`std::server::called`). */
+export const encodeCall = (from: string, body: Uint8Array): Uint8Array => new Out().word(CALL_MAGIC).text(from).chunk(body).bytes();
+
+/** A message's bytes, as its receiver reads them (`std::server::delivered`). */
+export const encodeMessage = (from: string, id: number, body: Uint8Array): Uint8Array =>
+  new Out().word(MESSAGE_MAGIC).text(from).u64(BigInt(id)).chunk(body).bytes();
+
+/** How long a message waits after its `tries`-th miss: a second, doubling, up to an hour. */
+export const backoff = (tries: number): number => Math.min(1000 * 2 ** Math.min(tries - 1, 22), RETRY_CAP_MS);
+
 // ---- an instance ------------------------------------------------------------------------------
 
 /** What `f` answers, or null (a failed request) if it throws. */
@@ -365,8 +498,16 @@ function answerOf(f: () => Uint8Array): Uint8Array | null {
 /** A printed line's text, whatever its bytes. */
 const LINES = new TextDecoder();
 
-/** A call's command the host carries out after it returns. */
-type Command = { kind: "write"; body: Uint8Array } | { kind: "respond"; conn: number; response: HttpResponse };
+/** A call's command the host carries out after it returns: once its writes and sends commit. */
+type Command =
+  | { kind: "write"; body: Uint8Array }
+  | { kind: "respond"; conn: number; response: HttpResponse }
+  | { kind: "dispatch"; conn: number; to: string | number }
+  | { kind: "call"; id: number; to: string; body: Uint8Array }
+  | { kind: "build"; id: number; artifact: string; body: Uint8Array }
+  | { kind: "reply"; conn: number; body: Uint8Array }
+  | { kind: "send"; to: string; body: Uint8Array }
+  | { kind: "ack"; conn: number };
 
 /** What runs an instance: the HTTP server here, a room (room.ts). It holds the events the program
  * hasn't read, and takes the requests the program makes (`submit`): a command `C` for after the
@@ -379,6 +520,8 @@ export interface Owner<C> {
   /** Seconds on the host's clock, never going back. */
   clock(): number;
   submit(self: Instance<C>, id: number, service: string, body: Uint8Array): void;
+  /** An answer `self` waited for arrived between calls (`Instance.later`): a call is due. */
+  arrived?(self: Instance<C>): void;
 }
 
 /** One instance of the server build, and the host's part of it: its owner's commands are `C`. */
@@ -485,6 +628,17 @@ export class Instance<C> {
     this.arriving.push(Promise.resolve(a).then((x) => [id, x] as [number, Uint8Array | null]));
   }
 
+  /** Request `id`'s answer, readable from the call after it arrives, however many calls run
+   * meanwhile: a call to another instance, which may take seconds, and may call back. */
+  later(id: number, a: Promise<Uint8Array | null>): void {
+    void a
+      .catch(() => null)
+      .then((x) => {
+        this.answered.set(id, x);
+        this.owner.arrived?.(this);
+      });
+  }
+
   /** The answers its last call's requests got, readable from its next call. */
   async settle(): Promise<void> {
     for (const [id, a] of await Promise.all(this.arriving.splice(0))) this.answered.set(id, a);
@@ -500,6 +654,8 @@ export function commonAnswer(service: string, body: Uint8Array, now: number): Ui
       return answerOf(() => random(body));
     case "crypto/verify":
       return verify(body).catch(() => null);
+    case SERVICE_HMAC:
+      return hmac(body).catch(() => null);
     case SERVICE_TIME:
       return body.length === 0 ? new Out().u64(BigInt(Math.floor(now))).bytes() : null;
     default:
@@ -564,9 +720,16 @@ function imports_<C>(owner: Owner<C>, me: () => Instance<C>): WebAssembly.Module
   };
 }
 
-/** A request waiting for its response. */
+/** What a connection is: a request, answered by `http/respond` (or, at the edge, `server/dispatch`),
+ * a call, answered by `server/reply`, or a message, acknowledged by `server/ack`. */
+type Kind = "request" | "call" | "message";
+
+/** A connection waiting for its answer. */
 interface Open {
-  resolve: (response: Uint8Array) => void;
+  kind: Kind;
+  /** Its answer: a response's bytes for a request; a reply's for a call, or an empty one for a
+   * message acknowledged; null for a call or a message that wasn't. */
+  resolve: (answer: Uint8Array | null) => void;
   timer: ReturnType<typeof setTimeout>;
   /** Its bytes, for a fresh instance if the one it was queued for failed before reading it, and
    * whether it was given to one so already (once: a request every instance fails on is failed). */
@@ -578,19 +741,27 @@ interface Open {
  * a call that finishes it sets the alarm again, so it comes only to an object that lost it. */
 const RECOVER_MS = 1000;
 
+/** The most messages one round of the outbox tries at once. */
+const ROUND = 64;
+
 /** The highest connection number, past which `std::net::POISONED` marks a message. */
 export const POISONED = 2 ** 31;
 
-/** A server build's HTTP instance, its store and its requests. */
+/** A connection's answer when it gets none: 504 for a request, nothing for a call or a message. */
+const unanswered = (kind: Kind): Uint8Array | null => (kind === "request" ? bare(504) : null);
+
+/** A named instance of a server build, with its store and outbox; or, with no storage, the edge
+ * instance, with neither. It answers requests, calls and messages. */
 export class Server implements Owner<Command> {
   readonly limits: Limits;
-  readonly store: Store;
+  /** The store; null at the edge. */
+  readonly store: Store | null;
   /** The events the program hasn't read, and whether any came since its last call. */
   queue = new Inbox();
   private fresh = false;
   private instance: Instance<Command> | null = null;
   private starting: Promise<Instance<Command>> | null = null;
-  /** Connections responded to, in the current call. */
+  /** Connections answered, in the current call. */
   private readonly responding = new Set<number>();
   private readonly open = new Map<number, Open>();
   private nextConn = 1;
@@ -605,20 +776,36 @@ export class Server implements Owner<Command> {
   /** When the alarm this object set is due (0: none it knows of). */
   private alarmAt = 0;
   private readonly now: () => number;
+  /** The outbox's messages being tried now. */
+  private readonly trying = new Set<number>();
+  /** The instance's name: empty at the edge; null until a request, call or message names it. */
+  private named: string | null;
 
   constructor(
     readonly module: WebAssembly.Module,
-    storage: Storage,
+    storage: Storage | null,
     readonly options: Options = {},
   ) {
     this.limits = options.limits ?? LIMITS;
     this.now = options.now ?? Date.now;
-    this.store = new Store(storage);
+    this.store = storage === null ? null : new Store(storage);
+    this.named = this.store === null ? "" : this.store.name;
     this.started = this.now();
+    // Messages a reset object hadn't delivered go on from its alarm.
+    const due = this.store?.nextDue() ?? null;
+    if (due !== null) this.schedule(due);
   }
 
   get print(): ((line: string) => void) | undefined {
     return this.options.print;
+  }
+
+  /** The instance's name, which a request, a call or a message to it says (kept in its store, for
+   * an object its alarm wakes). */
+  name(name: string): void {
+    if (this.store === null || this.named === name) return;
+    this.named = name;
+    this.store.name = name;
   }
 
   /** Seconds since the host started, never going back. */
@@ -629,13 +816,31 @@ export class Server implements Owner<Command> {
 
   /** Answers a request's bytes (`encodeRequest`) with a response's (`encodeResponse`). */
   request(bytes: Uint8Array): Promise<Uint8Array> {
-    // What the object holds is bounded: past it, a request is turned away before it's queued.
-    if (this.open.size >= this.limits.open || this.queue.held + bytes.length > this.limits.queued) return Promise.resolve(bare(503));
+    return this.connect("request", bytes, bare(503)) as Promise<Uint8Array>;
+  }
+
+  /** Answers a call from instance `from` (empty: the edge) with the program's reply; null if it
+   * didn't reply, or failed. */
+  call(from: string, body: Uint8Array): Promise<Uint8Array | null> {
+    return this.connect("call", encodeCall(from, body), null);
+  }
+
+  /** Gives the program message `id` from instance `from`: whether it acknowledged it, once its
+   * writes committed. */
+  async message(from: string, id: number, body: Uint8Array): Promise<boolean> {
+    return (await this.connect("message", encodeMessage(from, id, body), null)) !== null;
+  }
+
+  /** A connection of `kind` whose one message is `bytes`, answered as `Open.resolve` says; `full`
+   * is its answer if the object holds too much to take it. */
+  private connect(kind: Kind, bytes: Uint8Array, full: Uint8Array | null): Promise<Uint8Array | null> {
+    // What the object holds is bounded: past it, a connection is turned away before it's queued.
+    if (this.open.size >= this.limits.open || this.queue.held + bytes.length > this.limits.queued) return Promise.resolve(full);
     const conn = this.nextConn++;
     if (this.nextConn >= POISONED) this.nextConn = 1;
-    const answer = new Promise<Uint8Array>((resolve) => {
-      const timer = setTimeout(() => this.finish(conn, bare(504)), RESPOND_WITHIN_MS);
-      this.open.set(conn, { resolve, timer, bytes, retried: false });
+    const answer = new Promise<Uint8Array | null>((resolve) => {
+      const timer = setTimeout(() => this.finish(conn, unanswered(kind)), RESPOND_WITHIN_MS);
+      this.open.set(conn, { kind, resolve, timer, bytes, retried: false });
     });
     this.queue.push(connectionEvent(conn, true));
     this.queue.pushMessage(conn, bytes);
@@ -644,12 +849,27 @@ export class Server implements Owner<Command> {
     return answer;
   }
 
-  /** The object's alarm: the work that no request waits on. An object woken from eviction starts
-   * its instance and calls it once, so a program that keeps its queue in the store goes on. */
+  /** The object's alarm: the work that no request waits on, and the outbox. An object woken from
+   * eviction starts its instance and calls it once, so a program that keeps its queue in the
+   * store goes on. */
   async alarm(): Promise<void> {
     this.alarmAt = 0;
     this.woken = true;
-    await this.pump();
+    await Promise.all([this.pump(), this.deliver()]);
+  }
+
+  /** An answer an instance waited for arrived. */
+  arrived(self: Instance<Command>): void {
+    if (self !== this.instance) return;
+    this.fresh = true;
+    void this.pump();
+  }
+
+  /** Asks for the alarm at `at`, unless it's due sooner already. */
+  private schedule(at: number): void {
+    if (this.alarmAt !== 0 && this.alarmAt <= at) return;
+    this.alarmAt = at;
+    this.options.setAlarm?.(at);
   }
 
   /** Whether a call is due. */
@@ -669,8 +889,7 @@ export class Server implements Owner<Command> {
         await this.once();
         // Past a turn, the rest goes on in the alarm: its own invocation, and its own CPU time.
         if (this.due() && this.now() - began >= this.limits.turn) {
-          this.alarmAt = this.now();
-          this.options.setAlarm?.(this.alarmAt);
+          this.schedule(this.now());
           return;
         }
         await new Promise((r) => setTimeout(r, 0));
@@ -700,11 +919,11 @@ export class Server implements Owner<Command> {
       const before = this.queue.length;
       instance.call(() => instance.serve(time));
       this.leftover = this.queue.length > 0 && this.queue.length < before;
-      this.carryOut(instance.commands);
+      this.carryOut(instance, instance.commands);
       // Work left (an answer due, events left) survives an eviction: the alarm brings it back.
-      if (this.due() && this.alarmAt < this.now()) {
-        this.alarmAt = this.now() + RECOVER_MS;
-        this.options.setAlarm?.(this.alarmAt);
+      if (this.due() && (this.alarmAt === 0 || this.alarmAt < this.now())) {
+        this.alarmAt = 0;
+        this.schedule(this.now() + RECOVER_MS);
       }
     } catch (e) {
       this.fail(e);
@@ -718,7 +937,7 @@ export class Server implements Owner<Command> {
       try {
         const i = await Instance.start<Command>(this, this.module);
         // What `serve_init` wrote commits before its first `serve`.
-        this.carryOut(i.commands);
+        this.carryOut(i, i.commands);
         this.instance = i;
         return i;
       } finally {
@@ -728,22 +947,89 @@ export class Server implements Owner<Command> {
     return this.starting;
   }
 
-  /** A call's writes committed, then its responses sent. */
-  private carryOut(commands: Command[]): void {
-    this.store.commit(commands.flatMap((c) => (c.kind === "write" ? [c.body] : [])));
+  /** A call's writes and sends committed, then its answers, calls and acknowledgements sent. */
+  private carryOut(instance: Instance<Command>, commands: Command[]): void {
+    const sends = commands.flatMap((c) => (c.kind === "send" ? [{ to: c.to, body: c.body }] : []));
+    this.store?.commit(
+      commands.flatMap((c) => (c.kind === "write" ? [c.body] : [])),
+      sends,
+      this.now(),
+    );
+    const peers = this.options.peers;
     for (const c of commands) {
-      if (c.kind === "respond") this.finish(c.conn, encodeResponse(withHostHeaders(c.response)));
+      switch (c.kind) {
+        case "respond":
+          this.finish(c.conn, encodeResponse(withHostHeaders(c.response)));
+          break;
+        case "dispatch": {
+          const o = this.open.get(c.conn);
+          if (o === undefined) break;
+          if (typeof c.to === "number") this.finish(c.conn, bare(c.to));
+          else if (peers === undefined) this.finish(c.conn, bare(503));
+          else void peers.request(c.to, o.bytes).catch(() => bare(503)).then((r) => this.finish(c.conn, r));
+          break;
+        }
+        case "reply":
+          this.finish(c.conn, c.body);
+          break;
+        case "ack":
+          this.finish(c.conn, new Uint8Array(0));
+          break;
+        case "call":
+          instance.later(c.id, peers?.call(c.to, this.named ?? "", c.body) ?? Promise.resolve(null));
+          break;
+        case "build":
+          instance.later(c.id, peers?.callBuild(c.artifact, c.body) ?? Promise.resolve(null));
+          break;
+      }
+    }
+    if (sends.length > 0) {
+      // The alarm comes back for them if this object goes before they're delivered.
+      this.schedule(this.now() + RECOVER_MS);
+      void this.deliver();
     }
   }
 
-  /** Request `conn` is answered with `response`, and closes for the program (unless `tell` is
+  /** Tries the outbox's messages that are due, each once, at most `ROUND` at a time: one
+   * acknowledged goes, one not waits twice as long as before (up to an hour), and a message
+   * older than an hour writes a line to the log once, naming its receiver's kind alone. Then the
+   * alarm is set for the next one due. */
+  async deliver(): Promise<void> {
+    const store = this.store;
+    const peers = this.options.peers;
+    if (store === null || peers === undefined) return;
+    const from = this.named ?? "";
+    const round = store.due(this.now(), ROUND + this.trying.size).filter((m) => !this.trying.has(m.id));
+    await Promise.all(
+      round.map(async (m) => {
+        this.trying.add(m.id);
+        const ok = await peers.deliver(m.dest, from, m.id, m.body).catch(() => false);
+        this.trying.delete(m.id);
+        if (ok) {
+          store.acknowledged(m.id);
+          return;
+        }
+        const now = this.now();
+        if (store.missed(m.id, m.tries + 1, now + backoff(m.tries + 1), now)) {
+          this.options.log?.(`wrela: a message to a \`${m.dest.split("/")[0]}\` instance has waited more than an hour (${m.tries + 1} tries)`);
+        }
+      }),
+    );
+    const next = store.nextDue();
+    if (next === null) return;
+    if (next <= this.now() && round.length > 0) return this.deliver();
+    this.alarmAt = 0;
+    this.schedule(Math.max(next, this.now() + (round.length > 0 ? 0 : RECOVER_MS)));
+  }
+
+  /** Connection `conn` is answered with `answer`, and closes for the program (unless `tell` is
    * false: its instance went, and the next never heard of it). */
-  private finish(conn: number, response: Uint8Array, tell = true): void {
+  private finish(conn: number, answer: Uint8Array | null, tell = true): void {
     const o = this.open.get(conn);
     if (o === undefined) return;
     clearTimeout(o.timer);
     this.open.delete(conn);
-    o.resolve(response);
+    o.resolve(answer);
     if (tell) {
       this.queue.push(connectionEvent(conn, false));
       this.fresh = true;
@@ -752,7 +1038,7 @@ export class Server implements Owner<Command> {
   }
 
   /** A call failed (or, with `started` false, an instance didn't start): the instance goes, and
-   * every request open on it that a call was given with it. One no call has read yet waits for
+   * every connection open on it that a call was given with it. One no call has read yet waits for
    * the next instance, unless none starts. */
   private fail(e: unknown, started = true): void {
     const f = Failure.of(e);
@@ -776,39 +1062,122 @@ export class Server implements Owner<Command> {
         this.queue.pushMessage(conn, o.bytes);
         this.fresh = true;
       } else {
-        this.finish(conn, bare(f.program ? 500 : 503), false);
+        this.finish(conn, o.kind === "request" ? bare(f.program ? 500 : 503) : null, false);
       }
     }
   }
 
+  /** Connection `conn`, from a command's body (its first word), if it's open and of `kind`:
+   * else null if it closed (the client went, or it timed out: nowhere to go), and a refusal if
+   * it's another kind's, or answered already in this call. */
+  private answering(self: Instance<Command>, service: string, body: Uint8Array, kind: Kind): number | null {
+    if (body.length < 4) self.refuse(`\`${service}\` needs a connection's number`);
+    const conn = new DataView(body.buffer, body.byteOffset).getUint32(0, true);
+    const o = this.open.get(conn);
+    if (o === undefined) return null;
+    if (o.kind !== kind) {
+      self.refuse(`\`${service}\` answers a ${kind}, and connection ${conn} is a ${o.kind}: a request takes \`http/respond\`, a call \`server/reply\`, a message \`server/ack\``);
+    }
+    if (this.responding.has(conn)) self.refuse(`${kind} ${conn} takes one answer`);
+    this.responding.add(conn);
+    return conn;
+  }
+
   /** A host request the program made: a command for after the call, or a request answered for
-   * the next. */
+   * the next (at once, for its name). */
   submit(self: Instance<Command>, id: number, service: string, body: Uint8Array): void {
+    const edge = this.store === null;
+    const named = (r: In, what: string, valid: (s: string) => boolean): string => {
+      const name = r.text();
+      if (!valid(name)) self.refuse(`\`${service}\`: \`${name}\` isn't ${what}`);
+      return name;
+    };
     switch (service) {
       case "store/write":
+        if (edge) self.refuse("`store/write`: the edge has no store: `call` an instance that has one");
         return self.command({ kind: "write", body }, body.length);
       case SERVICE_RESPOND: {
-        if (body.length < 4) self.refuse("`http/respond` needs a connection's number");
-        const conn = new DataView(body.buffer, body.byteOffset).getUint32(0, true);
-        if (!this.open.has(conn)) return; // the client went, or it timed out: nowhere to go
-        if (this.responding.has(conn)) self.refuse(`request ${conn} takes one response`);
+        const conn = this.answering(self, service, body, "request");
+        if (conn === null) return;
         let response: HttpResponse;
         try {
           response = checkResponse(body.subarray(4));
         } catch (e) {
           self.refuse(`\`http/respond\`: ${(e as Error).message}`);
         }
-        this.responding.add(conn);
         return self.command({ kind: "respond", conn, response }, body.length);
       }
+      case SERVICE_DISPATCH: {
+        if (!edge) self.refuse("`server/dispatch` is the edge's: an instance answers its requests itself");
+        const conn = this.answering(self, service, body, "request");
+        const r = new In(body.subarray(4));
+        let to: string | number;
+        try {
+          const how = r.byte();
+          if (how === 1) to = named(r, "an instance's name", instanceName);
+          else if (how === 2) to = r.word();
+          else throw new Error(`a dispatch of kind ${how}`);
+          r.end("dispatch");
+        } catch (e) {
+          if (e instanceof Failure) throw e;
+          self.refuse(`\`server/dispatch\`: ${(e as Error).message}`);
+        }
+        if (typeof to === "number" && (to < 400 || to > 599)) self.refuse(`\`server/dispatch\`: a refusal's status is 400 to 599, not ${to}`);
+        if (conn === null) return;
+        return self.command({ kind: "dispatch", conn, to }, body.length);
+      }
+      case SERVICE_REPLY: {
+        const conn = this.answering(self, service, body, "call");
+        const r = new In(body.subarray(4));
+        let reply: Uint8Array;
+        try {
+          reply = r.chunk();
+          r.end("reply");
+        } catch (e) {
+          self.refuse(`\`server/reply\`: ${(e as Error).message}`);
+        }
+        if (conn === null) return;
+        return self.command({ kind: "reply", conn, body: reply }, body.length);
+      }
+      case SERVICE_ACK: {
+        if (body.length !== 4) self.refuse("`server/ack` takes a connection's number");
+        const conn = this.answering(self, service, body, "message");
+        if (conn === null) return;
+        return self.command({ kind: "ack", conn }, body.length);
+      }
+      case SERVICE_CALL:
+      case SERVICE_SEND:
+      case SERVICE_CALL_BUILD: {
+        if (service === SERVICE_SEND && edge) self.refuse("`server/send`: the edge has no outbox: `call` an instance that sends");
+        const r = new In(body);
+        let to: string;
+        let rest: Uint8Array;
+        try {
+          to = service === SERVICE_CALL_BUILD ? named(r, "an artifact's path", artifactPath) : named(r, "an instance's name", instanceName);
+          rest = r.chunk();
+          r.end("service");
+        } catch (e) {
+          if (e instanceof Failure) throw e;
+          self.refuse(`\`${service}\`: ${(e as Error).message}`);
+        }
+        if (service === SERVICE_SEND) return self.command({ kind: "send", to, body: rest }, body.length);
+        if (service === SERVICE_CALL) return self.command({ kind: "call", id, to, body: rest }, body.length);
+        return self.command({ kind: "build", id, artifact: to, body: rest }, body.length);
+      }
+      case SERVICE_ME:
+        // Answered at once: the program reads it in the call that asks.
+        if (this.named === null) return self.answer(id, null);
+        self.answered.set(id, new TextEncoder().encode(this.named));
+        return;
       case "net/send":
       case "net/close":
       case "net/tag":
       case "net/keep":
       case "net/compact":
-        return self.refuse(`\`${service}\`: an HTTP server's connections take one response (\`std::http::respond\`)`);
+        return self.refuse(`\`${service}\`: an HTTP server's connections take one answer (\`std::http::respond\`)`);
       case "store/get":
       case "store/scan":
+        if (this.store === null) return self.refuse(`\`${service}\`: the edge has no store: \`call\` an instance that has one`);
         return self.answer(id, this.store.answer(service, body));
       default:
         return self.answer(id, commonAnswer(service, body, this.now()));

@@ -120,6 +120,20 @@ var HTTP_REQUEST_MAGIC = 827410519;
 var HTTP_RESPONSE_MAGIC = 827476055;
 var SERVICE_RESPOND = "http/respond";
 var SERVICE_TIME = "time/unix";
+var CALL_MAGIC = 826495831;
+var MESSAGE_MAGIC = 827151191;
+var SERVICE_ME = "server/me";
+var SERVICE_DISPATCH = "server/dispatch";
+var SERVICE_CALL = "server/call";
+var SERVICE_REPLY = "server/reply";
+var SERVICE_SEND = "server/send";
+var SERVICE_ACK = "server/ack";
+var SERVICE_CALL_BUILD = "server/call_build";
+var SERVICE_HMAC = "crypto/hmac";
+var MAX_INSTANCE_NAME = 256;
+var SERVER_INSTANCE = "server";
+var RETRY_CAP_MS = 3600000;
+var VERIFY_SCHEMA = "wrela-verify-1";
 var MAX_HTTP_REQUEST = 1048576;
 var RESPOND_WITHIN_MS = 30000;
 var HTTP_METHODS = ["GET", "HEAD", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"];
@@ -926,6 +940,34 @@ class Store {
   constructor(storage) {
     this.storage = storage;
     storage.sql.exec("CREATE TABLE IF NOT EXISTS kv (key BLOB PRIMARY KEY, value BLOB NOT NULL) WITHOUT ROWID");
+    storage.sql.exec("CREATE TABLE IF NOT EXISTS wrela_outbox (id INTEGER PRIMARY KEY AUTOINCREMENT, dest TEXT NOT NULL, body BLOB NOT NULL, made INTEGER NOT NULL, tries INTEGER NOT NULL, due INTEGER NOT NULL, told INTEGER NOT NULL)");
+    storage.sql.exec("CREATE TABLE IF NOT EXISTS wrela_meta (key TEXT PRIMARY KEY, value TEXT NOT NULL)");
+  }
+  get name() {
+    const rows = this.storage.sql.exec("SELECT value FROM wrela_meta WHERE key = 'name'").toArray();
+    return rows.length === 0 ? null : String(rows[0]["value"]);
+  }
+  set name(name) {
+    this.storage.sql.exec("INSERT OR REPLACE INTO wrela_meta (key, value) VALUES ('name', ?)", name);
+  }
+  due(now, limit) {
+    return this.storage.sql.exec("SELECT id, dest, body, made, tries FROM wrela_outbox WHERE due <= ? ORDER BY id LIMIT ?", now, limit).toArray().map((r) => ({ id: Number(r["id"]), dest: String(r["dest"]), body: asBytes(r["body"]), made: Number(r["made"]), tries: Number(r["tries"]) }));
+  }
+  nextDue() {
+    const rows = this.storage.sql.exec("SELECT MIN(due) AS at FROM wrela_outbox").toArray();
+    const at = rows[0]?.["at"];
+    return at === null || at === undefined ? null : Number(at);
+  }
+  acknowledged(id) {
+    this.storage.sql.exec("DELETE FROM wrela_outbox WHERE id = ?", id);
+  }
+  missed(id, tries, due, now) {
+    const old = this.storage.sql.exec("SELECT made, told FROM wrela_outbox WHERE id = ?", id).toArray()[0];
+    if (old === undefined)
+      return false;
+    const tell = Number(old["told"]) === 0 && now - Number(old["made"]) >= RETRY_CAP_MS;
+    this.storage.sql.exec("UPDATE wrela_outbox SET tries = ?, due = ?, told = ? WHERE id = ?", tries, due, tell || Number(old["told"]) === 1 ? 1 : 0, id);
+    return tell;
   }
   answer(service, body) {
     if (service === "store/get")
@@ -967,9 +1009,9 @@ class Store {
     }
     return new Out().word(count).push(out.bytes()).bytes();
   }
-  commit(batches) {
+  commit(batches, sends = [], now = 0) {
     const ops = writes(batches);
-    if (ops.length === 0)
+    if (ops.length === 0 && sends.length === 0)
       return;
     this.storage.transactionSync(() => {
       for (const [k, v] of ops) {
@@ -977,6 +1019,9 @@ class Store {
           this.storage.sql.exec("DELETE FROM kv WHERE key = ?", blob(k));
         else
           this.storage.sql.exec("INSERT OR REPLACE INTO kv (key, value) VALUES (?, ?)", blob(k), blob(v));
+      }
+      for (const m of sends) {
+        this.storage.sql.exec("INSERT INTO wrela_outbox (dest, body, made, tries, due, told) VALUES (?, ?, ?, 0, ?, 0)", m.to, blob(m.body), now, now);
       }
     });
   }
@@ -1099,6 +1144,23 @@ async function verify(body) {
       throw new Error(`no signature algorithm ${alg}`);
   }
 }
+async function hmac(body) {
+  const r = new In(body);
+  const key = r.chunk().slice();
+  const message = r.chunk().slice();
+  r.end("service");
+  const k = await crypto.subtle.importKey("raw", key.length === 0 ? new Uint8Array(64) : key, { name: "HMAC", hash: "SHA-256" }, false, ["sign"]);
+  return new Uint8Array(await crypto.subtle.sign("HMAC", k, message));
+}
+function instanceName(name) {
+  return name === SERVER_INSTANCE || name.includes("/") && artifactPath(name);
+}
+function artifactPath(path) {
+  return path.length > 0 && path.length <= MAX_INSTANCE_NAME && path.split("/").every((p) => p !== "" && p !== "." && p !== ".." && /^[A-Za-z0-9._-]+$/.test(p));
+}
+var encodeCall = (from, body) => new Out().word(CALL_MAGIC).text(from).chunk(body).bytes();
+var encodeMessage = (from, id, body) => new Out().word(MESSAGE_MAGIC).text(from).u64(BigInt(id)).chunk(body).bytes();
+var backoff = (tries) => Math.min(1000 * 2 ** Math.min(tries - 1, 22), RETRY_CAP_MS);
 function answerOf(f) {
   try {
     return f();
@@ -1203,6 +1265,12 @@ class Instance {
   answer(id, a) {
     this.arriving.push(Promise.resolve(a).then((x) => [id, x]));
   }
+  later(id, a) {
+    a.catch(() => null).then((x) => {
+      this.answered.set(id, x);
+      this.owner.arrived?.(this);
+    });
+  }
   async settle() {
     for (const [id, a] of await Promise.all(this.arriving.splice(0)))
       this.answered.set(id, a);
@@ -1214,6 +1282,8 @@ function commonAnswer(service, body, now) {
       return answerOf(() => random(body));
     case "crypto/verify":
       return verify(body).catch(() => null);
+    case SERVICE_HMAC:
+      return hmac(body).catch(() => null);
     case SERVICE_TIME:
       return body.length === 0 ? new Out().u64(BigInt(Math.floor(now))).bytes() : null;
     default:
@@ -1280,7 +1350,9 @@ function imports_(owner, me) {
   };
 }
 var RECOVER_MS = 1000;
+var ROUND = 64;
 var POISONED = 2 ** 31;
+var unanswered = (kind) => kind === "request" ? bare(504) : null;
 
 class Server {
   module;
@@ -1301,30 +1373,51 @@ class Server {
   leftover = false;
   alarmAt = 0;
   now;
+  trying = new Set;
+  named;
   constructor(module, storage, options = {}) {
     this.module = module;
     this.options = options;
     this.limits = options.limits ?? LIMITS;
     this.now = options.now ?? Date.now;
-    this.store = new Store(storage);
+    this.store = storage === null ? null : new Store(storage);
+    this.named = this.store === null ? "" : this.store.name;
     this.started = this.now();
+    const due = this.store?.nextDue() ?? null;
+    if (due !== null)
+      this.schedule(due);
   }
   get print() {
     return this.options.print;
+  }
+  name(name) {
+    if (this.store === null || this.named === name)
+      return;
+    this.named = name;
+    this.store.name = name;
   }
   clock() {
     this.lastClock = Math.max(this.lastClock, (this.now() - this.started) / 1000);
     return this.lastClock;
   }
   request(bytes) {
+    return this.connect("request", bytes, bare(503));
+  }
+  call(from, body) {
+    return this.connect("call", encodeCall(from, body), null);
+  }
+  async message(from, id, body) {
+    return await this.connect("message", encodeMessage(from, id, body), null) !== null;
+  }
+  connect(kind, bytes, full) {
     if (this.open.size >= this.limits.open || this.queue.held + bytes.length > this.limits.queued)
-      return Promise.resolve(bare(503));
+      return Promise.resolve(full);
     const conn = this.nextConn++;
     if (this.nextConn >= POISONED)
       this.nextConn = 1;
     const answer = new Promise((resolve) => {
-      const timer = setTimeout(() => this.finish(conn, bare(504)), RESPOND_WITHIN_MS);
-      this.open.set(conn, { resolve, timer, bytes, retried: false });
+      const timer = setTimeout(() => this.finish(conn, unanswered(kind)), RESPOND_WITHIN_MS);
+      this.open.set(conn, { kind, resolve, timer, bytes, retried: false });
     });
     this.queue.push(connectionEvent(conn, true));
     this.queue.pushMessage(conn, bytes);
@@ -1335,7 +1428,19 @@ class Server {
   async alarm() {
     this.alarmAt = 0;
     this.woken = true;
-    await this.pump();
+    await Promise.all([this.pump(), this.deliver()]);
+  }
+  arrived(self) {
+    if (self !== this.instance)
+      return;
+    this.fresh = true;
+    this.pump();
+  }
+  schedule(at) {
+    if (this.alarmAt !== 0 && this.alarmAt <= at)
+      return;
+    this.alarmAt = at;
+    this.options.setAlarm?.(at);
   }
   due() {
     return this.fresh || this.leftover || this.woken || (this.instance?.arriving.length ?? 0) > 0;
@@ -1349,8 +1454,7 @@ class Server {
       while (this.due()) {
         await this.once();
         if (this.due() && this.now() - began >= this.limits.turn) {
-          this.alarmAt = this.now();
-          this.options.setAlarm?.(this.alarmAt);
+          this.schedule(this.now());
           return;
         }
         await new Promise((r) => setTimeout(r, 0));
@@ -1378,10 +1482,10 @@ class Server {
       const before = this.queue.length;
       instance.call(() => instance.serve(time));
       this.leftover = this.queue.length > 0 && this.queue.length < before;
-      this.carryOut(instance.commands);
-      if (this.due() && this.alarmAt < this.now()) {
-        this.alarmAt = this.now() + RECOVER_MS;
-        this.options.setAlarm?.(this.alarmAt);
+      this.carryOut(instance, instance.commands);
+      if (this.due() && (this.alarmAt === 0 || this.alarmAt < this.now())) {
+        this.alarmAt = 0;
+        this.schedule(this.now() + RECOVER_MS);
       }
     } catch (e) {
       this.fail(e);
@@ -1393,7 +1497,7 @@ class Server {
     this.starting ??= (async () => {
       try {
         const i = await Instance.start(this, this.module);
-        this.carryOut(i.commands);
+        this.carryOut(i, i.commands);
         this.instance = i;
         return i;
       } finally {
@@ -1402,20 +1506,81 @@ class Server {
     })();
     return this.starting;
   }
-  carryOut(commands) {
-    this.store.commit(commands.flatMap((c) => c.kind === "write" ? [c.body] : []));
+  carryOut(instance, commands) {
+    const sends = commands.flatMap((c) => c.kind === "send" ? [{ to: c.to, body: c.body }] : []);
+    this.store?.commit(commands.flatMap((c) => c.kind === "write" ? [c.body] : []), sends, this.now());
+    const peers = this.options.peers;
     for (const c of commands) {
-      if (c.kind === "respond")
-        this.finish(c.conn, encodeResponse(withHostHeaders(c.response)));
+      switch (c.kind) {
+        case "respond":
+          this.finish(c.conn, encodeResponse(withHostHeaders(c.response)));
+          break;
+        case "dispatch": {
+          const o = this.open.get(c.conn);
+          if (o === undefined)
+            break;
+          if (typeof c.to === "number")
+            this.finish(c.conn, bare(c.to));
+          else if (peers === undefined)
+            this.finish(c.conn, bare(503));
+          else
+            peers.request(c.to, o.bytes).catch(() => bare(503)).then((r) => this.finish(c.conn, r));
+          break;
+        }
+        case "reply":
+          this.finish(c.conn, c.body);
+          break;
+        case "ack":
+          this.finish(c.conn, new Uint8Array(0));
+          break;
+        case "call":
+          instance.later(c.id, peers?.call(c.to, this.named ?? "", c.body) ?? Promise.resolve(null));
+          break;
+        case "build":
+          instance.later(c.id, peers?.callBuild(c.artifact, c.body) ?? Promise.resolve(null));
+          break;
+      }
+    }
+    if (sends.length > 0) {
+      this.schedule(this.now() + RECOVER_MS);
+      this.deliver();
     }
   }
-  finish(conn, response, tell = true) {
+  async deliver() {
+    const store = this.store;
+    const peers = this.options.peers;
+    if (store === null || peers === undefined)
+      return;
+    const from = this.named ?? "";
+    const round = store.due(this.now(), ROUND + this.trying.size).filter((m) => !this.trying.has(m.id));
+    await Promise.all(round.map(async (m) => {
+      this.trying.add(m.id);
+      const ok = await peers.deliver(m.dest, from, m.id, m.body).catch(() => false);
+      this.trying.delete(m.id);
+      if (ok) {
+        store.acknowledged(m.id);
+        return;
+      }
+      const now = this.now();
+      if (store.missed(m.id, m.tries + 1, now + backoff(m.tries + 1), now)) {
+        this.options.log?.(`wrela: a message to a \`${m.dest.split("/")[0]}\` instance has waited more than an hour (${m.tries + 1} tries)`);
+      }
+    }));
+    const next = store.nextDue();
+    if (next === null)
+      return;
+    if (next <= this.now() && round.length > 0)
+      return this.deliver();
+    this.alarmAt = 0;
+    this.schedule(Math.max(next, this.now() + (round.length > 0 ? 0 : RECOVER_MS)));
+  }
+  finish(conn, answer, tell = true) {
     const o = this.open.get(conn);
     if (o === undefined)
       return;
     clearTimeout(o.timer);
     this.open.delete(conn);
-    o.resolve(response);
+    o.resolve(answer);
     if (tell) {
       this.queue.push(connectionEvent(conn, false));
       this.fresh = true;
@@ -1445,39 +1610,136 @@ class Server {
         this.queue.pushMessage(conn, o.bytes);
         this.fresh = true;
       } else {
-        this.finish(conn, bare(f.program ? 500 : 503), false);
+        this.finish(conn, o.kind === "request" ? bare(f.program ? 500 : 503) : null, false);
       }
     }
   }
+  answering(self, service, body, kind) {
+    if (body.length < 4)
+      self.refuse(`\`${service}\` needs a connection's number`);
+    const conn = new DataView(body.buffer, body.byteOffset).getUint32(0, true);
+    const o = this.open.get(conn);
+    if (o === undefined)
+      return null;
+    if (o.kind !== kind) {
+      self.refuse(`\`${service}\` answers a ${kind}, and connection ${conn} is a ${o.kind}: a request takes \`http/respond\`, a call \`server/reply\`, a message \`server/ack\``);
+    }
+    if (this.responding.has(conn))
+      self.refuse(`${kind} ${conn} takes one answer`);
+    this.responding.add(conn);
+    return conn;
+  }
   submit(self, id, service, body) {
+    const edge = this.store === null;
+    const named = (r, what, valid) => {
+      const name = r.text();
+      if (!valid(name))
+        self.refuse(`\`${service}\`: \`${name}\` isn't ${what}`);
+      return name;
+    };
     switch (service) {
       case "store/write":
+        if (edge)
+          self.refuse("`store/write`: the edge has no store: `call` an instance that has one");
         return self.command({ kind: "write", body }, body.length);
       case SERVICE_RESPOND: {
-        if (body.length < 4)
-          self.refuse("`http/respond` needs a connection's number");
-        const conn = new DataView(body.buffer, body.byteOffset).getUint32(0, true);
-        if (!this.open.has(conn))
+        const conn = this.answering(self, service, body, "request");
+        if (conn === null)
           return;
-        if (this.responding.has(conn))
-          self.refuse(`request ${conn} takes one response`);
         let response;
         try {
           response = checkResponse(body.subarray(4));
         } catch (e) {
           self.refuse(`\`http/respond\`: ${e.message}`);
         }
-        this.responding.add(conn);
         return self.command({ kind: "respond", conn, response }, body.length);
       }
+      case SERVICE_DISPATCH: {
+        if (!edge)
+          self.refuse("`server/dispatch` is the edge's: an instance answers its requests itself");
+        const conn = this.answering(self, service, body, "request");
+        const r = new In(body.subarray(4));
+        let to;
+        try {
+          const how = r.byte();
+          if (how === 1)
+            to = named(r, "an instance's name", instanceName);
+          else if (how === 2)
+            to = r.word();
+          else
+            throw new Error(`a dispatch of kind ${how}`);
+          r.end("dispatch");
+        } catch (e) {
+          if (e instanceof Failure)
+            throw e;
+          self.refuse(`\`server/dispatch\`: ${e.message}`);
+        }
+        if (typeof to === "number" && (to < 400 || to > 599))
+          self.refuse(`\`server/dispatch\`: a refusal's status is 400 to 599, not ${to}`);
+        if (conn === null)
+          return;
+        return self.command({ kind: "dispatch", conn, to }, body.length);
+      }
+      case SERVICE_REPLY: {
+        const conn = this.answering(self, service, body, "call");
+        const r = new In(body.subarray(4));
+        let reply;
+        try {
+          reply = r.chunk();
+          r.end("reply");
+        } catch (e) {
+          self.refuse(`\`server/reply\`: ${e.message}`);
+        }
+        if (conn === null)
+          return;
+        return self.command({ kind: "reply", conn, body: reply }, body.length);
+      }
+      case SERVICE_ACK: {
+        if (body.length !== 4)
+          self.refuse("`server/ack` takes a connection's number");
+        const conn = this.answering(self, service, body, "message");
+        if (conn === null)
+          return;
+        return self.command({ kind: "ack", conn }, body.length);
+      }
+      case SERVICE_CALL:
+      case SERVICE_SEND:
+      case SERVICE_CALL_BUILD: {
+        if (service === SERVICE_SEND && edge)
+          self.refuse("`server/send`: the edge has no outbox: `call` an instance that sends");
+        const r = new In(body);
+        let to;
+        let rest;
+        try {
+          to = service === SERVICE_CALL_BUILD ? named(r, "an artifact's path", artifactPath) : named(r, "an instance's name", instanceName);
+          rest = r.chunk();
+          r.end("service");
+        } catch (e) {
+          if (e instanceof Failure)
+            throw e;
+          self.refuse(`\`${service}\`: ${e.message}`);
+        }
+        if (service === SERVICE_SEND)
+          return self.command({ kind: "send", to, body: rest }, body.length);
+        if (service === SERVICE_CALL)
+          return self.command({ kind: "call", id, to, body: rest }, body.length);
+        return self.command({ kind: "build", id, artifact: to, body: rest }, body.length);
+      }
+      case SERVICE_ME:
+        if (this.named === null)
+          return self.answer(id, null);
+        self.answered.set(id, new TextEncoder().encode(this.named));
+        return;
       case "net/send":
       case "net/close":
       case "net/tag":
       case "net/keep":
       case "net/compact":
-        return self.refuse(`\`${service}\`: an HTTP server's connections take one response (\`std::http::respond\`)`);
+        return self.refuse(`\`${service}\`: an HTTP server's connections take one answer (\`std::http::respond\`)`);
       case "store/get":
       case "store/scan":
+        if (this.store === null)
+          return self.refuse(`\`${service}\`: the edge has no store: \`call\` an instance that has one`);
         return self.answer(id, this.store.answer(service, body));
       default:
         return self.answer(id, commonAnswer(service, body, this.now()));
@@ -1922,6 +2184,16 @@ class Room {
         return self.command({ kind: "tag", conn: conn(), tag: word(body, 4) }, body.length);
       case SERVICE_RESPOND:
         return self.refuse("`http/respond`: a room's connections are its peers', not HTTP requests");
+      case SERVICE_ME:
+        self.answered.set(id, new TextEncoder().encode(SERVER_INSTANCE));
+        return;
+      case SERVICE_DISPATCH:
+      case SERVICE_CALL:
+      case SERVICE_REPLY:
+      case SERVICE_SEND:
+      case SERVICE_ACK:
+      case SERVICE_CALL_BUILD:
+        return self.refuse(`\`${service}\`: a room's peers are its connections; calls and messages are an HTTP instance's`);
       case "store/get":
       case "store/scan":
         return self.answer(id, this.store.answer(service, body).catch(() => null));
@@ -1932,7 +2204,7 @@ class Room {
 }
 
 // src/cloudflare.ts
-var SERVER_OBJECT = "server";
+var SERVER_OBJECT = SERVER_INSTANCE;
 function refusal(status, headers = {}) {
   return new Response(null, { status, headers: [["cache-control", "no-store"], ...HOST_HEADERS, ...Object.entries(headers)] });
 }
@@ -2002,7 +2274,59 @@ async function pastLimit(env, method, path, address) {
   }
   return null;
 }
-async function api(request, env, options = {}) {
+var bytesOf = (b) => b instanceof Uint8Array ? b : new Uint8Array(b);
+function peersOf(env, log = (l) => console.error(l)) {
+  const stub = (name) => env.WRELA_SERVER.getByName(name);
+  return {
+    request: (name, bytes) => stub(name).request(name, bytes).then(bytesOf, () => bare(503)),
+    call: (name, from, body) => stub(name).call(name, from, body).then((b) => b === null ? null : bytesOf(b), () => null),
+    deliver: (name, from, id, body) => stub(name).deliver(name, from, id, body).catch(() => false),
+    callBuild: (artifact, body) => callBuild(env, artifact, body, log)
+  };
+}
+async function callBuild(env, artifact, body, log) {
+  const loader = env.WRELA_LOADER;
+  const builds = env.WRELA_BUILDS;
+  if (loader === undefined || builds === undefined) {
+    log("wrela: `call_build` needs the Worker's WRELA_LOADER and WRELA_BUILDS bindings");
+    return null;
+  }
+  try {
+    const worker = loader.get(artifact, async () => {
+      const file = async (name) => {
+        const o = await builds.get(`${artifact}/${name}`);
+        if (o === null)
+          throw new Error(`the archived build has no ${name}`);
+        return o;
+      };
+      const meta = JSON.parse(await (await file("verifier.json")).text());
+      if (meta.schema !== VERIFY_SCHEMA)
+        throw new Error(`the archived build's verifier is \`${meta.schema}\`, not \`${VERIFY_SCHEMA}\``);
+      const modules = {};
+      for (const name of meta.modules) {
+        const o = await file(name);
+        modules[name] = name.endsWith(".wasm") ? { wasm: await o.arrayBuffer() } : await o.text();
+      }
+      return { compatibilityDate: meta.compatibility_date, mainModule: meta.main, modules, globalOutbound: null, env: {} };
+    });
+    const reply = await worker.getEntrypoint().verify(body);
+    return reply === null || reply === undefined ? null : bytesOf(reply);
+  } catch (e) {
+    log(`wrela: an archived build's verifier failed: ${e.message}`);
+    return null;
+  }
+}
+function edgeOf(module, env) {
+  const log = (line) => console.error(line);
+  const edge = new Server(module, null, {
+    peers: peersOf(env, log),
+    setAlarm: (at) => void setTimeout(() => void edge.alarm(), Math.max(0, at - Date.now())),
+    log,
+    ...env.WRELA_PRINT === "1" ? { print: (line) => console.log(line) } : {}
+  });
+  return edge;
+}
+async function api(module, request, env, options = {}) {
   const url = new URL(request.url);
   const prefix = options.prefix ?? "/api/";
   if (!url.pathname.startsWith(prefix))
@@ -2036,13 +2360,7 @@ async function api(request, env, options = {}) {
   const bytes = encodeRequest({ time: BigInt(Date.now()), method, path: url.pathname, query: url.search.slice(1), headers, body });
   if (bytes.length > MAX_HTTP_REQUEST)
     return refusal(413);
-  let answer;
-  try {
-    answer = await env.WRELA_SERVER.getByName(SERVER_OBJECT).request(bytes);
-  } catch {
-    answer = bare(503);
-  }
-  const s = decodeResponse(answer);
+  const s = decodeResponse(await edgeOf(module, env).request(bytes));
   const out = new Headers;
   for (const [n, v] of s.headers)
     out.append(n, v);
@@ -2057,20 +2375,30 @@ async function api(request, env, options = {}) {
   }
   return response;
 }
-var bytesOf = (b) => b instanceof Uint8Array ? b : new Uint8Array(b);
 function serverClass(module) {
   return class WrelaServer extends DurableObject {
     server;
     constructor(ctx, env) {
       super(ctx, env);
+      const log = (line) => console.error(line);
       this.server = new Server(module, ctx.storage, {
+        peers: peersOf(env, log),
         setAlarm: (at) => void ctx.storage.setAlarm(at),
-        log: (line) => console.error(line),
+        log,
         ...env.WRELA_PRINT === "1" ? { print: (line) => console.log(line) } : {}
       });
     }
-    async request(bytes) {
+    async request(name, bytes) {
+      this.server.name(name);
       return this.server.request(bytesOf(bytes));
+    }
+    async call(name, from, body) {
+      this.server.name(name);
+      return this.server.call(from, bytesOf(body));
+    }
+    async deliver(name, from, id, body) {
+      this.server.name(name);
+      return this.server.message(from, id, bytesOf(body));
     }
     async answer(service, body) {
       return this.server.store.answer(service, bytesOf(body));
@@ -2154,10 +2482,16 @@ function roomClass(module) {
 var WrelaServer = serverClass(module);
 var WrelaRoom = roomClass(module);
 var pair = pairOf(module);
+var api2 = (request, env, options) => api(module, request, env, options);
 var rooms2 = (request, env) => rooms(request, env, pair);
+function verify2(bytes) {
+  const verifier = new Server(module, null, { log: (line) => console.error(line) });
+  return verifier.call("", bytes instanceof Uint8Array ? bytes : new Uint8Array(bytes));
+}
 export {
   WrelaRoom,
   WrelaServer,
-  api,
-  rooms2 as rooms
+  api2 as api,
+  rooms2 as rooms,
+  verify2 as verify
 };

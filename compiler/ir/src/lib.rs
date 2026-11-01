@@ -311,6 +311,9 @@ pub enum HostOp {
     /// `wrela.request_status(request)`: an `i32`, -1 while pending, -2 failed, else the answer's
     /// length in bytes.
     RequestStatus,
+    /// Submits the commands made so far in this call (`wrela.submit`), so the host has a request
+    /// it answers at once before the program reads its status.
+    Flush,
     /// `wrela.request_take(request, address)`: copies the answer to the address (a `u32`).
     RequestTake,
     /// `wrela.limit(index)`: one of the GPU's limits, a `u32`.

@@ -6,6 +6,10 @@
 // - `verify(algorithm, key, message, signature)`: whether `signature` is `key`'s over `message`.
 //   `verified` reads the answer. A key that isn't one of the algorithm's fails the request; a
 //   signature that's malformed is simply not the key's.
+// - `hmac(key, message)`: HMAC-SHA256 of `message` under `key` (RFC 2104, FIPS 180-4), 32
+//   bytes: a tag only the key's holder makes, such as a challenge the server checks later
+//   without keeping it. `same` compares two tags in time that doesn't depend on where they
+//   differ.
 
 use std::host::request
 use std::io::Pending
@@ -56,6 +60,32 @@ pub fn verified(answer: [u8]) -> bool {
     answer.len() == 1 && answer[0] == 1
 }
 
+/// The bytes an `hmac` answers with.
+pub const HMAC_BYTES: u32 = 32
+
+/// Asks for HMAC-SHA256 of `message` under `key` (any length; RFC 2104 hashes a key longer than
+/// 64 bytes first): the answer is the 32-byte tag.
+@server
+pub fn hmac(key: [u8], message: [u8]) -> Pending<u8> {
+    var w = Writer::new()
+    w.write_counted(key)
+    w.write_counted(message)
+    request("crypto/hmac", take w.into_bytes())
+}
+
+/// Whether `a` and `b` are the same bytes, in time that depends on their lengths alone, not on
+/// where they differ: for comparing a tag the client sent with the one `hmac` made.
+pub fn same(a: [u8], b: [u8]) -> bool {
+    if a.len() != b.len() {
+        return false
+    }
+    var differ: u8 = 0
+    for i in 0..a.len() {
+        differ = differ | (a[i] ^ b[i])
+    }
+    differ == 0
+}
+
 /// A P-256 key as `verify` takes it, from its coordinates (32 bytes each, big-endian, as COSE
 /// gives them): the uncompressed SEC1 point.
 pub fn p256_key(x: [u8], y: [u8]) -> Vec<u8> {
@@ -88,4 +118,10 @@ fn keys_take_the_forms_the_host_reads() {
     let r = rsa_key([9, 9, 9], [1, 0, 1])
     assert(r.len() == 14 && r[0] == 3 && r[7] == 3 && r[13] == 1)
     assert(verified([1]) && !verified([0]) && !verified([]))
+}
+
+@test
+fn same_compares_every_byte() {
+    assert(same([1, 2, 3], [1, 2, 3]) && same([], []))
+    assert(!same([1, 2, 3], [1, 2, 4]) && !same([1, 2], [1, 2, 3]) && !same([9, 2, 3], [1, 2, 3]))
 }

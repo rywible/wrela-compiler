@@ -1372,6 +1372,7 @@ pub(crate) fn intrinsic(
         Some(
             l @ (Lang::NextRequest
             | Lang::RequestStatus
+            | Lang::FlushCommands
             | Lang::RequestTake
             | Lang::Limit
             | Lang::InputTake
@@ -1397,6 +1398,10 @@ pub(crate) fn intrinsic(
         Some(Lang::NextRequest) => {
             let u = fl.mb.m.types.u32();
             Some(fl.value(u, ir::Expr::Host(ir::HostOp::NextRequest, Vec::new())))
+        }
+        Some(Lang::FlushCommands) => {
+            fl.emit(ir::Stmt::Eval(ir::Expr::Host(ir::HostOp::Flush, Vec::new())));
+            None
         }
         Some(Lang::RequestStatus) => {
             let r = fl.arg_value(&c.args[0])?;

@@ -27,7 +27,7 @@ test("a build's files resolve without the page's fragment", async () => {
   const { fetch, requested } = server();
   await loadBuild(`${BASE}#attract`, fetch);
   expect(requested.sort()).toEqual(
-    ["/game/fill.wgsl", "/game/first-light.wgsl", "/game/game.wasm", "/game/manifest.json"].sort(),
+    ["/game/addresses.json", "/game/fill.wgsl", "/game/first-light.wgsl", "/game/game.wasm", "/game/manifest.json"].sort(),
   );
 });
 
@@ -42,8 +42,58 @@ test("loads a build's manifest, WASM and shaders", async () => {
     ["first-light.wgsl", "fill.wgsl"].map(readFixtureText),
   );
   expect(requested.sort()).toEqual(
-    ["/game/fill.wgsl", "/game/first-light.wgsl", "/game/game.wasm", "/game/manifest.json"].sort(),
+    ["/game/addresses.json", "/game/fill.wgsl", "/game/first-light.wgsl", "/game/game.wasm", "/game/manifest.json"].sort(),
   );
+});
+
+test("a build's map puts its payloads at their addresses, and the rest beside it", async () => {
+  const lines = readFixture("game.wasm").subarray(0, 0);
+  const addresses = JSON.stringify({
+    format: "wrela-addresses-1",
+    files: { "game.wasm": "/b/aa.wasm", "first-light.wgsl": "/b/bb.wgsl", "game.lines": "/b/cc.lines", "files/x/data.bin": "/b/dd.bin" },
+  });
+  const requested: string[] = [];
+  const fetch: Fetch = async (url) => {
+    requested.push(url.href);
+    const name = { "/b/aa.wasm": "game.wasm", "/b/bb.wgsl": "first-light.wgsl" }[url.pathname] ?? url.pathname.replace(/^\/game\//, "");
+    if (name === "addresses.json") return new Response(addresses);
+    if (url.pathname === "/b/cc.lines" || url.pathname === "/b/dd.bin") return new Response(lines);
+    const path = join(FIRST_LIGHT, name);
+    return existsSync(path) ? new Response(readFileSync(path)) : new Response("nope", { status: 404 });
+  };
+  const build = await loadBuild(BASE, fetch);
+  expect(new Uint8Array(await (build.wasm as Response).arrayBuffer())).toEqual(readFixture("game.wasm"));
+  expect(build.shaders[0]).toBe(readFixtureText("first-light.wgsl"));
+  await loadLines(BASE, build.manifest, fetch, build.addresses);
+  await browserIo(BASE, fetch, BASE, undefined, null, build.addresses).fetch("files/x/data.bin");
+  await browserIo(BASE, fetch, BASE, undefined, null, build.addresses).fetch("other.bin").catch(() => {});
+  expect(requested.sort()).toEqual(
+    [
+      "http://localhost/b/aa.wasm",
+      "http://localhost/b/bb.wgsl",
+      "http://localhost/b/cc.lines",
+      "http://localhost/b/dd.bin",
+      "http://localhost/game/addresses.json",
+      "http://localhost/game/fill.wgsl",
+      "http://localhost/game/manifest.json",
+      "http://localhost/game/other.bin",
+    ].sort(),
+  );
+});
+
+test("a map that names an address outside /b/, or isn't one, fails the load", async () => {
+  for (const [files, why] of [
+    [{ "game.wasm": "https://elsewhere.example/b/aa.wasm" }, "outside /b/"],
+    [{ "game.wasm": "/releases/aa.wasm" }, "outside /b/"],
+    [{ "game.wasm": "/b/../aa.wasm" }, "outside /b/"],
+    [{ "game.wasm": "//elsewhere.example/b/aa.wasm" }, "outside /b/"],
+    [{ "game.wasm": "/b/aa.wasm?x" }, "outside /b/"],
+    [{ "../game.wasm": "/b/aa.wasm" }, "names `../game.wasm`"],
+  ] as const) {
+    const map = JSON.stringify({ format: "wrela-addresses-1", files });
+    await expect(loadBuild(BASE, server({ "addresses.json": map }).fetch)).rejects.toThrow(why);
+  }
+  await expect(loadBuild(BASE, server({ "addresses.json": "{}" }).fetch)).rejects.toThrow("format");
 });
 
 test("a relaxed-SIMD build's relaxed module loads only where relaxed SIMD runs", async () => {
@@ -116,6 +166,7 @@ test("build and program requests refuse redirects before they leave the build's 
   await expect(io.post("save", Uint8Array.of(1))).rejects.toThrow("POST save failed: 302 Found");
   expect(requested).toEqual([
     { url: "http://localhost/game/manifest.json", method: "GET", redirect: "manual" },
+    { url: "http://localhost/game/addresses.json", method: "GET", redirect: "manual" },
     { url: "http://localhost/game/data.bin", method: "GET", redirect: "manual" },
     { url: "http://localhost/game/save", method: "POST", redirect: "manual" },
   ]);
@@ -138,6 +189,7 @@ test("default browser fetches keep the no-redirect policy", async () => {
   }
   expect(requested).toEqual([
     { url: "http://localhost/game/manifest.json", redirect: "manual" },
+    { url: "http://localhost/game/addresses.json", redirect: "manual" },
     { url: "http://localhost/game/input.json", redirect: "manual" },
     { url: "http://localhost/game/game.lines", redirect: "manual" },
     { url: "http://localhost/game/data.bin", redirect: "manual" },
