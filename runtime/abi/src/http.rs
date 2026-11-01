@@ -20,6 +20,24 @@
 //! | the headers: a `u32` count, then each name (lower case) and value as the method is | the body: a `u32` length, then bytes |
 //! | the body: a `u32` length, then bytes | |
 //!
+//! A client that reads something public asks with `http/fetch-public`
+//! ([`SERVICE_FETCH_PUBLIC`]): a `GET`, sent without the origin's cookies, that the browser's
+//! HTTP cache may answer.
+//!
+//! **Instances** (language.md §19.5): the Cloudflare host runs a server build as named instances,
+//! each with its own store, and an edge instance, with none, that each request reaches first. An
+//! instance is called (`server/call`, [`SERVICE_CALL`]) and sent messages (`server/send`,
+//! [`SERVICE_SEND`]) by name ([`instance_name`]); each call and each message is a short
+//! connection, as a request is, whose one message starts with [`CALL_MAGIC`] or
+//! [`MESSAGE_MAGIC`]:
+//!
+//! | A call | A message |
+//! |---|---|
+//! | [`CALL_MAGIC`] | [`MESSAGE_MAGIC`] |
+//! | the caller's name: a `u32` length, then UTF-8 (empty: the edge) | the sender's name, as a call's |
+//! | the body: a `u32` length, then bytes | the message's id, a `u64`, the same each time it comes |
+//! | | the body: a `u32` length, then bytes |
+//!
 //! What crosses is allowlisted, so no address reaches a program: a server sees only the request
 //! headers [`seen_by_server`] takes, sets only those [`set_by_server`] takes, and a client sets
 //! and sees those of [`set_by_client`] and [`seen_by_client`].
@@ -34,6 +52,61 @@ pub const SERVICE_RESPOND: &str = "http/respond";
 pub const SERVICE_FETCH: &str = "http/fetch";
 /// The service that answers the time of day.
 pub const SERVICE_TIME: &str = "time/unix";
+/// The service a client reads something public with: a `GET` without cookies, which the
+/// browser's HTTP cache may answer.
+pub const SERVICE_FETCH_PUBLIC: &str = "http/fetch-public";
+/// What a call's bytes start with, as its callee reads them.
+pub const CALL_MAGIC: [u8; 4] = *b"WSC1";
+/// What a sent message's bytes start with, as its receiver reads them.
+pub const MESSAGE_MAGIC: [u8; 4] = *b"WSM1";
+/// The request that answers an instance's own name, at once (empty: the edge).
+pub const SERVICE_ME: &str = "server/me";
+/// The command that sends a request that reached the edge on: to an instance, or refused.
+pub const SERVICE_DISPATCH: &str = "server/dispatch";
+/// The request that calls an instance, answered with its reply.
+pub const SERVICE_CALL: &str = "server/call";
+/// The command that answers a call, once the call's writes are committed.
+pub const SERVICE_REPLY: &str = "server/reply";
+/// The command that sends an instance a message, kept in the sender's outbox until it's
+/// acknowledged.
+pub const SERVICE_SEND: &str = "server/send";
+/// The command that acknowledges a message, once the call's writes are committed.
+pub const SERVICE_ACK: &str = "server/ack";
+/// The request that calls an archived build's verifier, answered with its reply.
+pub const SERVICE_CALL_BUILD: &str = "server/call_build";
+/// The request that answers HMAC-SHA256 of a message under a key.
+pub const SERVICE_HMAC: &str = "crypto/hmac";
+/// The longest instance name, and the longest artifact path, in bytes.
+pub const MAX_INSTANCE_NAME: usize = 256;
+/// The instance that holds the store a server's rooms share.
+pub const SERVER_INSTANCE: &str = "server";
+/// The longest wait between two tries of a message, in milliseconds; a message older than it
+/// writes a line to the log, once.
+pub const RETRY_CAP_MS: u32 = 3_600_000;
+/// The verifier artifact's contract (`server/verifier/verifier.json`'s `schema`).
+pub const VERIFY_SCHEMA: &str = "wrela-verify-1";
+
+/// Whether `name` names an instance: `server`, or a kind and a name (`account/7f3a`), 3 to
+/// [`MAX_INSTANCE_NAME`] bytes of parts of `a`-`z`, `A`-`Z`, `0`-`9`, `-`, `_` and `.`, with
+/// `/` between them, none of them empty, `.` or `..`.
+pub fn instance_name(name: &str) -> bool {
+    name == SERVER_INSTANCE || (name.contains('/') && artifact_path(name))
+}
+
+/// Whether `path` names an archived build (`call_build`): 1 to [`MAX_INSTANCE_NAME`] bytes of
+/// parts as an instance name's, with `/` between them.
+pub fn artifact_path(path: &str) -> bool {
+    !path.is_empty()
+        && path.len() <= MAX_INSTANCE_NAME
+        && path.split('/').all(|p| {
+            !p.is_empty()
+                && p != "."
+                && p != ".."
+                && p.bytes()
+                    .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_' || b == b'.')
+        })
+}
+
 /// The most bytes a request is, encoded: one message, and one host request.
 pub const MAX_REQUEST: usize = 1 << 20;
 /// How long a request waits for its response before the host answers 504 for it.
@@ -288,5 +361,18 @@ mod tests {
         assert!(set_by_server("set-cookie") && !set_by_server("access-control-allow-origin"));
         assert!(!seen_by_client("set-cookie") && seen_by_client("x-wrela-page"));
         assert!(set_by_client("content-type") && !set_by_client("cookie"));
+    }
+
+    #[test]
+    fn instance_names_are_a_kind_and_a_name_or_the_rooms_server() {
+        for name in ["server", "account/7f3a", "board/capybara/b3/c1/any", "names/0a", "a/b.c-d_e"]
+        {
+            assert!(instance_name(name), "{name}");
+        }
+        let long = format!("a/{}", "x".repeat(MAX_INSTANCE_NAME - 1));
+        for name in ["", "account", "/a", "a/", "a//b", "a/./b", "a/../b", "a/b c", "a/é", &long] {
+            assert!(!instance_name(name), "{name:?}");
+        }
+        assert!(artifact_path("verifiers/capybara/b3/0123abcd") && !artifact_path("../x"));
     }
 }

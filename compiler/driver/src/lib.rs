@@ -1036,6 +1036,13 @@ fn compile_loaded_in(
         if client.is_some() || server.is_some() {
             build::pair(client, server, relaxed);
         }
+        // The verifier artifact carries the server's module as it ships, its pair id with it.
+        let shipped = files.iter().find(|(p, _)| p == build::SERVER_WASM).map(|(_, b)| b.clone());
+        if let Some(bytes) = shipped
+            && let Some((_, copy)) = files.iter_mut().find(|(p, _)| p == build::VERIFIER_WASM)
+        {
+            *copy = bytes;
+        }
     }
     sort_and_dedup(&mut diagnostics);
     if has_errors(&diagnostics) {

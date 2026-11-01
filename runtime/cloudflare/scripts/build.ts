@@ -1,12 +1,14 @@
 // Builds the host into a directory (default: dist/): cloudflare.js, which `wrela build` writes
-// beside a server build's module. It imports `./game.wasm` and `cloudflare:workers`, which
-// Wrangler resolves when it bundles the site's Worker.
+// beside a server build's module, and verifier.js, a verifier artifact's entry, which it writes
+// as server/verifier/main.js beside a copy of both. cloudflare.js imports `./game.wasm` and
+// `cloudflare:workers`, which Wrangler resolves when it bundles the site's Worker, and the Worker
+// Loader when it loads a verifier.
 // dist/ is checked in, so the compiler can embed the host without bun; `bun run check-dist`
 // fails when it's stale.
 //
 //     bun scripts/build.ts [out-dir]
 
-import { mkdirSync, readdirSync, renameSync, rmSync } from "node:fs";
+import { copyFileSync, mkdirSync, readdirSync, renameSync, rmSync } from "node:fs";
 import { join, resolve } from "node:path";
 
 export const ROOT = resolve(import.meta.dir, "..");
@@ -27,6 +29,7 @@ export async function build(outDir: string): Promise<string[]> {
     throw new AggregateError(result.logs, "the host failed to build");
   }
   renameSync(join(outDir, "entry.js"), join(outDir, "cloudflare.js"));
+  copyFileSync(join(ROOT, "src/verifier.js"), join(outDir, "verifier.js"));
   return readdirSync(outDir).sort();
 }
 

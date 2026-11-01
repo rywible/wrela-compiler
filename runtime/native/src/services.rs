@@ -11,6 +11,8 @@
 //! - **Randomness** (`crypto/random`): bytes from the operating system's generator.
 //! - **The time of day** (`time/unix`): the system clock's milliseconds since the Unix epoch,
 //!   eight bytes.
+//! - **HMAC** (`crypto/hmac`): HMAC-SHA256 of a message under a key (RFC 2104), by the RustCrypto
+//!   `hmac` crate.
 //! - **Signatures** (`crypto/verify`): whether a signature is a key's over a message, by the
 //!   algorithms passkeys use: ES256 (ECDSA on P-256 with SHA-256), Ed25519 and RS256 (RSA
 //!   PKCS #1 v1.5 with SHA-256). The checks are the RustCrypto and dalek crates'; nothing here
@@ -78,6 +80,7 @@ impl Services {
             "crypto/random" => random(body),
             wrela_abi::http::SERVICE_TIME => unix_ms(body).map(|ms| ms.to_le_bytes().to_vec()),
             "crypto/verify" => verify(body).map(|ok| vec![u8::from(ok)]),
+            wrela_abi::http::SERVICE_HMAC => hmac(body),
             _ => Err(format!("this server has no service `{service}`")),
         }
     }
@@ -327,6 +330,19 @@ impl<'a> Bytes<'a> {
     }
 }
 
+/// `crypto/hmac`: a key and a message (each a length, then bytes) → HMAC-SHA256 of the message
+/// under the key, 32 bytes.
+fn hmac(body: &[u8]) -> Result<Vec<u8>, String> {
+    use hmac::Mac;
+    let mut r = Bytes(body);
+    let key = r.chunk()?;
+    let message = r.chunk()?;
+    r.end()?;
+    let mut mac = hmac::Hmac::<sha2::Sha256>::new_from_slice(key).map_err(|e| e.to_string())?;
+    mac.update(message);
+    Ok(mac.finalize().into_bytes().to_vec())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -386,6 +402,19 @@ mod tests {
         );
         let down = scan(&s, b"", b"", 2, true);
         assert_eq!(down.iter().map(|e| e.0.as_slice()).collect::<Vec<_>>(), [&b"b/2"[..], b"b/1"]);
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn hmac_is_rfc_4231s() {
+        let d = dir("hmac");
+        let s = Services::open(&d.join("store.sqlite")).expect("open");
+        // RFC 4231 §4.3, test case 2.
+        let body = [chunk(b"Jefe"), chunk(b"what do ya want for nothing?")].concat();
+        let tag = s.answer("crypto/hmac", &body).expect("a tag");
+        let hex: String = tag.iter().map(|b| format!("{b:02x}")).collect();
+        assert_eq!(hex, "5bdcc146bf60754e6a042426089575c75a003f089d2739839dec58b964ec3843");
+        assert!(s.answer("crypto/hmac", &chunk(b"Jefe")).is_err(), "no message");
         let _ = std::fs::remove_dir_all(&d);
     }
 

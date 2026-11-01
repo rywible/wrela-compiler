@@ -207,6 +207,16 @@ fn net_command(service: &str, body: &[u8]) -> Option<Result<Net, String>> {
             }
             _ => Err("`net/tag` needs a connection's number and a tag".to_string()),
         },
+        // Instances are the Cloudflare host's (language.md §19.5): a room here has no other
+        // instance to call or send to, and no request to dispatch.
+        wrela_abi::http::SERVICE_DISPATCH
+        | wrela_abi::http::SERVICE_CALL
+        | wrela_abi::http::SERVICE_REPLY
+        | wrela_abi::http::SERVICE_SEND
+        | wrela_abi::http::SERVICE_ACK
+        | wrela_abi::http::SERVICE_CALL_BUILD => Err(format!(
+            "`{service}`: this host runs rooms, whose instance is `server`; calls and messages between instances are the Cloudflare host's"
+        )),
         _ => return None,
     })
 }
@@ -454,6 +464,12 @@ fn linker() -> wasmtime::Result<Linker<RoomState>> {
                             }
                             let net = net.map_err(|why| s.refuse(why))?;
                             s.commands.push(net);
+                            continue;
+                        }
+                        // A room's instance is `server`, whose store it uses: answered at once.
+                        if service == wrela_abi::http::SERVICE_ME {
+                            let name = wrela_abi::http::SERVER_INSTANCE.as_bytes().to_vec();
+                            s.answered.insert(request, Ok(name));
                             continue;
                         }
                         let answer = match &s.answers {

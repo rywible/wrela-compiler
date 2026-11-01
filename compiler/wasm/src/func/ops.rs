@@ -1419,6 +1419,7 @@ pub(super) fn host(
                 I::GlobalSet(globals::NEXT_REQUEST),
             ]);
         }
+        ir::HostOp::Flush => fe.ins.push(I::Call(fe.at.helpers.flush)),
         ir::HostOp::RequestStatus
         | ir::HostOp::Limit
         | ir::HostOp::Payload
@@ -1433,7 +1434,7 @@ pub(super) fn host(
         | ir::HostOp::Tick => {
             // A call of the host's import, with the arguments in order. (A request made in
             // this call is pending until the next one, so its command needn't reach the host
-            // before its status is read.)
+            // before its status is read; one the host answers at once is flushed first, `Flush`.)
             let h = fe.at.helpers;
             let (helper, returns) = match op {
                 ir::HostOp::RequestStatus => (h.request_status, true),

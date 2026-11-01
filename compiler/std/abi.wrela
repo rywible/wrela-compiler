@@ -10,6 +10,12 @@ pub(package) const HTTP_REQUEST_MAGIC: u32 = 827410519
 /// What an HTTP response's bytes start with, `WHR1`.
 pub(package) const HTTP_RESPONSE_MAGIC: u32 = 827476055
 
+/// What a call's bytes start with, as its callee reads them (`std::server`), `WSC1`.
+pub(package) const CALL_MAGIC: u32 = 826495831
+
+/// What a sent message's bytes start with, as its receiver reads them, `WSM1`.
+pub(package) const MESSAGE_MAGIC: u32 = 827151191
+
 /// Bumped whenever work appears: the helpers wait on it.
 pub(package) const PAR_WAKE: u32 = 256
 

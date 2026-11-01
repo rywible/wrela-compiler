@@ -49,4 +49,22 @@ describe("http/fetch", () => {
     expect(httpFetch(ask("GET", "/x", "", [["cookie", "a=1"]]), ORIGIN, send)).rejects.toThrow("can't set");
     expect(httpFetch(ask("TRACE", "/x"), ORIGIN, send)).rejects.toThrow("isn't a method");
   });
+
+  test("a public read is a GET without cookies, which the HTTP cache may answer", async () => {
+    let seen: RequestInit | null = null;
+    const send = (async (_url: URL, init: RequestInit) => {
+      seen = init;
+      return new Response("board", { headers: { "cache-control": "public, max-age=60" } });
+    }) as unknown as typeof fetch;
+    const answer = decodeResponse(await httpFetch(ask("GET", "/api/board"), ORIGIN, send, true));
+    expect(seen!.credentials).toBe("omit");
+    expect(seen!.cache).toBe("default");
+    expect(seen!.redirect).toBe("error");
+    expect(answer.headers).toEqual([["cache-control", "public, max-age=60"]]);
+    expect(httpFetch(ask("POST", "/api/board"), ORIGIN, send, true)).rejects.toThrow("a `GET`");
+    // An ordinary fetch keeps its cookies and caches nothing.
+    await httpFetch(ask("GET", "/api/board"), ORIGIN, send);
+    expect(seen!.credentials).toBe("same-origin");
+    expect(seen!.cache).toBe("no-store");
+  });
 });

@@ -470,8 +470,9 @@ The pin moves to 0.13.0.
    `wrela-serve` retries a room's events one at a time to find the poisoned one. Is that worth
    doing for HTTP, where one attacker's request could otherwise fail others' concurrent
    requests?
-4. **Past one object.** Sharding the store, if a server ever needs more than about 1,000 requests a
-   second or 10 GB.
+4. **Past one object.** Closed in 0.18.0: a server runs as named instances, each its own object
+   and store, routed at an edge instance, calling each other at most once and sending each other
+   messages at least once through an outbox (language.md §19.5, `std::server`).
 5. **workerd in the checks.** The glue that only workerd runs (RPC, alarms, `transactionSync`'s
    real behaviour, the Hibernation API and the forwarded WebSocket handshake) is tested against
    fakes. Should a check run `wrangler dev` where Node is on the machine? One question for it: a

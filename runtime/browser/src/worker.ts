@@ -122,7 +122,7 @@ function fatal(e: unknown): void {
   ticker.control.stop();
   const build = running;
   const at = buildBase;
-  void locate(errorMessage(e), async () => (build ? loadLines(at, build.manifest) : null)).then((text) => {
+  void locate(errorMessage(e), async () => (build ? loadLines(at, build.manifest, undefined, build.addresses) : null)).then((text) => {
     self.postMessage({ type: "fatal", message: text, unsupported: e instanceof UnsupportedError } satisfies FromWorker);
     if (testing) {
       reportDone(text).catch((err: unknown) => console.error(`can't report the failure: ${errorMessage(err)}`));
@@ -317,7 +317,7 @@ interface Carried {
  * on (`carried`). */
 function programOptions(b: Build, ticks: TickSettings, carried: Carried | null): ProgramOptions {
   return {
-    io: browserIo(base, undefined, buildBase, requestHost, storageNamespace),
+    io: browserIo(base, undefined, buildBase, requestHost, storageNamespace, b.addresses),
     builds: handOvers ?? undefined,
     spawnWorker,
     startVoice,

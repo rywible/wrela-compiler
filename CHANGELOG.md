@@ -3,6 +3,37 @@
 Each release's changes a program or a tool can see. The pull request of each release holds the
 detail; `docs/release.md` says how a release is cut.
 
+## 0.18.0
+
+- **A server runs as named instances** (language.md §19.5, `std::server`): one `WrelaServer`
+  class holds every instance, `getByName("<kind>/<name>")`, each with its own store; `server` is
+  the rooms' store. Every API request now reaches a fresh **edge instance** in the Worker first,
+  with no store, which routes it with `dispatch(conn, Route)` (`Instance(name)`, `Edge`,
+  `Refuse(status)`) or answers it itself. `me()` is an instance's name (empty at the edge).
+  `call(name, bytes)` / `reply(conn, bytes)`: at most once, the reply after the callee's writes
+  commit. `send(name, bytes)` / `ack(conn)`: at least once, from an outbox written in the call's
+  transaction, retried with backoff capped at an hour forever (one log line past an hour, with
+  no request data), and dropped only once the receiver's acknowledging call commits.
+  `call_build(artifact, bytes)` calls an archived build's verifier through the Worker Loader with
+  no bindings and no network. A program that serves HTTP must now `dispatch` at its edge (no
+  compatibility: there were no accounts yet). `wrela-serve`'s rooms answer `me()` with `server`
+  and refuse the rest.
+- **The verifier artifact:** `wrela build` writes `server/verifier/` beside a server build:
+  `main.js` (a `WorkerEntrypoint` whose `verify(bytes)` calls the build's edge instance),
+  `cloudflare.js`, `game.wasm` and `verifier.json` (`schema` `wrela-verify-1`,
+  `compatibility_date`, `main`, `modules`). `server/cloudflare.json` adds the Worker Loader
+  binding `WRELA_LOADER`; a release that uses `call_build` binds an R2 bucket `WRELA_BUILDS`.
+- **`std::crypto::hmac(key, message)`**: HMAC-SHA256 (WebCrypto on Cloudflare, the `hmac` crate
+  on `wrela-serve`), and `same(a, b)`, a comparison in constant time.
+- **`std::http::fetch_public(path, headers)`**: a client's `GET` to its own origin without
+  cookies, which the browser's HTTP cache may answer (`http/fetch-public`).
+- **A build's payloads at content addresses** (language.md §15.2): a build may ship
+  `addresses.json` (`{"format": "wrela-addresses-1", "files": {path: "/b/..."}}`). The browser
+  host loads the WASM modules, the shaders, `game.lines` and the program's fetched files from
+  their addresses; an address outside `/b/` fails the load, and no map is as before.
+- `std::host::flush_commands`, a std intrinsic, lets the host answer a request in the call that
+  makes it (`me()`).
+
 ## 0.17.0
 
 - **A program is opened at an address with a fragment** (language.md §17.1):

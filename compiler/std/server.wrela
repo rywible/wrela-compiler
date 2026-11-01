@@ -1,0 +1,290 @@
+// A server's instances (language.md §19.5): one server build runs as many named instances, each
+// with its own store, and an edge instance, with none, that every request reaches first.
+//
+// - **Names.** An instance is `<kind>/<name>` (`account/7f3a`, `board/capybara/b3/c1/any`), or
+//   `server`, whose store a server's rooms share (`instance_name`). `me()` is an instance's own
+//   name, and the edge's is empty.
+// - **The edge** runs beside the router, before any instance. It has no store, and it may
+//   `call`. A request reaches it first: the program's `route` decides where it goes, and
+//   `dispatch` sends it there: to an instance (`Route::Instance`), refused (`Route::Refuse`), or
+//   kept at the edge (`Route::Edge`), which answers it itself with `std::http::respond`.
+// - **`call(name, bytes)`** asks an instance and is answered with its reply: at most once. The
+//   callee hears a call as a short connection, as a request is (`called` reads it), and answers
+//   it with `reply`, once its call's writes are committed. A call no one replies to in 30 s, or
+//   whose callee fails, fails.
+// - **`send(name, bytes)`** tells an instance something: at least once. The message is kept in
+//   the sender's outbox, written in the same transaction as the call's writes, and tried until the
+//   receiver acknowledges it (`ack`, in the call whose writes complete its effect), with backoff
+//   up to an hour between tries. A message can come more than once, and out of order: its effect
+//   is an upsert of a key only the sender writes, with the sender's revision, so a late or
+//   repeated one changes nothing (`delivered` reads one, with an id that's the same each time).
+// - **`call_build(artifact, bytes)`** asks an archived build's verifier (`server/verifier/`,
+//   which `wrela build` writes), loaded with no bindings and no network, and is answered with
+//   its reply.
+//
+// Calls, sends, replies, acknowledgements and dispatches are commands, carried out once the
+// call's writes are committed, as `respond` is; a call that fails carries out none of them.
+//
+// The bytes (runtime/abi `http`): a call's message is `WSC1`, the caller's name and the body; a
+// sent message's is `WSM1`, the sender's name, its id (a `u64`) and the body.
+
+use std::abi::{CALL_MAGIC, MESSAGE_MAGIC}
+use std::host::{flush_commands, request}
+use std::io::Pending
+use std::serialize::{Reader, Writer}
+
+/// The longest instance name, and the longest artifact path, in bytes.
+pub const MAX_NAME: u32 = 256
+
+/// The instance whose store a server's rooms share.
+pub const SERVER: Text = "server"
+
+/// Where a request that reached the edge goes: `route`'s answer.
+pub enum Route: Clone {
+    /// To the instance of this name, which answers it.
+    Instance(String),
+    /// Nowhere: the edge answers it itself.
+    Edge,
+    /// Refused with this status (400 to 599), with no body.
+    Refuse(u32),
+}
+
+/// A call an instance heard: its connection, which `reply` answers, the caller's name (empty:
+/// the edge, or the host of a verifier) and the body.
+pub struct Call: Clone {
+    pub conn: u32,
+    pub from: String,
+    pub body: Vec<u8>,
+}
+
+/// A message an instance was sent: its connection, which `ack` acknowledges, the sender's name,
+/// its id, which is the same each time it comes, and the body.
+pub struct Message: Clone {
+    pub conn: u32,
+    pub from: String,
+    pub id: u64,
+    pub body: Vec<u8>,
+}
+
+/// This instance's own name: empty at the edge. A room's is `server`, whose store it uses.
+@server
+pub fn me() -> String {
+    var asked = request("server/me", [u8(0); 0])
+    // The host answers it at once, in the same call, once it has the request.
+    flush_commands()
+    match asked.poll() {
+        Some(Ok(b)) => String::from_utf8(take b).expect("an instance's name is UTF-8"),
+        _ => panic("`me`: this host doesn't name its instances"),
+    }
+}
+
+/// Whether `name` names an instance: `server`, or 3 to `MAX_NAME` bytes of parts of `a`-`z`,
+/// `A`-`Z`, `0`-`9`, `-`, `_` and `.`, with `/` between them, none of them empty, `.` or `..`,
+/// and at least two of them (a kind, then a name).
+pub fn instance_name(name: str) -> bool {
+    name == SERVER || (name.find("/").is_some() && artifact_path(name))
+}
+
+/// Whether `path` names an archived build for `call_build`: 1 to `MAX_NAME` bytes of parts as an
+/// instance name's, with `/` between them.
+pub fn artifact_path(path: str) -> bool {
+    let n = path.len()
+    if n == 0 || n > MAX_NAME {
+        return false
+    }
+    var start = 0
+    for i in 0..n + 1 {
+        if i == n || path.byte(i) == 47 {
+            let len = i - start
+            let dot = |k: u32| path.byte(start + k) == 46
+            if len == 0 || (len == 1 && dot(0)) || (len == 2 && dot(0) && dot(1)) {
+                return false
+            }
+            start = i + 1
+            continue
+        }
+        let b = path.byte(i)
+        let plain = (b >= 97 && b <= 122) || (b >= 65 && b <= 90) || (b >= 48 && b <= 57)
+        if !plain && b != 45 && b != 95 && b != 46 {
+            return false
+        }
+    }
+    true
+}
+
+/// Sends request `conn`, which reached the edge, where `to` says: to instance `name`, which
+/// answers it (`Route::Instance`), or refused with `status` (`Route::Refuse`). `Route::Edge`
+/// sends nothing and gives `true`: the edge answers it itself, with `respond`. A request takes
+/// one answer, a dispatch's or a response; a dispatch anywhere but the edge, to a name that isn't
+/// an instance's, or with a status outside 400 to 599 fails the call.
+///
+/// ```wrela
+/// use std::http::{Request, request, respond, text}
+/// use std::input::{Event, events, payload}
+/// use std::server::{Route, dispatch, me}
+///
+/// @server
+/// fn route(r: Request) -> Route {
+///     if r.path.as_str().starts_with("/api/account/") {
+///         Route::Instance(String::from("account/7f3a"))
+///     } else if r.path.as_str() == "/api/hello" {
+///         Route::Edge
+///     } else {
+///         Route::Refuse(404)
+///     }
+/// }
+///
+/// @server
+/// fn answer() {
+///     let edge = me().is_empty()
+///     for e in events() {
+///         let Event::Message { conn, .. } = e else { continue }
+///         let Some(bytes) = payload(e) else { continue }
+///         let Some(r) = request(conn, bytes) else { continue }
+///         if edge && !dispatch(conn, route(r)) {
+///             continue
+///         }
+///         respond(conn, text(200, "hello"))
+///     }
+/// }
+/// ```
+@server
+pub fn dispatch(conn: u32, to: Route) -> bool {
+    var w = Writer::new()
+    w.write_u32(conn)
+    match to {
+        Route::Instance(name) => {
+            assert(instance_name(name.as_str()), "dispatch: not an instance's name")
+            w.write_u8(1)
+            w.write_str(name.as_str())
+        },
+        Route::Refuse(status) => {
+            assert(status >= 400 && status <= 599, "dispatch: a refusal's status is 400 to 599")
+            w.write_u8(2)
+            w.write_u32(status)
+        },
+        Route::Edge => return true,
+    }
+    let _ = request("server/dispatch", take w.into_bytes())
+    false
+}
+
+/// Calls instance `name` with `body`, once this call's writes are committed: the answer is its
+/// reply. It fails if the callee fails, or doesn't reply in 30 s; it's never made twice. A name
+/// that isn't an instance's panics.
+@server
+pub fn call(name: str, body: [u8]) -> Pending<u8> {
+    assert(instance_name(name), "call: not an instance's name")
+    var w = Writer::new()
+    w.write_str(name)
+    w.write_counted(body)
+    request("server/call", take w.into_bytes())
+}
+
+/// The call in a message's bytes (`payload` of an `Event::Message` on connection `conn`), or none
+/// if they aren't one.
+pub fn called(conn: u32, bytes: [u8]) -> Option<Call> {
+    var r = Reader::new(Vec::from(bytes))
+    if r.read_u32().ok()? != CALL_MAGIC {
+        return None
+    }
+    let from = r.read_string().ok()?
+    let body = r.read_counted().ok()?
+    if !r.at_end() {
+        return None
+    }
+    Some(Call { conn, from, body })
+}
+
+/// Answers the call on connection `conn` with `body`, once this call's writes are committed. A
+/// call takes one reply; a second fails the call.
+@server
+pub fn reply(conn: u32, body: [u8]) {
+    var w = Writer::new()
+    w.write_u32(conn)
+    w.write_counted(body)
+    let _ = request("server/reply", take w.into_bytes())
+}
+
+/// Sends instance `name` a message, `body`: kept in this instance's outbox, in the same
+/// transaction as this call's writes, and tried until the receiver acknowledges it. The edge has
+/// no outbox: it `call`s an instance that sends. A name that isn't an instance's panics.
+@server
+pub fn send(name: str, body: [u8]) {
+    assert(instance_name(name), "send: not an instance's name")
+    var w = Writer::new()
+    w.write_str(name)
+    w.write_counted(body)
+    let _ = request("server/send", take w.into_bytes())
+}
+
+/// The message in a message's bytes (`payload` of an `Event::Message` on connection `conn`), or
+/// none if they aren't one.
+pub fn delivered(conn: u32, bytes: [u8]) -> Option<Message> {
+    var r = Reader::new(Vec::from(bytes))
+    if r.read_u32().ok()? != MESSAGE_MAGIC {
+        return None
+    }
+    let from = r.read_string().ok()?
+    let id = r.read_u64().ok()?
+    let body = r.read_counted().ok()?
+    if !r.at_end() {
+        return None
+    }
+    Some(Message { conn, from, id, body })
+}
+
+/// Acknowledges the message on connection `conn`, once this call's writes are committed: its
+/// sender drops it then, and not before. Acknowledge in the call whose writes complete the
+/// message's effect; a message not acknowledged in 30 s comes again later.
+@server
+pub fn ack(conn: u32) {
+    var w = Writer::new()
+    w.write_u32(conn)
+    let _ = request("server/ack", take w.into_bytes())
+}
+
+/// Calls the verifier of the archived build at `artifact` (a path in the host's store of builds:
+/// `verifiers/capybara/b3/<hash>`) with `body`, once this call's writes are committed: the answer
+/// is its reply. The build runs with no bindings and no network. It fails if there's no such
+/// build, or it fails or doesn't reply. A path that isn't one panics.
+@server
+pub fn call_build(artifact: str, body: [u8]) -> Pending<u8> {
+    assert(artifact_path(artifact), "call_build: not an artifact's path")
+    var w = Writer::new()
+    w.write_str(artifact)
+    w.write_counted(body)
+    request("server/call_build", take w.into_bytes())
+}
+
+// ---- tests -------------------------------------------------------------------------------------
+
+@test
+fn instance_names_are_a_kind_and_a_name() {
+    assert(instance_name("server") && instance_name("account/7f3a"))
+    assert(instance_name("board/capybara/b3/c1/any") && instance_name("a/b.c-d_e"))
+    assert(!instance_name("") && !instance_name("account") && !instance_name("/a"))
+    assert(!instance_name("a/") && !instance_name("a//b") && !instance_name("a/../b"))
+    assert(!instance_name("a/b c") && !instance_name("a/./b"))
+    assert(artifact_path("verifiers/capybara/b3/0123abcd") && !artifact_path("../x"))
+}
+
+@test
+fn a_call_and_a_message_read_back_and_others_do_not() {
+    var w = Writer::new()
+    w.write_u32(CALL_MAGIC)
+    w.write_str("account/7f")
+    w.write_counted([1, 2, 3])
+    let c = called(4, take w.into_bytes()).expect("a call")
+    assert(c.conn == 4 && c.from.as_str() == "account/7f" && c.body.len() == 3)
+    var m = Writer::new()
+    m.write_u32(MESSAGE_MAGIC)
+    m.write_str("")
+    m.write_u64(1 << 40)
+    m.write_counted([9])
+    let bytes = take m.into_bytes()
+    let got = delivered(5, bytes.clone()).expect("a message")
+    assert(got.from.is_empty() && got.id == 1 << 40 && got.body[0] == 9)
+    assert(called(5, bytes).is_none(), "a message isn't a call")
+    assert(delivered(5, [1, 2, 3, 4]).is_none(), "not a message")
+}

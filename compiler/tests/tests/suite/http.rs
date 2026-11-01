@@ -6,7 +6,13 @@
 //! bytes and a signature checked by WebCrypto, the headers a server sees (never an address), the
 //! refusals before the object (a rate limit's among them), a public answer served from the cache,
 //! and that a trap or a misused response fails the instance's open requests and the next starts
-//! afresh.
+//! afresh. Its edge sends every request to the instance `server`.
+//!
+//! A second program has instances of two kinds (`account/a`, `account/b`, `board/all`) and an
+//! edge (runtime/cloudflare/test/instances.test.ts): routing, a call and its reply, messages
+//! acknowledged once their effect commits, delivered out of order, twice, and after either side
+//! is reset between its commit and the acknowledgement, the time of day's sibling `hmac`, and
+//! the build's own verifier artifact loaded through a Worker Loader with no bindings.
 
 /// The program: each route asks what it names, and answers when the host has.
 const PROGRAM: &str = r#"
@@ -14,6 +20,7 @@ use std::crypto::{Signature, random, verified, verify}
 use std::http::{Request, Response, bytes, request, respond, session_cookie, text}
 use std::input::{Event, events, payload}
 use std::io::Pending
+use std::server::{Route, dispatch, me}
 use std::store::{get, put, value}
 use std::time::{unix_ms, wall_clock}
 
@@ -25,13 +32,14 @@ struct Asked {
 }
 
 pub struct Server {
+    edge: bool,
     asked: Vec<Asked>,
     closed: u32,
     served: u32,
 }
 
 pub fn serve_init() -> Server {
-    Server { asked: Vec::new(), closed: 0, served: 0 }
+    Server { edge: me().is_empty(), asked: Vec::new(), closed: 0, served: 0 }
 }
 
 fn chunk(b: [u8], at: mut u32) -> Vec<u8> {
@@ -74,6 +82,10 @@ fn answered(a: Asked, got: Vec<u8>) {
 fn route(s: mut Server, r: Request) {
     let path = r.path.as_str()
     let conn = r.conn
+    if s.edge {
+        let _ = dispatch(conn, Route::Instance(String::from("server")))
+        return
+    }
     let cookie = r.cookie("__Host-visit").is_none()
     if path == "/api/count" {
         s.asked.push(Asked { conn, op: 1, answer: get([99, 111, 117, 110, 116]), cookie })
@@ -174,6 +186,271 @@ fn a_server_answers_http_through_its_cloudflare_host() {
     let said =
         format!("{}{}", String::from_utf8_lossy(&run.stdout), String::from_utf8_lossy(&run.stderr));
     assert!(run.status.success(), "the end-to-end test failed:\n{said}");
+    assert!(said.contains(" 0 fail") && !said.contains("skip"), "every case ran:\n{said}");
+}
+
+/// The program of instances: accounts that add to a sum and send it, revisioned, to a board that
+/// keeps each account's newest; an edge that routes, calls an account, asks an `hmac` and calls
+/// the build's verifier (whose edge replies `ok` to `good`, `no` to `bad`, and traps on anything
+/// else, as a malformed replay).
+const INSTANCES: &str = r#"
+use std::crypto::hmac
+use std::http::{Request, bytes, request, respond, text}
+use std::input::{Event, events, payload}
+use std::io::Pending
+use std::server::{Call, Route, ack, call, call_build, called, delivered, dispatch, me, reply, send}
+use std::store::{entries, get, put, scan, value}
+
+const ADD: u8 = 1
+const PEEK: u8 = 2
+const UPSERT: u8 = 3
+const BOARD: u8 = 4
+const PEEKED: u8 = 5
+const BYTES: u8 = 6
+
+struct Waiting {
+    conn: u32,
+    op: u8,
+    answer: Pending<u8>,
+    n: u32,
+    rev: u32,
+    from: String,
+}
+
+pub struct Server {
+    me: String,
+    waiting: Vec<Waiting>,
+}
+
+pub fn serve_init() -> Server {
+    Server { me: me(), waiting: Vec::new() }
+}
+
+fn word(b: [u8], at: u32) -> u32 {
+    u32(b[at]) | (u32(b[at + 1]) << 8) | (u32(b[at + 2]) << 16) | (u32(b[at + 3]) << 24)
+}
+
+fn push_word(out: mut Vec<u8>, x: u32) {
+    out.push(u8(x & 255))
+    out.push(u8((x >> 8) & 255))
+    out.push(u8((x >> 16) & 255))
+    out.push(u8(x >> 24))
+}
+
+fn push_text(k: mut Vec<u8>, s: str) {
+    for i in 0..s.len() {
+        k.push(s.byte(i))
+    }
+}
+
+fn key(s: str) -> Vec<u8> {
+    var k: Vec<u8> = Vec::new()
+    push_text(mut k, s)
+    k
+}
+
+fn wait(s: mut Server, conn: u32, op: u8, answer: take Pending<u8>) {
+    s.waiting.push(Waiting { conn, op, answer, n: 0, rev: 0, from: String::new() })
+}
+
+@server
+fn route(r: Request) -> Route {
+    let path = r.path.as_str()
+    if path == "/api/add/a" || path == "/api/me/a" {
+        Route::Instance(String::from("account/a"))
+    } else if path == "/api/add/b" {
+        Route::Instance(String::from("account/b"))
+    } else if path == "/api/board" {
+        Route::Instance(String::from("board/all"))
+    } else if path == "/api/peek" || path == "/api/me" || path == "/api/hmac" {
+        Route::Edge
+    } else if path == "/api/verify" || path == "/api/verify-old" {
+        Route::Edge
+    } else {
+        Route::Refuse(404)
+    }
+}
+
+fn at_edge(s: mut Server, r: Request) {
+    let path = r.path.as_str()
+    let conn = r.conn
+    if path == "/api/me" {
+        if s.me.is_empty() {
+            respond(conn, text(200, "edge"))
+        } else {
+            respond(conn, text(200, s.me.as_str()))
+        }
+    } else if path == "/api/peek" {
+        wait(mut s, conn, PEEKED, call("account/a", [PEEK]))
+    } else if path == "/api/hmac" {
+        wait(mut s, conn, BYTES, hmac([107, 101, 121], r.body))
+    } else if path == "/api/verify" {
+        wait(mut s, conn, BYTES, call_build("verifiers/ledger/1", r.body))
+    } else {
+        wait(mut s, conn, BYTES, call_build("verifiers/ledger/0", r.body))
+    }
+}
+
+fn at_instance(s: mut Server, r: Request) {
+    let path = r.path.as_str()
+    let conn = r.conn
+    if path == "/api/me/a" {
+        respond(conn, text(200, s.me.as_str()))
+    } else if path == "/api/board" {
+        wait(mut s, conn, BOARD, scan(key("best/"), key("best0"), 100))
+    } else {
+        let n = if r.body.len() > 0 { u32(r.body[0]) } else { 0 }
+        s.waiting.push(Waiting { conn, op: ADD, answer: get(key("acct")), n, rev: 0, from: String::new() })
+    }
+}
+
+/// The verifier: `good` is a valid replay, `bad` an invalid one, and anything else malformed.
+fn verify(c: Call) {
+    if c.body.len() == 4 && c.body[0] == 103 {
+        reply(c.conn, [111, 107])
+    } else if c.body.len() == 3 && c.body[0] == 98 {
+        reply(c.conn, [110, 111])
+    } else {
+        panic("a malformed replay")
+    }
+}
+
+fn heard(s: mut Server, conn: u32, b: [u8]) {
+    if let Some(c) = called(conn, b) {
+        if s.me.is_empty() {
+            verify(c)
+        } else {
+            wait(mut s, conn, PEEK, get(key("acct")))
+        }
+        return
+    }
+    if let Some(m) = delivered(conn, b) {
+        var k = key("best/")
+        push_text(mut k, m.from.as_str())
+        let n = word(m.body, 4)
+        let rev = word(m.body, 0)
+        s.waiting.push(Waiting { conn, op: UPSERT, answer: get(k), n, rev, from: m.from.clone() })
+        return
+    }
+    let Some(r) = request(conn, b) else { return }
+    if !s.me.is_empty() {
+        at_instance(mut s, r)
+    } else if dispatch(conn, route(r)) {
+        at_edge(mut s, r)
+    }
+}
+
+fn answered(w: Waiting, got: Vec<u8>) {
+    if w.op == ADD {
+        var sum = w.n
+        var rev = 1
+        if let Some(v) = value(got) {
+            sum += word(v, 0)
+            rev += word(v, 4)
+        }
+        var acct: Vec<u8> = Vec::new()
+        push_word(mut acct, sum)
+        push_word(mut acct, rev)
+        put(key("acct"), acct)
+        var up: Vec<u8> = Vec::new()
+        push_word(mut up, rev)
+        push_word(mut up, sum)
+        send("board/all", up)
+        respond(w.conn, text(200, f"{sum}"))
+    } else if w.op == PEEK {
+        var out: Vec<u8> = Vec::new()
+        let sum = match value(got) {
+            Some(v) => word(v, 0),
+            None => 0,
+        }
+        push_word(mut out, sum)
+        reply(w.conn, out)
+    } else if w.op == UPSERT {
+        // The sender's revision orders its upserts: an older or repeated one changes nothing.
+        let newer = match value(got) {
+            Some(v) => word(v, 0) < w.rev,
+            None => true,
+        }
+        if newer {
+            var k = key("best/")
+            push_text(mut k, w.from.as_str())
+            var v: Vec<u8> = Vec::new()
+            push_word(mut v, w.rev)
+            push_word(mut v, w.n)
+            put(k, v)
+        }
+        ack(w.conn)
+    } else if w.op == BOARD {
+        var out = String::new()
+        if let Some(es) = entries(got) {
+            for e in es {
+                var name: Vec<u8> = Vec::new()
+                for i in 5..e.key.len() {
+                    name.push(e.key[i])
+                }
+                out.push_str(String::from_utf8(take name).unwrap_or(String::new()).as_str())
+                out.push_str(f"={word(e.value, 4)};")
+            }
+        }
+        respond(w.conn, text(200, out.as_str()))
+    } else if w.op == PEEKED {
+        respond(w.conn, text(200, f"{word(got, 0)}"))
+    } else {
+        respond(w.conn, bytes(200, got, "application/octet-stream"))
+    }
+}
+
+pub fn serve(s: mut Server, time: f32) {
+    var i = 0
+    while i < s.waiting.len() {
+        match s.waiting[i].answer.poll() {
+            Some(result) => {
+                let w = s.waiting.remove(i)
+                match result {
+                    Ok(b) => answered(w, b),
+                    // A call or a message no one answers fails at its caller, or comes again.
+                    Err(_) => if w.op != PEEK && w.op != UPSERT {
+                        respond(w.conn, text(502, "it failed"))
+                    },
+                }
+            },
+            None => i += 1,
+        }
+    }
+    for e in events() {
+        let Event::Message { conn, .. } = e else { continue }
+        let Some(b) = payload(e) else { continue }
+        heard(mut s, conn, b)
+    }
+}
+"#;
+
+#[test]
+fn instances_call_and_send_each_other_through_the_cloudflare_host() {
+    let root = super::scratch("http-instances");
+    let pkg = root.join("pkg");
+    super::write_package(&pkg, "ledger", INSTANCES);
+    let out = root.join("build");
+    wrela_tests::must_build(&pkg, &out);
+    let json =
+        std::fs::read_to_string(out.join("server/verifier/verifier.json")).expect("verifier.json");
+    let verifier: serde_json::Value = serde_json::from_str(&json).expect("JSON");
+    assert_eq!(verifier["schema"], "wrela-verify-1");
+    assert_eq!(
+        std::fs::read(out.join("server/verifier/game.wasm")).ok(),
+        std::fs::read(out.join("server/game.wasm")).ok(),
+        "the verifier holds the build's module"
+    );
+    let host = wrela_tests::repo_root().join("runtime/cloudflare");
+    let run = std::process::Command::new("bun")
+        .args(["test", "test/instances.test.ts"])
+        .env("WRELA_INSTANCES_BUILD", &out)
+        .current_dir(&host)
+        .output()
+        .expect("bun runs runtime/cloudflare/test/instances.test.ts");
+    let said =
+        format!("{}{}", String::from_utf8_lossy(&run.stdout), String::from_utf8_lossy(&run.stderr));
+    assert!(run.status.success(), "the instances test failed:\n{said}");
     assert!(said.contains(" 0 fail") && !said.contains("skip"), "every case ran:\n{said}");
 }
 

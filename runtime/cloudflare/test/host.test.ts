@@ -6,7 +6,7 @@ import { describe, expect, test } from "bun:test";
 import { readFileSync } from "node:fs";
 import { join } from "node:path";
 import { Out } from "../../browser/src/http.ts";
-import { checkResponse, decodeRequest, decodeResponse, derToRaw, encodeRequest, encodeResponse, MAX_SCAN, random, Store, verify } from "../src/host.ts";
+import { artifactPath, checkResponse, decodeRequest, decodeResponse, derToRaw, encodeRequest, encodeResponse, hmac, instanceName, MAX_SCAN, random, Store, verify } from "../src/host.ts";
 import { storage } from "./fakes.ts";
 
 const hex = (s: string) => new Uint8Array((s.match(/../g) ?? []).map((b) => parseInt(b, 16)));
@@ -154,5 +154,22 @@ describe("cryptography", () => {
     expect(random(n).length).toBe(16);
     expect(random(n)).not.toEqual(random(n));
     expect(() => random(new Out().word(1025).bytes())).toThrow("more than 1024");
+  });
+});
+
+describe("instances and HMAC", () => {
+  test("HMAC-SHA256 is RFC 4231's, and an empty key is 64 zero bytes", async () => {
+    // RFC 4231 §4.3, test case 2.
+    const tag = await hmac(new Out().chunk(enc("Jefe")).chunk(enc("what do ya want for nothing?")).bytes());
+    expect(tag).toEqual(hex("5bdcc146bf60754e6a042426089575c75a003f089d2739839dec58b964ec3843"));
+    const empty = await hmac(new Out().chunk(new Uint8Array(0)).chunk(enc("m")).bytes());
+    expect(empty).toEqual(await hmac(new Out().chunk(new Uint8Array(64)).chunk(enc("m")).bytes()));
+  });
+
+  test("instance names are a kind and a name, or the rooms' server", () => {
+    for (const name of ["server", "account/7f3a", "board/capybara/b3/c1/any"]) expect(instanceName(name)).toBe(true);
+    for (const name of ["", "account", "/a", "a/", "a//b", "a/../b", "a/b c", `a/${"x".repeat(255)}`]) expect(instanceName(name)).toBe(false);
+    expect(artifactPath("verifiers/capybara/b3/0123")).toBe(true);
+    expect(artifactPath("../x")).toBe(false);
   });
 });
