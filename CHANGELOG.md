@@ -3,7 +3,7 @@
 Each release's changes a program or a tool can see. The pull request of each release holds the
 detail; `docs/release.md` says how a release is cut.
 
-## Unreleased
+## 0.20.0
 
 - **A room's relay** (language.md §19.3, §19.6): `std::net::relay(conn, via)` (`@client`) opens
   a lossy, unordered channel to the other peers of the room that connection `via` is open to,
@@ -13,7 +13,9 @@ detail; `docs/release.md` says how a release is cut.
   object holds the app (`WRELA_SFU_APP`) and its secret token (`WRELA_SFU_TOKEN`) and speaks to
   the SFU for its peers over text messages on their WebSockets, and the page's WebRTC, on the
   main thread, hands each data channel to the render worker. A peer's text message no longer
-  closes its connection. `wrela-serve` has no relay yet.
+  closes its connection. A tag has one relay (the same peer joining on a new connection ends the
+  old one), a connection may join 4 times a minute, and one whose WebRTC isn't up in 30 seconds
+  gives its place up. `wrela-serve` has no relay yet.
 
 ## 0.19.0
 
