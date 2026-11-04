@@ -246,7 +246,8 @@ export class Room implements Owner<Net> {
     if (conn === null) return;
     if (typeof data === "string") {
       if (data.length > MAX_UP) return this.cut(conn, 1009, `a message past ${MAX_UP} bytes`);
-      return this.relay.message(conn, data);
+      if (!this.relay.message(conn, data)) this.cut(conn, 1008, "more relay messages wait than may");
+      return;
     }
     if (data.byteLength > MAX_UP) return this.cut(conn, 1009, `a message past ${MAX_UP} bytes`);
     const cost = data.byteLength + OVERHEAD;
@@ -317,7 +318,10 @@ export class Room implements Owner<Net> {
     this.incoming = [];
     this.waiting.clear();
     this.held = 0;
-    for (const socket of this.sockets.values()) shut(socket, code, why);
+    for (const [conn, socket] of this.sockets) {
+      this.relay.closed(conn, this.relayPeer(conn));
+      shut(socket, code, why);
+    }
     this.sockets.clear();
   }
 
@@ -560,7 +564,14 @@ export class Room implements Owner<Net> {
       const s = conn === null ? undefined : this.sockets.get(conn);
       if (conn === null || s === undefined) continue;
       try {
-        if (c.kind === "tag") s.serializeAttachment({ ...attached(s), conn: c.conn, tag: c.tag } satisfies Attached);
+        if (c.kind === "tag") {
+          // A connection given another tag (or none) is another peer: its relay ends.
+          const before = this.relayPeer(c.conn);
+          if (before?.relay != null && before.tag !== c.tag) {
+            this.relay.closed(c.conn, before, true);
+            s.serializeAttachment({ ...attached(s), conn: c.conn, tag: c.tag, relay: null } satisfies Attached);
+          } else s.serializeAttachment({ ...attached(s), conn: c.conn, tag: c.tag } satisfies Attached);
+        }
         else if (c.kind === "send") s.send(c.bytes);
         else if (c.kind === "close") {
           this.relay.closed(c.conn, this.relayPeer(c.conn));

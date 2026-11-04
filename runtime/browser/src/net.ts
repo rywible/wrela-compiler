@@ -240,6 +240,9 @@ interface RelaySession {
   rtc: number;
   publish: Channel | null;
   peers: Map<number, Channel>;
+  /** The channel id the room last gave for each peer: one that resolves after it's another
+   * (or the peer's gone) closes. */
+  wanted: Map<number, number>;
   /** Whether the program heard it's open. */
   opened: boolean;
   closed: boolean;
@@ -289,6 +292,7 @@ export class Net {
   /** Checks one export's commands without opening, sending or closing anything. A send can
    * close a connection at its byte limits, so later opens see that same planned lifetime. */
   plan(): Pick<Net, "open" | "send" | "close" | "relay"> {
+    const rtc = this.rtc !== null;
     const sessions = new Map<number, { open: boolean; writer: boolean; socket: boolean; pending: number; relay: boolean }>();
     const state = (conn: number) => {
       let planned = sessions.get(conn);
@@ -321,7 +325,9 @@ export class Net {
       relay(conn, via) {
         const session = state(conn);
         if (session.open) throw new Error(`connection ${conn} is open`);
-        session.open = state(via).open;
+        // A relay goes by a WebSocket the program heard is open, on a page with WebRTC.
+        const v = state(via);
+        session.open = v.open && v.socket && v.writer && rtc;
         session.writer = false;
         session.socket = false;
         session.pending = 0;
@@ -431,7 +437,8 @@ export class Net {
       if (typeof e.data === "string") {
         // The room's word about a relay: anything else from it is past what a room says.
         const control = parseControl(e.data);
-        if (control === null || session.relay === null) return;
+        // About the relay that goes by it now, or about one that ended: then it's nothing.
+        if (control === null || session.relay === null || this.#relays.get(session.relay)?.rtc !== control.n) return;
         this.#control(session.relay, control);
         return;
       }
@@ -525,21 +532,23 @@ export class Net {
    * on a host with none, closes as it opens. */
   relay(conn: number, via: number): void {
     if (this.#sessions.has(conn) || this.#relays.has(conn)) throw new Error(`connection ${conn} is open`);
-    const relay: RelaySession = { via, rtc: this.#nextRtc++, publish: null, peers: new Map(), opened: false, closed: false };
+    const relay: RelaySession = { via, rtc: this.#nextRtc++, publish: null, peers: new Map(), wanted: new Map(), opened: false, closed: false };
     this.#relays.set(conn, relay);
     const session = this.#sessions.get(via);
     const why = session === undefined || session.closed
       ? `connection ${via} isn't open`
       : session.relay !== null
         ? `connection ${via} has a relay already`
-        : session.socket === null
+        : session.socket === null && session.transport !== null
           ? "this server has no relay"
-          : this.rtc === null
-            ? "this page can't make a relay (no WebRTC)"
-            : null;
+          : session.socket?.readyState !== WebSocket.OPEN
+            ? `connection ${via} isn't open yet`
+            : this.rtc === null
+              ? "this page can't make a relay (no WebRTC)"
+              : null;
     if (why !== null) return this.#endRelay(conn, relay, true, `connection ${conn}: ${why}`);
     session!.relay = conn;
-    this.#text(via, { relay: "join" });
+    this.#text(via, { relay: "join", n: relay.rtc });
   }
 
   /** Sends a control message on connection `via`'s WebSocket, if it's open. */
@@ -558,9 +567,9 @@ export class Net {
       case "offer":
         void rtc.answer(relay.rtc, control.sdp).then((sdp) => {
           if (relay.closed) return;
-          this.#text(relay.via, { relay: "answer", sdp });
+          this.#text(relay.via, { relay: "answer", n: relay.rtc, sdp });
           return rtc.connected(relay.rtc).then(() => {
-            if (!relay.closed) this.#text(relay.via, { relay: "ready" });
+            if (!relay.closed) this.#text(relay.via, { relay: "ready", n: relay.rtc });
           });
         }).catch(fail);
         return;
@@ -579,8 +588,9 @@ export class Net {
         }).catch(fail);
         return;
       case "peer":
+        relay.wanted.set(control.peer, control.id);
         void rtc.channel(relay.rtc, control.id).then((channel) => {
-          if (relay.closed) return channel.close();
+          if (relay.closed || relay.wanted.get(control.peer) !== control.id) return channel.close();
           relay.peers.get(control.peer)?.close();
           relay.peers.set(control.peer, channel);
           channel.binaryType = "arraybuffer";
@@ -596,6 +606,7 @@ export class Net {
         }).catch(fail);
         return;
       case "gone":
+        relay.wanted.delete(control.peer);
         relay.peers.get(control.peer)?.close();
         relay.peers.delete(control.peer);
         return;
@@ -628,7 +639,7 @@ export class Net {
     const via = this.#sessions.get(relay.via);
     if (via?.relay === conn) {
       via.relay = null;
-      this.#text(relay.via, { relay: "leave" });
+      this.#text(relay.via, { relay: "leave", n: relay.rtc });
     }
     relay.publish?.close();
     for (const c of relay.peers.values()) c.close();

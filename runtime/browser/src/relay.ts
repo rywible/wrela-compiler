@@ -18,20 +18,23 @@ export const STUN = "stun:stun.cloudflare.com:3478";
 /** A text message about a relay, on its peer's WebSocket to the room. From the peer: `join`,
  * the page's `answer` to the SFU's offer, `ready` once its WebRTC connected, `leave`. From the
  * room: the SFU's `offer`, the channel it `publish`es on, a `peer`'s channel it hears on, a peer
- * `gone`, and `closed` (refused, or ended), which ends it. */
+ * `gone`, and `closed` (refused, or ended), which ends it. Each names its relay by `n`, the
+ * number the page gave it at `join`, so a word about a relay that ended never reaches the next
+ * one on the same connection. */
 export type Control =
-  | { relay: "join" }
-  | { relay: "answer"; sdp: string }
-  | { relay: "ready" }
-  | { relay: "leave" }
-  | { relay: "offer"; sdp: string }
-  | { relay: "publish"; id: number }
-  | { relay: "peer"; peer: number; id: number }
-  | { relay: "gone"; peer: number }
-  | { relay: "closed"; why: string };
+  | { relay: "join"; n: number }
+  | { relay: "answer"; n: number; sdp: string }
+  | { relay: "ready"; n: number }
+  | { relay: "leave"; n: number }
+  | { relay: "offer"; n: number; sdp: string }
+  | { relay: "publish"; n: number; id: number }
+  | { relay: "peer"; n: number; peer: number; id: number }
+  | { relay: "gone"; n: number; peer: number }
+  | { relay: "closed"; n: number; why: string };
 
 const channelId = (x: unknown) => Number.isInteger(x) && (x as number) >= 0 && (x as number) < 65535;
 const tagOf = (x: unknown) => Number.isInteger(x) && (x as number) > 0 && (x as number) < 2 ** 32;
+const relayOf = (x: unknown) => Number.isInteger(x) && (x as number) >= 0 && (x as number) < 2 ** 32;
 
 /** A control message as `text` holds it, or null if it isn't one. */
 export function parseControl(text: string): Control | null {
@@ -43,22 +46,24 @@ export function parseControl(text: string): Control | null {
   }
   if (typeof v !== "object" || v === null) return null;
   const m = v as Record<string, unknown>;
+  if (!relayOf(m["n"])) return null;
+  const n = m["n"] as number;
   switch (m["relay"]) {
     case "join":
     case "ready":
     case "leave":
-      return { relay: m["relay"] };
+      return { relay: m["relay"], n };
     case "answer":
     case "offer":
-      return typeof m["sdp"] === "string" ? { relay: m["relay"], sdp: m["sdp"] } : null;
+      return typeof m["sdp"] === "string" ? { relay: m["relay"], n, sdp: m["sdp"] } : null;
     case "publish":
-      return channelId(m["id"]) ? { relay: "publish", id: m["id"] as number } : null;
+      return channelId(m["id"]) ? { relay: "publish", n, id: m["id"] as number } : null;
     case "peer":
-      return channelId(m["id"]) && tagOf(m["peer"]) ? { relay: "peer", peer: m["peer"] as number, id: m["id"] as number } : null;
+      return channelId(m["id"]) && tagOf(m["peer"]) ? { relay: "peer", n, peer: m["peer"] as number, id: m["id"] as number } : null;
     case "gone":
-      return tagOf(m["peer"]) ? { relay: "gone", peer: m["peer"] as number } : null;
+      return tagOf(m["peer"]) ? { relay: "gone", n, peer: m["peer"] as number } : null;
     case "closed":
-      return typeof m["why"] === "string" ? { relay: "closed", why: m["why"] } : null;
+      return typeof m["why"] === "string" ? { relay: "closed", n, why: m["why"] } : null;
     default:
       return null;
   }

@@ -247,6 +247,7 @@ var RELAY_PENDING = 64 * 1024;
 var RELAY_CHANNEL = "relay";
 var channelId = (x) => Number.isInteger(x) && x >= 0 && x < 65535;
 var tagOf = (x) => Number.isInteger(x) && x > 0 && x < 2 ** 32;
+var relayOf = (x) => Number.isInteger(x) && x >= 0 && x < 2 ** 32;
 function parseControl(text) {
   let v;
   try {
@@ -257,22 +258,25 @@ function parseControl(text) {
   if (typeof v !== "object" || v === null)
     return null;
   const m = v;
+  if (!relayOf(m["n"]))
+    return null;
+  const n = m["n"];
   switch (m["relay"]) {
     case "join":
     case "ready":
     case "leave":
-      return { relay: m["relay"] };
+      return { relay: m["relay"], n };
     case "answer":
     case "offer":
-      return typeof m["sdp"] === "string" ? { relay: m["relay"], sdp: m["sdp"] } : null;
+      return typeof m["sdp"] === "string" ? { relay: m["relay"], n, sdp: m["sdp"] } : null;
     case "publish":
-      return channelId(m["id"]) ? { relay: "publish", id: m["id"] } : null;
+      return channelId(m["id"]) ? { relay: "publish", n, id: m["id"] } : null;
     case "peer":
-      return channelId(m["id"]) && tagOf(m["peer"]) ? { relay: "peer", peer: m["peer"], id: m["id"] } : null;
+      return channelId(m["id"]) && tagOf(m["peer"]) ? { relay: "peer", n, peer: m["peer"], id: m["id"] } : null;
     case "gone":
-      return tagOf(m["peer"]) ? { relay: "gone", peer: m["peer"] } : null;
+      return tagOf(m["peer"]) ? { relay: "gone", n, peer: m["peer"] } : null;
     case "closed":
-      return typeof m["why"] === "string" ? { relay: "closed", why: m["why"] } : null;
+      return typeof m["why"] === "string" ? { relay: "closed", n, why: m["why"] } : null;
     default:
       return null;
   }
@@ -1785,16 +1789,24 @@ class Server {
 
 // src/relay.ts
 var MAX_RELAY_PEERS = 8;
+var STALL_MS = 30000;
+var JOINS = 4;
+var MAX_QUEUED = 16;
 var SFU_API = "https://rtc.live.cloudflare.com/v1/apps";
 var policy = { dataChannelName: RELAY_CHANNEL, ordered: false, maxRetransmits: 0 };
+var message = (e) => e instanceof Error ? e.message : String(e);
 
 class Relay {
   room;
   sfu;
+  now;
   #running = Promise.resolve();
-  constructor(room, sfu) {
+  #queued = new Map;
+  #joins = new Map;
+  constructor(room, sfu, now = Date.now) {
     this.room = room;
     this.sfu = sfu;
+    this.now = now;
   }
   get settled() {
     return this.#running;
@@ -1802,60 +1814,92 @@ class Relay {
   message(conn, text) {
     const control = parseControl(text);
     if (control === null)
-      return;
-    this.#then(() => this.#take(conn, control));
+      return true;
+    const queued = (this.#queued.get(conn) ?? 0) + 1;
+    if (queued > MAX_QUEUED)
+      return false;
+    this.#queued.set(conn, queued);
+    this.#then(async () => {
+      this.#queued.set(conn, (this.#queued.get(conn) ?? 1) - 1);
+      await this.#take(conn, control);
+    });
+    return true;
   }
-  closed(conn, peer) {
+  closed(conn, peer, tell = false) {
+    if (!tell) {
+      this.#queued.delete(conn);
+      this.#joins.delete(conn);
+    }
     if (peer?.relay == null)
       return;
     const gone = { ...peer, relay: peer.relay };
-    this.#then(() => this.#leave(gone, false));
+    this.#then(() => this.#leave(gone, tell));
   }
   #then(work) {
-    this.#running = this.#running.then(work).catch((e) => this.room.log(`wrela: a room's relay: ${e instanceof Error ? e.message : String(e)}`));
+    this.#running = this.#running.then(work).catch((e) => this.room.log(`wrela: a room's relay: ${message(e)}`));
   }
   async#take(conn, control) {
     const peer = this.room.peer(conn);
     if (peer === null)
       return;
+    if (control.relay !== "join" && peer.relay?.n !== control.n)
+      return;
     try {
       switch (control.relay) {
         case "join":
-          return await this.#join(peer);
+          return await this.#join(peer, control.n);
         case "answer":
           if (peer.relay?.stage !== "offered")
             return;
           await this.#api("PUT", `/sessions/${peer.relay.session}/renegotiate`, { sessionDescription: { type: "answer", sdp: control.sdp } });
-          return this.room.keep(conn, { ...peer.relay, stage: "answered" });
+          return this.#keep(conn, { ...peer.relay, stage: "answered" });
         case "ready":
           if (peer.relay?.stage !== "answered")
             return;
           return await this.#live(peer, peer.relay);
         case "leave":
           if (peer.relay !== null)
-            await this.#leave(peer, true);
+            await this.#leave({ ...peer, relay: peer.relay }, false);
           return;
         default:
           return;
       }
     } catch (e) {
-      this.room.log(`wrela: a room's relay: ${e instanceof Error ? e.message : String(e)}`);
+      this.room.log(`wrela: a room's relay: ${message(e)}`);
       const now = this.room.peer(conn);
-      if (now?.relay != null)
-        await this.#leave(now, true).catch(() => {});
-      this.room.text(conn, { relay: "closed", why: "the relay couldn't be reached" });
+      if (now?.relay != null && now.relay.n === control.n)
+        await this.#leave({ ...now, relay: now.relay }, false).catch(() => {});
+      if (now !== null)
+        this.room.text(conn, { relay: "closed", n: control.n, why: "the relay couldn't be reached" });
     }
   }
-  async#join(peer) {
-    const refuse = (why) => this.room.text(peer.conn, { relay: "closed", why });
+  #keep(conn, relay) {
+    const now = this.room.peer(conn);
+    if (now !== null && now.relay?.n === relay.n && now.relay.session === relay.session)
+      this.room.keep(conn, relay);
+  }
+  async#join(peer, n) {
+    const refuse = (why) => this.room.text(peer.conn, { relay: "closed", n, why });
     if (peer.relay !== null)
-      return;
+      await this.#leave({ ...peer, relay: peer.relay }, false);
     if (this.sfu === null)
       return refuse("this server has no relay");
     if (peer.tag === 0)
       return refuse("the room hasn't let this connection in");
-    if (this.room.peers().filter((p) => p.relay !== null).length >= MAX_RELAY_PEERS)
+    const at = this.now();
+    const recent = (this.#joins.get(peer.conn) ?? []).filter((t) => at - t < 60000);
+    if (recent.length >= JOINS)
+      return refuse(`this connection joined the relay ${JOINS} times this minute`);
+    this.#joins.set(peer.conn, [...recent, at]);
+    for (const o of this.room.peers()) {
+      if (o.conn === peer.conn || o.relay === null)
+        continue;
+      if (o.tag === peer.tag || o.relay.stage !== "live" && at - o.relay.since >= STALL_MS)
+        await this.#leave({ ...o, relay: o.relay }, true);
+    }
+    if (this.room.peers().filter((p) => p.conn !== peer.conn && p.relay !== null).length >= MAX_RELAY_PEERS) {
       return refuse(`the room's relay is full (${MAX_RELAY_PEERS})`);
+    }
     const made = await this.#api("POST", "/sessions/new", undefined);
     const session = made["sessionId"];
     if (typeof session !== "string")
@@ -1866,46 +1910,63 @@ class Relay {
     const sdp = established["sessionDescription"]?.sdp;
     if (typeof sdp !== "string")
       throw new Error("the SFU gave no offer");
-    this.room.keep(peer.conn, { session, stage: "offered", publish: null, peers: {} });
-    this.room.text(peer.conn, { relay: "offer", sdp });
+    const now = this.room.peer(peer.conn);
+    if (now === null || now.relay !== null || now.tag !== peer.tag)
+      return;
+    this.room.keep(peer.conn, { n, session, stage: "offered", since: at, publish: null, peers: {} });
+    this.room.text(peer.conn, { relay: "offer", n, sdp });
   }
   async#live(peer, relay) {
     const [mine] = await this.#channels(relay.session, [{ location: "local", ...policy }]);
     const state = { ...relay, stage: "live", publish: mine };
-    this.room.keep(peer.conn, state);
-    this.room.text(peer.conn, { relay: "publish", id: mine });
+    this.#keep(peer.conn, state);
+    this.room.text(peer.conn, { relay: "publish", n: relay.n, id: mine });
     const others = this.room.peers().filter((p) => p.conn !== peer.conn && p.relay?.stage === "live");
     if (others.length === 0)
       return;
     const heard = await this.#channels(relay.session, others.map((o) => ({ location: "remote", sessionId: o.relay.session, ...policy })));
+    const still = this.room.peer(peer.conn);
+    if (still?.relay?.n !== relay.n || still.relay.session !== relay.session)
+      return;
     others.forEach((o, i) => {
-      state.peers[String(o.tag)] = heard[i];
-      this.room.text(peer.conn, { relay: "peer", peer: o.tag, id: heard[i] });
+      state.peers[String(o.tag)] = { id: heard[i], session: o.relay.session };
+      this.room.text(peer.conn, { relay: "peer", n: relay.n, peer: o.tag, id: heard[i] });
     });
-    this.room.keep(peer.conn, state);
+    this.#keep(peer.conn, state);
     for (const o of others) {
       const [id] = await this.#channels(o.relay.session, [{ location: "remote", sessionId: relay.session, ...policy }]);
       const now = this.room.peer(o.conn);
-      if (now?.relay == null)
+      if (now?.relay == null || now.relay.session !== o.relay.session)
         continue;
-      this.room.keep(o.conn, { ...now.relay, peers: { ...now.relay.peers, [String(peer.tag)]: id } });
-      this.room.text(o.conn, { relay: "peer", peer: peer.tag, id });
+      const old = now.relay.peers[String(peer.tag)];
+      if (old !== undefined)
+        await this.#close(now.relay.session, old.id);
+      this.room.keep(o.conn, { ...now.relay, peers: { ...now.relay.peers, [String(peer.tag)]: { id, session: relay.session } } });
+      this.room.text(o.conn, { relay: "peer", n: now.relay.n, peer: peer.tag, id });
     }
   }
   async#leave(peer, tell) {
-    this.room.keep(peer.conn, null);
+    const mine = peer.relay;
+    const now = this.room.peer(peer.conn);
+    if (now?.relay?.session === mine.session)
+      this.room.keep(peer.conn, null);
     if (tell)
-      this.room.text(peer.conn, { relay: "closed", why: "" });
+      this.room.text(peer.conn, { relay: "closed", n: mine.n, why: "" });
     for (const o of this.room.peers()) {
-      const id = o.relay?.peers[String(peer.tag)];
-      if (o.conn === peer.conn || o.relay == null || id === undefined)
+      const heard = o.relay?.peers[String(peer.tag)];
+      if (o.conn === peer.conn || o.relay == null || heard === undefined || heard.session !== mine.session)
         continue;
       const rest = { ...o.relay.peers };
       delete rest[String(peer.tag)];
       this.room.keep(o.conn, { ...o.relay, peers: rest });
-      this.room.text(o.conn, { relay: "gone", peer: peer.tag });
-      await this.#api("PUT", `/sessions/${o.relay.session}/datachannels/close`, { dataChannels: [{ id }] }).catch(() => {});
+      this.room.text(o.conn, { relay: "gone", n: o.relay.n, peer: peer.tag });
+      await this.#close(o.relay.session, heard.id);
     }
+    if (mine.publish !== null)
+      await this.#close(mine.session, mine.publish);
+  }
+  async#close(session, id) {
+    await this.#api("PUT", `/sessions/${session}/datachannels/close`, { dataChannels: [{ id }] }).catch(() => {});
   }
   async#channels(session, channels) {
     const r = await this.#api("POST", `/sessions/${session}/datachannels/new`, { dataChannels: channels });
@@ -2069,7 +2130,9 @@ class Room {
     if (typeof data === "string") {
       if (data.length > MAX_UP)
         return this.cut(conn, 1009, `a message past ${MAX_UP} bytes`);
-      return this.relay.message(conn, data);
+      if (!this.relay.message(conn, data))
+        this.cut(conn, 1008, "more relay messages wait than may");
+      return;
     }
     if (data.byteLength > MAX_UP)
       return this.cut(conn, 1009, `a message past ${MAX_UP} bytes`);
@@ -2126,8 +2189,10 @@ class Room {
     this.incoming = [];
     this.waiting.clear();
     this.held = 0;
-    for (const socket of this.sockets.values())
+    for (const [conn, socket] of this.sockets) {
+      this.relay.closed(conn, this.relayPeer(conn));
       shut(socket, code, why);
+    }
     this.sockets.clear();
   }
   count(e, sign) {
@@ -2366,9 +2431,14 @@ class Room {
       if (conn === null || s === undefined)
         continue;
       try {
-        if (c.kind === "tag")
-          s.serializeAttachment({ ...attached(s), conn: c.conn, tag: c.tag });
-        else if (c.kind === "send")
+        if (c.kind === "tag") {
+          const before = this.relayPeer(c.conn);
+          if (before?.relay != null && before.tag !== c.tag) {
+            this.relay.closed(c.conn, before, true);
+            s.serializeAttachment({ ...attached(s), conn: c.conn, tag: c.tag, relay: null });
+          } else
+            s.serializeAttachment({ ...attached(s), conn: c.conn, tag: c.tag });
+        } else if (c.kind === "send")
           s.send(c.bytes);
         else if (c.kind === "close") {
           this.relay.closed(c.conn, this.relayPeer(c.conn));

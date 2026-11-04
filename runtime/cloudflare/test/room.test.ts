@@ -36,14 +36,14 @@ test("a peer's message past MAX_UP closes its connection; its text is about its 
   const b = new FakeSocket();
   room.connect(a);
   room.connect(b);
-  room.message(a, '{"relay":"join"}');
+  room.message(a, '{"relay":"join","n":1}');
   room.message(a, "not a relay's");
   room.message(b, new ArrayBuffer(MAX_UP + 1));
   await room.wake();
   await room.settled;
   expect([a.closed, b.closed]).toEqual([null, 1009]);
   // A room with no SFU app has no relay.
-  expect(a.texts).toEqual([{ relay: "closed", why: "this server has no relay" }]);
+  expect(a.texts).toEqual([{ relay: "closed", n: 1, why: "this server has no relay" }]);
   expect(a.attachment).toEqual({ conn: 1, tag: 0 });
   expect(b.attachment).toEqual({ conn: 2, tag: 0 });
 });

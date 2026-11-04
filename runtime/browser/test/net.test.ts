@@ -503,13 +503,13 @@ describe("what a connection holds", () => {
       net.relay(5, 4);
       expect(() => net.relay(5, 4)).toThrow("connection 5 is open");
       expect(() => net.open(5, "lobby", 0xabn)).toThrow("connection 5 is open");
-      expect(socket.sent).toEqual(['{"relay":"join"}']);
+      expect(socket.sent).toEqual(['{"relay":"join","n":1}']);
       const room = (c: object) => socket.onmessage!({ data: JSON.stringify(c) });
-      room({ relay: "offer", sdp: "sfu-offer" });
+      room({ relay: "offer", n: 1, sdp: "sfu-offer" });
       await settle(() => socket.sent.length === 3);
-      expect(socket.sent.slice(1)).toEqual(['{"relay":"answer","sdp":"page-answer"}', '{"relay":"ready"}']);
-      room({ relay: "publish", id: 2 });
-      room({ relay: "peer", peer: 9, id: 3 });
+      expect(socket.sent.slice(1)).toEqual(['{"relay":"answer","n":1,"sdp":"page-answer"}', '{"relay":"ready","n":1}']);
+      room({ relay: "publish", n: 1, id: 2 });
+      room({ relay: "peer", n: 1, peer: 9, id: 3 });
       await settle(() => channels.size === 2);
       // Nothing is open until the publishing channel is; what arrives before is dropped.
       channels.get(3)!.onmessage!({ data: Uint8Array.of(1).buffer });
@@ -526,17 +526,31 @@ describe("what a connection holds", () => {
         { conn: 5, bytes: Uint8Array.of(9, 0, 0, 0, 6, 7) },
       ]);
       expect(asked).toEqual(["answer 1 sfu-offer", "connected 1", "channel 1 2", "channel 1 3"]);
+      // A relay by a WebSocket not open yet closes as it opens.
+      net.open(8, "lobby", 0xabn);
+      await settle(() => made.length > 1);
+      net.relay(10, 8);
+      expect(lines.at(-1)).toBe("connection 10: connection 8 isn't open yet");
+      net.arrived = net.arrived.filter((a) => a.conn !== 10);
       // A peer gone closes its channel; a message past MAX_RELAY closes the relay, which leaves.
-      room({ relay: "gone", peer: 9 });
+      room({ relay: "gone", n: 1, peer: 9 });
       expect(channels.get(3)!.closed).toBe(true);
+      // A peer's channel the room took back before it came is closed as it comes.
+      room({ relay: "peer", n: 1, peer: 11, id: 4 });
+      room({ relay: "gone", n: 1, peer: 11 });
+      await settle(() => channels.get(4)?.closed === true);
       net.send(5, new Uint8Array(MAX_RELAY + 1));
-      expect(lines).toEqual([`connection 5: a relay message of ${MAX_RELAY + 1} bytes, past ${MAX_RELAY}`]);
-      expect(socket.sent.at(-1)).toBe('{"relay":"leave"}');
+      expect(lines.at(-1)).toBe(`connection 5: a relay message of ${MAX_RELAY + 1} bytes, past ${MAX_RELAY}`);
+      expect(socket.sent.at(-1)).toBe('{"relay":"leave","n":1}');
       expect(channels.get(2)!.closed).toBe(true);
       expect(asked.at(-1)).toBe("close 1");
       expect(net.arrived.at(-1)).toEqual({ conn: 5, open: false });
-      // Again on the same connection; its closing closes the relay first.
+      // Again on the same connection: the room's word about the last one doesn't reach it, and
+      // the connection's closing closes the relay first.
       net.relay(6, 4);
+      expect(socket.sent.at(-1)).toBe('{"relay":"join","n":3}');
+      room({ relay: "closed", n: 1, why: "" });
+      expect(net.arrived.at(-1)).toEqual({ conn: 5, open: false });
       socket.close();
       expect(net.arrived.slice(-2)).toEqual([{ conn: 6, open: false }, { conn: 4, open: false }]);
       // A relay of what isn't open, or on a page with no WebRTC, closes as it opens.

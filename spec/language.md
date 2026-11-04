@@ -2634,7 +2634,8 @@ A journal that the program traps on, or a poisoned message that it traps on, qua
 
 - **What it carries:** `send(conn, bytes)` puts at most `MAX_RELAY` (1024) bytes on it, which reach each other peer on the relay at most once, in any order, or not at all, and are never sent again. A longer message closes the relay. A message the network can't take at once is dropped.
 - **What arrives:** each message arrives as the sender's tag (a `u32`, little-endian), then its bytes. Nothing arrives before the relay's open event.
-- **Who may join:** only a connection the room has tagged (`std::net::tag`, which a `Room` does at a peer's hello). Its tag names it to the others. The room's program never sees what the relay carries, and its tags are all it decides.
+- **Who may join:** only a connection the room has tagged (`std::net::tag`, which a `Room` does at a peer's hello). Its tag names it to the others, and a tag has one relay: the same tag joining on another connection ends the relay on the old one, and a connection whose tag changes leaves. The room's program never sees what the relay carries, and its tags are all it decides.
+- **When it opens:** `via` must be a WebSocket the program has heard is open; a relay of a connection still opening closes as it opens.
 - **Its events:** it gives one `Connection` event when it is open, and exactly one when it is closed, whatever closes it. Closing `via` closes the relay first. A connection has at most one relay.
 - **Where it runs:** a relay goes through Realtime SFU on the Cloudflare host (§19.6). `wrela-serve` has none yet, so a relay of a WebTransport connection closes as it opens, and so does one on a page that can't hand a WebRTC data channel to a worker.
 
@@ -2738,11 +2739,12 @@ The Cloudflare host also runs a server build's rooms, each in a Durable Object o
 - **The contract of §19.2 holds.** A call's store writes commit in the instance `server`'s object (`WrelaServer`, §19.5), then its records are kept in the room's SQLite in one transaction, then its sends, closes and tags go. A room that starts reads its journal back from connection 0, then hears of its open connections again, with their tags. A failed call's events are taken again one at a time on a fresh instance: the message the program traps on alone comes back poisoned, and a trap on that, or on the journal, quarantines the room. A quarantined room stays so in its storage, and closes its connections and each new one (1011). An event past the host's limits waits, with those after it, for the object's alarm (250 ms), however much comes meanwhile; after three failures in a row the room's peers are let go (1013), to come back. A socket that fails once a call's records are kept closes (1011), and the call isn't taken again.
 - **An idle room costs nothing in memory:** its object leaves memory with its peers still connected, each socket's attachment holding its connection's number and tag. An object that wakes, after eviction or a deploy, starts the room again from its journal, and its peers stay connected.
 - **A room's relay goes through Realtime SFU** (`runtime/cloudflare/src/relay.ts`). The room's object speaks to the SFU's API for its peers, with the app `WRELA_SFU_APP` and its token, the secret `WRELA_SFU_TOKEN` (`wrangler secret put`). Without both, every relay is refused. The browser asks over text messages on the peer's own WebSocket, as JSON with a `relay` field:
-  - The peer asks to `join`.
+  - The peer asks to `join`, naming the relay with a number `n` that every later message about it carries, both ways, so a word about a relay that ended never reaches the next one on that connection.
   - The room makes it an SFU session and sends the SFU's `offer`.
   - The page answers from its main thread's WebRTC (`answer`), and says `ready` once it connects.
   - The room publishes the peer's channel `relay` (unordered, `maxRetransmits` 0) and sends its id (`publish`). It subscribes the peer to every other joined peer's channel and each of them to its (`peer`, with the tag), and tells them when it goes (`gone`).
-  - `leave` or the socket's close ends it, and `closed` tells the page why.
+  - `leave` or the socket's close ends it, and its channels close. `closed` tells the page why the room ended one (never in answer to `leave`).
+  - A connection may join 4 times a minute, and one with more than 16 relay messages waiting closes (1008). A peer whose WebRTC isn't up 30 seconds after it joined gives its place up to the next to join.
 
   Each page connects to the SFU alone, never to another peer, and the room never sends a peer another's SDP, so no peer learns another's address. At most 8 peers share a room's relay. A relay's state is in its socket's attachment, so it outlives eviction. The SFU's traffic is billed by Realtime: what it sends out, past 1,000 GB a month free; what comes in is free.
 
