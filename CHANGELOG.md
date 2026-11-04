@@ -20,6 +20,10 @@ detail; `docs/release.md` says how a release is cut.
   adapter. For a machine with no GPU (a cloud VM an agent works on); off by default, and its
   timings are a CPU's (a profile's `adapter` says `Cpu`).
 - **`std::transform::inverse` and `determinant`** of any `mat4`.
+- **`std::net::room()`** (language.md §19.2): a room's own name, as its peers open it
+  (`/room/<name>`), so a room can keep what must outlive its build's journal in the store under
+  it. Cloudflare's room object keeps the name it was opened by; `wrela-serve` names each room it
+  starts (`net/room`).
 
 ## 0.18.0
 

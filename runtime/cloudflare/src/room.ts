@@ -41,6 +41,8 @@ export const CONN_IN = 1 << 20;
 /** How soon a room that failed at the host's limits tries again, in milliseconds. */
 export const RETRY_MS = 250;
 const UNREAD = "`serve` returned without reading all its events";
+/** The service that answers a room's own name (`std::net::room`). */
+export const SERVICE_ROOM = "net/room";
 
 /** A WebSocket as the room uses it (the Hibernation API's: its attachment survives eviction). */
 export interface Socket {
@@ -120,6 +122,8 @@ export class Room implements Owner<Net> {
   private readonly replaced: boolean;
   /** The last connection number given, kept so none is given twice. */
   private lastConn: number;
+  /** Its name (`/room/<name>`), kept from the first connection, for `std::net::room`. */
+  private name: string | null;
   /** Unix milliseconds the room's time counts from, kept so it goes on after a restart. */
   private readonly origin: number;
   private lastClock = 0;
@@ -145,6 +149,8 @@ export class Room implements Owner<Net> {
     if (origin === undefined) sql.exec("INSERT INTO meta (key, value) VALUES ('origin', ?)", this.origin);
     const q = meta.get("quarantined");
     this.quarantined = typeof q === "string" ? q : null;
+    const named = meta.get("name");
+    this.name = typeof named === "string" ? named : null;
     const last = meta.get("conn");
     this.lastConn = typeof last === "number" ? last : JOURNAL;
     const pair = options.pair !== undefined ? options.pair : pairOf(module);
@@ -175,6 +181,13 @@ export class Room implements Owner<Net> {
     this.lastConn = this.lastConn + 1 >= POISONED ? 1 : this.lastConn + 1;
     this.storage.sql.exec("INSERT OR REPLACE INTO meta (key, value) VALUES ('conn', ?)", this.lastConn);
     return this.lastConn;
+  }
+
+  /** The room is `name`, as its peers open it: kept, since an object can't read its own name. */
+  named(name: string): void {
+    if (this.name === name) return;
+    this.name = name;
+    this.storage.sql.exec("INSERT OR REPLACE INTO meta (key, value) VALUES ('name', ?)", name);
   }
 
   /** A peer connected on `socket`. A quarantined room closes it. */
@@ -547,6 +560,10 @@ export class Room implements Owner<Net> {
       case SERVICE_ME:
         // A room's store is the instance `server`'s, answered at once.
         self.answered.set(id, new TextEncoder().encode(SERVER_INSTANCE));
+        return;
+      case SERVICE_ROOM:
+        // Its own name, answered at once; a room that was never opened by name has none.
+        self.answered.set(id, this.name === null ? null : new TextEncoder().encode(this.name));
         return;
       case SERVICE_DISPATCH:
       case SERVICE_CALL:

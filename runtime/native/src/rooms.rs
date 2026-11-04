@@ -371,7 +371,7 @@ impl RoomHost {
                 Arc::new(move |service: &str, body: &[u8]| s.answer(service, body));
             answer
         });
-        let mut room = Room::start(&self.build, self.limits, answers)?;
+        let mut room = Room::start_named(&self.build, self.limits, answers, Some(&self.name))?;
         for r in &records {
             room.push_message(JOURNAL, r.clone());
         }
