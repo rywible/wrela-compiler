@@ -65,6 +65,8 @@ Each is used as facts or as a method; no code was copied.
 | RFC 8259 (JSON) | IETF | `std::json` |
 | W3C Web Authentication Level 3; RFC 8949 (CBOR), RFC 9053 (COSE keys), RFC 4648 (base64url) | W3C and IETF | Passkeys: the browser host's `passkey/create` and `passkey/get`, and `std::webauthn`'s checks of an authenticator's answer (§7, without attestation) |
 | RFC 1950 (Adler-32) | IETF | The browser host's PNG writer (`runtime/browser/src/png.ts`) |
+| RFC 1950 (zlib) and RFC 1951 (deflate); Mark Adler's `puff` (zlib's `contrib/puff`) | IETF; zlib licence, read as a description | `std::zlib`'s inflate: the formats from the RFCs, and `puff`'s method (each canonical code held as its counts a length and its symbols in order, read a bit at a time); written afresh, no code copied |
+| W3C [PNG Specification, Third Edition](https://www.w3.org/TR/png-3/) | W3C | `std::png`: the chunks, the colour types and bit depths, the filters and Paeth's predictor, Adam7, `tRNS` |
 | gitignore(5) | Git documentation | `wrela suite allow` reads a workspace's `.gitignore` files as git does |
 | Pillow's Lanczos3 resize and `thumbnail` size rule | HPND; read as a description | `std::tool::image`'s resize and `image::fit`; the test computes its reference from the Lanczos formula itself |
 | Chrome's [DevTools protocol](https://chromedevtools.github.io/devtools-protocol/), and `--remote-debugging-pipe` as Playwright launches it | Published documentation | `runtime/chrome`'s driver |
@@ -107,6 +109,8 @@ dependency was added.
 
 ## Fixtures
 
-The image fixtures in `compiler/tests/images` are four flat colours that Claude made. The frozen
+The image fixtures in `compiler/tests/images` are four flat colours that Claude made. The PNG and
+zlib fixtures in `compiler/tests/png` are generated patterns that Claude made with Python's
+`zlib` and Pillow (HPND), and Pillow's decoder checked the 8-bit ones. The frozen
 programs in `compiler/tests/frozen` are copies from `rywible/wrela`, whose `docs/process.md`
 records their sources.

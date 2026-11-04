@@ -1,0 +1,137 @@
+// std::png and std::zlib (language.md §20.2) on files made elsewhere: PNGs of every colour type
+// at every bit depth, plain and interlaced, with transparency, split image data and an ancillary
+// chunk, each beside the RGBA8 bytes it must decode to (made by a Python encoder of the PNG
+// specification's filters and Adam7 passes over zlib, its 8-bit files checked against Pillow's
+// decoder); Pillow's own files; malformed files, which decode to `None`; and zlib streams of
+// each block type, with what they hold. One texture is decoded in a constant, as a program
+// bakes one when it's built.
+use std::png::{Image, decode}
+use std::zlib::{adler32, inflate, inflate_raw}
+
+pub fn frame(time: f32, width: u32, height: u32) {}
+
+// A texture decoded when the program is built.
+const BAKED: Image = decode(embed("cases/c6d16i.png")).unwrap()
+
+fn same(png: [u8], rgba: [u8], width: u32, height: u32) {
+    let Some(image) = decode(png) else { panic("a well-formed PNG decodes") }
+    assert(image.width == width && image.height == height, "its size")
+    assert(image.pixels.len() == rgba.len(), "four bytes a pixel")
+    for i in 0..rgba.len() { assert(image.pixels[i] == rgba[i], "each byte as made") }
+}
+
+@test
+fn every_colour_type_and_depth_decodes_to_its_pixels() {
+    same(embed("cases/c0d1.png"), embed("cases/c0d1.rgba"), width: 13, height: 11)
+    same(embed("cases/c0d16.png"), embed("cases/c0d16.rgba"), width: 13, height: 11)
+    same(embed("cases/c0d16i.png"), embed("cases/c0d16i.rgba"), width: 13, height: 11)
+    same(embed("cases/c0d1i.png"), embed("cases/c0d1i.rgba"), width: 13, height: 11)
+    same(embed("cases/c0d2.png"), embed("cases/c0d2.rgba"), width: 13, height: 11)
+    same(embed("cases/c0d2i.png"), embed("cases/c0d2i.rgba"), width: 13, height: 11)
+    same(embed("cases/c0d4.png"), embed("cases/c0d4.rgba"), width: 13, height: 11)
+    same(embed("cases/c0d4i.png"), embed("cases/c0d4i.rgba"), width: 13, height: 11)
+    same(embed("cases/c0d8.png"), embed("cases/c0d8.rgba"), width: 13, height: 11)
+    same(embed("cases/c0d8i.png"), embed("cases/c0d8i.rgba"), width: 13, height: 11)
+    same(embed("cases/c0trns.png"), embed("cases/c0trns.rgba"), width: 9, height: 7)
+    same(embed("cases/c2d16.png"), embed("cases/c2d16.rgba"), width: 13, height: 11)
+    same(embed("cases/c2d16i.png"), embed("cases/c2d16i.rgba"), width: 13, height: 11)
+    same(embed("cases/c2d8.png"), embed("cases/c2d8.rgba"), width: 13, height: 11)
+    same(embed("cases/c2d8i.png"), embed("cases/c2d8i.rgba"), width: 13, height: 11)
+    same(embed("cases/c2trns.png"), embed("cases/c2trns.rgba"), width: 9, height: 7)
+    same(embed("cases/c3d1.png"), embed("cases/c3d1.rgba"), width: 13, height: 11)
+    same(embed("cases/c3d1i.png"), embed("cases/c3d1i.rgba"), width: 13, height: 11)
+    same(embed("cases/c3d2.png"), embed("cases/c3d2.rgba"), width: 13, height: 11)
+    same(embed("cases/c3d2i.png"), embed("cases/c3d2i.rgba"), width: 13, height: 11)
+    same(embed("cases/c3d4.png"), embed("cases/c3d4.rgba"), width: 13, height: 11)
+    same(embed("cases/c3d4i.png"), embed("cases/c3d4i.rgba"), width: 13, height: 11)
+    same(embed("cases/c3d8.png"), embed("cases/c3d8.rgba"), width: 13, height: 11)
+    same(embed("cases/c3d8i.png"), embed("cases/c3d8i.rgba"), width: 13, height: 11)
+    same(embed("cases/c3trns.png"), embed("cases/c3trns.rgba"), width: 9, height: 7)
+    same(embed("cases/c4d16.png"), embed("cases/c4d16.rgba"), width: 13, height: 11)
+    same(embed("cases/c4d16i.png"), embed("cases/c4d16i.rgba"), width: 13, height: 11)
+    same(embed("cases/c4d8.png"), embed("cases/c4d8.rgba"), width: 13, height: 11)
+    same(embed("cases/c4d8i.png"), embed("cases/c4d8i.rgba"), width: 13, height: 11)
+    same(embed("cases/c6d16.png"), embed("cases/c6d16.rgba"), width: 13, height: 11)
+    same(embed("cases/c6d16i.png"), embed("cases/c6d16i.rgba"), width: 13, height: 11)
+    same(embed("cases/c6d8.png"), embed("cases/c6d8.rgba"), width: 13, height: 11)
+    same(embed("cases/c6d8i.png"), embed("cases/c6d8i.rgba"), width: 13, height: 11)
+    same(embed("cases/one-interlaced.png"), embed("cases/one-interlaced.rgba"), width: 1, height: 1)
+    same(embed("cases/pillow-l.png"), embed("cases/pillow-l.rgba"), width: 40, height: 24)
+    same(embed("cases/pillow-p.png"), embed("cases/pillow-p.rgba"), width: 40, height: 24)
+    same(embed("cases/pillow-rgb.png"), embed("cases/pillow-rgb.rgba"), width: 40, height: 24)
+    same(embed("cases/pillow-rgba.png"), embed("cases/pillow-rgba.rgba"), width: 40, height: 24)
+    same(embed("cases/split-idat.png"), embed("cases/split-idat.rgba"), width: 31, height: 17)
+    same(
+        embed("cases/three-by-two-interlaced.png"),
+        embed("cases/three-by-two-interlaced.rgba"),
+        width: 3,
+        height: 2,
+    )
+}
+
+@test
+fn a_constant_holds_a_texture_decoded_when_the_program_was_built() {
+    let rgba = embed("cases/c6d16i.rgba")
+    assert(BAKED.width == 13 && BAKED.height == 11)
+    for i in 0..rgba.len() { assert(BAKED.pixels[i] == rgba.at(i)) }
+    // Texel (0, 0) as four channels, and a sample at its centre is that texel.
+    let t = BAKED.texel(x: 0, y: 0)
+    assert(t.x == f32(rgba.at(0)) / 255.0 && t.w == f32(rgba.at(3)) / 255.0)
+    let s = BAKED.sample(vec2(0.5 / 13.0, 0.5 / 11.0))
+    assert(abs(s.x - t.x) < 0.000001 && abs(s.w - t.w) < 0.000001)
+    // Halfway between texels (0, 0) and (1, 0), the sample is their mean; past the right edge it
+    // repeats the left.
+    let m = BAKED.sample(vec2(1.0 / 13.0, 0.5 / 11.0))
+    assert(abs(m.y - (t.y + BAKED.texel(x: 1, y: 0).y) / 2.0) < 0.00001)
+    let wrapped = BAKED.sample(vec2(1.0 + 0.5 / 13.0, 0.5 / 11.0))
+    assert(abs(wrapped.z - t.z) < 0.00001)
+}
+
+@test
+fn a_malformed_file_is_none() {
+    assert(decode(embed("cases/bad-crc.png")).is_none(), "crc")
+    assert(decode(embed("cases/bad-depth-three.png")).is_none(), "depth-three")
+    assert(decode(embed("cases/bad-filter-five.png")).is_none(), "filter-five")
+    assert(decode(embed("cases/bad-long-data.png")).is_none(), "long-data")
+    assert(decode(embed("cases/bad-no-palette.png")).is_none(), "no-palette")
+    assert(decode(embed("cases/bad-no-signature.png")).is_none(), "no-signature")
+    assert(decode(embed("cases/bad-palette-index.png")).is_none(), "palette-index")
+    assert(decode(embed("cases/bad-rgb-depth-four.png")).is_none(), "rgb-depth-four")
+    assert(decode(embed("cases/bad-short-data.png")).is_none(), "short-data")
+    assert(decode(embed("cases/bad-truncated.png")).is_none(), "truncated")
+    assert(decode(embed("cases/bad-unknown-critical.png")).is_none(), "unknown-critical")
+    assert(decode(embed("cases/bad-zero-width.png")).is_none(), "zero-width")
+    assert(decode([u8(0); 0]).is_none(), "no bytes")
+}
+
+fn holds(z: [u8], want: [u8]) {
+    let Some(out) = inflate(z) else { panic("a well-formed stream inflates") }
+    assert(out.len() == want.len(), "its length")
+    for i in 0..want.len() { assert(out[i] == want[i], "each byte") }
+}
+
+@test
+fn each_kind_of_block_inflates_to_what_it_holds() {
+    holds(embed("cases/z-fixed.z"), embed("cases/z-fixed.bin"))
+    holds(embed("cases/z-dynamic.z"), embed("cases/z-dynamic.bin"))
+    holds(embed("cases/z-fast.z"), embed("cases/z-fast.bin"))
+    holds(embed("cases/z-empty.z"), embed("cases/z-empty.bin"))
+    // 66,000 bytes stored, in two blocks: byte i is i² mod 251.
+    let Some(stored) = inflate(embed("cases/z-stored.z")) else { panic("stored blocks") }
+    assert(stored.len() == 66000)
+    for i in 0..66000 { assert(u32(stored[i]) == u32((u64(i) * u64(i)) % 251)) }
+    let Some(raw) = inflate_raw(embed("cases/z-raw.deflate")) else { panic("a raw stream") }
+    let text = embed("cases/z-dynamic.bin")
+    assert(raw.len() == text.len() && adler32(raw) == adler32(text))
+}
+
+@test
+fn a_malformed_stream_is_none() {
+    assert(inflate(embed("cases/zbad-adler.z")).is_none(), "its sum")
+    assert(inflate(embed("cases/zbad-truncated.z")).is_none(), "cut short")
+    assert(inflate(embed("cases/zbad-dictionary.z")).is_none(), "a preset dictionary")
+    assert(inflate(embed("cases/zbad-reserved.z")).is_none(), "a reserved block type")
+    // A stream may not inflate past what its reader allows.
+    assert(inflate(embed("cases/z-dynamic.z"), most: 1000).is_none(), "past `most`")
+    assert(inflate(embed("cases/z-fixed.z"), most: 27).is_some(), "exactly `most`")
+}

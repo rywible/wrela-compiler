@@ -850,6 +850,18 @@ fn a_texture_is_a_fields_data() {
     assert_eq!(crate::tests_pass(&dir), 4);
 }
 
+/// Textures baked when a program is built (compiler/tests/png, language.md §20.2): `std::png`
+/// decodes PNGs of every colour type and bit depth, plain and Adam7-interlaced, with `tRNS`,
+/// split image data and Pillow's own files, to the RGBA8 bytes made beside them; a constant holds
+/// one decoded at build time; malformed files are `None`; and `std::zlib` inflates stored, fixed
+/// and dynamic blocks, raw and zlib-wrapped, and refuses a bad sum, a cut stream, a preset
+/// dictionary, a reserved block type and output past its `most`.
+#[test]
+fn a_png_decodes_when_the_program_is_built() {
+    let dir = wrela_tests::repo_root().join("compiler/tests/png");
+    assert_eq!(crate::tests_pass(&dir), 5);
+}
+
 /// Tapes that can hold a creature (language.md §14.4): each new operation against its std
 /// twin at 10⁶ points on the CPU and the GPU (compiler/tests/tape_ops), and a full 4,096-op
 /// tape bound as storage, run on both hosts and timed (compiler/tests/tape_long).
