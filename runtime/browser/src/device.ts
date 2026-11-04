@@ -30,11 +30,11 @@ export const deviceFeatures = (device: GPUDevice): readonly string[] => (SEEN.ge
 
 /** Opens a hardware adapter with its own limits and every optional feature it has, as the native
  * host does. `keep` (test mode's `features=`) is what the program may see of them: null all,
- * else `none` or a comma list. */
-export async function openDevice(fatal: (error: Error) => void, keep: string | null = null): Promise<GPUDevice> {
+ * else `none` or a comma list. `software` (test mode's `software=1`) admits a fallback adapter. */
+export async function openDevice(fatal: (error: Error) => void, keep: string | null = null, software = false): Promise<GPUDevice> {
   const adapter = await navigator.gpu?.requestAdapter({ powerPreference: "high-performance" });
   if (!adapter) throw new UnsupportedError("WebGPU isn't available here (no adapter)");
-  if (adapter.info.isFallbackAdapter !== false) throw new UnsupportedError("hardware GPU required; WebGPU selected a fallback adapter");
+  if (adapter.info.isFallbackAdapter !== false && !software) throw new UnsupportedError("hardware GPU required; WebGPU selected a fallback adapter");
   if (!adapter.features.has("indirect-first-instance")) throw new UnsupportedError("the GPU doesn't support indirect-first-instance");
   const requiredLimits: Record<string, number> = {};
   for (const name of LIMIT_SOURCES.flat()) requiredLimits[name] = adapter.limits[name];

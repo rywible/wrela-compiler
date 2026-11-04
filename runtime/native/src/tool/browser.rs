@@ -341,9 +341,25 @@ fn navigate(
             "`{url}` isn't one of the tool's servers' origins or an `https://` host it's granted"
         ));
     }
-    tab.navigate(url, result_of(s, handle, url, true), due)?;
+    tab.navigate(&softened(url), result_of(s, handle, url, true), due)?;
     page_ready(tab, due)?;
     Ok(Vec::new())
+}
+
+/// `url` as the browser opens it: where a software adapter is allowed (`WRELA_ALLOW_SOFTWARE=1`),
+/// a test-mode page (`#test`) is given `software=1`, so the program runs on WebGPU's fallback
+/// adapter as the native host runs on the CPU's.
+fn softened(url: &str) -> String {
+    software_url(url, crate::software_allowed())
+}
+
+fn software_url(url: &str, software: bool) -> String {
+    let test = url.split_once('#').is_some_and(|(_, f)| f == "test" || f.starts_with("test&"));
+    if software && test && !url.contains("&software=") {
+        format!("{url}&software=1")
+    } else {
+        url.to_string()
+    }
 }
 
 /// Waits until `tab`'s page has a context to ask (one between documents hasn't), by `due`: the
@@ -412,7 +428,7 @@ fn open(
     // The page's result: what its server keeps from now on.
     let options =
         TabOptions { size: Some(size), console: None, done: result_of(s, handle, url, false) };
-    let tab = held.browser.open(url, options, due)?;
+    let tab = held.browser.open(&softened(url), options, due)?;
     page_ready(&tab, due)?;
     *locked(&held.tab) = Some(tab);
     held.busy.store(false, Ordering::Release);
@@ -543,6 +559,28 @@ fn capture(
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn a_test_page_is_given_a_software_adapter_only_where_allowed() {
+        let page = "http://127.0.0.1:4000/b/#test&frames=3";
+        assert_eq!(super::software_url(page, true), format!("{page}&software=1"));
+        assert_eq!(super::software_url(page, false), page);
+        assert_eq!(
+            super::software_url("http://127.0.0.1:4000/b/#test", true),
+            "http://127.0.0.1:4000/b/#test&software=1"
+        );
+        assert_eq!(
+            super::software_url("http://127.0.0.1:4000/b/#testing", true),
+            "http://127.0.0.1:4000/b/#testing"
+        );
+        assert_eq!(
+            super::software_url("http://127.0.0.1:4000/b/", true),
+            "http://127.0.0.1:4000/b/"
+        );
+        let given = format!("{page}&software=1");
+        assert_eq!(super::software_url(&given, true), given);
+    }
+
     use super::*;
 
     #[test]

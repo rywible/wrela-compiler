@@ -40,7 +40,9 @@ test("reads every parameter", () => {
     checks: 1,
     show: 0,
     hdr: 0,
+    software: 0,
   });
+  expect(parseTestParams("#test&software=1")).toEqual({ ...TEST_DEFAULTS, software: 1 });
   expect(parseTestParams("#test&clip=600&clipfrom=300")).toEqual({ ...TEST_DEFAULTS, clip: 600, clipfrom: 300 });
   expect(parseTestParams("#test&input=scripts/a.json&latency=40")).toEqual({ ...TEST_DEFAULTS, input: "scripts/a.json", latency: 40 });
   expect(parseTestParams("#test&paced=1&tickdelay=30&framedelay=5&keylatency=20&salt=7&saturate=1")).toEqual({

@@ -29,7 +29,8 @@
 // sees only those optional device features (`std::gpu::features()`), though the device has them
 // all: its fallback paths, measured on a device that has the features. With `checks=0`, the
 // command checker is off, as in a release build's normal run, where WebGPU's own validation
-// (an `uncapturederror`) is what stops a wrong command: a profile's runs.
+// (an `uncapturederror`) is what stops a wrong command: a profile's runs. With `software=1`, a
+// software adapter (WebGPU's fallback) may run it, where there's no GPU.
 //
 // A program with a ticker (`std::tick::start`) runs it on the lockstep schedule (#43 §2.3):
 // before frame i, the ticks up to ⌊(i + 1)·hz/fps⌋ run, and the frame waits for them, as on
@@ -109,6 +110,9 @@ export interface TestParams {
    * Otherwise test mode keeps it `SCREEN_FORMAT`, so goldens and hashes don't change; with it the
    * run writes `screen.json` (the canvas's configuration, the screen's middle texel). */
   hdr: number;
+  /** 1: a software adapter (WebGPU's fallback, such as SwiftShader) may run the program, on a
+   * machine with no GPU; its timings are a CPU's (the native host's `WRELA_ALLOW_SOFTWARE`). */
+  software: number;
 }
 
 export const TEST_DEFAULTS: TestParams = {
@@ -139,6 +143,7 @@ export const TEST_DEFAULTS: TestParams = {
   checks: 1,
   show: 0,
   hdr: 0,
+  software: 0,
 };
 /** Every parameter's name, in order. */
 const NAMES = Object.keys(TEST_DEFAULTS) as (keyof TestParams)[];

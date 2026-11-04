@@ -1,0 +1,315 @@
+// Inflate: bytes compressed with deflate (RFC 1951), as a zlib stream (RFC 1950) or raw, read
+// back. It runs anywhere CPU code does, so a constant can decompress an embedded file when the
+// program is built: a texture's PNG (`std::png`), or a model's buffers. A stream that isn't
+// well formed is `None`, never a panic: a block of a reserved type, a code over- or
+// undersubscribed where RFC 1951 allows neither, a symbol no code has, a distance before the
+// start of the output, a stream that ends early, or a zlib header or Adler-32 sum that doesn't
+// hold.
+//
+// The decoder is Mark Adler's `puff` method (zlib's `contrib/puff`), written afresh: each code
+// is canonical, so it's held as its count of codes a length and its symbols in code order, and a
+// symbol is read a bit at a time, the code compared against the first code of each length.
+//
+// ```wrela
+// use std::zlib::inflate
+//
+// // "abc", compressed by zlib at level 9: a fixed-code block, then the Adler-32 sum.
+// let z = [0x78, 0xda, 0x4b, 0x4c, 0x4a, 0x06, 0x00, 0x02, 0x4d, 0x01, 0x27]
+// let Some(text) = inflate(z) else { panic("a stream") }
+// assert(text.len() == 3 && text[0] == 97 && text[2] == 99)
+// ```
+
+use std::collections::Vec
+
+/// The longest code, in bits.
+const MOST_BITS: u32 = 15
+
+/// The base length of each length symbol from 257, and its extra bits.
+const LENGTH_BASE: [u32; 29] = [
+    3, 4, 5, 6, 7, 8, 9, 10, 11, 13, 15, 17, 19, 23, 27, 31, 35, 43, 51, 59, 67, 83, 99, 115, 131,
+    163, 195, 227, 258,
+]
+const LENGTH_EXTRA: [u32; 29] = [
+    0, 0, 0, 0, 0, 0, 0, 0, 1, 1, 1, 1, 2, 2, 2, 2, 3, 3, 3, 3, 4, 4, 4, 4, 5, 5, 5, 5, 0,
+]
+
+/// The base distance of each distance symbol, and its extra bits.
+const DISTANCE_BASE: [u32; 30] = [
+    1, 2, 3, 4, 5, 7, 9, 13, 17, 25, 33, 49, 65, 97, 129, 193, 257, 385, 513, 769, 1025, 1537, 2049,
+    3073, 4097, 6145, 8193, 12289, 16385, 24577,
+]
+const DISTANCE_EXTRA: [u32; 30] = [
+    0, 0, 0, 0, 1, 1, 2, 2, 3, 3, 4, 4, 5, 5, 6, 6, 7, 7, 8, 8, 9, 9, 10, 10, 11, 11, 12, 12, 13,
+    13,
+]
+
+/// The order the code-length code's lengths come in (RFC 1951 §3.2.7).
+const LENGTH_ORDER: [u32; 19] = [16, 17, 18, 0, 8, 7, 9, 6, 10, 5, 11, 4, 12, 3, 13, 2, 14, 1, 15]
+
+/// Where a stream is read: the next byte, the bits taken from bytes before it and not yet used
+/// (lowest first, as deflate packs them), and whether a read went past the end.
+struct Bits: Copy {
+    at: u32,
+    hold: u32,
+    count: u32,
+    short: bool,
+}
+
+impl Bits {
+    fn new(at: u32) -> Bits {
+        Bits { at: at, hold: 0, count: 0, short: false }
+    }
+
+    /// The next `n` bits (at most 16), the first the lowest. Past the end they're 0, and
+    /// `short` says so.
+    fn read(mut self, data: [u8], n: u32) -> u32 {
+        while self.count < n {
+            if self.at >= data.len() {
+                self.short = true
+                return 0
+            }
+            self.hold = self.hold | (u32(data[self.at]) << self.count)
+            self.at += 1
+            self.count += 8
+        }
+        let v = self.hold & ((1 << n) - 1)
+        self.hold = self.hold >> n
+        self.count -= n
+        v
+    }
+
+    /// The next bit.
+    fn bit(mut self, data: [u8]) -> u32 {
+        if self.count == 0 {
+            if self.at >= data.len() {
+                self.short = true
+                return 0
+            }
+            self.hold = u32(data[self.at])
+            self.at += 1
+            self.count = 8
+        }
+        let v = self.hold & 1
+        self.hold = self.hold >> 1
+        self.count -= 1
+        v
+    }
+
+    /// Drops the bits left in the byte being read, so the next read starts a byte.
+    fn align(mut self) {
+        self.hold = 0
+        self.count = 0
+    }
+}
+
+/// A canonical Huffman code: how many codes it has of each length (index 0 unused), and its
+/// symbols in code order.
+struct Code: Clone {
+    counts: [u32; 16],
+    symbols: Vec<u32>,
+}
+
+/// The code whose symbol `s` has `lengths[s]` bits (0: no code). `None` if the lengths
+/// oversubscribe the code space, or, unless `incomplete` allows it, leave part of it unused;
+/// a code of a single symbol is always allowed (RFC 1951 §3.2.7).
+fn code(lengths: [u32], incomplete: bool) -> Option<Code> {
+    var counts: [u32; 16] = [0; 16]
+    for l in lengths { counts[l] += 1 }
+    var used = 0
+    for l in 1..16 { used += counts[l] }
+    var left = 1
+    for l in 1..16 {
+        left = left * 2
+        if counts[l] > left { return None }
+        left -= counts[l]
+    }
+    if left > 0 && !incomplete && used > 1 { return None }
+    var offsets: [u32; 16] = [0; 16]
+    for l in 1..15 { offsets[l + 1] = offsets[l] + counts[l] }
+    var symbols = Vec::filled(used, 0)
+    for s in 0..lengths.len() {
+        let l = lengths[s]
+        if l != 0 {
+            symbols[offsets[l]] = s
+            offsets[l] += 1
+        }
+    }
+    counts[0] = 0
+    Some(Code { counts: counts, symbols: symbols })
+}
+
+/// The next symbol of `c`, or `None` for a code `c` doesn't have or a stream that ended.
+fn symbol(bits: mut Bits, data: [u8], c: Code) -> Option<u32> {
+    var code = 0
+    var first = 0
+    var index = 0
+    for l in 1..MOST_BITS + 1 {
+        code = code | bits.bit(data)
+        let count = c.counts[l]
+        if code < first + count {
+            return if bits.short { None } else {
+                Some(c.symbols[index + code - first])
+            }
+        }
+        index += count
+        first = (first + count) * 2
+        code = code * 2
+    }
+    None
+}
+
+/// The fixed codes of RFC 1951 §3.2.6: lengths and literals, and distances.
+fn fixed() -> (Code, Code) {
+    var lengths: Vec<u32> = Vec::with_capacity(288)
+    for s in 0..288 {
+        lengths.push(if s < 144 { 8 } else if s < 256 { 9 } else if s < 280 { 7 } else { 8 })
+    }
+    let Some(lit) = code(lengths, incomplete: false) else { panic("the fixed code is complete") }
+    let distances = Vec::filled(30, 5)
+    let Some(dist) = code(distances, incomplete: true) else { panic("the fixed distances") }
+    (lit, dist)
+}
+
+/// A dynamic block's codes (RFC 1951 §3.2.7), or `None` if they aren't well formed.
+fn dynamic(bits: mut Bits, data: [u8]) -> Option<(Code, Code)> {
+    let nlen = bits.read(data, 5) + 257
+    let ndist = bits.read(data, 5) + 1
+    let ncode = bits.read(data, 4) + 4
+    if nlen > 286 || ndist > 30 { return None }
+    var order: [u32; 19] = [0; 19]
+    for i in 0..ncode { order[LENGTH_ORDER[i]] = bits.read(data, 3) }
+    if bits.short { return None }
+    let Some(lencode) = code(order, incomplete: false) else { return None }
+    var lengths = Vec::filled(nlen + ndist, 0)
+    var i = 0
+    while i < nlen + ndist {
+        let Some(s) = symbol(mut bits, data, lencode) else { return None }
+        if s < 16 {
+            lengths[i] = s
+            i += 1
+        } else {
+            var value = 0
+            var times = 0
+            if s == 16 {
+                if i == 0 { return None }
+                value = lengths[i - 1]
+                times = 3 + bits.read(data, 2)
+            } else if s == 17 {
+                times = 3 + bits.read(data, 3)
+            } else {
+                times = 11 + bits.read(data, 7)
+            }
+            if i + times > nlen + ndist { return None }
+            for _ in 0..times {
+                lengths[i] = value
+                i += 1
+            }
+        }
+    }
+    if bits.short || lengths[256] == 0 { return None }
+    var lit_lengths: Vec<u32> = Vec::with_capacity(nlen)
+    for k in 0..nlen { lit_lengths.push(lengths[k]) }
+    var dist_lengths: Vec<u32> = Vec::with_capacity(ndist)
+    for k in 0..ndist { dist_lengths.push(lengths[nlen + k]) }
+    let Some(lit) = code(lit_lengths, incomplete: false) else { return None }
+    let Some(dist) = code(dist_lengths, incomplete: true) else { return None }
+    Some((lit, dist))
+}
+
+/// A compressed block's symbols, decoded onto `out`. False if the block isn't well formed or
+/// `out` would pass `most` bytes.
+fn codes(bits: mut Bits, data: [u8], lit: Code, dist: Code, out: mut Vec<u8>, most: u32) -> bool {
+    loop {
+        let Some(s) = symbol(mut bits, data, lit) else { return false }
+        if s < 256 {
+            if out.len() >= most { return false }
+            out.push(u8(s))
+        } else if s == 256 {
+            return true
+        } else {
+            let k = s - 257
+            if k >= 29 { return false }
+            let length = LENGTH_BASE[k] + bits.read(data, LENGTH_EXTRA[k])
+            let Some(d) = symbol(mut bits, data, dist) else { return false }
+            if d >= 30 { return false }
+            let distance = DISTANCE_BASE[d] + bits.read(data, DISTANCE_EXTRA[d])
+            if bits.short || distance > out.len() || length > most - out.len() { return false }
+            let from = out.len() - distance
+            for j in 0..length {
+                let b = out[from + j]
+                out.push(b)
+            }
+        }
+    }
+}
+
+/// The deflate stream that starts at byte `at` of `data`, decompressed, and the byte after its
+/// last block; or `None` if it isn't well formed or would decompress past `most` bytes.
+fn deflate_at(data: [u8], at: u32, most: u32) -> Option<(Vec<u8>, u32)> {
+    var bits = Bits::new(at)
+    var out: Vec<u8> = Vec::new()
+    var last = false
+    while !last {
+        last = bits.read(data, 1) == 1
+        let kind = bits.read(data, 2)
+        if bits.short { return None }
+        if kind == 0 {
+            bits.align()
+            let start = bits.at
+            if start + 4 > data.len() { return None }
+            let n = u32(data[start]) | (u32(data[start + 1]) << 8)
+            let check = u32(data[start + 2]) | (u32(data[start + 3]) << 8)
+            if (n ^ 0xffff) != check { return None }
+            if n > data.len() - start - 4 || n > most - out.len() { return None }
+            for j in 0..n { out.push(data[start + 4 + j]) }
+            bits.at = start + 4 + n
+        } else if kind == 1 {
+            let (lit, dist) = fixed()
+            if !codes(mut bits, data, lit, dist, mut out, most) { return None }
+        } else if kind == 2 {
+            let Some((lit, dist)) = dynamic(mut bits, data) else { return None }
+            if !codes(mut bits, data, lit, dist, mut out, most) { return None }
+        } else {
+            return None
+        }
+    }
+    Some((out, bits.at))
+}
+
+/// A raw deflate stream (RFC 1951), decompressed; `None` if it isn't well formed, or would
+/// decompress to more than `most` bytes.
+pub fn inflate_raw(data: [u8], most: u32 = 0xffffffff) -> Option<Vec<u8>> {
+    let Some((out, _)) = deflate_at(data, 0, most) else { return None }
+    Some(out)
+}
+
+/// A zlib stream (RFC 1950), decompressed: its header checked (deflate, no preset dictionary)
+/// and its Adler-32 sum checked against what it decompressed to. `None` if any of it doesn't
+/// hold, or it would decompress to more than `most` bytes.
+pub fn inflate(data: [u8], most: u32 = 0xffffffff) -> Option<Vec<u8>> {
+    if data.len() < 6 { return None }
+    let cmf = u32(data[0])
+    let flg = u32(data[1])
+    if (cmf & 15) != 8 || (cmf >> 4) > 7 || (cmf * 256 + flg) % 31 != 0 || (flg & 32) != 0 {
+        return None
+    }
+    let Some((out, end)) = deflate_at(data, 2, most) else { return None }
+    if end + 4 > data.len() { return None }
+    let sum = (u32(data[end]) << 24) |
+        (u32(data[end + 1]) << 16) |
+        (u32(data[end + 2]) << 8) |
+        u32(data[end + 3])
+    if sum != adler32(out) { return None }
+    Some(out)
+}
+
+/// The Adler-32 sum of `bytes` (RFC 1950 §8).
+pub fn adler32(bytes: [u8]) -> u32 {
+    var a = 1
+    var b = 0
+    for x in bytes {
+        a = (a + u32(x)) % 65521
+        b = (b + a) % 65521
+    }
+    (b << 16) | a
+}

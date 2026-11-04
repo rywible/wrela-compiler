@@ -3,6 +3,24 @@
 Each release's changes a program or a tool can see. The pull request of each release holds the
 detail; `docs/release.md` says how a release is cut.
 
+## 0.19.0
+
+- **Textures baked when a program is built** (language.md §20.2): `std::png::decode` reads a
+  PNG (every colour type and bit depth, Adam7, `tRNS`) to an `Image` of RGBA8 pixels, rows top
+  to bottom, with `texel` and `sample` (bilinear, repeating, at glTF's texture coordinates), so a
+  constant decodes an embedded texture (`decode(embed("skin.png"))`) and bakes it into the
+  fields and parameters the program draws with, and nothing decodes an image while it runs. A
+  malformed file is `None`. No gamma is applied: an ordinary file's bytes are sRGB. A 1024 × 1024
+  RGBA texture decodes in under a second of the build, within a constant's default fuel.
+- **`std::zlib`**: `inflate` (a zlib stream, its header and Adler-32 sum checked), `inflate_raw`
+  (raw deflate), each `None` for a malformed stream or one past `most` bytes, and `adler32`.
+- **A software adapter, on purpose:** `WRELA_ALLOW_SOFTWARE=1` lets the native host open a GPU
+  on the CPU (lavapipe, SwiftShader), and gives a Chrome run that a frame test, `wrela profile`
+  or a tool's browser starts test mode's new `software=1`, which admits WebGPU's fallback
+  adapter. For a machine with no GPU (a cloud VM an agent works on); off by default, and its
+  timings are a CPU's (a profile's `adapter` says `Cpu`).
+- **`std::transform::inverse` and `determinant`** of any `mat4`.
+
 ## 0.18.0
 
 - **A server runs as named instances** (language.md §19.5, `std::server`): one `WrelaServer`
