@@ -61,10 +61,13 @@ export function workers(): void {
  * Hibernation API keeps it (a copy). */
 export class FakeSocket {
   sent: Uint8Array[] = [];
+  /** The text messages it was sent (a relay's, relay.ts), parsed. */
+  texts: unknown[] = [];
   closed: number | null = null;
   attachment: unknown = null;
-  send(bytes: Uint8Array) {
-    this.sent.push(new Uint8Array(bytes));
+  send(bytes: Uint8Array | string) {
+    if (typeof bytes === "string") this.texts.push(JSON.parse(bytes));
+    else this.sent.push(new Uint8Array(bytes));
   }
   close(code = 1000) {
     this.closed ??= code;

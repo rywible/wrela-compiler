@@ -5,6 +5,7 @@ import { describe, expect, test } from "bun:test";
 import { EVENT_SIZE } from "../src/abi.gen.ts";
 import { connectionEvent, isNetwork, textEvent } from "../src/input.ts";
 import { Frames, frame, HELD, Inbox, MAX_FRAME, MAX_UP, Net, OVERHEAD, PENDING, parseServer, roomName } from "../src/net.ts";
+import { MAX_RELAY, type Rtc } from "../src/relay.ts";
 
 const word = (e: Uint8Array, i: number) => new DataView(e.buffer, e.byteOffset, EVENT_SIZE).getUint32(4 * i, true);
 
@@ -435,5 +436,117 @@ describe("what a connection holds", () => {
       }
       expect(inbox.held).toBe(0);
     });
+  });
+  test("a relay goes by its room's WebSocket: the room speaks to the SFU, the page's WebRTC carries it", async () => {
+    const made: FakeSocket[] = [];
+    class FakeSocket {
+      static readonly OPEN = 1;
+      readyState = 0;
+      binaryType = "blob";
+      bufferedAmount = 0;
+      sent: (Uint8Array | string)[] = [];
+      onopen: (() => void) | null = null;
+      onmessage: ((e: { data: unknown }) => void) | null = null;
+      onclose: (() => void) | null = null;
+      onerror: (() => void) | null = null;
+      constructor(readonly url: string) {
+        made.push(this);
+      }
+      send(b: Uint8Array | string) {
+        this.sent.push(b);
+      }
+      close() {
+        this.onclose?.();
+      }
+    }
+    class FakeChannel {
+      readyState = "connecting";
+      bufferedAmount = 0;
+      binaryType = "blob";
+      sent: Uint8Array[] = [];
+      closed = false;
+      onopen: ((e: unknown) => void) | null = null;
+      onmessage: ((e: { data: unknown }) => void) | null = null;
+      onclose: ((e: unknown) => void) | null = null;
+      constructor(readonly id: number) {}
+      send(b: Uint8Array) {
+        this.sent.push(b);
+      }
+      close() {
+        this.closed = true;
+      }
+    }
+    const asked: string[] = [];
+    const channels = new Map<number, FakeChannel>();
+    const rtc: Rtc = {
+      answer: async (relay, sdp) => (asked.push(`answer ${relay} ${sdp}`), "page-answer"),
+      connected: async (relay) => void asked.push(`connected ${relay}`),
+      channel: async (relay, id) => {
+        asked.push(`channel ${relay} ${id}`);
+        const c = new FakeChannel(id);
+        channels.set(id, c);
+        return c;
+      },
+      close: (relay) => void asked.push(`close ${relay}`),
+    };
+    const real = globalThis.WebSocket;
+    const fetched = globalThis.fetch;
+    Object.assign(globalThis, { WebSocket: FakeSocket, fetch: async () => new Response('{"url": "wss://wrela.dev"}') });
+    try {
+      const lines: string[] = [];
+      const net = new Net(() => "https://wrela.dev/", (l) => lines.push(l), rtc);
+      net.open(4, "lobby", 0xabn);
+      await settle(() => made.length > 0);
+      const socket = made[0]!;
+      socket.readyState = FakeSocket.OPEN;
+      socket.onopen!();
+      net.relay(5, 4);
+      expect(() => net.relay(5, 4)).toThrow("connection 5 is open");
+      expect(() => net.open(5, "lobby", 0xabn)).toThrow("connection 5 is open");
+      expect(socket.sent).toEqual(['{"relay":"join"}']);
+      const room = (c: object) => socket.onmessage!({ data: JSON.stringify(c) });
+      room({ relay: "offer", sdp: "sfu-offer" });
+      await settle(() => socket.sent.length === 3);
+      expect(socket.sent.slice(1)).toEqual(['{"relay":"answer","sdp":"page-answer"}', '{"relay":"ready"}']);
+      room({ relay: "publish", id: 2 });
+      room({ relay: "peer", peer: 9, id: 3 });
+      await settle(() => channels.size === 2);
+      // Nothing is open until the publishing channel is; what arrives before is dropped.
+      channels.get(3)!.onmessage!({ data: Uint8Array.of(1).buffer });
+      net.send(5, Uint8Array.of(1));
+      expect(channels.get(2)!.sent).toEqual([]);
+      channels.get(2)!.readyState = "open";
+      channels.get(2)!.onopen!({});
+      net.send(5, Uint8Array.of(4, 5));
+      expect(channels.get(2)!.sent).toEqual([Uint8Array.of(4, 5)]);
+      channels.get(3)!.onmessage!({ data: Uint8Array.of(6, 7).buffer });
+      expect(net.arrived).toEqual([
+        { conn: 4, open: true },
+        { conn: 5, open: true },
+        { conn: 5, bytes: Uint8Array.of(9, 0, 0, 0, 6, 7) },
+      ]);
+      expect(asked).toEqual(["answer 1 sfu-offer", "connected 1", "channel 1 2", "channel 1 3"]);
+      // A peer gone closes its channel; a message past MAX_RELAY closes the relay, which leaves.
+      room({ relay: "gone", peer: 9 });
+      expect(channels.get(3)!.closed).toBe(true);
+      net.send(5, new Uint8Array(MAX_RELAY + 1));
+      expect(lines).toEqual([`connection 5: a relay message of ${MAX_RELAY + 1} bytes, past ${MAX_RELAY}`]);
+      expect(socket.sent.at(-1)).toBe('{"relay":"leave"}');
+      expect(channels.get(2)!.closed).toBe(true);
+      expect(asked.at(-1)).toBe("close 1");
+      expect(net.arrived.at(-1)).toEqual({ conn: 5, open: false });
+      // Again on the same connection; its closing closes the relay first.
+      net.relay(6, 4);
+      socket.close();
+      expect(net.arrived.slice(-2)).toEqual([{ conn: 6, open: false }, { conn: 4, open: false }]);
+      // A relay of what isn't open, or on a page with no WebRTC, closes as it opens.
+      net.relay(7, 4);
+      expect(lines.at(-1)).toBe("connection 7: connection 4 isn't open");
+      const plain = new Net(() => "https://wrela.dev/", (l) => lines.push(l));
+      plain.relay(1, 2);
+      expect(plain.arrived).toEqual([{ conn: 1, open: false }]);
+    } finally {
+      Object.assign(globalThis, { WebSocket: real, fetch: fetched });
+    }
   });
 });

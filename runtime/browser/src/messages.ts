@@ -3,6 +3,7 @@
 // helpers), which it then speaks to through a channel of each one's own.
 
 import type { Scripted } from "./input.ts";
+import type { RtcAsk } from "./relay.ts";
 import type { TestParams } from "./testmode.ts";
 
 export type ToWorker =
@@ -36,6 +37,9 @@ export type ToWorker =
    * alpha, premultiplied, not opaque. */
   | { type: "see-through"; on: boolean }
   | { type: "host-reply"; id: number; bytes: Uint8Array<ArrayBuffer>; error: string | null }
+  /** The main thread's answer to a relay's `rtc` ask: an answer's SDP, or a negotiated data
+   * channel handed to the worker, or nothing; or why it failed. */
+  | { type: "rtc-reply"; id: number; sdp: string | null; channel: RTCDataChannel | null; error: string | null }
   /** To a thread the main thread started for the render worker: its channel to the render
    * worker, on which its work comes and its answers go. */
   | { type: "parent"; port: MessagePort }
@@ -73,6 +77,8 @@ export type FromWorker =
   /** `unsupported`: the machine can't run a program (`UnsupportedError`), rather than it failed. */
   | { type: "fatal"; message: string; unsupported: boolean }
   | { type: "host-request"; id: number; service: string; bytes: Uint8Array<ArrayBuffer> }
+  /** A relay's ask of the page's WebRTC (relay.ts `RtcHost`), which lives on the main thread. */
+  | { type: "rtc"; id: number; ask: RtcAsk }
   | { type: "presented" }
   /** Start a thread, this script again, named `name`, and hand it `port` (a `parent` message):
    * a worker can't start one in every browser (the Claude app's browser pane can't). */

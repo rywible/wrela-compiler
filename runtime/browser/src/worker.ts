@@ -14,6 +14,7 @@ import { browserIo, type Build, Handed, loadBuild, loadLines, loadScript, networ
 import { locate } from "./lines.ts";
 import { Live } from "./live.ts";
 import { type Inbox, Net } from "./net.ts";
+import type { Channel, Rtc, RtcAsk } from "./relay.ts";
 import { type Compiled, type PrintSink, type Program, type ProgramOptions, runWorker, type SpawnWorker } from "./program.ts";
 import type { FromHelper, FromTicker, FromWorker, Loaded, Replay, TickerOptions, TickerStart, TickReport, ToWorker, VoiceOptions } from "./messages.ts";
 import { encodePng } from "./png.ts";
@@ -75,6 +76,9 @@ function postTick(record: Uint8Array): void {
   }
 }
 
+/** Where the main thread's answers to relays' asks go (`rtcOfPage`). */
+let rtcReplies: ((msg: Extract<ToWorker, { type: "rtc-reply" }>) => void) | null = null;
+
 /** The program's connections: one set for the page, which a reload to another program closes.
  * Its server is in `net.json` beside the running build. */
 const net = new Net(
@@ -83,7 +87,38 @@ const net = new Net(
     console.warn(`wrela: ${line}`);
     hostLine?.(line);
   },
+  // A browser that can't hand a data channel to a worker gives no relay.
+  typeof RTCDataChannel === "function" ? rtcOfPage() : null,
 );
+
+/** The page's WebRTC, on the main thread: each ask a message, each answer a reply. */
+function rtcOfPage(): Rtc {
+  let next = 1;
+  const asked = new Map<number, { resolve: (r: { sdp: string | null; channel: RTCDataChannel | null }) => void; reject: (e: Error) => void }>();
+  rtcReplies = (msg) => {
+    const waiting = asked.get(msg.id);
+    if (waiting === undefined) return;
+    asked.delete(msg.id);
+    if (msg.error === null) waiting.resolve(msg);
+    else waiting.reject(new Error(msg.error));
+  };
+  const ask = (a: RtcAsk) => {
+    const id = next++;
+    return new Promise<{ sdp: string | null; channel: RTCDataChannel | null }>((resolve, reject) => {
+      asked.set(id, { resolve, reject });
+      self.postMessage({ type: "rtc", id, ask: a } satisfies FromWorker);
+    });
+  };
+  return {
+    answer: (relay, sdp) => ask({ op: "answer", relay, sdp }).then((r) => r.sdp ?? ""),
+    connected: (relay) => ask({ op: "connected", relay }).then(() => {}),
+    channel: (relay, id) => ask({ op: "channel", relay, id }).then((r) => {
+      if (r.channel === null) throw new Error("the page gave no channel");
+      return r.channel as unknown as Channel;
+    }),
+    close: (relay) => void ask({ op: "close", relay }).catch(() => {}),
+  };
+}
 
 /** The running program has no ticker: neither ring keeps what it hasn't read. */
 function detachTicker(): void {
@@ -1088,6 +1123,9 @@ function receive(msg: ToWorker, reply: (message: FromTicker | FromHelper) => voi
     }
     case "file":
       handed.give(msg.url, msg.bytes);
+      return;
+    case "rtc-reply":
+      rtcReplies?.(msg);
       return;
     case "host-reply": {
       const waiting = hostRequests.get(msg.id);

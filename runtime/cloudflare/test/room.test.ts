@@ -30,16 +30,20 @@ function program(trap = false): WebAssembly.Module {
   return new WebAssembly.Module(buildModule({ imports: [INPUT], memory: 1, ownMemory: true, funcs: [{ type: SERVE, body: [...read, ...check], export: "serve" }] }));
 }
 
-test("a peer's text message, or one past MAX_UP, closes its connection", async () => {
+test("a peer's message past MAX_UP closes its connection; its text is about its relay", async () => {
   const room = new Room(program(), storage(), store, []);
   const a = new FakeSocket();
   const b = new FakeSocket();
   room.connect(a);
   room.connect(b);
-  room.message(a, "text");
+  room.message(a, '{"relay":"join"}');
+  room.message(a, "not a relay's");
   room.message(b, new ArrayBuffer(MAX_UP + 1));
   await room.wake();
-  expect([a.closed, b.closed]).toEqual([1003, 1009]);
+  await room.settled;
+  expect([a.closed, b.closed]).toEqual([null, 1009]);
+  // A room with no SFU app has no relay.
+  expect(a.texts).toEqual([{ relay: "closed", why: "this server has no relay" }]);
   expect(a.attachment).toEqual({ conn: 1, tag: 0 });
   expect(b.attachment).toEqual({ conn: 2, tag: 0 });
 });

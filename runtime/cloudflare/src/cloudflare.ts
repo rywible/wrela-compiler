@@ -79,6 +79,10 @@ export interface Env {
   WRELA_LIMITS?: string;
   /** "1": the program's printed lines go to the Worker's log. */
   WRELA_PRINT?: string;
+  /** The Realtime SFU app rooms' relays go through (`std::net::relay`), and its token, a secret
+   * (`wrangler secret put WRELA_SFU_TOKEN`). Without both, a relay is refused. */
+  WRELA_SFU_APP?: string;
+  WRELA_SFU_TOKEN?: string;
   /** The rate limits' bindings, by name. */
   [binding: string]: unknown;
 }
@@ -391,8 +395,12 @@ export function roomClass(module: WebAssembly.Module) {
     constructor(ctx: DurableObjectState, env: Env) {
       super(ctx, env);
       const server = env.WRELA_SERVER.getByName(SERVER_OBJECT);
+      const sfu = typeof env.WRELA_SFU_APP === "string" && typeof env.WRELA_SFU_TOKEN === "string" && env.WRELA_SFU_APP !== "" && env.WRELA_SFU_TOKEN !== ""
+        ? { app: env.WRELA_SFU_APP, token: env.WRELA_SFU_TOKEN }
+        : null;
       this.room = new Room(module, ctx.storage, server, ctx.getWebSockets(), {
         pair,
+        sfu,
         log: (line) => console.error(line),
         ...(env.WRELA_PRINT === "1" ? { print: (line: string) => console.log(line) } : {}),
       });
