@@ -3,6 +3,13 @@
 Each release's changes a program or a tool can see. The pull request of each release holds the
 detail; `docs/release.md` says how a release is cut.
 
+## Unreleased
+
+- **`std::net::room()`** (language.md §19.2): a room's own name, as its peers open it
+  (`/room/<name>`), so a room can keep what must outlive its build's journal in the store under
+  it. Cloudflare's room object keeps the name it was opened by; `wrela-serve` names each room it
+  starts (`net/room`).
+
 ## 0.18.0
 
 - **A server runs as named instances** (language.md §19.5, `std::server`): one `WrelaServer`

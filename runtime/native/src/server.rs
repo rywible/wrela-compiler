@@ -166,6 +166,8 @@ struct RoomState {
     commands: Vec<Net>,
     command_bytes: usize,
     command_cap: usize,
+    /// The room's name (`std::net::room`), answered at once; none, and the request fails.
+    name: Option<String>,
 }
 
 /// A room's network command (`std::net`): what the host does with a call's, once it
@@ -187,6 +189,9 @@ pub enum Net {
     /// are kept (`store/write`, [`crate::services`]).
     Write(Vec<u8>),
 }
+
+/// The service that answers a room's own name (`std::net::room`).
+pub const SERVICE_ROOM: &str = "net/room";
 
 /// A network command from a host request's service and body, if it's one.
 fn net_command(service: &str, body: &[u8]) -> Option<Result<Net, String>> {
@@ -274,7 +279,18 @@ impl Room {
         limits: Limits,
         answers: Option<Answers>,
     ) -> Result<Room, Failure> {
+        Room::start_named(build, limits, answers, None)
+    }
+
+    /// Starts room `name` of `build`, as [`Room::start`]: `std::net::room` answers `name`.
+    pub fn start_named(
+        build: &ServerBuild,
+        limits: Limits,
+        answers: Option<Answers>,
+        name: Option<&str>,
+    ) -> Result<Room, Failure> {
         let state = RoomState {
+            name: name.map(str::to_string),
             limit: limits.memory,
             denied: false,
             answers,
@@ -470,6 +486,15 @@ fn linker() -> wasmtime::Result<Linker<RoomState>> {
                         if service == wrela_abi::http::SERVICE_ME {
                             let name = wrela_abi::http::SERVER_INSTANCE.as_bytes().to_vec();
                             s.answered.insert(request, Ok(name));
+                            continue;
+                        }
+                        // Its own name, which the host knows: answered at once too.
+                        if service == SERVICE_ROOM {
+                            let name = match &s.name {
+                                Some(n) => Ok(n.as_bytes().to_vec()),
+                                None => Err("this room has no name".to_string()),
+                            };
+                            s.answered.insert(request, name);
                             continue;
                         }
                         let answer = match &s.answers {

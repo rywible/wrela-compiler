@@ -399,7 +399,8 @@ export function roomClass(module: WebAssembly.Module) {
     }
 
     /** A peer's upgrade, which `rooms` checked. */
-    async fetch(_request: Request): Promise<Response> {
+    async fetch(request: Request): Promise<Response> {
+      this.room.named(new URL(request.url).pathname.slice("/room/".length));
       const pair = new WebSocketPair();
       const [client, server] = [pair[0], pair[1]];
       this.ctx.acceptWebSocket(server);

@@ -1753,6 +1753,7 @@ var RETRIES = 3;
 var CONN_IN = 1 << 20;
 var RETRY_MS = 250;
 var UNREAD = "`serve` returned without reading all its events";
+var SERVICE_ROOM = "net/room";
 var attached = (socket) => socket.deserializeAttachment();
 function shut(socket, code, why) {
   try {
@@ -1780,6 +1781,7 @@ class Room {
   quarantined;
   replaced;
   lastConn;
+  name;
   origin;
   lastClock = 0;
   running = Promise.resolve();
@@ -1802,6 +1804,8 @@ class Room {
       sql.exec("INSERT INTO meta (key, value) VALUES ('origin', ?)", this.origin);
     const q = meta.get("quarantined");
     this.quarantined = typeof q === "string" ? q : null;
+    const named = meta.get("name");
+    this.name = typeof named === "string" ? named : null;
     const last = meta.get("conn");
     this.lastConn = typeof last === "number" ? last : JOURNAL;
     const pair = options.pair !== undefined ? options.pair : pairOf(module);
@@ -1830,6 +1834,12 @@ class Room {
     this.lastConn = this.lastConn + 1 >= POISONED ? 1 : this.lastConn + 1;
     this.storage.sql.exec("INSERT OR REPLACE INTO meta (key, value) VALUES ('conn', ?)", this.lastConn);
     return this.lastConn;
+  }
+  named(name) {
+    if (this.name === name)
+      return;
+    this.name = name;
+    this.storage.sql.exec("INSERT OR REPLACE INTO meta (key, value) VALUES ('name', ?)", name);
   }
   connect(socket) {
     if (this.replaced || this.quarantined !== null) {
@@ -2187,6 +2197,9 @@ class Room {
       case SERVICE_ME:
         self.answered.set(id, new TextEncoder().encode(SERVER_INSTANCE));
         return;
+      case SERVICE_ROOM:
+        self.answered.set(id, this.name === null ? null : new TextEncoder().encode(this.name));
+        return;
       case SERVICE_DISPATCH:
       case SERVICE_CALL:
       case SERVICE_REPLY:
@@ -2450,7 +2463,8 @@ function roomClass(module) {
         ...env.WRELA_PRINT === "1" ? { print: (line) => console.log(line) } : {}
       });
     }
-    async fetch(_request) {
+    async fetch(request) {
+      this.room.named(new URL(request.url).pathname.slice("/room/".length));
       const pair = new WebSocketPair;
       const [client, server] = [pair[0], pair[1]];
       this.ctx.acceptWebSocket(server);

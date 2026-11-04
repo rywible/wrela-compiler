@@ -20,7 +20,7 @@
 //   A room is rebuilt from its records (`Room::replay`), and the reducer is deterministic
 //   (`Reduce`, checked as `@deterministic` code is), so it's rebuilt exactly.
 
-use std::host::request
+use std::host::{flush_commands, request}
 use std::input::{Event, events, payload}
 use std::pack::{Budget, Pack, pack, unpack, unpack_within}
 
@@ -1583,6 +1583,18 @@ pub fn keep(record: [u8]) {
 @server
 pub fn compact(snapshot: [u8]) {
     let _ = request("net/compact", snapshot)
+}
+
+/// The room's own name, as its peers open it (`/room/<name>`): what a room keeps in the store
+/// under, so what lasts past its build's journal finds it again. The host answers at once.
+@server
+pub fn room() -> String {
+    var asked = request("net/room", [u8(0); 0])
+    flush_commands()
+    match asked.poll() {
+        Some(Ok(b)) => String::from_utf8(take b).expect("a room's name is UTF-8"),
+        _ => panic("`room`: this host doesn't name its rooms"),
+    }
 }
 
 /// Opens connection `conn` (a number not open) to room `room` of the program's server: 1 to 64 of

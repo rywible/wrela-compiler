@@ -703,3 +703,44 @@ fn a_room_that_keeps_nothing_leaves_no_journal() {
     drop(room);
     assert!(!dir.join("a.journal").exists());
 }
+
+/// A room that tells each connection that opens its own name (`std::net::room`).
+const NAMED: &str = r#"
+use std::input::{Event, events}
+use std::net::{room, send}
+
+pub fn serve(time: f32) {
+    for e in events() {
+        match e {
+            Event::Connection { conn, open, .. } => {
+                if open {
+                    let name = room()
+                    send(conn, name.as_bytes())
+                }
+            },
+            _ => {},
+        }
+    }
+}
+"#;
+
+#[test]
+fn a_room_reads_its_own_name() {
+    let wasm = server_wasm("rooms-named", NAMED);
+    let build = std::sync::Arc::new(ServerBuild::from_wasm(&wasm).expect("a server build"));
+    let dir = crate::scratch_root().join("rooms-named-dir");
+    let _ = std::fs::remove_dir_all(&dir);
+    let hash = wrela_abi::ticks::wasm_hash(&wasm);
+    let mut room = RoomHost::open(build, hash, &dir, "isle-7", limits(), None).expect("open");
+    room.connect(1);
+    room.wake(0.1).expect("wake");
+    let sent: Vec<_> = room
+        .take_outbox()
+        .into_iter()
+        .filter_map(|o| match o {
+            Out::Send(1, b) => Some(b),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(sent, vec![b"isle-7".to_vec()]);
+}
