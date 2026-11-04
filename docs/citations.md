@@ -66,6 +66,7 @@ Each is used as facts or as a method; no code was copied.
 | W3C Web Authentication Level 3; RFC 8949 (CBOR), RFC 9053 (COSE keys), RFC 4648 (base64url) | W3C and IETF | Passkeys: the browser host's `passkey/create` and `passkey/get`, and `std::webauthn`'s checks of an authenticator's answer (§7, without attestation) |
 | RFC 1950 (Adler-32) | IETF | The browser host's PNG writer (`runtime/browser/src/png.ts`) |
 | RFC 1950 (zlib) and RFC 1951 (deflate); Mark Adler's `puff` (zlib's `contrib/puff`) | IETF; zlib licence, read as a description | `std::zlib`'s inflate: the formats from the RFCs, and `puff`'s method (each canonical code held as its counts a length and its symbols in order, read a bit at a time); written afresh, no code copied |
+| E. Lengyel, *Foundations of Game Engine Development*, vol. 1: Mathematics (2016), §1.7.5 | Published method | `std::transform::inverse`: a 4 × 4 inverse from cross products of the columns' upper three rows |
 | W3C [PNG Specification, Third Edition](https://www.w3.org/TR/png-3/) | W3C | `std::png`: the chunks, the colour types and bit depths, the filters and Paeth's predictor, Adam7, `tRNS` |
 | gitignore(5) | Git documentation | `wrela suite allow` reads a workspace's `.gitignore` files as git does |
 | Pillow's Lanczos3 resize and `thumbnail` size rule | HPND; read as a description | `std::tool::image`'s resize and `image::fit`; the test computes its reference from the Lanczos formula itself |
