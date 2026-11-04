@@ -735,10 +735,20 @@ pub fn open_device_with(
 }
 
 fn require_hardware(name: &str, kind: wgpu::DeviceType) -> Result<()> {
-    if matches!(kind, wgpu::DeviceType::IntegratedGpu | wgpu::DeviceType::DiscreteGpu) {
-        Ok(())
-    } else {
-        Err(Error::Gpu(format!("hardware GPU required; {name} reports {kind:?}")))
+    admits(name, kind, crate::software_allowed())
+}
+
+/// Whether an adapter of `kind` may run a build: a hardware GPU always, a software one
+/// (`Cpu`) only where `software` allows it, and a virtual or unknown one never.
+fn admits(name: &str, kind: wgpu::DeviceType, software: bool) -> Result<()> {
+    match kind {
+        wgpu::DeviceType::IntegratedGpu | wgpu::DeviceType::DiscreteGpu => Ok(()),
+        wgpu::DeviceType::Cpu if software => Ok(()),
+        wgpu::DeviceType::Cpu => Err(Error::Gpu(format!(
+            "hardware GPU required; {name} reports {kind:?} (set {}=1 to run on it: its timings are a CPU's)",
+            crate::ALLOW_SOFTWARE
+        ))),
+        _ => Err(Error::Gpu(format!("hardware GPU required; {name} reports {kind:?}"))),
     }
 }
 
@@ -2927,14 +2937,26 @@ mod tests {
     #[test]
     fn hardware_rendering_rejects_software_virtual_and_unknown_adapters() {
         for kind in [wgpu::DeviceType::Cpu, wgpu::DeviceType::VirtualGpu, wgpu::DeviceType::Other] {
-            let error = require_hardware("test adapter", kind).unwrap_err().to_string();
+            let error = admits("test adapter", kind, false).unwrap_err().to_string();
             assert!(
                 error.contains("hardware GPU required") && error.contains("test adapter"),
                 "{error}"
             );
         }
         for kind in [wgpu::DeviceType::IntegratedGpu, wgpu::DeviceType::DiscreteGpu] {
-            assert!(require_hardware("hardware", kind).is_ok());
+            assert!(admits("hardware", kind, false).is_ok());
+            assert!(admits("hardware", kind, true).is_ok());
+        }
+    }
+
+    #[test]
+    fn a_software_adapter_runs_only_when_allowed() {
+        let refused = admits("llvmpipe", wgpu::DeviceType::Cpu, false).unwrap_err().to_string();
+        assert!(refused.contains("WRELA_ALLOW_SOFTWARE=1"), "{refused}");
+        assert!(admits("llvmpipe", wgpu::DeviceType::Cpu, true).is_ok());
+        // Allowing software never admits a virtual or unknown adapter.
+        for kind in [wgpu::DeviceType::VirtualGpu, wgpu::DeviceType::Other] {
+            assert!(admits("other", kind, true).is_err());
         }
     }
 

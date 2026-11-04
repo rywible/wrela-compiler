@@ -64,6 +64,9 @@ pub(crate) const OBSERVE: &str = r#"(async (q) => {
   return null;
 })"#;
 
+/// What [`ADAPTER`] says of a page whose only adapter is WebGPU's fallback.
+pub(crate) const SOFTWARE_ONLY: &str = "WebGPU offers only a software adapter";
+
 /// Whether the page offers a hardware WebGPU adapter: `""`, or why not.
 pub(crate) const ADAPTER: &str = r#"(async () => {
   if (!navigator.gpu) return "the page has no WebGPU";

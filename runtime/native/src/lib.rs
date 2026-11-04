@@ -27,6 +27,17 @@ mod confined;
 mod error;
 #[cfg(feature = "gpu")]
 mod gpu;
+
+/// The variable that admits a software adapter (`WRELA_ALLOW_SOFTWARE=1`): a GPU on the CPU, such
+/// as Mesa's lavapipe or SwiftShader, for a machine with no GPU (a cloud VM an agent works on).
+/// The native host opens one, and a Chrome run it starts is given test mode's `software=1`. Its
+/// timings are a CPU's: a profile's `adapter` names its device type (`Cpu`).
+pub const ALLOW_SOFTWARE: &str = "WRELA_ALLOW_SOFTWARE";
+
+/// Whether this process may run on a software adapter ([`ALLOW_SOFTWARE`] is `1`).
+pub fn software_allowed() -> bool {
+    std::env::var(ALLOW_SOFTWARE).is_ok_and(|v| v == "1")
+}
 #[cfg(feature = "gpu")]
 mod handover;
 #[cfg(feature = "gpu")]

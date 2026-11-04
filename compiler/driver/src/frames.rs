@@ -535,6 +535,10 @@ fn against_chrome(
         }
         fragment.push_str(&format!("&features={keep}"));
     }
+    // A software adapter, where the native host was allowed one (`WRELA_ALLOW_SOFTWARE`).
+    if wrela_host::software_allowed() {
+        fragment.push_str("&software=1");
+    }
     let timeout = std::time::Duration::from_secs_f64((f64::from(frames) / FPS * 3.0).max(120.0));
     // The build's directory alone is served: it is the page.
     wrela_host::pages::run(wrela_host::pages::Page {
