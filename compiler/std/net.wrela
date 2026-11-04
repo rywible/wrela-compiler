@@ -1607,6 +1607,26 @@ pub fn open(conn: u32, room: str) {
     let _ = request("net/open", body)
 }
 
+/// The most bytes a relay message carries (`relay`): one network packet's worth, so none is split.
+pub const MAX_RELAY: u32 = 1024
+
+/// Opens connection `conn` (a number not open) as the relay of the room that connection `via` is
+/// open to: a lossy, unordered channel to the room's other peers that doesn't pass through the
+/// room. What `send` puts on it reaches each other peer on the room's relay at most once, in any
+/// order, or not at all, and is never sent again; it is at most `MAX_RELAY` bytes (a longer one
+/// closes the relay). What arrives is the sender's tag (`tag`, a `u32`, little-endian), then its
+/// bytes. Only a connection the room has tagged may join; the room never sees what the relay
+/// carries. It gives one `Connection` event when it is open, and exactly one when it is closed,
+/// whatever closes it, `via` closing included. On Cloudflare a relay goes through Realtime SFU
+/// (language.md §19.6), so no peer learns another's address.
+@client
+pub fn relay(conn: u32, via: u32) {
+    var body: Vec<u8> = Vec::with_capacity(8)
+    word(mut body, conn)
+    word(mut body, via)
+    let _ = request("net/relay", body)
+}
+
 /// Sends `bytes` on connection `conn`: on a server, once the call's records are kept. Bytes for a
 /// connection that has closed go nowhere.
 pub fn send(conn: u32, bytes: [u8]) {

@@ -10,6 +10,7 @@ import { Semantics } from "./semantics.ts";
 import { listen, pollPads } from "./listen.ts";
 import { type FromVoice, type FromWorker, type ToWorker, VOICE_PROCESSOR, type VoiceOptions } from "./messages.ts";
 import { BrowserPlatform } from "./platform.ts";
+import { RtcHost } from "./rtc-host.ts";
 import { asksForTest, loaded, mayTest, parseTestParams, putResult, sleepUntil, type TestParams } from "./testmode.ts";
 
 let shown = false;
@@ -357,6 +358,8 @@ function start(): void {
       on => worker.postMessage({ type: "see-through", on } satisfies ToWorker),
     );
     platform.onUnderlaid = muteVoice;
+    // The page's WebRTC, for the program's relays (`std::net::relay`).
+    const rtc = new RtcHost();
     const clip = new Clip();
     let maxScreen = Infinity;
     // The render worker's threads (the ticker's, the helpers): started here, since a worker
@@ -392,6 +395,15 @@ function start(): void {
       } else if (msg.type === "screen-limit") {
         maxScreen = msg.max;
         Object.assign(sized, fitSize(sized.width, sized.height, maxScreen));
+      } else if (msg.type === "rtc") {
+        rtc.ask(msg.ask).then(
+          (r) => {
+            const channel = typeof r === "object" && r !== null ? r : null;
+            const reply = { type: "rtc-reply", id: msg.id, sdp: typeof r === "string" ? r : null, channel, error: null } satisfies ToWorker;
+            worker.postMessage(reply, channel === null ? [] : [channel as unknown as Transferable]);
+          },
+          (error) => worker.postMessage({ type: "rtc-reply", id: msg.id, sdp: null, channel: null, error: errorMessage(error) } satisfies ToWorker),
+        );
       } else if (msg.type === "host-request") {
         platform.request(msg.service, msg.bytes).then(
           bytes => worker.postMessage({ type: "host-reply", id: msg.id, bytes, error: null } satisfies ToWorker),

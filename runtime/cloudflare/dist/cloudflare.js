@@ -242,6 +242,46 @@ class InputRing {
   }
 }
 
+// ../browser/src/relay.ts
+var RELAY_PENDING = 64 * 1024;
+var RELAY_CHANNEL = "relay";
+var channelId = (x) => Number.isInteger(x) && x >= 0 && x < 65535;
+var tagOf = (x) => Number.isInteger(x) && x > 0 && x < 2 ** 32;
+var relayOf = (x) => Number.isInteger(x) && x >= 0 && x < 2 ** 32;
+function parseControl(text) {
+  let v;
+  try {
+    v = JSON.parse(text);
+  } catch {
+    return null;
+  }
+  if (typeof v !== "object" || v === null)
+    return null;
+  const m = v;
+  if (!relayOf(m["n"]))
+    return null;
+  const n = m["n"];
+  switch (m["relay"]) {
+    case "join":
+    case "ready":
+    case "leave":
+      return { relay: m["relay"], n };
+    case "answer":
+    case "offer":
+      return typeof m["sdp"] === "string" ? { relay: m["relay"], n, sdp: m["sdp"] } : null;
+    case "publish":
+      return channelId(m["id"]) ? { relay: "publish", n, id: m["id"] } : null;
+    case "peer":
+      return channelId(m["id"]) && tagOf(m["peer"]) ? { relay: "peer", n, peer: m["peer"], id: m["id"] } : null;
+    case "gone":
+      return tagOf(m["peer"]) ? { relay: "gone", n, peer: m["peer"] } : null;
+    case "closed":
+      return typeof m["why"] === "string" ? { relay: "closed", n, why: m["why"] } : null;
+    default:
+      return null;
+  }
+}
+
 // ../browser/src/net.ts
 var MAX_FRAME = 64 * 1024;
 var MAX_UP = MAX_FRAME - 64;
@@ -1747,6 +1787,220 @@ class Server {
   }
 }
 
+// src/relay.ts
+var MAX_RELAY_PEERS = 8;
+var STALL_MS = 30000;
+var JOINS = 4;
+var MAX_QUEUED = 16;
+var SFU_API = "https://rtc.live.cloudflare.com/v1/apps";
+var policy = { dataChannelName: RELAY_CHANNEL, ordered: false, maxRetransmits: 0 };
+var message = (e) => e instanceof Error ? e.message : String(e);
+
+class Relay {
+  room;
+  sfu;
+  now;
+  #running = Promise.resolve();
+  #queued = new Map;
+  #joins = new Map;
+  constructor(room, sfu, now = Date.now) {
+    this.room = room;
+    this.sfu = sfu;
+    this.now = now;
+  }
+  get settled() {
+    return this.#running;
+  }
+  message(conn, text) {
+    const control = parseControl(text);
+    if (control === null)
+      return true;
+    const queued = (this.#queued.get(conn) ?? 0) + 1;
+    if (queued > MAX_QUEUED)
+      return false;
+    this.#queued.set(conn, queued);
+    this.#then(async () => {
+      const left = (this.#queued.get(conn) ?? 1) - 1;
+      if (left > 0)
+        this.#queued.set(conn, left);
+      else
+        this.#queued.delete(conn);
+      await this.#take(conn, control);
+    });
+    return true;
+  }
+  closed(conn, peer, tell = false) {
+    if (!tell) {
+      this.#queued.delete(conn);
+      this.#joins.delete(conn);
+    }
+    if (peer?.relay == null)
+      return;
+    const gone = { ...peer, relay: peer.relay };
+    this.#then(() => this.#leave(gone, tell));
+  }
+  #then(work) {
+    this.#running = this.#running.then(work).catch((e) => this.room.log(`wrela: a room's relay: ${message(e)}`));
+  }
+  async#take(conn, control) {
+    const peer = this.room.peer(conn);
+    if (peer === null)
+      return;
+    if (control.relay !== "join" && peer.relay?.n !== control.n)
+      return;
+    try {
+      switch (control.relay) {
+        case "join":
+          return await this.#join(peer, control.n);
+        case "answer":
+          if (peer.relay?.stage !== "offered")
+            return;
+          await this.#api("PUT", `/sessions/${peer.relay.session}/renegotiate`, { sessionDescription: { type: "answer", sdp: control.sdp } });
+          return this.#keep(conn, { ...peer.relay, stage: "answered" });
+        case "ready":
+          if (peer.relay?.stage !== "answered")
+            return;
+          return await this.#live(peer, peer.relay);
+        case "leave":
+          if (peer.relay !== null)
+            await this.#leave({ ...peer, relay: peer.relay }, false);
+          return;
+        default:
+          return;
+      }
+    } catch (e) {
+      this.room.log(`wrela: a room's relay: ${message(e)}`);
+      const now = this.room.peer(conn);
+      if (now?.relay != null && now.relay.n === control.n)
+        await this.#leave({ ...now, relay: now.relay }, false).catch(() => {});
+      if (now !== null)
+        this.room.text(conn, { relay: "closed", n: control.n, why: "the relay couldn't be reached" });
+    }
+  }
+  #keep(conn, relay) {
+    const now = this.room.peer(conn);
+    if (now !== null && now.relay?.n === relay.n && now.relay.session === relay.session)
+      this.room.keep(conn, relay);
+  }
+  async#join(peer, n) {
+    const refuse = (why) => this.room.text(peer.conn, { relay: "closed", n, why });
+    if (peer.relay !== null)
+      await this.#leave({ ...peer, relay: peer.relay }, false);
+    if (this.sfu === null)
+      return refuse("this server has no relay");
+    if (peer.tag === 0)
+      return refuse("the room hasn't let this connection in");
+    const at = this.now();
+    const recent = (this.#joins.get(peer.conn) ?? []).filter((t) => at - t < 60000);
+    if (recent.length >= JOINS)
+      return refuse(`this connection joined the relay ${JOINS} times this minute`);
+    this.#joins.set(peer.conn, [...recent, at]);
+    for (const o of this.room.peers()) {
+      if (o.conn === peer.conn || o.relay === null)
+        continue;
+      if (o.tag === peer.tag || o.relay.stage !== "live" && at - o.relay.since >= STALL_MS)
+        await this.#leave({ ...o, relay: o.relay }, true);
+    }
+    if (this.room.peers().filter((p) => p.conn !== peer.conn && p.relay !== null).length >= MAX_RELAY_PEERS) {
+      return refuse(`the room's relay is full (${MAX_RELAY_PEERS})`);
+    }
+    const made = await this.#api("POST", "/sessions/new", undefined);
+    const session = made["sessionId"];
+    if (typeof session !== "string")
+      throw new Error("the SFU gave no session");
+    const established = await this.#api("POST", `/sessions/${session}/datachannels/establish`, {
+      dataChannel: { location: "remote", dataChannelName: "server-events" }
+    });
+    const sdp = established["sessionDescription"]?.sdp;
+    if (typeof sdp !== "string")
+      throw new Error("the SFU gave no offer");
+    const now = this.room.peer(peer.conn);
+    if (now === null)
+      return;
+    if (now.relay !== null || now.tag !== peer.tag)
+      return refuse("the connection changed while it joined");
+    this.room.keep(peer.conn, { n, session, stage: "offered", since: at, publish: null, peers: {} });
+    this.room.text(peer.conn, { relay: "offer", n, sdp });
+  }
+  async#live(peer, relay) {
+    const [mine] = await this.#channels(relay.session, [{ location: "local", ...policy }]);
+    const state = { ...relay, stage: "live", publish: mine };
+    this.#keep(peer.conn, state);
+    this.room.text(peer.conn, { relay: "publish", n: relay.n, id: mine });
+    const others = this.room.peers().filter((p) => p.conn !== peer.conn && p.relay?.stage === "live");
+    if (others.length === 0)
+      return;
+    const heard = await this.#channels(relay.session, others.map((o) => ({ location: "remote", sessionId: o.relay.session, ...policy })));
+    const still = this.room.peer(peer.conn);
+    if (still?.relay?.n !== relay.n || still.relay.session !== relay.session)
+      return;
+    others.forEach((o, i) => {
+      state.peers[String(o.tag)] = { id: heard[i], session: o.relay.session };
+      this.room.text(peer.conn, { relay: "peer", n: relay.n, peer: o.tag, id: heard[i] });
+    });
+    this.#keep(peer.conn, state);
+    for (const o of others) {
+      const [id] = await this.#channels(o.relay.session, [{ location: "remote", sessionId: relay.session, ...policy }]);
+      const now = this.room.peer(o.conn);
+      if (now?.relay == null || now.relay.session !== o.relay.session)
+        continue;
+      const old = now.relay.peers[String(peer.tag)];
+      if (old !== undefined)
+        await this.#close(now.relay.session, old.id);
+      this.room.keep(o.conn, { ...now.relay, peers: { ...now.relay.peers, [String(peer.tag)]: { id, session: relay.session } } });
+      this.room.text(o.conn, { relay: "peer", n: now.relay.n, peer: peer.tag, id });
+    }
+  }
+  async#leave(peer, tell) {
+    const mine = peer.relay;
+    const now = this.room.peer(peer.conn);
+    if (now?.relay?.session === mine.session)
+      this.room.keep(peer.conn, null);
+    if (tell)
+      this.room.text(peer.conn, { relay: "closed", n: mine.n, why: "" });
+    for (const o of this.room.peers()) {
+      const heard = o.relay?.peers[String(peer.tag)];
+      if (o.conn === peer.conn || o.relay == null || heard === undefined || heard.session !== mine.session)
+        continue;
+      const rest = { ...o.relay.peers };
+      delete rest[String(peer.tag)];
+      this.room.keep(o.conn, { ...o.relay, peers: rest });
+      this.room.text(o.conn, { relay: "gone", n: o.relay.n, peer: peer.tag });
+      await this.#close(o.relay.session, heard.id);
+    }
+    if (mine.publish !== null)
+      await this.#close(mine.session, mine.publish);
+  }
+  async#close(session, id) {
+    await this.#api("PUT", `/sessions/${session}/datachannels/close`, { dataChannels: [{ id }] }).catch(() => {});
+  }
+  async#channels(session, channels) {
+    const r = await this.#api("POST", `/sessions/${session}/datachannels/new`, { dataChannels: channels });
+    const got = r["dataChannels"];
+    if (!Array.isArray(got) || got.length !== channels.length)
+      throw new Error("the SFU gave the wrong channels");
+    return got.map((c) => {
+      if (c["errorCode"] !== undefined || typeof c["id"] !== "number")
+        throw new Error(`the SFU refused a channel: ${String(c["errorDescription"] ?? c["errorCode"])}`);
+      return c["id"];
+    });
+  }
+  async#api(method, path, body) {
+    const sfu = this.sfu;
+    const init = {
+      method,
+      headers: { authorization: `Bearer ${sfu.token}`, "content-type": "application/json" },
+      ...body === undefined ? {} : { body: JSON.stringify(body) }
+    };
+    const r = await (sfu.fetch ?? fetch)(`${SFU_API}/${sfu.app}${path}`, init);
+    const json = await r.json().catch(() => ({}));
+    if (!r.ok || json["errorCode"] !== undefined) {
+      throw new Error(`the SFU's ${path.replace(/\/sessions\/[^/]+/, "/sessions/…")}: ${r.status} ${String(json["errorDescription"] ?? "")}`.trim());
+    }
+    return json;
+  }
+}
+
 // src/room.ts
 var JOURNAL = 0;
 var RETRIES = 3;
@@ -1786,12 +2040,29 @@ class Room {
   lastClock = 0;
   running = Promise.resolve();
   now;
+  relay;
   constructor(module, storage, store, open, options = {}) {
     this.module = module;
     this.storage = storage;
     this.store = store;
     this.options = options;
     this.limits = options.limits ?? LIMITS;
+    this.relay = new Relay({
+      peer: (conn) => this.relayPeer(conn),
+      peers: () => [...this.sockets.keys()].map((c) => this.relayPeer(c)).filter((p) => p !== null),
+      text: (conn, control) => {
+        try {
+          this.sockets.get(conn)?.send(JSON.stringify(control));
+        } catch {}
+      },
+      keep: (conn, relay) => {
+        const socket = this.sockets.get(conn);
+        const a = socket === undefined ? null : attached(socket);
+        if (socket !== undefined && a !== null)
+          socket.serializeAttachment({ ...a, relay });
+      },
+      log: (line) => this.options.log?.(line)
+    }, options.sfu ?? null);
     this.print = options.print;
     this.now = options.now ?? Date.now;
     const sql = storage.sql;
@@ -1853,12 +2124,22 @@ class Room {
     this.incoming.push({ kind: "opened", conn });
     this.wake();
   }
+  relayPeer(conn) {
+    const socket = this.sockets.get(conn);
+    const a = socket === undefined ? null : attached(socket);
+    return a === null ? null : { conn, tag: a.tag, relay: a.relay ?? null };
+  }
   message(socket, data) {
     const conn = this.connOf(socket);
     if (conn === null)
       return;
-    if (typeof data === "string")
-      return this.cut(conn, 1003, "a room takes binary messages");
+    if (typeof data === "string") {
+      if (data.length > MAX_UP)
+        return this.cut(conn, 1009, `a message past ${MAX_UP} bytes`);
+      if (!this.relay.message(conn, data))
+        this.cut(conn, 1008, "more relay messages wait than may");
+      return;
+    }
     if (data.byteLength > MAX_UP)
       return this.cut(conn, 1009, `a message past ${MAX_UP} bytes`);
     const cost = data.byteLength + OVERHEAD;
@@ -1881,7 +2162,7 @@ class Room {
     return this.wake(true);
   }
   get settled() {
-    return this.running;
+    return Promise.all([this.running, this.relay.settled]).then(() => {});
   }
   wake(alarm = false) {
     this.running = this.running.then(() => this.wakeNow(alarm), () => this.wakeNow(alarm));
@@ -1892,8 +2173,10 @@ class Room {
     return conn !== undefined && this.sockets.get(conn) === socket ? conn : null;
   }
   disconnect(conn) {
+    const peer = this.relayPeer(conn);
     if (!this.sockets.delete(conn))
       return;
+    this.relay.closed(conn, peer);
     this.forget(conn);
     this.incoming.push({ kind: "closed", conn });
     this.wake();
@@ -1912,8 +2195,10 @@ class Room {
     this.incoming = [];
     this.waiting.clear();
     this.held = 0;
-    for (const socket of this.sockets.values())
+    for (const [conn, socket] of this.sockets) {
+      this.relay.closed(conn, this.relayPeer(conn));
       shut(socket, code, why);
+    }
     this.sockets.clear();
   }
   count(e, sign) {
@@ -2152,11 +2437,17 @@ class Room {
       if (conn === null || s === undefined)
         continue;
       try {
-        if (c.kind === "tag")
-          s.serializeAttachment({ conn: c.conn, tag: c.tag });
-        else if (c.kind === "send")
+        if (c.kind === "tag") {
+          const before = this.relayPeer(c.conn);
+          if (before?.relay != null && before.tag !== c.tag) {
+            this.relay.closed(c.conn, before, true);
+            s.serializeAttachment({ ...attached(s), conn: c.conn, tag: c.tag, relay: null });
+          } else
+            s.serializeAttachment({ ...attached(s), conn: c.conn, tag: c.tag });
+        } else if (c.kind === "send")
           s.send(c.bytes);
         else if (c.kind === "close") {
+          this.relay.closed(c.conn, this.relayPeer(c.conn));
           this.sockets.delete(c.conn);
           this.forget(c.conn);
           s.close(1000, "");
@@ -2457,8 +2748,10 @@ function roomClass(module) {
     constructor(ctx, env) {
       super(ctx, env);
       const server = env.WRELA_SERVER.getByName(SERVER_OBJECT);
+      const sfu = typeof env.WRELA_SFU_APP === "string" && typeof env.WRELA_SFU_TOKEN === "string" && env.WRELA_SFU_APP !== "" && env.WRELA_SFU_TOKEN !== "" ? { app: env.WRELA_SFU_APP, token: env.WRELA_SFU_TOKEN } : null;
       this.room = new Room(module, ctx.storage, server, ctx.getWebSockets(), {
         pair,
+        sfu,
         log: (line) => console.error(line),
         ...env.WRELA_PRINT === "1" ? { print: (line) => console.log(line) } : {}
       });

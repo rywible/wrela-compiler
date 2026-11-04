@@ -10,6 +10,7 @@
 import { EVENT_SIZE, EventKind, PAIR_SECTION, PAYLOAD_PER_CALL } from "./abi.gen.ts";
 import { errorMessage } from "./errors.ts";
 import { connectionEvent, isNetwork, messageEvent } from "./input.ts";
+import { type Channel, type Control, fromPeer, MAX_RELAY, parseControl, RELAY_PENDING, type Rtc } from "./relay.ts";
 
 /** The largest frame, in bytes: as the server host's (`wrela-serve`). */
 export const MAX_FRAME = 64 * 1024;
@@ -227,6 +228,24 @@ interface Session {
   writer: WritableStreamDefaultWriter<Uint8Array> | null;
   closed: boolean;
   pending: number;
+  /** The relay that goes by it (`std::net::relay`), if one does. */
+  relay: number | null;
+}
+
+/** A relay: the connection it goes by, the channel it sends on once the room gave it, and the
+ * channels it hears each other peer on. */
+interface RelaySession {
+  via: number;
+  /** Its number with the page's WebRTC, never given twice. */
+  rtc: number;
+  publish: Channel | null;
+  peers: Map<number, Channel>;
+  /** The channel id the room last gave for each peer: one that resolves after it's another
+   * (or the peer's gone) closes. */
+  wanted: Map<number, number>;
+  /** Whether the program heard it's open. */
+  opened: boolean;
+  closed: boolean;
 }
 
 /** The pair id in a session's path: 16 hex digits. */
@@ -254,6 +273,8 @@ const pendingOf = (s: Session) => (s.socket !== null ? s.socket.bufferedAmount :
  */
 export class Net {
   readonly #sessions = new Map<number, Session>();
+  readonly #relays = new Map<number, RelaySession>();
+  #nextRtc = 1;
   #server: { url: string; ready: Promise<Server> } | null = null;
   /** What arrived: a message's bytes, or a connection's opening or closing. */
   arrived: ({ conn: number; bytes: Uint8Array } | { conn: number; open: boolean })[] = [];
@@ -264,22 +285,29 @@ export class Net {
   constructor(
     readonly base: () => string,
     readonly print: (line: string) => void,
+    /** The page's WebRTC, for relays (none: a relay closes as it opens). */
+    readonly rtc: Rtc | null = null,
   ) {}
 
   /** Checks one export's commands without opening, sending or closing anything. A send can
    * close a connection at its byte limits, so later opens see that same planned lifetime. */
-  plan(): Pick<Net, "open" | "send" | "close"> {
-    const sessions = new Map<number, { open: boolean; writer: boolean; socket: boolean; pending: number }>();
+  plan(): Pick<Net, "open" | "send" | "close" | "relay"> {
+    const rtc = this.rtc !== null;
+    const sessions = new Map<number, { open: boolean; writer: boolean; socket: boolean; pending: number; relay: boolean }>();
     const state = (conn: number) => {
       let planned = sessions.get(conn);
       if (planned === undefined) {
         const session = this.#sessions.get(conn);
-        planned = {
-          open: session !== undefined && !session.closed,
-          writer: session?.writer != null || session?.socket?.readyState === WebSocket.OPEN,
-          socket: session?.socket != null,
-          pending: session === undefined ? 0 : pendingOf(session),
-        };
+        const relay = this.#relays.get(conn);
+        planned = relay !== undefined
+          ? { open: !relay.closed, writer: false, socket: false, pending: 0, relay: true }
+          : {
+              open: session !== undefined && !session.closed,
+              writer: session?.writer != null || session?.socket?.readyState === WebSocket.OPEN,
+              socket: session?.socket != null,
+              pending: session === undefined ? 0 : pendingOf(session),
+              relay: false,
+            };
         sessions.set(conn, planned);
       }
       return planned;
@@ -292,9 +320,25 @@ export class Net {
         session.writer = false;
         session.socket = false;
         session.pending = 0;
+        session.relay = false;
+      },
+      relay(conn, via) {
+        const session = state(conn);
+        if (session.open) throw new Error(`connection ${conn} is open`);
+        // A relay goes by a WebSocket the program heard is open, on a page with WebRTC.
+        const v = state(via);
+        session.open = v.open && v.socket && v.writer && rtc;
+        session.writer = false;
+        session.socket = false;
+        session.pending = 0;
+        session.relay = true;
       },
       send(conn, bytes) {
         const session = state(conn);
+        if (session.relay) {
+          if (bytes.length > MAX_RELAY) session.open = false;
+          return;
+        }
         if (!session.open || !session.writer) return;
         const cost = costOf(session.socket, bytes.length);
         if (bytes.length > MAX_UP || session.pending + cost > PENDING) session.open = false;
@@ -325,8 +369,8 @@ export class Net {
   /** Opens connection `conn` to room `room`, for the build of pair id `pair` (a build of none
    * can't join a room). A number already open is the program's mistake. */
   open(conn: number, room: string, pair: bigint | null): void {
-    if (this.#sessions.has(conn)) throw new Error(`connection ${conn} is open`);
-    const session: Session = { transport: null, socket: null, writer: null, closed: false, pending: 0 };
+    if (this.#sessions.has(conn) || this.#relays.has(conn)) throw new Error(`connection ${conn} is open`);
+    const session: Session = { transport: null, socket: null, writer: null, closed: false, pending: 0, relay: null };
     this.#sessions.set(conn, session);
     if (!roomName(room)) {
       this.print(`connection ${conn}: \`${room}\` isn't a room's name`);
@@ -390,6 +434,14 @@ export class Net {
     };
     socket.onmessage = (e: MessageEvent<unknown>) => {
       if (session.closed) return;
+      if (typeof e.data === "string") {
+        // The room's word about a relay: anything else from it is past what a room says.
+        const control = parseControl(e.data);
+        // About the relay that goes by it now, or about one that ended: then it's nothing.
+        if (control === null || session.relay === null || this.#relays.get(session.relay)?.rtc !== control.n) return;
+        this.#control(session.relay, control);
+        return;
+      }
       if (!(e.data instanceof ArrayBuffer) || e.data.byteLength > MAX_FRAME || this.#held + e.data.byteLength + OVERHEAD > HELD) {
         this.print(`connection ${conn}: a message that isn't a frame, or past what may wait for the program`);
         this.#end(conn, session);
@@ -407,6 +459,8 @@ export class Net {
    * program last heard). A message past MAX_UP closes it, and so does one past PENDING bytes
    * not yet written. */
   send(conn: number, bytes: Uint8Array): void {
+    const relay = this.#relays.get(conn);
+    if (relay !== undefined) return this.#relaySend(conn, relay, bytes);
     const session = this.#sessions.get(conn);
     if (session?.socket && !session.closed) {
       if (session.socket.readyState !== WebSocket.OPEN) return;
@@ -440,12 +494,15 @@ export class Net {
 
   /** Closes connection `conn`. */
   close(conn: number): void {
+    const relay = this.#relays.get(conn);
+    if (relay !== undefined) return this.#endRelay(conn, relay, true, "");
     const session = this.#sessions.get(conn);
     if (session) this.#end(conn, session);
   }
 
   /** Closes every connection, giving no events: the build changed, and its program goes. */
   closeAll(): void {
+    for (const [conn, relay] of [...this.#relays]) this.#endRelay(conn, relay, false, "");
     for (const [conn, session] of [...this.#sessions]) this.#end(conn, session, false);
     this.arrived = [];
     this.#held = 0;
@@ -456,12 +513,138 @@ export class Net {
     if (session.closed) return;
     session.closed = true;
     if (this.#sessions.get(conn) === session) this.#sessions.delete(conn);
+    if (session.relay !== null) {
+      const relay = this.#relays.get(session.relay);
+      if (relay !== undefined) this.#endRelay(session.relay, relay, tell, "");
+    }
     try {
       session.transport?.close();
       session.socket?.close(1000);
     } catch {
       // It's closed already.
     }
+    if (tell) this.arrived.push({ conn, open: false });
+  }
+
+  /** Opens connection `conn` as the relay of the room connection `via` is open to: on a
+   * WebSocket to the room (the Cloudflare host), through Realtime SFU, which the room's object
+   * speaks to for it. A relay of a connection that isn't open, of one with a relay already, or
+   * on a host with none, closes as it opens. */
+  relay(conn: number, via: number): void {
+    if (this.#sessions.has(conn) || this.#relays.has(conn)) throw new Error(`connection ${conn} is open`);
+    const relay: RelaySession = { via, rtc: this.#nextRtc++, publish: null, peers: new Map(), wanted: new Map(), opened: false, closed: false };
+    this.#relays.set(conn, relay);
+    const session = this.#sessions.get(via);
+    const why = session === undefined || session.closed
+      ? `connection ${via} isn't open`
+      : session.relay !== null
+        ? `connection ${via} has a relay already`
+        : session.socket === null && session.transport !== null
+          ? "this server has no relay"
+          : session.socket?.readyState !== WebSocket.OPEN
+            ? `connection ${via} isn't open yet`
+            : this.rtc === null
+              ? "this page can't make a relay (no WebRTC)"
+              : null;
+    if (why !== null) return this.#endRelay(conn, relay, true, `connection ${conn}: ${why}`);
+    session!.relay = conn;
+    this.#text(via, { relay: "join", n: relay.rtc });
+  }
+
+  /** Sends a control message on connection `via`'s WebSocket, if it's open. */
+  #text(via: number, control: Control): void {
+    const socket = this.#sessions.get(via)?.socket;
+    if (socket?.readyState === WebSocket.OPEN) socket.send(JSON.stringify(control));
+  }
+
+  /** What the room said about relay `conn`. */
+  #control(conn: number, control: Control): void {
+    const relay = this.#relays.get(conn);
+    if (relay === undefined || relay.closed) return;
+    const rtc = this.rtc!;
+    const fail = (e: unknown) => this.#endRelay(conn, relay, true, `connection ${conn}: ${errorMessage(e)}`);
+    switch (control.relay) {
+      case "offer":
+        void rtc.answer(relay.rtc, control.sdp).then((sdp) => {
+          if (relay.closed) return;
+          this.#text(relay.via, { relay: "answer", n: relay.rtc, sdp });
+          return rtc.connected(relay.rtc).then(() => {
+            if (!relay.closed) this.#text(relay.via, { relay: "ready", n: relay.rtc });
+          });
+        }).catch(fail);
+        return;
+      case "publish":
+        void rtc.channel(relay.rtc, control.id).then((channel) => {
+          if (relay.closed) return channel.close();
+          relay.publish = channel;
+          const opened = () => {
+            if (relay.closed || relay.opened) return;
+            relay.opened = true;
+            this.arrived.push({ conn, open: true });
+          };
+          channel.onopen = opened;
+          channel.onclose = () => this.#endRelay(conn, relay, true, "");
+          if (channel.readyState === "open") opened();
+        }).catch(fail);
+        return;
+      case "peer":
+        relay.wanted.set(control.peer, control.id);
+        void rtc.channel(relay.rtc, control.id).then((channel) => {
+          if (relay.closed || relay.wanted.get(control.peer) !== control.id) return channel.close();
+          relay.peers.get(control.peer)?.close();
+          relay.peers.set(control.peer, channel);
+          channel.binaryType = "arraybuffer";
+          channel.onmessage = (e) => {
+            // Until the program hears the relay is open, and past what may wait, it's dropped:
+            // a relay may lose any message.
+            if (relay.closed || !relay.opened || !(e.data instanceof ArrayBuffer) || e.data.byteLength > MAX_RELAY) return;
+            if (this.#held + e.data.byteLength + 4 + OVERHEAD > HELD) return;
+            const bytes = fromPeer(control.peer, new Uint8Array(e.data));
+            this.#held += bytes.length + OVERHEAD;
+            this.arrived.push({ conn, bytes });
+          };
+        }).catch(fail);
+        return;
+      case "gone":
+        relay.wanted.delete(control.peer);
+        relay.peers.get(control.peer)?.close();
+        relay.peers.delete(control.peer);
+        return;
+      case "closed":
+        return this.#endRelay(conn, relay, true, control.why === "" ? "" : `connection ${conn}: ${control.why}`);
+      default:
+        return;
+    }
+  }
+
+  /** A send on relay `conn`: past MAX_RELAY it closes; while it isn't open, or past what its
+   * channel holds unsent, it's dropped, as the network may drop it. */
+  #relaySend(conn: number, relay: RelaySession, bytes: Uint8Array): void {
+    if (relay.closed) return;
+    if (bytes.length > MAX_RELAY) {
+      return this.#endRelay(conn, relay, true, `connection ${conn}: a relay message of ${bytes.length} bytes, past ${MAX_RELAY}`);
+    }
+    const channel = relay.publish;
+    if (channel === null || channel.readyState !== "open" || channel.bufferedAmount + bytes.length > RELAY_PENDING) return;
+    channel.send(bytes.slice());
+  }
+
+  /** Ends a relay once: it leaves the room's relay, its WebRTC closes, and the program hears
+   * (if `tell`). */
+  #endRelay(conn: number, relay: RelaySession, tell: boolean, why: string): void {
+    if (relay.closed) return;
+    relay.closed = true;
+    if (this.#relays.get(conn) === relay) this.#relays.delete(conn);
+    if (why !== "") this.print(why);
+    const via = this.#sessions.get(relay.via);
+    if (via?.relay === conn) {
+      via.relay = null;
+      this.#text(relay.via, { relay: "leave", n: relay.rtc });
+    }
+    relay.publish?.close();
+    for (const c of relay.peers.values()) c.close();
+    relay.peers.clear();
+    this.rtc?.close(relay.rtc);
     if (tell) this.arrived.push({ conn, open: false });
   }
 

@@ -3,6 +3,18 @@
 Each release's changes a program or a tool can see. The pull request of each release holds the
 detail; `docs/release.md` says how a release is cut.
 
+## Unreleased
+
+- **A room's relay** (language.md §19.3, §19.6): `std::net::relay(conn, via)` (`@client`) opens
+  a lossy, unordered channel to the other peers of the room that connection `via` is open to,
+  which doesn't pass through the room: each message (at most `MAX_RELAY`, 1024 bytes) reaches
+  each other peer at most once, or not at all, as the sender's tag then its bytes. Only a
+  connection the room tagged may join. On Cloudflare it goes through Realtime SFU: the room's
+  object holds the app (`WRELA_SFU_APP`) and its secret token (`WRELA_SFU_TOKEN`) and speaks to
+  the SFU for its peers over text messages on their WebSockets, and the page's WebRTC, on the
+  main thread, hands each data channel to the render worker. A peer's text message no longer
+  closes its connection. `wrela-serve` has no relay yet.
+
 ## 0.19.0
 
 - **Textures baked when a program is built** (language.md §20.2): `std::png::decode` reads a

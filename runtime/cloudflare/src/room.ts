@@ -17,7 +17,8 @@
 //   in a row the room's peers are let go, to come back later.
 //
 // Each WebSocket binary message is one frame (no varint), at most `MAX_UP` bytes from a peer; a
-// text message, or a longer one, closes its connection. A connection with more than `CONN_IN`
+// longer one closes its connection. A text message is about the peer's relay (relay.ts), which the
+// room's object runs beside the program. A connection with more than `CONN_IN`
 // bytes waiting for the room is closed too, and so is one whose message would take what all wait
 // past `Limits.queued`. Past a turn (`Limits.turn`), the room goes on in its alarm.
 //
@@ -30,6 +31,7 @@ import { SERVER_INSTANCE, SERVICE_ACK, SERVICE_CALL, SERVICE_CALL_BUILD, SERVICE
 import { connectionEvent } from "../../browser/src/input.ts";
 import { Inbox, MAX_FRAME, MAX_UP, OVERHEAD, pairOf, pairParam, withinCall } from "../../browser/src/net.ts";
 import { blob, commonAnswer, Failure, Instance, LIMITS, type Limits, type Owner, POISONED, type Storage, writes } from "./host.ts";
+import { Relay, type RelayPeer, type RelayState, type SfuConfig } from "./relay.ts";
 
 /** The connection a room's journal comes from (`std::net::JOURNAL`). */
 export const JOURNAL = 0;
@@ -46,7 +48,7 @@ export const SERVICE_ROOM = "net/room";
 
 /** A WebSocket as the room uses it (the Hibernation API's: its attachment survives eviction). */
 export interface Socket {
-  send(bytes: Uint8Array): void;
+  send(bytes: Uint8Array | string): void;
   close(code?: number, reason?: string): void;
   serializeAttachment(value: unknown): void;
   deserializeAttachment(): unknown;
@@ -65,12 +67,16 @@ export interface RoomOptions {
   now?: () => number;
   print?: (line: string) => void;
   log?: (line: string) => void;
+  /** The Realtime SFU app its relay speaks to (none: a relay is refused). */
+  sfu?: SfuConfig | null;
 }
 
 /** What a socket's attachment holds: its connection, and the tag the program gave it. */
 interface Attached {
   conn: number;
   tag: number;
+  /** Its relay, once it joined (relay.ts). */
+  relay?: RelayState | null;
 }
 const attached = (socket: Socket) => socket.deserializeAttachment() as Attached | null;
 
@@ -129,6 +135,8 @@ export class Room implements Owner<Net> {
   private lastClock = 0;
   private running: Promise<void> = Promise.resolve();
   private readonly now: () => number;
+  /** Its peers' relay (`std::net::relay`). */
+  readonly relay: Relay;
 
   constructor(
     readonly module: WebAssembly.Module,
@@ -138,6 +146,26 @@ export class Room implements Owner<Net> {
     readonly options: RoomOptions = {},
   ) {
     this.limits = options.limits ?? LIMITS;
+    this.relay = new Relay(
+      {
+        peer: (conn) => this.relayPeer(conn),
+        peers: () => [...this.sockets.keys()].map((c) => this.relayPeer(c)!).filter((p) => p !== null),
+        text: (conn, control) => {
+          try {
+            this.sockets.get(conn)?.send(JSON.stringify(control));
+          } catch {
+            // It's closing: its close says the rest.
+          }
+        },
+        keep: (conn, relay) => {
+          const socket = this.sockets.get(conn);
+          const a = socket === undefined ? null : attached(socket);
+          if (socket !== undefined && a !== null) socket.serializeAttachment({ ...a, relay } satisfies Attached);
+        },
+        log: (line) => this.options.log?.(line),
+      },
+      options.sfu ?? null,
+    );
     this.print = options.print;
     this.now = options.now ?? Date.now;
     const sql = storage.sql;
@@ -204,11 +232,23 @@ export class Room implements Owner<Net> {
     this.wake();
   }
 
-  /** A message from `socket`: binary, at most `MAX_UP` bytes, or its connection closes. */
+  /** Connection `conn` as its relay sees it. */
+  private relayPeer(conn: number): RelayPeer | null {
+    const socket = this.sockets.get(conn);
+    const a = socket === undefined ? null : attached(socket);
+    return a === null ? null : { conn, tag: a.tag, relay: a.relay ?? null };
+  }
+
+  /** A message from `socket`: binary, at most `MAX_UP` bytes, or its connection closes; or text,
+   * about its relay. */
   message(socket: Socket, data: ArrayBuffer | string): void {
     const conn = this.connOf(socket);
     if (conn === null) return;
-    if (typeof data === "string") return this.cut(conn, 1003, "a room takes binary messages");
+    if (typeof data === "string") {
+      if (data.length > MAX_UP) return this.cut(conn, 1009, `a message past ${MAX_UP} bytes`);
+      if (!this.relay.message(conn, data)) this.cut(conn, 1008, "more relay messages wait than may");
+      return;
+    }
     if (data.byteLength > MAX_UP) return this.cut(conn, 1009, `a message past ${MAX_UP} bytes`);
     const cost = data.byteLength + OVERHEAD;
     const waiting = (this.waiting.get(conn) ?? 0) + cost;
@@ -233,7 +273,7 @@ export class Room implements Owner<Net> {
 
   /** Settles once the room has taken what it was given. */
   get settled(): Promise<void> {
-    return this.running;
+    return Promise.all([this.running, this.relay.settled]).then(() => {});
   }
 
   /** Whatever came, taken in order, one wake at a time; while a failure at the host's limits, or
@@ -252,7 +292,9 @@ export class Room implements Owner<Net> {
   }
 
   private disconnect(conn: number): void {
+    const peer = this.relayPeer(conn);
     if (!this.sockets.delete(conn)) return;
+    this.relay.closed(conn, peer);
     this.forget(conn);
     this.incoming.push({ kind: "closed", conn });
     this.wake();
@@ -276,7 +318,10 @@ export class Room implements Owner<Net> {
     this.incoming = [];
     this.waiting.clear();
     this.held = 0;
-    for (const socket of this.sockets.values()) shut(socket, code, why);
+    for (const [conn, socket] of this.sockets) {
+      this.relay.closed(conn, this.relayPeer(conn));
+      shut(socket, code, why);
+    }
     this.sockets.clear();
   }
 
@@ -519,9 +564,17 @@ export class Room implements Owner<Net> {
       const s = conn === null ? undefined : this.sockets.get(conn);
       if (conn === null || s === undefined) continue;
       try {
-        if (c.kind === "tag") s.serializeAttachment({ conn: c.conn, tag: c.tag } satisfies Attached);
+        if (c.kind === "tag") {
+          // A connection given another tag (or none) is another peer: its relay ends.
+          const before = this.relayPeer(c.conn);
+          if (before?.relay != null && before.tag !== c.tag) {
+            this.relay.closed(c.conn, before, true);
+            s.serializeAttachment({ ...attached(s), conn: c.conn, tag: c.tag, relay: null } satisfies Attached);
+          } else s.serializeAttachment({ ...attached(s), conn: c.conn, tag: c.tag } satisfies Attached);
+        }
         else if (c.kind === "send") s.send(c.bytes);
         else if (c.kind === "close") {
+          this.relay.closed(c.conn, this.relayPeer(c.conn));
           this.sockets.delete(c.conn);
           this.forget(c.conn);
           s.close(1000, "");

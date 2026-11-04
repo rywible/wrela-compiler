@@ -414,7 +414,7 @@ export interface ProgramOptions {
   inbox?: Inbox | undefined;
   /** Its connections (`std::net`): without them, `net/` requests fail as any request this
    * host can't answer. */
-  net?: Pick<Net, "open" | "send" | "close" | "closeAll" | "plan"> | undefined;
+  net?: Pick<Net, "open" | "send" | "close" | "relay" | "closeAll" | "plan"> | undefined;
   /** Queues a record the program posted into its ticks (`std::tick::post`, runtime/abi
    * `input`) for its ticker; without it, posts are kept nowhere. */
   postTick?: (record: Uint8Array) => void;
@@ -482,7 +482,7 @@ export class Program {
   readonly #net: ProgramOptions["net"] | null;
   readonly #postTick: ProgramOptions["postTick"] | null;
   /** This export's planned connection states, made only when it submits a network command. */
-  #netPlan: Pick<Net, "open" | "send" | "close"> | null = null;
+  #netPlan: Pick<Net, "open" | "send" | "close" | "relay"> | null = null;
   /** Its build's pair id, which its connections give its server. */
   #pair: bigint | null = null;
   /** What the replaced build kept (`wrela.kept`), and what this one keeps (`wrela.keep`). */
@@ -778,6 +778,16 @@ export class Program {
         try {
           const conn = connOf(service, body);
           net.open(conn, room, this.#pair);
+        } catch (e) {
+          throw new TrapError(errorMessage(e));
+        }
+        return;
+      }
+      case "net/relay": {
+        if (body.length !== 8) throw new TrapError("`net/relay` takes two connections' numbers");
+        const via = new DataView(body.buffer, body.byteOffset + 4, 4).getUint32(0, true);
+        try {
+          net.relay(connOf(service, body), via);
         } catch (e) {
           throw new TrapError(errorMessage(e));
         }

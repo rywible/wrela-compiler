@@ -953,8 +953,9 @@ describe("requests", () => {
     const word = (x: number) => Uint8Array.of(x & 255, (x >> 8) & 255, (x >> 16) & 255, x >>> 24);
     const done: string[] = [];
     const net = {
-      plan: () => ({ open() {}, send() {}, close() {} }),
+      plan: () => ({ open() {}, send() {}, close() {}, relay() {} }),
       open: (conn: number, room: string) => void done.push(`open ${conn} ${room}`),
+      relay: (conn: number, via: number) => void done.push(`relay ${conn} ${via}`),
       send: (conn: number, bytes: Uint8Array) => void done.push(`send ${conn} ${[...bytes].join(",")}`),
       close: (conn: number) => void done.push(`close ${conn}`),
       closeAll: () => void done.push("all"),
@@ -962,11 +963,12 @@ describe("requests", () => {
     const batch = new Encoder()
       .hostRequest(4, "net/open", Uint8Array.of(...word(7), ...new TextEncoder().encode("board-1")))
       .hostRequest(5, "net/send", Uint8Array.of(...word(7), 1, 2, 3))
-      .hostRequest(6, "net/close", word(7))
+      .hostRequest(6, "net/relay", Uint8Array.of(...word(8), ...word(7)))
+      .hostRequest(7, "net/close", word(7))
       .finish();
     const p = await program(batch, { net });
     p.call("ask");
-    expect(done).toEqual(["open 7 board-1", "send 7 1,2,3", "close 7"]);
+    expect(done).toEqual(["open 7 board-1", "send 7 1,2,3", "relay 8 7", "close 7"]);
     await later();
     expect(p.call("status")).toBe(-1);
     const short = await program(new Encoder().hostRequest(4, "net/send", Uint8Array.of(1, 2)).finish(), { net });
@@ -1006,9 +1008,9 @@ describe("requests", () => {
     const rooms: string[] = [];
     const room = "\uFEFFroom";
     const net = {
-      plan: () => ({ open() {}, send() {}, close() {} }),
+      plan: () => ({ open() {}, send() {}, close() {}, relay() {} }),
       open: (_conn: number, room: string) => { rooms.push(room); },
-      send() {}, close() {}, closeAll() {},
+      send() {}, close() {}, relay() {}, closeAll() {},
     };
     const p = await program(new Encoder().hostRequest(4, "net/open", Uint8Array.of(7, 0, 0, 0, ...new TextEncoder().encode(room))).finish(), { net });
     p.call("ask");
