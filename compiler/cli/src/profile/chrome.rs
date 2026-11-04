@@ -73,6 +73,9 @@ fn common(a: &Args) -> String {
     if !a.checked {
         s.push_str("&checks=0");
     }
+    if wrela_host::software_allowed() {
+        s.push_str("&software=1");
+    }
     s
 }
 

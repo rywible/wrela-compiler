@@ -1,0 +1,341 @@
+// PNG read (W3C PNG Specification, Third Edition): a file decoded to RGBA8 pixels in CPU code,
+// so a constant can bake an embedded texture when the program is built, into the fields and
+// parameters the program draws with, and nothing decodes an image while it runs. (A client
+// that must show an image it fetched asks the host: `std::host::decode_image`.)
+//
+// It reads every colour type at every bit depth PNG allows (grey, RGB, a palette, grey with
+// alpha, RGBA; 1, 2, 4, 8 and 16 bits), Adam7's interlace, and `tRNS`'s transparency. Each pixel
+// comes out as four bytes, red, green, blue and alpha, rows top to bottom; a 16-bit sample keeps
+// its high byte, a sample of fewer than 8 bits is scaled to 0..255, and a pixel without alpha
+// is opaque. Colour is as the file holds it: no gamma (`gAMA`, `sRGB`, `iCCP`) is applied, so
+// an ordinary file's bytes are sRGB. A file that isn't well formed is `None`, never a panic: a
+// bad signature or CRC, chunks out of order, a critical chunk it doesn't know, a header PNG
+// doesn't allow, a palette index past the palette, a filter it doesn't know, or image data that
+// doesn't decompress (`std::zlib::inflate`) to exactly the image's size.
+//
+// A program bakes a texture in a constant, `decode(embed("skin.png"))`, and reads it there with
+// `texel` and `sample`.
+//
+// ```wrela
+// use std::png::decode
+//
+// // A PNG of two pixels, made by Pillow: opaque red, then half-transparent blue.
+// let file = [
+//     0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 0x00, 0x00, 0x00, 0x0d, 0x49, 0x48, 0x44,
+//     0x52, 0x00, 0x00, 0x00, 0x02, 0x00, 0x00, 0x00, 0x01, 0x08, 0x06, 0x00, 0x00, 0x00, 0xf4,
+//     0x22, 0x7f, 0x8a, 0x00, 0x00, 0x00, 0x11, 0x49, 0x44, 0x41, 0x54, 0x78, 0x9c, 0x63, 0xf8,
+//     0xcf, 0xc0, 0xf0, 0x9f, 0x81, 0xe1, 0x7f, 0x03, 0x00, 0x0f, 0x7a, 0x03, 0x7e, 0x0b, 0xcb,
+//     0x2e, 0xb1, 0x00, 0x00, 0x00, 0x00, 0x49, 0x45, 0x4e, 0x44, 0xae, 0x42, 0x60, 0x82,
+// ]
+// let Some(image) = decode(file) else { panic("a PNG") }
+// assert(image.width == 2 && image.height == 1)
+// assert(image.texel(0, 0) == vec4(1.0, 0.0, 0.0, 1.0))
+// assert(image.pixels[6] == 255 && image.pixels[7] == 128)
+// ```
+
+use std::collections::Vec
+use std::zlib::inflate
+
+/// The widest and tallest image `decode` reads, in pixels.
+pub const MOST_SIDE: u32 = 16384
+
+/// An image: its size in pixels, and its pixels, four bytes each (red, green, blue, alpha),
+/// rows top to bottom.
+pub struct Image: Clone {
+    pub width: u32,
+    pub height: u32,
+    pub pixels: Vec<u8>,
+}
+
+impl Image {
+    /// The pixel at column `x` and row `y` (from the top left), each channel 0..1.
+    pub fn texel(self, x: u32, y: u32) -> vec4 {
+        let i = (y * self.width + x) * 4
+        vec4(
+            f32(self.pixels[i]),
+            f32(self.pixels[i + 1]),
+            f32(self.pixels[i + 2]),
+            f32(self.pixels[i + 3]),
+        ) /
+            255.0
+    }
+
+    /// The image at `uv` (0 to 1 across, 0 to 1 down from the top, as glTF's texture
+    /// coordinates are), read bilinearly between the four nearest pixels' centres and repeating
+    /// past its edges, each channel 0..1.
+    pub fn sample(self, uv: vec2) -> vec4 {
+        let p = uv * vec2(f32(self.width), f32(self.height)) - vec2(0.5)
+        let f = floor(p)
+        let t = p - f
+        let x0 = wrap(i32(f.x), self.width)
+        let y0 = wrap(i32(f.y), self.height)
+        let x1 = (x0 + 1) % self.width
+        let y1 = (y0 + 1) % self.height
+        let top = mix(self.texel(x0, y0), self.texel(x1, y0), t.x)
+        let bottom = mix(self.texel(x0, y1), self.texel(x1, y1), t.x)
+        mix(top, bottom, t.y)
+    }
+}
+
+/// `i` brought into 0..n, repeating.
+fn wrap(i: i32, n: u32) -> u32 {
+    let m = i32(n)
+    let r = i % m
+    u32(if r < 0 { r + m } else { r })
+}
+
+/// Adam7's seven passes: each one's first column and row, and its step across and down.
+const PASSES: [[u32; 4]; 7] = [
+    [0, 0, 8, 8],
+    [4, 0, 8, 8],
+    [0, 4, 4, 8],
+    [2, 0, 4, 4],
+    [0, 2, 2, 4],
+    [1, 0, 2, 2],
+    [0, 1, 1, 2],
+]
+
+/// What `IHDR` says, and what follows from it: samples a pixel, and bytes a whole pixel for
+/// the filters (at least 1).
+struct Header: Copy {
+    width: u32,
+    height: u32,
+    depth: u32,
+    colour: u32,
+    interlaced: bool,
+    channels: u32,
+    bpp: u32,
+}
+
+/// The four bytes at `at`, most significant first.
+fn be(data: [u8], at: u32) -> u32 {
+    (u32(data[at]) << 24) | (u32(data[at + 1]) << 16) | (u32(data[at + 2]) << 8) | u32(data[at + 3])
+}
+
+/// CRC-32's table (ISO 3309, as PNG's chunks use it): each byte's remainder by the reflected
+/// polynomial 0xedb88320.
+fn crc_table() -> Vec<u32> {
+    var table: Vec<u32> = Vec::with_capacity(256)
+    for n in 0..256 {
+        var c = n
+        for _ in 0..8 { c = if (c & 1) == 1 { 0xedb88320 ^ (c >> 1) } else { c >> 1 } }
+        table.push(c)
+    }
+    table
+}
+
+/// The header that `IHDR`'s 13 bytes at `at` hold, or `None` if PNG doesn't allow it.
+fn header(data: [u8], at: u32) -> Option<Header> {
+    let width = be(data, at)
+    let height = be(data, at + 4)
+    let depth = u32(data[at + 8])
+    let colour = u32(data[at + 9])
+    if width == 0 || height == 0 || width > MOST_SIDE || height > MOST_SIDE { return None }
+    if data[at + 10] != 0 || data[at + 11] != 0 || data[at + 12] > 1 { return None }
+    let channels = match colour {
+        0 => 1,
+        2 => 3,
+        3 => 1,
+        4 => 2,
+        6 => 4,
+        _ => return None,
+    }
+    let allowed = match colour {
+        0 => depth == 1 || depth == 2 || depth == 4 || depth == 8 || depth == 16,
+        3 => depth == 1 || depth == 2 || depth == 4 || depth == 8,
+        _ => depth == 8 || depth == 16,
+    }
+    if !allowed { return None }
+    let bpp = max(1, channels * depth / 8)
+    Some(
+        Header {
+            width: width,
+            height: height,
+            depth: depth,
+            colour: colour,
+            interlaced: data[at + 12] == 1,
+            channels: channels,
+            bpp: bpp,
+        },
+    )
+}
+
+/// A pass's size in pixels: its columns and rows (either may be 0).
+fn pass_size(h: Header, pass: u32) -> (u32, u32) {
+    if !h.interlaced { return (h.width, h.height) }
+    let p = PASSES[pass]
+    let w = if h.width > p[0] { (h.width - p[0] + p[2] - 1) / p[2] } else { 0 }
+    let r = if h.height > p[1] { (h.height - p[1] + p[3] - 1) / p[3] } else { 0 }
+    (w, r)
+}
+
+/// The bytes of a row of `w` pixels, without its filter byte.
+fn stride(h: Header, w: u32) -> u32 {
+    (w * h.channels * h.depth + 7) / 8
+}
+
+/// Paeth's predictor (PNG §9.4): of the left, above and above-left bytes, the one nearest
+/// `left + above - above_left`, ties to the left, then above.
+fn paeth(a: u32, b: u32, c: u32) -> u32 {
+    let p = i32(a) + i32(b) - i32(c)
+    let pa = abs(p - i32(a))
+    let pb = abs(p - i32(b))
+    let pc = abs(p - i32(c))
+    if pa <= pb && pa <= pc { a } else if pb <= pc { b } else { c }
+}
+
+/// Undoes the filters of `rows` rows of `width` bytes each, each after its filter byte, from
+/// byte `at` of `data`, in place. False for a filter PNG doesn't have.
+fn unfilter(data: mut Vec<u8>, at: u32, rows: u32, width: u32, bpp: u32) -> bool {
+    for y in 0..rows {
+        let row = at + y * (width + 1)
+        let filter = data[row]
+        if filter > 4 { return false }
+        for i in 0..width {
+            let x = u32(data[row + 1 + i])
+            let a = if i >= bpp { u32(data[row + 1 + i - bpp]) } else { 0 }
+            let b = if y > 0 { u32(data[row - width + i]) } else { 0 }
+            let c = if y > 0 && i >= bpp { u32(data[row - width + i - bpp]) } else { 0 }
+            let predicted = match filter {
+                0 => 0,
+                1 => a,
+                2 => b,
+                3 => (a + b) / 2,
+                _ => paeth(a, b, c),
+            }
+            data[row + 1 + i] = u8((x + predicted) & 255)
+        }
+    }
+    true
+}
+
+/// Sample `index` of the row whose bytes start at `row`, at `depth` bits.
+fn sample_at(data: [u8], row: u32, index: u32, depth: u32) -> u32 {
+    if depth == 8 { return u32(data[row + index]) }
+    if depth == 16 { return (u32(data[row + 2 * index]) << 8) | u32(data[row + 2 * index + 1]) }
+    let bit = index * depth
+    let byte = u32(data[row + bit / 8])
+    (byte >> (8 - depth - bit % 8)) & ((1 << depth) - 1)
+}
+
+/// A sample of `depth` bits as a byte.
+fn to8(v: u32, depth: u32) -> u32 {
+    if depth == 16 { v >> 8 } else if depth == 8 { v } else { v * 255 / ((1 << depth) - 1) }
+}
+
+/// The PNG file `data`, decoded; `None` if it isn't well formed (as this module's comment says).
+pub fn decode(data: [u8]) -> Option<Image> {
+    let signature = [137, 80, 78, 71, 13, 10, 26, 10]
+    if data.len() < 8 { return None }
+    for i in 0..8 { if u32(data[i]) != signature[i] { return None } }
+    let table = crc_table()
+    var head: Option<Header> = None
+    var palette: Vec<u8> = Vec::new()
+    var alpha: Vec<u8> = Vec::new()
+    var idat: Vec<u8> = Vec::new()
+    // 0 before the image data, 1 in it, 2 after it.
+    var phase = 0
+    var ended = false
+    var at = 8
+    while !ended {
+        if data.len() - at < 12 { return None }
+        let n = be(data, at)
+        if n > data.len() - at - 12 { return None }
+        var crc = 0xffffffff
+        for i in 0..n + 4 { crc = table[(crc ^ u32(data[at + 4 + i])) & 255] ^ (crc >> 8) }
+        if (crc ^ 0xffffffff) != be(data, at + 8 + n) { return None }
+        let kind = be(data, at + 4)
+        let body = at + 8
+        let first = head.is_none()
+        if first != (kind == 0x49484452) { return None }
+        if kind != 0x49444154 && phase == 1 { phase = 2 }
+        if kind == 0x49484452 {
+            if n != 13 { return None }
+            let Some(h) = header(data, body) else { return None }
+            head = Some(h)
+        } else if kind == 0x504c5445 {
+            if phase != 0 || n == 0 || n % 3 != 0 || n > 768 || palette.len() > 0 { return None }
+            for i in 0..n { palette.push(data[body + i]) }
+        } else if kind == 0x74524e53 {
+            if phase != 0 { return None }
+            for i in 0..n { alpha.push(data[body + i]) }
+        } else if kind == 0x49444154 {
+            if phase == 2 { return None }
+            phase = 1
+            for i in 0..n { idat.push(data[body + i]) }
+        } else if kind == 0x49454e44 {
+            ended = true
+        } else if (data[at + 4] & 32) == 0 {
+            // A critical chunk this reader doesn't know.
+            return None
+        }
+        at = body + n + 4
+    }
+    let Some(h) = head else { return None }
+    if h.colour == 3 && palette.len() == 0 { return None }
+    if (h.colour == 4 || h.colour == 6) && alpha.len() > 0 { return None }
+    if h.colour == 0 && alpha.len() != 0 && alpha.len() != 2 { return None }
+    if h.colour == 2 && alpha.len() != 0 && alpha.len() != 6 { return None }
+    if h.colour == 3 && alpha.len() > palette.len() / 3 { return None }
+    let passes = if h.interlaced { 7 } else { 1 }
+    var total = 0
+    for pass in 0..passes {
+        let (w, r) = pass_size(h, pass)
+        if w > 0 && r > 0 { total += r * (stride(h, w) + 1) }
+    }
+    let Some(raw) = inflate(idat, most: total) else { return None }
+    if raw.len() != total { return None }
+    var rows = take raw
+    var pixels = Vec::filled(h.width * h.height * 4, u8(0))
+    // The transparent colour of a grey or RGB image, as its raw samples.
+    let key = |i: u32| -> u32 { (u32(alpha[2 * i]) << 8) | u32(alpha[2 * i + 1]) }
+    var start = 0
+    for pass in 0..passes {
+        let (w, r) = pass_size(h, pass)
+        if w == 0 || r == 0 { continue }
+        let s = stride(h, w)
+        if !unfilter(mut rows, start, r, s, h.bpp) { return None }
+        let p = if h.interlaced { PASSES[pass] } else { [0, 0, 1, 1] }
+        for y in 0..r {
+            let row = start + y * (s + 1) + 1
+            for x in 0..w {
+                let c = x * h.channels
+                var rgba = [0, 0, 0, 255]
+                if h.colour == 0 {
+                    let v = sample_at(rows, row, c, h.depth)
+                    let g = to8(v, h.depth)
+                    rgba = [g, g, g, if alpha.len() == 2 && v == key(0) { 0 } else { 255 }]
+                } else if h.colour == 2 {
+                    let r0 = sample_at(rows, row, c, h.depth)
+                    let g0 = sample_at(rows, row, c + 1, h.depth)
+                    let b0 = sample_at(rows, row, c + 2, h.depth)
+                    let clear = alpha.len() == 6 && r0 == key(0) && g0 == key(1) && b0 == key(2)
+                    rgba = [
+                        to8(r0, h.depth),
+                        to8(g0, h.depth),
+                        to8(b0, h.depth),
+                        if clear { 0 } else { 255 },
+                    ]
+                } else if h.colour == 3 {
+                    let i = sample_at(rows, row, c, h.depth)
+                    if 3 * i + 2 >= palette.len() { return None }
+                    rgba = [
+                        u32(palette[3 * i]),
+                        u32(palette[3 * i + 1]),
+                        u32(palette[3 * i + 2]),
+                        if i < alpha.len() { u32(alpha[i]) } else { 255 },
+                    ]
+                } else if h.colour == 4 {
+                    let g = to8(sample_at(rows, row, c, h.depth), h.depth)
+                    rgba = [g, g, g, to8(sample_at(rows, row, c + 1, h.depth), h.depth)]
+                } else {
+                    for k in 0..4 { rgba[k] = to8(sample_at(rows, row, c + k, h.depth), h.depth) }
+                }
+                let o = ((p[1] + y * p[3]) * h.width + p[0] + x * p[2]) * 4
+                for k in 0..4 { pixels[o + k] = u8(rgba[k]) }
+            }
+        }
+        start += r * (s + 1)
+    }
+    Some(Image { width: h.width, height: h.height, pixels: pixels })
+}

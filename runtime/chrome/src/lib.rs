@@ -897,11 +897,19 @@ impl Tab {
         lock(&self.state.seen).size.unwrap_or(self.inner.window)
     }
 
-    /// Whether the page offers a hardware WebGPU adapter: an error saying why not, if not.
+    /// Whether the page offers a hardware WebGPU adapter (or, with `WRELA_ALLOW_SOFTWARE=1`, a
+    /// software one): an error saying why not, if not.
     pub fn hardware_adapter(&self, deadline: Instant) -> Result<(), String> {
         let found = self.evaluate(script::ADAPTER, deadline)?;
         match found.as_str() {
             Some("") => Ok(()),
+            // A software adapter, where the native host was allowed one (`wrela_host`'s
+            // `ALLOW_SOFTWARE`): a machine with no GPU.
+            Some(script::SOFTWARE_ONLY)
+                if std::env::var("WRELA_ALLOW_SOFTWARE").is_ok_and(|v| v == "1") =>
+            {
+                Ok(())
+            }
             Some(why) => Err(format!("{why}: the browser tests need a hardware GPU")),
             None => Err("the page didn't say what adapter it has".into()),
         }

@@ -115,6 +115,54 @@ pub fn ortho(left: f32, right: f32, bottom: f32, top: f32, near: f32, far: f32) 
     )
 }
 
+/// The determinant of `m`: the factor it scales volumes by (negative where it mirrors), and 0
+/// where it has no inverse.
+pub fn determinant(m: mat4) -> f32 {
+    let a = m[0].xyz
+    let b = m[1].xyz
+    let c = m[2].xyz
+    let d = m[3].xyz
+    let u = a * m[1].w - b * m[0].w
+    let v = c * m[3].w - d * m[2].w
+    dot(cross(a, b), v) + dot(cross(c, d), u)
+}
+
+/// The inverse of `m`, any transform with a nonzero `determinant` (projections, scales and
+/// shears too): `inverse(m) * m` is the identity, within rounding. A singular `m` has none, and
+/// its components come out infinite or NaN, so a caller whose matrix may be singular checks
+/// the determinant first. Lengyel's form of the cofactors, by cross products of the columns'
+/// upper three rows (*Foundations of Game Engine Development*, vol. 1, §1.7.5).
+pub fn inverse(m: mat4) -> mat4 {
+    let a = m[0].xyz
+    let b = m[1].xyz
+    let c = m[2].xyz
+    let d = m[3].xyz
+    let x = m[0].w
+    let y = m[1].w
+    let z = m[2].w
+    let w = m[3].w
+    let s0 = cross(a, b)
+    let t0 = cross(c, d)
+    let u0 = a * y - b * x
+    let v0 = c * w - d * z
+    let k = 1.0 / (dot(s0, v0) + dot(t0, u0))
+    let s = s0 * k
+    let t = t0 * k
+    let u = u0 * k
+    let v = v0 * k
+    // The inverse's rows.
+    let r0 = vec4(cross(b, v) + t * y, -dot(b, t))
+    let r1 = vec4(cross(v, a) - t * x, dot(a, t))
+    let r2 = vec4(cross(d, u) + s * w, -dot(d, s))
+    let r3 = vec4(cross(u, c) - s * z, dot(c, s))
+    mat4(
+        vec4(r0.x, r1.x, r2.x, r3.x),
+        vec4(r0.y, r1.y, r2.y, r3.y),
+        vec4(r0.z, r1.z, r2.z, r3.z),
+        vec4(r0.w, r1.w, r2.w, r3.w),
+    )
+}
+
 // ---- tests ------------------------------------------------------------------------------------
 
 fn near(a: vec3, b: vec3) -> bool {
@@ -155,4 +203,45 @@ fn a_camera_sees_along_its_minus_z() {
     let o = ortho(left: -2.0, right: 4.0, bottom: -1.0, top: 3.0, near: 1.0, far: 9.0)
     assert(near(apply(o, vec3(-2.0, -1.0, -1.0)), vec3(-1.0, -1.0, 0.0)))
     assert(near(apply(o, vec3(4.0, 3.0, -9.0)), vec3(1.0, 1.0, 1.0)))
+}
+
+/// Whether every component of `a` is within `tolerance` of `b`'s.
+fn close(a: mat4, b: mat4, tolerance: f32) -> bool {
+    for i in 0..4 {
+        let d = abs(a[i] - b[i])
+        if max(max(d.x, d.y), max(d.z, d.w)) > tolerance { return false }
+    }
+    true
+}
+
+@test
+fn a_transform_times_its_inverse_is_the_identity() {
+    let shear = mat4(
+        vec4(1.0, 0.2, 0.0, 0.0),
+        vec4(0.5, 1.0, 0.3, 0.0),
+        vec4(0.0, -0.4, 1.0, 0.0),
+        vec4(0.0, 0.0, 0.0, 1.0),
+    )
+    let cases = [
+        identity(),
+        translate(vec3(3.0, -2.0, 7.5)),
+        rotate(vec3(1.0, 2.0, -0.5), 0.9) * scale(vec3(2.0, 0.5, -3.0)),
+        translate(vec3(0.1, 4.0, -1.0)) * rotate_y(2.1) * shear * scale(vec3(1.5)),
+        perspective(fovy: 1.0, aspect: 1.6, near: 0.1, far: 500.0),
+        look_at(vec3(3.0, 2.0, 5.0), vec3(0.0, 1.0, 0.0)),
+        ortho(left: -2.0, right: 4.0, bottom: -1.0, top: 3.0, near: 1.0, far: 9.0),
+    ]
+    for m in cases {
+        let i = inverse(m)
+        assert(close(i * m, identity(), 0.0001) && close(m * i, identity(), 0.0001))
+    }
+    // A point taken through a transform and back is where it was.
+    let m = cases[3]
+    let p = vec3(0.7, -1.3, 2.2)
+    assert(near(apply(inverse(m), apply(m, p)), p))
+    // The determinant: a scale's product, a rotation's 1, a mirror's sign, and 0 when singular.
+    assert(abs(determinant(scale(vec3(2.0, 3.0, 4.0))) - 24.0) < 0.0001)
+    assert(abs(determinant(rotate(vec3(0.3, 1.0, 0.2), 1.3)) - 1.0) < 0.0001)
+    assert(determinant(scale(vec3(1.0, -1.0, 1.0))) < 0.0)
+    assert(determinant(scale(vec3(1.0, 0.0, 1.0))) == 0.0)
 }
