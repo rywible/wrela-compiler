@@ -100,7 +100,9 @@ export class Relay {
     if (queued > MAX_QUEUED) return false;
     this.#queued.set(conn, queued);
     this.#then(async () => {
-      this.#queued.set(conn, (this.#queued.get(conn) ?? 1) - 1);
+      const left = (this.#queued.get(conn) ?? 1) - 1;
+      if (left > 0) this.#queued.set(conn, left);
+      else this.#queued.delete(conn);
       await this.#take(conn, control);
     });
     return true;
@@ -188,7 +190,8 @@ export class Relay {
     if (typeof sdp !== "string") throw new Error("the SFU gave no offer");
     // The connection may have closed meanwhile: then the session is left to the SFU's timeout.
     const now = this.room.peer(peer.conn);
-    if (now === null || now.relay !== null || now.tag !== peer.tag) return;
+    if (now === null) return;
+    if (now.relay !== null || now.tag !== peer.tag) return refuse("the connection changed while it joined");
     this.room.keep(peer.conn, { n, session, stage: "offered", since: at, publish: null, peers: {} });
     this.room.text(peer.conn, { relay: "offer", n, sdp });
   }
