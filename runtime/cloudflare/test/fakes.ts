@@ -69,6 +69,8 @@ export class FakeSocket {
     if (typeof bytes === "string") this.texts.push(JSON.parse(bytes));
     else this.sent.push(new Uint8Array(bytes));
   }
+  /** A socket the Worker answers itself (not through the Hibernation API) is accepted first. */
+  accept() {}
   close(code = 1000) {
     this.closed ??= code;
   }

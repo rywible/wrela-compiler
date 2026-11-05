@@ -365,6 +365,7 @@ class Inbox {
 }
 var withinCall = (given, length) => given === 0 || given + length <= PAYLOAD_PER_CALL;
 var roomName = (name) => /^[a-z0-9_-]{1,64}$/.test(name);
+var OUTDATED_CLOSE = 4409;
 var pairParam = (pair) => pair.toString(16).padStart(16, "0");
 function pairOf(module) {
   const [section] = WebAssembly.Module.customSections(module, PAIR_SECTION);
@@ -2749,6 +2750,13 @@ function serverClass(module) {
     }
   };
 }
+function outdated() {
+  const pair = new WebSocketPair;
+  const [client, server] = [pair[0], pair[1]];
+  server.accept();
+  server.close(OUTDATED_CLOSE, "another build");
+  return new Response(null, { status: 101, webSocket: client });
+}
 async function rooms(request, env, pair) {
   const url = new URL(request.url);
   if (!url.pathname.startsWith("/room/"))
@@ -2759,11 +2767,13 @@ async function rooms(request, env, pair) {
   if (!roomName(name))
     return refusal(404);
   const hex = pair === null ? null : pairParam(pair);
-  if (hex === null || url.searchParams.get("pair") !== hex)
+  if (hex === null)
     return refusal(403);
   const origin = request.headers.get("origin");
   if (origin !== null && !origins(env).includes(origin))
     return refusal(403);
+  if (url.searchParams.get("pair") !== hex)
+    return outdated();
   const limited = await gate(env, request, "GET", url.pathname);
   if (limited !== null)
     return limited;

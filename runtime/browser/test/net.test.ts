@@ -4,7 +4,7 @@
 import { describe, expect, test } from "bun:test";
 import { EVENT_SIZE } from "../src/abi.gen.ts";
 import { connectionEvent, isNetwork, textEvent } from "../src/input.ts";
-import { Frames, frame, HELD, Inbox, MAX_FRAME, MAX_UP, Net, OVERHEAD, PENDING, parseServer, roomName } from "../src/net.ts";
+import { Frames, frame, HELD, Inbox, MAX_FRAME, MAX_UP, Net, OUTDATED, OUTDATED_CLOSE, OVERHEAD, PENDING, parseServer, roomName } from "../src/net.ts";
 import { MAX_RELAY, type Rtc } from "../src/relay.ts";
 
 const word = (e: Uint8Array, i: number) => new DataView(e.buffer, e.byteOffset, EVENT_SIZE).getUint32(4 * i, true);
@@ -174,7 +174,7 @@ describe("connections", () => {
       closed = false;
       onopen: (() => void) | null = null;
       onmessage: ((e: { data: unknown }) => void) | null = null;
-      onclose: (() => void) | null = null;
+      onclose: ((e?: { code: number }) => void) | null = null;
       onerror: (() => void) | null = null;
       constructor(readonly url: string) {
         made.push(this);
@@ -219,6 +219,15 @@ describe("connections", () => {
       expect(inbox.length).toBe(2);
       socket.onclose!();
       expect(net.arrived).toEqual([{ conn: 4, open: false }]);
+      // A server of another build closes it with OUTDATED_CLOSE: its closing carries OUTDATED.
+      net.deliver(new Inbox());
+      net.open(5, "lobby", 0xabn);
+      await settle(() => made.length > 1);
+      made[1]!.onclose!({ code: OUTDATED_CLOSE });
+      expect(net.arrived).toEqual([{ conn: 5, open: false, tag: OUTDATED }]);
+      const told = new Inbox();
+      net.deliver(told);
+      expect(told.length).toBe(1);
     } finally {
       Object.assign(globalThis, { WebSocket: real, fetch: fetched });
     }

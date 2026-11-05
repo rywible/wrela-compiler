@@ -248,6 +248,13 @@ interface RelaySession {
   closed: boolean;
 }
 
+/** The WebSocket close code a server gives a connection of another build than its own (a page
+ * loaded before a deploy): no room of this build is there to open. */
+export const OUTDATED_CLOSE = 4409;
+/** The tag a closed connection's event carries when its server runs another build
+ * (`std::net::OUTDATED`). */
+export const OUTDATED = 1;
+
 /** The pair id in a session's path: 16 hex digits. */
 export const pairParam = (pair: bigint) => pair.toString(16).padStart(16, "0");
 
@@ -277,7 +284,7 @@ export class Net {
   #nextRtc = 1;
   #server: { url: string; ready: Promise<Server> } | null = null;
   /** What arrived: a message's bytes, or a connection's opening or closing. */
-  arrived: ({ conn: number; bytes: Uint8Array } | { conn: number; open: boolean })[] = [];
+  arrived: ({ conn: number; bytes: Uint8Array } | { conn: number; open: boolean; tag?: number })[] = [];
   /** The bytes the messages in `arrived` hold, each counted with OVERHEAD more. */
   #held = 0;
 
@@ -451,7 +458,9 @@ export class Net {
       this.#held += bytes.length + OVERHEAD;
       this.arrived.push({ conn, bytes });
     };
-    socket.onclose = () => this.#end(conn, session);
+    // A server running another build closes with OUTDATED_CLOSE: the program hears it as its
+    // closing's tag (`std::net::OUTDATED`), since no connection of this build opens again.
+    socket.onclose = (e?: CloseEvent) => this.#end(conn, session, true, e?.code === OUTDATED_CLOSE ? OUTDATED : 0);
     socket.onerror = () => this.#end(conn, session);
   }
 
@@ -509,7 +518,7 @@ export class Net {
   }
 
   /** Ends a connection once: its session closes, and the program hears (if `tell`). */
-  #end(conn: number, session: Session, tell = true): void {
+  #end(conn: number, session: Session, tell = true, tag = 0): void {
     if (session.closed) return;
     session.closed = true;
     if (this.#sessions.get(conn) === session) this.#sessions.delete(conn);
@@ -523,7 +532,7 @@ export class Net {
     } catch {
       // It's closed already.
     }
-    if (tell) this.arrived.push({ conn, open: false });
+    if (tell) this.arrived.push(tag === 0 ? { conn, open: false } : { conn, open: false, tag });
   }
 
   /** Opens connection `conn` as the relay of the room connection `via` is open to: on a
@@ -658,7 +667,7 @@ export class Net {
     const full = new Set<number>();
     for (const a of arrived) {
       if (!("bytes" in a)) {
-        inbox.push(connectionEvent(a.conn, a.open));
+        inbox.push(connectionEvent(a.conn, a.open, a.tag ?? 0));
       } else if (full.has(a.conn)) {
         continue;
       } else if (inbox.held + a.bytes.length + OVERHEAD > HELD) {

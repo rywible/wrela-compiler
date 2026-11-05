@@ -1597,8 +1597,16 @@ pub fn room() -> String {
     }
 }
 
+/// The tag of a client's closed `Connection` event when the server runs another build than this
+/// one (the page was loaded before a deploy), on Cloudflare (`wrela-serve` refuses such a client,
+/// a closing of tag 0): no room of this build will open again, so the
+/// program stops trying and, when it suits the player, loads the page again
+/// (`std::host::reload`). A connection closed for any other reason has tag 0.
+pub const OUTDATED: u32 = 1
+
 /// Opens connection `conn` (a number not open) to room `room` of the program's server: 1 to 64 of
-/// a-z, 0-9, `-` and `_`. The browser host finds the server in `net.json` beside the build.
+/// a-z, 0-9, `-` and `_`. The browser host finds the server in `net.json` beside the build. On
+/// Cloudflare a server of another build closes it with `OUTDATED`.
 @client
 pub fn open(conn: u32, room: str) {
     var body: Vec<u8> = Vec::with_capacity(4 + room.len())

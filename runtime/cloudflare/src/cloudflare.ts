@@ -18,7 +18,7 @@
 import { DurableObject } from "cloudflare:workers";
 import { HTTP_METHODS, MAX_HTTP_REQUEST, SAFE_METHODS } from "../../browser/src/abi.gen.ts";
 import { Out, seenByServer } from "../../browser/src/http.ts";
-import { pairOf, pairParam, roomName } from "../../browser/src/net.ts";
+import { OUTDATED_CLOSE, pairOf, pairParam, roomName } from "../../browser/src/net.ts";
 import { SERVER_INSTANCE, VERIFY_SCHEMA } from "../../browser/src/abi.gen.ts";
 import { bare, decodeResponse, encodeRequest, type Header, HOST_HEADERS, NO_BODY, type Peers, secretsOf, Server } from "./host.ts";
 import { Room, type StoreClient } from "./room.ts";
@@ -363,12 +363,23 @@ export function serverClass(module: WebAssembly.Module) {
   };
 }
 
+/** The answer to a client of another build than this one: its WebSocket, closed at once with
+ * OUTDATED_CLOSE. */
+function outdated(): Response {
+  const pair = new WebSocketPair();
+  const [client, server] = [pair[0], pair[1]];
+  server.accept();
+  server.close(OUTDATED_CLOSE, "another build");
+  return new Response(null, { status: 101, webSocket: client });
+}
+
 /** A room's WebSocket: the response to `request` for `/room/<name>?pair=<16 hex digits>`, or null
  * for a path that isn't a room's. Before the room's object is billed it refuses what isn't an
- * upgrade (426), a room's name that isn't one (404), another program's pair (403), a page of
+ * upgrade (426), a room's name that isn't one (404), a server build without a pair id (403), a page of
  * another origin (403: a browser's Origin must be one of `WRELA_ORIGINS`; a client with none
- * isn't a browser, and the room's protocol decides), and a client past its rate limits (429). Each
- * build's rooms are its own (`<pair>:<name>`), as `wrela-serve` keeps each build's apart. */
+ * isn't a browser, and the room's protocol decides), and a client past its rate limits (429). A
+ * client of another build gets a socket closed with OUTDATED_CLOSE (`outdated`). Each build's
+ * rooms are its own (`<pair>:<name>`), as `wrela-serve` keeps each build's apart. */
 export async function rooms(request: Request, env: Env, pair: bigint | null): Promise<Response | null> {
   const url = new URL(request.url);
   if (!url.pathname.startsWith("/room/")) return null;
@@ -376,9 +387,13 @@ export async function rooms(request: Request, env: Env, pair: bigint | null): Pr
   const name = url.pathname.slice("/room/".length);
   if (!roomName(name)) return refusal(404);
   const hex = pair === null ? null : pairParam(pair);
-  if (hex === null || url.searchParams.get("pair") !== hex) return refusal(403);
+  if (hex === null) return refusal(403);
   const origin = request.headers.get("origin");
   if (origin !== null && !origins(env).includes(origin)) return refusal(403);
+  // Another build's client (a page loaded before a deploy): a refused handshake looks like a lost
+  // connection to a browser, so the Worker takes the socket and closes it with OUTDATED_CLOSE,
+  // and the page knows to load this build. No room's object is billed for it.
+  if (url.searchParams.get("pair") !== hex) return outdated();
   const limited = await gate(env, request, "GET", url.pathname);
   if (limited !== null) return limited;
   if (env.WRELA_ROOM === undefined) return refusal(404);
