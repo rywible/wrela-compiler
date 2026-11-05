@@ -271,17 +271,23 @@ pub fn secret_name(name: str) -> bool {
     true
 }
 
-/// The host's secret `name` (`secret_name`): its value's UTF-8 bytes. A host gives a program only
-/// the secrets its configuration names as the program's (on Cloudflare the Worker variable
-/// `WRELA_SECRETS`, their names comma-separated, each a Worker secret; on `wrela-serve` the
-/// environment variable of that name, likewise): one it doesn't name, or that isn't set, fails.
-/// Every instance may ask, the edge's and a room's included. A name that isn't one panics.
+/// The host's secret `name` (`secret_name`): its value's UTF-8 bytes, answered at once. A host
+/// gives a program only the secrets its configuration names as the program's (on Cloudflare the
+/// Worker variable `WRELA_SECRETS`, their names comma-separated, each a Worker secret; on
+/// `wrela-serve` the environment variable of that name, likewise): none for one it doesn't name,
+/// or that isn't set. Every instance may ask, the edge's and a room's included, so a room reads
+/// its keys in the call it starts in, holding nothing back. A name that isn't one panics.
 @server
-pub fn secret(name: str) -> Pending<u8> {
+pub fn secret(name: str) -> Option<Vec<u8>> {
     assert(secret_name(name), "secret: not a secret's name")
     var w = Writer::new()
     w.write_str(name)
-    request("server/secret", take w.into_bytes())
+    var asked = request("server/secret", take w.into_bytes())
+    flush_commands()
+    match asked.poll() {
+        Some(Ok(b)) => Some(take b),
+        _ => None,
+    }
 }
 
 // ---- tests -------------------------------------------------------------------------------------

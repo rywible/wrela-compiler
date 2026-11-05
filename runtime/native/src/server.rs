@@ -488,6 +488,11 @@ fn linker() -> wasmtime::Result<Linker<RoomState>> {
                             s.answered.insert(request, Ok(name));
                             continue;
                         }
+                        // The time of day and the program's secrets: answered at once too.
+                        if let Some(answer) = crate::services::at_once(service, body) {
+                            s.answered.insert(request, answer);
+                            continue;
+                        }
                         // Its own name, which the host knows: answered at once too.
                         if service == SERVICE_ROOM {
                             let name = match &s.name {

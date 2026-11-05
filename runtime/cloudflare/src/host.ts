@@ -1201,6 +1201,11 @@ export class Server implements Owner<Command> {
         if (service === SERVICE_CALL) return self.command({ kind: "call", id, to, body: rest }, body.length);
         return self.command({ kind: "build", id, artifact: to, body: rest }, body.length);
       }
+      case SERVICE_SECRET:
+      case SERVICE_TIME:
+        // Answered at once, as `me` is: the program reads them in the call that asks.
+        self.answered.set(id, commonAnswer(service, body, this.now(), this.options.secrets) as Uint8Array | null);
+        return;
       case SERVICE_ME:
         // Answered at once: the program reads it in the call that asks.
         if (this.named === null) return self.answer(id, null);

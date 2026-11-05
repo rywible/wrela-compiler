@@ -1789,6 +1789,10 @@ class Server {
           return self.command({ kind: "call", id, to, body: rest }, body.length);
         return self.command({ kind: "build", id, artifact: to, body: rest }, body.length);
       }
+      case SERVICE_SECRET:
+      case SERVICE_TIME:
+        self.answered.set(id, commonAnswer(service, body, this.now(), this.options.secrets));
+        return;
       case SERVICE_ME:
         if (this.named === null)
           return self.answer(id, null);
@@ -2511,6 +2515,10 @@ class Room {
         return self.refuse("`http/respond`: a room's connections are its peers', not HTTP requests");
       case SERVICE_ME:
         self.answered.set(id, new TextEncoder().encode(SERVER_INSTANCE));
+        return;
+      case SERVICE_SECRET:
+      case SERVICE_TIME:
+        self.answered.set(id, commonAnswer(service, body, this.now(), this.options.secrets));
         return;
       case SERVICE_ROOM:
         self.answered.set(id, this.name === null ? null : new TextEncoder().encode(this.name));

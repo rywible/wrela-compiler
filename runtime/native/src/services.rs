@@ -72,7 +72,7 @@ impl Services {
         self.store.lock().map_err(|_| "the store's lock is poisoned".to_string())
     }
 
-    /// The answer to request `service` with `body`: its bytes, or why there are none.
+        /// The answer to request `service` with `body`: its bytes, or why there are none.
     pub fn answer(&self, service: &str, body: &[u8]) -> Result<Vec<u8>, String> {
         match service {
             "store/get" => self.get(body),
@@ -342,6 +342,16 @@ fn hmac(body: &[u8]) -> Result<Vec<u8>, String> {
     let mut mac = hmac::Hmac::<sha2::Sha256>::new_from_slice(key).map_err(|e| e.to_string())?;
     mac.update(message);
     Ok(mac.finalize().into_bytes().to_vec())
+}
+
+/// The answer to a request a server host gives at once, in the call that asks, if `service`
+/// is one: the time of day, or one of the program's secrets (`std::server::secret`).
+pub fn at_once(service: &str, body: &[u8]) -> Option<Result<Vec<u8>, String>> {
+    match service {
+        wrela_abi::http::SERVICE_TIME => Some(unix_ms(body).map(|ms| ms.to_le_bytes().to_vec())),
+        wrela_abi::http::SERVICE_SECRET => Some(secret(body, |name| std::env::var(name).ok())),
+        _ => None,
+    }
 }
 
 /// Whether `name` may name a host secret (`std::server::secret_name`).
