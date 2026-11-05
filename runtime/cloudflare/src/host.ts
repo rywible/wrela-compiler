@@ -58,8 +58,10 @@ import {
   SERVICE_ME,
   SERVICE_REPLY,
   SERVICE_RESPOND,
+  SERVICE_SECRET,
   SERVICE_SEND,
   SERVICE_TIME,
+  SECRETS_VARIABLE,
   THREAD_MAIN,
 } from "../../browser/src/abi.gen.ts";
 import { decodeResponse, encodeResponse, type Header, type HttpResponse, In, Out, setByServer } from "../../browser/src/http.ts";
@@ -129,6 +131,8 @@ export interface Options {
   print?: (line: string) => void;
   /** Where a failure's reason goes. */
   log?: (line: string) => void;
+  /** The host's secrets the program may read (`std::server::secret`); none: each fails. */
+  secrets?: Secrets;
 }
 
 /** Why a call failed: the program's own trap, or the host's limits or refusals. */
@@ -645,11 +649,44 @@ export class Instance<C> {
   }
 }
 
+/** The host's secrets a program may read (`std::server::secret`): a secret's value by its name,
+ * or null for one it may not read or that isn't set. */
+export type Secrets = (name: string) => string | null;
+
+/** A secret's name (`std::server::secret_name`): 1 to 64 of A-Z, 0-9 and `_`. */
+const SECRET_NAME = /^[A-Z0-9_]{1,64}$/;
+
+/** The secrets of `vars` (a Worker's `env`, a process's environment) that its variable
+ * `WRELA_SECRETS` names, comma-separated: only those, and only string values, are the program's. */
+export function secretsOf(vars: Record<string, unknown>): Secrets {
+  const listed = vars[SECRETS_VARIABLE];
+  const names = new Set(typeof listed === "string" ? listed.split(",").map((n) => n.trim()).filter((n) => SECRET_NAME.test(n)) : []);
+  return (name) => {
+    const v = names.has(name) ? vars[name] : undefined;
+    return typeof v === "string" ? v : null;
+  };
+}
+
+/** `server/secret`'s answer: the named secret's UTF-8, or null if the program may not read it. */
+function secretAnswer(body: Uint8Array, secrets: Secrets | undefined): Uint8Array | null {
+  try {
+    const r = new In(body);
+    const name = r.text();
+    r.end("service");
+    const v = SECRET_NAME.test(name) && secrets !== undefined ? secrets(name) : null;
+    return v === null ? null : new TextEncoder().encode(v);
+  } catch {
+    return null;
+  }
+}
+
 /** The answer to a request a host gives the same way wherever it runs a server build: random
- * bytes, a signature's check and the time of day (`now`, Unix milliseconds); null (a failed
- * request) for a service it doesn't give. */
-export function commonAnswer(service: string, body: Uint8Array, now: number): Uint8Array | null | Promise<Uint8Array | null> {
+ * bytes, a signature's check, the time of day (`now`, Unix milliseconds) and the secrets the
+ * program may read (`secrets`); null (a failed request) for a service it doesn't give. */
+export function commonAnswer(service: string, body: Uint8Array, now: number, secrets?: Secrets): Uint8Array | null | Promise<Uint8Array | null> {
   switch (service) {
+    case SERVICE_SECRET:
+      return secretAnswer(body, secrets);
     case "crypto/random":
       return answerOf(() => random(body));
     case "crypto/verify":
@@ -1164,6 +1201,11 @@ export class Server implements Owner<Command> {
         if (service === SERVICE_CALL) return self.command({ kind: "call", id, to, body: rest }, body.length);
         return self.command({ kind: "build", id, artifact: to, body: rest }, body.length);
       }
+      case SERVICE_SECRET:
+      case SERVICE_TIME:
+        // Answered at once, as `me` is: the program reads them in the call that asks.
+        self.answered.set(id, commonAnswer(service, body, this.now(), this.options.secrets) as Uint8Array | null);
+        return;
       case SERVICE_ME:
         // Answered at once: the program reads it in the call that asks.
         if (this.named === null) return self.answer(id, null);
@@ -1180,7 +1222,7 @@ export class Server implements Owner<Command> {
         if (this.store === null) return self.refuse(`\`${service}\`: the edge has no store: \`call\` an instance that has one`);
         return self.answer(id, this.store.answer(service, body));
       default:
-        return self.answer(id, commonAnswer(service, body, this.now()));
+        return self.answer(id, commonAnswer(service, body, this.now(), this.options.secrets));
     }
   }
 }

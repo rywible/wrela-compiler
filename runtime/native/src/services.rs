@@ -81,6 +81,7 @@ impl Services {
             wrela_abi::http::SERVICE_TIME => unix_ms(body).map(|ms| ms.to_le_bytes().to_vec()),
             "crypto/verify" => verify(body).map(|ok| vec![u8::from(ok)]),
             wrela_abi::http::SERVICE_HMAC => hmac(body),
+            wrela_abi::http::SERVICE_SECRET => secret(body, |name| std::env::var(name).ok()),
             _ => Err(format!("this server has no service `{service}`")),
         }
     }
@@ -343,6 +344,38 @@ fn hmac(body: &[u8]) -> Result<Vec<u8>, String> {
     Ok(mac.finalize().into_bytes().to_vec())
 }
 
+/// The answer to a request a server host gives at once, in the call that asks, if `service`
+/// is one: the time of day, or one of the program's secrets (`std::server::secret`).
+pub fn at_once(service: &str, body: &[u8]) -> Option<Result<Vec<u8>, String>> {
+    match service {
+        wrela_abi::http::SERVICE_TIME => Some(unix_ms(body).map(|ms| ms.to_le_bytes().to_vec())),
+        wrela_abi::http::SERVICE_SECRET => Some(secret(body, |name| std::env::var(name).ok())),
+        _ => None,
+    }
+}
+
+/// Whether `name` may name a host secret (`std::server::secret_name`).
+fn secret_name(name: &str) -> bool {
+    (1..=64).contains(&name.len())
+        && name.bytes().all(|b| b.is_ascii_uppercase() || b.is_ascii_digit() || b == b'_')
+}
+
+/// `server/secret`: a secret's name (counted) → its value's UTF-8, if the variable
+/// `WRELA_SECRETS` (comma-separated, as `vars` reads it) names it and it's set.
+fn secret(body: &[u8], vars: impl Fn(&str) -> Option<String>) -> Result<Vec<u8>, String> {
+    let mut r = Bytes(body);
+    let name = std::str::from_utf8(r.chunk()?).map_err(|_| "a secret's name isn't UTF-8")?;
+    r.end()?;
+    if !secret_name(name) {
+        return Err(format!("`{name}` isn't a secret's name"));
+    }
+    let listed = vars(wrela_abi::http::SECRETS_VARIABLE).unwrap_or_default();
+    if !listed.split(',').any(|n| n.trim() == name) {
+        return Err(format!("`{name}` isn't one of the program's secrets"));
+    }
+    vars(name).map(String::into_bytes).ok_or_else(|| format!("the secret `{name}` isn't set"))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -403,6 +436,21 @@ mod tests {
         let down = scan(&s, b"", b"", 2, true);
         assert_eq!(down.iter().map(|e| e.0.as_slice()).collect::<Vec<_>>(), [&b"b/2"[..], b"b/1"]);
         let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn a_secret_is_given_only_when_it_is_named_the_programs() {
+        let vars = |name: &str| match name {
+            "WRELA_SECRETS" => Some("KEY_A, KEY_B".to_string()),
+            "KEY_A" => Some("alpha".to_string()),
+            "KEY_C" => Some("hidden".to_string()),
+            _ => None,
+        };
+        assert_eq!(secret(&chunk(b"KEY_A"), vars), Ok(b"alpha".to_vec()));
+        assert!(secret(&chunk(b"KEY_B"), vars).is_err(), "named but not set");
+        assert!(secret(&chunk(b"KEY_C"), vars).is_err(), "set but not named");
+        assert!(secret(&chunk(b"WRELA_SECRETS"), vars).is_err(), "nor the list itself");
+        assert!(secret(&chunk(b"key_a"), vars).is_err(), "not a secret's name");
     }
 
     #[test]

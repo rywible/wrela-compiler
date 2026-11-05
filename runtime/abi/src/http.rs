@@ -76,6 +76,11 @@ pub const SERVICE_ACK: &str = "server/ack";
 pub const SERVICE_CALL_BUILD: &str = "server/call_build";
 /// The request that answers HMAC-SHA256 of a message under a key.
 pub const SERVICE_HMAC: &str = "crypto/hmac";
+/// The request that answers one of the host's secrets the program may read
+/// (`std::server::secret`): its name as a counted string → the value's UTF-8 bytes.
+pub const SERVICE_SECRET: &str = "server/secret";
+/// The host variable that names the secrets a program may read, comma-separated.
+pub const SECRETS_VARIABLE: &str = "WRELA_SECRETS";
 /// The longest instance name, and the longest artifact path, in bytes.
 pub const MAX_INSTANCE_NAME: usize = 256;
 /// The instance that holds the store a server's rooms share.

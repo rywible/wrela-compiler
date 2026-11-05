@@ -13,7 +13,7 @@
 // run: an expiry, an hour's count (language.md §19.4).
 
 use std::abi::CLOCK
-use std::host::request
+use std::host::{flush_commands, request}
 use std::io::Pending
 use std::mem::{read, read_clock, thread_block}
 use std::serialize::Reader
@@ -66,6 +66,18 @@ pub fn phase(name: str) {
 @server
 pub fn wall_clock() -> Pending<u8> {
     request("time/unix", [u8(0); 0])
+}
+
+/// The milliseconds since the Unix epoch now, by the host's wall clock (`wall_clock`), which a
+/// server host answers at once; none if it didn't.
+@server
+pub fn unix_now() -> Option<u64> {
+    var asked = wall_clock()
+    flush_commands()
+    match asked.poll() {
+        Some(Ok(b)) => unix_ms(b),
+        _ => None,
+    }
 }
 
 /// The milliseconds since the Unix epoch that a `wall_clock` answered, or none if the answer

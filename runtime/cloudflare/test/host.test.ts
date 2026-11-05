@@ -6,7 +6,7 @@ import { describe, expect, test } from "bun:test";
 import { readFileSync } from "node:fs";
 import { join } from "node:path";
 import { Out } from "../../browser/src/http.ts";
-import { artifactPath, checkResponse, decodeRequest, decodeResponse, derToRaw, encodeRequest, encodeResponse, hmac, instanceName, MAX_SCAN, random, Store, verify } from "../src/host.ts";
+import { artifactPath, checkResponse, commonAnswer, decodeRequest, decodeResponse, derToRaw, encodeRequest, encodeResponse, hmac, instanceName, MAX_SCAN, random, secretsOf, Store, verify } from "../src/host.ts";
 import { storage } from "./fakes.ts";
 
 const hex = (s: string) => new Uint8Array((s.match(/../g) ?? []).map((b) => parseInt(b, 16)));
@@ -164,6 +164,16 @@ describe("instances and HMAC", () => {
     expect(tag).toEqual(hex("5bdcc146bf60754e6a042426089575c75a003f089d2739839dec58b964ec3843"));
     const empty = await hmac(new Out().chunk(new Uint8Array(0)).chunk(enc("m")).bytes());
     expect(empty).toEqual(await hmac(new Out().chunk(new Uint8Array(64)).chunk(enc("m")).bytes()));
+  });
+
+  test("a secret is the program's only if WRELA_SECRETS names it", () => {
+    const env = { WRELA_SECRETS: "KEY_A, KEY_B,bad-name", KEY_A: "alpha", KEY_C: "hidden", WRELA_SFU_TOKEN: "sfu", KEY_D: 7 };
+    const secrets = secretsOf(env);
+    const ask = (name: string) => commonAnswer("server/secret", new Out().chunk(enc(name)).bytes(), 0, secrets);
+    expect(ask("KEY_A")).toEqual(enc("alpha"));
+    for (const name of ["KEY_B", "KEY_C", "KEY_D", "WRELA_SFU_TOKEN", "WRELA_SECRETS", "key_a"]) expect(ask(name)).toBeNull();
+    expect(commonAnswer("server/secret", new Out().chunk(enc("KEY_A")).bytes(), 0)).toBeNull();
+    expect(commonAnswer("server/secret", new Out().chunk(enc("KEY_A")).word(0).bytes(), 0, secrets)).toBeNull();
   });
 
   test("instance names are a kind and a name, or the rooms' server", () => {

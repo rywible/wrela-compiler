@@ -257,6 +257,39 @@ pub fn call_build(artifact: str, body: [u8]) -> Pending<u8> {
     request("server/call_build", take w.into_bytes())
 }
 
+/// Whether `name` may name a host secret (`secret`): 1 to 64 of `A`-`Z`, `0`-`9` and `_`.
+pub fn secret_name(name: str) -> bool {
+    if name.len() == 0 || name.len() > 64 {
+        return false
+    }
+    for i in 0..name.len() {
+        let b = name.byte(i)
+        if !((b >= 65 && b <= 90) || (b >= 48 && b <= 57) || b == 95) {
+            return false
+        }
+    }
+    true
+}
+
+/// The host's secret `name` (`secret_name`): its value's UTF-8 bytes, answered at once. A host
+/// gives a program only the secrets its configuration names as the program's (on Cloudflare the
+/// Worker variable `WRELA_SECRETS`, their names comma-separated, each a Worker secret; on
+/// `wrela-serve` the environment variable of that name, likewise): none for one it doesn't name,
+/// or that isn't set. Every instance may ask, the edge's and a room's included, so a room reads
+/// its keys in the call it starts in, holding nothing back. A name that isn't one panics.
+@server
+pub fn secret(name: str) -> Option<Vec<u8>> {
+    assert(secret_name(name), "secret: not a secret's name")
+    var w = Writer::new()
+    w.write_str(name)
+    var asked = request("server/secret", take w.into_bytes())
+    flush_commands()
+    match asked.poll() {
+        Some(Ok(b)) => Some(take b),
+        _ => None,
+    }
+}
+
 // ---- tests -------------------------------------------------------------------------------------
 
 @test
@@ -267,6 +300,12 @@ fn instance_names_are_a_kind_and_a_name() {
     assert(!instance_name("a/") && !instance_name("a//b") && !instance_name("a/../b"))
     assert(!instance_name("a/b c") && !instance_name("a/./b"))
     assert(artifact_path("verifiers/capybara/b3/0123abcd") && !artifact_path("../x"))
+}
+
+@test
+fn secret_names_are_upper_case_words() {
+    assert(secret_name("WRELA_CEREMONY_KEY") && secret_name("K") && secret_name("A1_B2"))
+    assert(!secret_name("") && !secret_name("lower") && !secret_name("A-B") && !secret_name("A B"))
 }
 
 @test

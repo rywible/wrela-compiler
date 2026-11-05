@@ -27,10 +27,10 @@
 // object reads nothing back; it closes its sockets (1012), and their peers come back to the new
 // build's rooms.
 
-import { SERVER_INSTANCE, SERVICE_ACK, SERVICE_CALL, SERVICE_CALL_BUILD, SERVICE_DISPATCH, SERVICE_ME, SERVICE_REPLY, SERVICE_RESPOND, SERVICE_SEND } from "../../browser/src/abi.gen.ts";
+import { SERVER_INSTANCE, SERVICE_ACK, SERVICE_CALL, SERVICE_CALL_BUILD, SERVICE_DISPATCH, SERVICE_ME, SERVICE_REPLY, SERVICE_RESPOND, SERVICE_SECRET, SERVICE_SEND, SERVICE_TIME } from "../../browser/src/abi.gen.ts";
 import { connectionEvent } from "../../browser/src/input.ts";
 import { Inbox, MAX_FRAME, MAX_UP, OVERHEAD, pairOf, pairParam, withinCall } from "../../browser/src/net.ts";
-import { blob, commonAnswer, Failure, Instance, LIMITS, type Limits, type Owner, POISONED, type Storage, writes } from "./host.ts";
+import { blob, commonAnswer, Failure, Instance, LIMITS, type Limits, type Owner, POISONED, type Secrets, type Storage, writes } from "./host.ts";
 import { Relay, type RelayPeer, type RelayState, type SfuConfig } from "./relay.ts";
 
 /** The connection a room's journal comes from (`std::net::JOURNAL`). */
@@ -69,6 +69,8 @@ export interface RoomOptions {
   log?: (line: string) => void;
   /** The Realtime SFU app its relay speaks to (none: a relay is refused). */
   sfu?: SfuConfig | null;
+  /** The host's secrets the program may read (`std::server::secret`); none: each fails. */
+  secrets?: Secrets;
 }
 
 /** What a socket's attachment holds: its connection, and the tag the program gave it. */
@@ -614,6 +616,11 @@ export class Room implements Owner<Net> {
         // A room's store is the instance `server`'s, answered at once.
         self.answered.set(id, new TextEncoder().encode(SERVER_INSTANCE));
         return;
+      case SERVICE_SECRET:
+      case SERVICE_TIME:
+        // Answered at once, as its name is: a room reads them in the call that asks.
+        self.answered.set(id, commonAnswer(service, body, this.now(), this.options.secrets) as Uint8Array | null);
+        return;
       case SERVICE_ROOM:
         // Its own name, answered at once; a room that was never opened by name has none.
         self.answered.set(id, this.name === null ? null : new TextEncoder().encode(this.name));
@@ -632,7 +639,7 @@ export class Room implements Owner<Net> {
           this.store.answer(service, body).catch(() => null),
         );
       default:
-        return self.answer(id, commonAnswer(service, body, this.now()));
+        return self.answer(id, commonAnswer(service, body, this.now(), this.options.secrets));
     }
   }
 }

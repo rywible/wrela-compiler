@@ -130,6 +130,8 @@ var SERVICE_SEND = "server/send";
 var SERVICE_ACK = "server/ack";
 var SERVICE_CALL_BUILD = "server/call_build";
 var SERVICE_HMAC = "crypto/hmac";
+var SERVICE_SECRET = "server/secret";
+var SECRETS_VARIABLE = "WRELA_SECRETS";
 var MAX_INSTANCE_NAME = 256;
 var SERVER_INSTANCE = "server";
 var RETRY_CAP_MS = 3600000;
@@ -1316,8 +1318,30 @@ class Instance {
       this.answered.set(id, a);
   }
 }
-function commonAnswer(service, body, now) {
+var SECRET_NAME = /^[A-Z0-9_]{1,64}$/;
+function secretsOf(vars) {
+  const listed = vars[SECRETS_VARIABLE];
+  const names = new Set(typeof listed === "string" ? listed.split(",").map((n) => n.trim()).filter((n) => SECRET_NAME.test(n)) : []);
+  return (name) => {
+    const v = names.has(name) ? vars[name] : undefined;
+    return typeof v === "string" ? v : null;
+  };
+}
+function secretAnswer(body, secrets) {
+  try {
+    const r = new In(body);
+    const name = r.text();
+    r.end("service");
+    const v = SECRET_NAME.test(name) && secrets !== undefined ? secrets(name) : null;
+    return v === null ? null : new TextEncoder().encode(v);
+  } catch {
+    return null;
+  }
+}
+function commonAnswer(service, body, now, secrets) {
   switch (service) {
+    case SERVICE_SECRET:
+      return secretAnswer(body, secrets);
     case "crypto/random":
       return answerOf(() => random(body));
     case "crypto/verify":
@@ -1765,6 +1789,10 @@ class Server {
           return self.command({ kind: "call", id, to, body: rest }, body.length);
         return self.command({ kind: "build", id, artifact: to, body: rest }, body.length);
       }
+      case SERVICE_SECRET:
+      case SERVICE_TIME:
+        self.answered.set(id, commonAnswer(service, body, this.now(), this.options.secrets));
+        return;
       case SERVICE_ME:
         if (this.named === null)
           return self.answer(id, null);
@@ -1782,7 +1810,7 @@ class Server {
           return self.refuse(`\`${service}\`: the edge has no store: \`call\` an instance that has one`);
         return self.answer(id, this.store.answer(service, body));
       default:
-        return self.answer(id, commonAnswer(service, body, this.now()));
+        return self.answer(id, commonAnswer(service, body, this.now(), this.options.secrets));
     }
   }
 }
@@ -2488,6 +2516,10 @@ class Room {
       case SERVICE_ME:
         self.answered.set(id, new TextEncoder().encode(SERVER_INSTANCE));
         return;
+      case SERVICE_SECRET:
+      case SERVICE_TIME:
+        self.answered.set(id, commonAnswer(service, body, this.now(), this.options.secrets));
+        return;
       case SERVICE_ROOM:
         self.answered.set(id, this.name === null ? null : new TextEncoder().encode(this.name));
         return;
@@ -2502,7 +2534,7 @@ class Room {
       case "store/scan":
         return self.answer(id, this.store.answer(service, body).catch(() => null));
       default:
-        return self.answer(id, commonAnswer(service, body, this.now()));
+        return self.answer(id, commonAnswer(service, body, this.now(), this.options.secrets));
     }
   }
 }
@@ -2624,6 +2656,7 @@ function edgeOf(module, env) {
   const log = (line) => console.error(line);
   const edge = new Server(module, null, {
     peers: peersOf(env, log),
+    secrets: secretsOf(env),
     setAlarm: (at) => void setTimeout(() => void edge.alarm(), Math.max(0, at - Date.now())),
     log,
     ...env.WRELA_PRINT === "1" ? { print: (line) => console.log(line) } : {}
@@ -2687,6 +2720,7 @@ function serverClass(module) {
       const log = (line) => console.error(line);
       this.server = new Server(module, ctx.storage, {
         peers: peersOf(env, log),
+        secrets: secretsOf(env),
         setAlarm: (at) => void ctx.storage.setAlarm(at),
         log,
         ...env.WRELA_PRINT === "1" ? { print: (line) => console.log(line) } : {}
@@ -2752,6 +2786,7 @@ function roomClass(module) {
       this.room = new Room(module, ctx.storage, server, ctx.getWebSockets(), {
         pair,
         sfu,
+        secrets: secretsOf(env),
         log: (line) => console.error(line),
         ...env.WRELA_PRINT === "1" ? { print: (line) => console.log(line) } : {}
       });
