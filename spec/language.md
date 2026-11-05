@@ -2592,7 +2592,7 @@ Every peer applies the committed entries in the room's order, with the same code
 
 The server host keeps each room durably (`wrela_host::rooms`). `std::net`'s `serve_room` runs a room for `serve`. The host writes each call's records (`keep`, `compact`) to the room's journal, flushed to disk, before it sends anything the call sent. A room that starts reads its journal back first.
 
-- **A room knows its name:** `std::net::room()` (`@server`) is the name its peers open it by (`/room/<name>`), answered at once by the host (`net/room`). A room keys what must outlive its build's journal by it in the store (`std::store`), which every build reads. A host that names no rooms makes it panic.
+- **A room knows its name:** `std::net::room()` (`@server`) is the name its peers open it by (`/room/<name>`), answered at once by the host (`net/room`). A room keys what must outlive its build's journal by it in the store (`std::store`), which every build reads. A host that names no rooms makes it panic; `std::net::room_name()` answers none there instead, so a program whose rooms and named instance `server` share a module (both answer `me()` with `server`) tells which it is.
 
 - The journal's header names its format, the server build's WASM hash and the room. The host does not read a journal of another build or room.
 - Each record carries a CRC-32C. A record cut short by a crash ends the journal.

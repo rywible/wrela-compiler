@@ -3,6 +3,15 @@
 Each release's changes a program or a tool can see. The pull request of each release holds the
 detail; `docs/release.md` says how a release is cut.
 
+## 0.24.0
+
+- **A program tells its rooms from its instance `server`** (language.md §19.6):
+  `std::net::room_name()` (`@server`) is the room's own name, as `std::net::room()` answers it,
+  or none where the host names no room. On Cloudflare a room and the named instance `server`,
+  whose store the rooms share, both answer `std::server::me()` with `server`, so a program that
+  calls the instance `server` (to read what its rooms wrote) runs its own code there, not a
+  room's.
+
 ## 0.23.0
 
 - **A page knows it's out of date** (language.md §19.3, §19.6): on Cloudflare, a room's connection

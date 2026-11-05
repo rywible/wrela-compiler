@@ -1589,11 +1589,22 @@ pub fn compact(snapshot: [u8]) {
 /// under, so what lasts past its build's journal finds it again. The host answers at once.
 @server
 pub fn room() -> String {
+    match room_name() {
+        Some(name) => name,
+        None => panic("`room`: this host doesn't name its rooms"),
+    }
+}
+
+/// The room's own name, as `room` answers it, or none where the host names no room: in a named
+/// instance of a server, the instance `server` (`std::server::SERVER`) among them, whose store
+/// the rooms share and whose `std::server::me()` is theirs, so only this tells the two apart.
+@server
+pub fn room_name() -> Option<String> {
     var asked = request("net/room", [u8(0); 0])
     flush_commands()
     match asked.poll() {
-        Some(Ok(b)) => String::from_utf8(take b).expect("a room's name is UTF-8"),
-        _ => panic("`room`: this host doesn't name its rooms"),
+        Some(Ok(b)) => Some(String::from_utf8(take b).expect("a room's name is UTF-8")),
+        _ => None,
     }
 }
 
