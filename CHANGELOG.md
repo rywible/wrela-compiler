@@ -3,6 +3,15 @@
 Each release's changes a program or a tool can see. The pull request of each release holds the
 detail; `docs/release.md` says how a release is cut.
 
+## 0.22.0
+
+- **A server reads its own secrets** (language.md §19.5): `std::server::secret(name)`
+  (`@server`) answers one of the host's secrets, as its value's UTF-8, to any instance, the edge
+  and a room included. A host gives only those its configuration names as the program's: on
+  Cloudflare the Worker variable `WRELA_SECRETS` (names, comma-separated), each a Worker secret;
+  on `wrela-serve` the environment variables its `WRELA_SECRETS` lists. Another, or one not set,
+  fails. So a room can check what an account signed without the key crossing a request.
+
 ## 0.21.0
 
 - **A program draws its own focus ring** (`std::semantics`): `Node.ringed` says the program

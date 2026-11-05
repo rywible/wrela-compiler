@@ -30,7 +30,7 @@
 import { SERVER_INSTANCE, SERVICE_ACK, SERVICE_CALL, SERVICE_CALL_BUILD, SERVICE_DISPATCH, SERVICE_ME, SERVICE_REPLY, SERVICE_RESPOND, SERVICE_SEND } from "../../browser/src/abi.gen.ts";
 import { connectionEvent } from "../../browser/src/input.ts";
 import { Inbox, MAX_FRAME, MAX_UP, OVERHEAD, pairOf, pairParam, withinCall } from "../../browser/src/net.ts";
-import { blob, commonAnswer, Failure, Instance, LIMITS, type Limits, type Owner, POISONED, type Storage, writes } from "./host.ts";
+import { blob, commonAnswer, Failure, Instance, LIMITS, type Limits, type Owner, POISONED, type Secrets, type Storage, writes } from "./host.ts";
 import { Relay, type RelayPeer, type RelayState, type SfuConfig } from "./relay.ts";
 
 /** The connection a room's journal comes from (`std::net::JOURNAL`). */
@@ -69,6 +69,8 @@ export interface RoomOptions {
   log?: (line: string) => void;
   /** The Realtime SFU app its relay speaks to (none: a relay is refused). */
   sfu?: SfuConfig | null;
+  /** The host's secrets the program may read (`std::server::secret`); none: each fails. */
+  secrets?: Secrets;
 }
 
 /** What a socket's attachment holds: its connection, and the tag the program gave it. */
@@ -632,7 +634,7 @@ export class Room implements Owner<Net> {
           this.store.answer(service, body).catch(() => null),
         );
       default:
-        return self.answer(id, commonAnswer(service, body, this.now()));
+        return self.answer(id, commonAnswer(service, body, this.now(), this.options.secrets));
     }
   }
 }

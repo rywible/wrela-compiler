@@ -20,7 +20,7 @@ import { HTTP_METHODS, MAX_HTTP_REQUEST, SAFE_METHODS } from "../../browser/src/
 import { Out, seenByServer } from "../../browser/src/http.ts";
 import { pairOf, pairParam, roomName } from "../../browser/src/net.ts";
 import { SERVER_INSTANCE, VERIFY_SCHEMA } from "../../browser/src/abi.gen.ts";
-import { bare, decodeResponse, encodeRequest, type Header, HOST_HEADERS, NO_BODY, type Peers, Server } from "./host.ts";
+import { bare, decodeResponse, encodeRequest, type Header, HOST_HEADERS, NO_BODY, type Peers, secretsOf, Server } from "./host.ts";
 import { Room, type StoreClient } from "./room.ts";
 
 /** A Workers Rate Limiting binding (`ratelimits` in the Wrangler configuration). */
@@ -261,6 +261,7 @@ export function edgeOf(module: WebAssembly.Module, env: Env): Server {
   const log = (line: string) => console.error(line);
   const edge: Server = new Server(module, null, {
     peers: peersOf(env, log),
+    secrets: secretsOf(env),
     // The Worker has no alarm: work past a turn goes on in a moment, while its request waits.
     setAlarm: (at) => void setTimeout(() => void edge.alarm(), Math.max(0, at - Date.now())),
     log,
@@ -321,6 +322,7 @@ export function serverClass(module: WebAssembly.Module) {
       const log = (line: string) => console.error(line);
       this.server = new Server(module, ctx.storage, {
         peers: peersOf(env, log),
+        secrets: secretsOf(env),
         setAlarm: (at) => void ctx.storage.setAlarm(at),
         log,
         ...(env.WRELA_PRINT === "1" ? { print: (line: string) => console.log(line) } : {}),
@@ -401,6 +403,7 @@ export function roomClass(module: WebAssembly.Module) {
       this.room = new Room(module, ctx.storage, server, ctx.getWebSockets(), {
         pair,
         sfu,
+        secrets: secretsOf(env),
         log: (line) => console.error(line),
         ...(env.WRELA_PRINT === "1" ? { print: (line: string) => console.log(line) } : {}),
       });
