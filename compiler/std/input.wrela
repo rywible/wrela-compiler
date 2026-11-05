@@ -200,7 +200,7 @@ pub enum Event: Copy + Eq + StateHash + Serialize {
     Message { conn: u32, serial: u64, len: u32 },
     /// Connection `conn` opened, or closed. On a server, `tag` is the tag the program gave it
     /// (`std::net::tag`), when the host tells a room it started again of it; on a client, a
-    /// closing's `tag` is `std::net::OUTDATED` when the server runs another build; else 0.
+    /// closing's `tag` is `std::net::OUTDATED` when a Cloudflare server runs another build; else 0.
     Connection { conn: u32, open: bool, tag: u32 },
     /// The field the host keeps for semantic node `node` changed (`std::semantics`): its newest
     /// revision. The program reads the field by the node (`field/state`); the host says so again
