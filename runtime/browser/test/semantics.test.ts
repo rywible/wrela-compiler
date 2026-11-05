@@ -4,7 +4,7 @@
 import { expect, test } from "bun:test";
 import { assistEvent, fieldEvent, keyCode } from "../src/input.ts";
 import type { Forward } from "../src/listen.ts";
-import { Action, FOCUSED, forwards, MODAL, readTree, Role, SELECTED, Semantics, utf16At, utf8At } from "../src/semantics.ts";
+import { Action, FOCUSED, forwards, MODAL, readTree, RINGED, Role, SELECTED, Semantics, utf16At, utf8At } from "../src/semantics.ts";
 import { Reader, Writer } from "../src/wire.ts";
 import { domEvent, type FakeElement, type FakePage, onPage } from "./page.ts";
 
@@ -244,6 +244,15 @@ test("an update keeps each element and its focus; the program's focus moves it; 
   expect(page.activeElement).toBe(canvas);
   o.tree(tree([]));
   expect(o.enter()).toBe(false);
+}));
+
+test("a node whose program draws its own focus ring is marked so the host draws none", () => onPage((page) => {
+  const { o, el } = overlay(page);
+  o.tree(tree([{ id: 1, role: Role.Button, label: "A", flags: RINGED }, { id: 2, role: Role.Button, label: "B" }]));
+  expect(el(1).classList.contains("wrela-ringed")).toBe(true);
+  expect(el(2).classList.contains("wrela-ringed")).toBe(false);
+  o.tree(tree([{ id: 1, role: Role.Button, label: "A" }, { id: 2, role: Role.Button, label: "B" }]));
+  expect(el(1).classList.contains("wrela-ringed")).toBe(false);
 }));
 
 test("a field is a real input in its form: each change is a revision the program hears of until it reads it", () => onPage(async (page) => {

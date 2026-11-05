@@ -3,6 +3,13 @@
 Each release's changes a program or a tool can see. The pull request of each release holds the
 detail; `docs/release.md` says how a release is cut.
 
+## 0.21.0
+
+- **A program draws its own focus ring** (`std::semantics`): `Node.ringed` says the program
+  draws that node's keyboard focus itself, so the browser host draws no outline over it
+  (`wrela-ringed`, flag 128 of the tree's bytes). A page's own controls then show one ring, the
+  program's, and none at all when a pointer opened a dialog that took the focus.
+
 ## 0.20.0
 
 - **A room's relay** (language.md §19.3, §19.6): `std::net::relay(conn, via)` (`@client`) opens

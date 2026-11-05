@@ -106,6 +106,9 @@ pub struct Node: Clone + Eq {
     pub modal: bool = false,
     /// The program's keyboard focus: the host moves the focus here when this changes.
     pub focused: bool = false,
+    /// The program draws this node's keyboard focus itself (its own ring, when the keyboard put
+    /// it there): the host draws none over it.
+    pub ringed: bool = false,
     pub level: u32 = 0,
     pub value: f32 = 0.0,
     pub min: f32 = 0.0,
@@ -150,6 +153,7 @@ pub fn structure(name: str, nodes: [Node]) -> Vec<u8> {
         if n.expanded { flags = flags | 16 }
         if n.modal { flags = flags | 32 }
         if n.focused { flags = flags | 64 }
+        if n.ringed { flags = flags | 128 }
         w.write_u8(u8(flags))
         w.write_u8(u8(min(n.level, 6)))
         for x in [n.value, n.min, n.max, n.step] { w.write_u32(bitcast_u32(x)) }
@@ -324,6 +328,7 @@ fn a_tree_and_its_geometry_have_the_hosts_layout() {
         label: String::from("io"),
         href: String::from("/std/io"),
         focused: true,
+        ringed: true,
     }
     let field = Node {
         id: 9,
@@ -341,7 +346,7 @@ fn a_tree_and_its_geometry_have_the_hosts_layout() {
     let b = structure("T", [take link, take field])
     // "T" (4 + 1), the count (4); the link: id, parent, role, flags, level, four numbers, controls.
     assert(b.len() > 9 + 4 + 4 + 1 + 1 + 1 + 16 + 4, f"{b.len()} bytes")
-    assert(b[9] == 7 && b[13] == 2 && b[17] == 6 && b[18] == 64, f"{b[9]} {b[13]} {b[17]} {b[18]}")
+    assert(b[9] == 7 && b[13] == 2 && b[17] == 6 && b[18] == 64 + 128, f"{b[9]} {b[13]} {b[17]} {b[18]}")
     let g = geometry(
         [Node { id: 3, role: Role::Text, rect: vec4(10.0, -5.0, 20.0, 10.0) }],
         vec4(0.0, 0.0, 100.0, 100.0),

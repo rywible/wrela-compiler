@@ -31,7 +31,9 @@ const ROLES = 22;
 const CONTAINERS = new Set<number>([Role.Group, Role.ListBox, Role.TabList, Role.TabPanel, Role.Dialog, Role.Menu, Role.Table, Role.Row]);
 
 /** A node's flags. */
-export const PRESSED = 1, SELECTED = 2, DISABLED = 4, CHECKED = 8, EXPANDED = 16, MODAL = 32, FOCUSED = 64;
+export const PRESSED = 1, SELECTED = 2, DISABLED = 4, CHECKED = 8, EXPANDED = 16, MODAL = 32, FOCUSED = 64,
+  /** The program draws this node's keyboard focus itself (its own ring): the host draws none. */
+  RINGED = 128;
 
 /** The Assist actions, as std::input numbers them. */
 export const Action = { Activate: 0, Select: 1, Focus: 2, Increment: 3, Decrement: 4, Dismiss: 5 } as const;
@@ -171,7 +173,8 @@ const STYLE = `
   -webkit-touch-callout: none; -webkit-tap-highlight-color: transparent; }
 .wrela-semantics .wrela-node:focus-visible, .wrela-semantics [role=listbox]:focus .wrela-active {
   outline: 3px solid #4766ff; outline-offset: 2px; border-radius: 4px; }
-.wrela-semantics input.wrela-node:focus-visible, .wrela-semantics textarea.wrela-node:focus-visible { outline: none; }
+.wrela-semantics input.wrela-node:focus-visible, .wrela-semantics textarea.wrela-node:focus-visible,
+.wrela-semantics .wrela-node.wrela-ringed:focus-visible { outline: none; }
 .wrela-semantics .wrela-live { position: absolute; width: 1px; height: 1px; overflow: hidden;
   clip-path: inset(50%); white-space: nowrap; }
 `;
@@ -567,6 +570,7 @@ export class Semantics implements Overlay {
     if (NAMED.has(role)) set("aria-label", n.label || null);
     else if (role !== Role.Separator && el.textContent !== n.label) el.textContent = n.label;
     set("aria-disabled", flag(DISABLED) ? "true" : null);
+    el.classList.toggle("wrela-ringed", flag(RINGED));
     switch (role) {
       case Role.Group: set("role", "group"); break;
       case Role.Button: set("aria-pressed", flag(PRESSED) ? "true" : null); break;
