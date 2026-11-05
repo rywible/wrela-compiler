@@ -9,7 +9,7 @@
 // A scenario is a list of steps: `{ "connect": peer }`, `{ "send": peer, "hex": bytes }`,
 // `{ "text": peer }` (a text message), `{ "restart": true }` (the room's object is reset: a new
 // one over the same storage and sockets) and `{ "route": path, "origin"?: page }` (the router's
-// answer's status). It prints `{ sent: { peer: [hex] }, closed: { peer: code }, routes: [status] }`.
+// answer's status, or the close code of a socket it closed at once). It prints `{ sent: { peer: [hex] }, closed: { peer: code }, routes: [status] }`.
 
 import { Database } from "bun:sqlite";
 import { readFileSync } from "node:fs";
@@ -22,10 +22,16 @@ const steps = JSON.parse(readFileSync(scenarioPath, "utf8")) as Step[];
 
 workers();
 
+// The last pair made: a socket the Worker closes at once (another build's client) answers its route
+// with its close code.
+let lastPair: { 0: Socket; 1: Socket } | null = null;
 Object.assign(globalThis, {
   WebSocketPair: class {
     0 = new Socket();
     1 = new Socket();
+    constructor() {
+      lastPair = this;
+    }
   },
 });
 // The Workers runtime answers an upgrade with 101 and the client's end; Bun's Response takes no 101.
@@ -74,8 +80,10 @@ for (const step of steps) {
   } else if (step.route !== undefined) {
     const headers: Record<string, string> = { upgrade: "websocket" };
     if (step.origin !== undefined) headers["origin"] = step.origin;
+    lastPair = null;
     const r = await host.rooms(new Request(`https://wrela.dev${step.route}`, { headers }), env);
-    routes.push(r === null ? 0 : (r as Response & { upgraded?: boolean }).upgraded ? 101 : r.status);
+    const upgraded = r !== null && (r as Response & { upgraded?: boolean }).upgraded;
+    routes.push(r === null ? 0 : upgraded ? (lastPair?.[1].closed ?? 101) : r.status);
   }
   await room.room.wake();
 }

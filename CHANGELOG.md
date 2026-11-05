@@ -3,6 +3,15 @@
 Each release's changes a program or a tool can see. The pull request of each release holds the
 detail; `docs/release.md` says how a release is cut.
 
+## 0.23.0
+
+- **A page knows it's out of date** (language.md §19.3, §19.6): on Cloudflare, a room's connection
+  from a client of another build (a page loaded before a deploy) is answered by the Worker with a
+  WebSocket closed at once with code 4409, where it was refused (403), which a browser can't tell
+  from a lost connection. The browser host gives the program that closing with the tag
+  `std::net::OUTDATED`, so it stops reopening rooms no build of its own runs, and can load the
+  page again (`std::host::reload`) when that suits the player. No room's object is billed for it.
+
 ## 0.22.0
 
 - **A server reads its own secrets** (language.md §19.5): `std::server::secret(name)`

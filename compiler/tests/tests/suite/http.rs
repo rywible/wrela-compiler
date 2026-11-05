@@ -544,5 +544,6 @@ fn a_room_runs_on_its_cloudflare_host_and_reads_its_journal_back() {
     );
     assert_eq!(result["closed"]["c"], serde_json::Value::Null, "a text message is about a relay, and closes nothing");
     assert_eq!(result["closed"]["a"], serde_json::Value::Null, "a's connection outlives the reset");
-    assert_eq!(result["routes"], serde_json::json!([101, 403, 404, 403, 0]));
+    // Another build's client is closed with the outdated code (4409), so its page knows to reload.
+    assert_eq!(result["routes"], serde_json::json!([101, 4409, 404, 403, 0]));
 }
