@@ -72,7 +72,7 @@ impl Services {
         self.store.lock().map_err(|_| "the store's lock is poisoned".to_string())
     }
 
-        /// The answer to request `service` with `body`: its bytes, or why there are none.
+    /// The answer to request `service` with `body`: its bytes, or why there are none.
     pub fn answer(&self, service: &str, body: &[u8]) -> Result<Vec<u8>, String> {
         match service {
             "store/get" => self.get(body),
