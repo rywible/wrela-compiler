@@ -2,15 +2,27 @@
 # macOS arm64, and publishes the tarballs and one SHA256SUMS as the tag's GitHub release: what
 # `wrela` downloads for a workspace that pins `toolchain = "X.Y.Z"` (spec/language.md §3.6). It
 # only builds and publishes: every check stays local (tools/check.sh). It belongs to
-# rywible/wrela-compiler and runs there alone; the tag must be Cargo's version.
+# rywible/wrela-compiler and runs there alone; the tag must be Cargo's version. Where a tag can't
+# be pushed, a run started by hand on `main` with the version (`workflow_dispatch`) does the same,
+# the release making the tag `vX.Y.Z` at the commit it built.
 name: Toolchain release
 
 on:
   push:
     tags: ["v*"]
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "The version to release, X.Y.Z: Cargo's on main"
+        required: true
+        type: string
 
 permissions:
   contents: read
+
+# The release's tag: the one pushed, or `v` and the version given by hand.
+env:
+  TAG: ${{ github.event_name == 'workflow_dispatch' && format('v{0}', inputs.version) || github.ref_name }}
 
 jobs:
   build:
@@ -28,7 +40,7 @@ jobs:
       - uses: actions/checkout@v4
 
       - name: Package
-        run: python3 tools/package.py --version "${GITHUB_REF_NAME#v}" --target "${{ matrix.target }}" --out dist
+        run: python3 tools/package.py --version "${TAG#v}" --target "${{ matrix.target }}" --out dist
 
       - uses: actions/upload-artifact@v4
         with:
@@ -55,6 +67,6 @@ jobs:
         run: |
           sha256sum *.tar.gz > SHA256SUMS
           cat SHA256SUMS
-          gh release create "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" --title "$GITHUB_REF_NAME" \
-            --notes "The wrela toolchain ${GITHUB_REF_NAME#v}: wrela, wrela-host, wrela-serve and Binaryen's wasm-opt for each target. A workspace pins it with toolchain = \"${GITHUB_REF_NAME#v}\"." \
+          gh release create "$TAG" --repo "$GITHUB_REPOSITORY" --target "$GITHUB_SHA" --title "$TAG" \
+            --notes "The wrela toolchain ${TAG#v}: wrela, wrela-host, wrela-serve and Binaryen's wasm-opt for each target. A workspace pins it with toolchain = \"${TAG#v}\"." \
             *.tar.gz SHA256SUMS
