@@ -64,6 +64,10 @@ tag and Cargo's version are different. Then tag that commit and push only the ta
 git tag vX.Y.Z && git push origin vX.Y.Z
 ```
 
+Where a tag can't be pushed (a session whose Git refuses tags), start the workflow by hand on
+`main` instead: Actions → Toolchain release → Run workflow, with the version `X.Y.Z`. The release
+it publishes makes the tag `vX.Y.Z` at the commit it built.
+
 ## 4. Watch the workflow
 
 The tag starts `.github/workflows/toolchain-release.yml`:
