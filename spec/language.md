@@ -1110,6 +1110,7 @@ All attributes except `@diagnostic`, `@intrinsic` and `@fuel` are part of a type
 | `@audio` | functions, function types | Code that the audio thread runs (§16.4) |
 | `@job` | functions | A job: a function whose body runs over several frames, to each `yield` (§16.3) |
 | `@test`, `@test(frames: n)`, `@test(tool)` | functions | A test. `wrela test` runs it as the build runs constants, or after `n` of the program's frames (§13.2). With `gpu: true` it runs on the GPU, and with `golden: "frame.png"` it compares its screen with a PNG. `@test(tool)` goes on a function, which runs on the package's tool build. |
+| `@budget(work: n, weight: m)` | GPU functions | The most work one call may do, and the most its code may weigh with every call written out (§18.11) |
 | `@fuel(n)` | constants, tests of code | The work that the build may do to compute the constant or run the test (§13.1) |
 | `@client`, `@server`, `@tool` | functions | Only that role's build may run the function (§15.3). Reaching it from another role's entries is E0708. A function has one role (E0204). |
 | `@testing` | exports | An export that only a test build has. See below. |
@@ -2512,7 +2513,7 @@ A pipeline is an entry point compiled for one set of type arguments: a generic k
 
 - **The pipeline-count query** reports how many instantiations each GPU entry point has, and why. `wrela pipelines <package>` lists each entry point's pipelines, their type arguments, and where CPU code dispatches or draws each. A site that runs only under a runtime condition of its function is marked `(under a condition)` (in `--json`, `conditional`): its pipeline is in the build however rarely the condition holds, so a stage to leave out is left out by the program's structure. `--json` gives the same list for tools.
 - **A shipped build keeps a budget for its shaders:** at most 256 KiB of WGSL for each pipeline. A browser compiles each pipeline while the scene loads, and the GPU's compile time grows faster than the shader's size.
-  - A release build over the budget is E0707, at the command that records the large pipeline.
+  - A release build over the budget is E0707, at the command that records the large pipeline. So is one whose pipeline weighs over 300,000 (§18.11).
   - The budget isn't checked for a test build, a debug build or a lifted build.
   - A pipeline is in the build only if a command in the optimized CPU code records it. A pipeline behind a constant branch, such as `if test_build() && counting`, leaves the build with the code that records it. (The `&&` holds its value in a local, which constant folding sees through.) Constants fold again after inlining, so a predicate whose body folds to a constant, `fn on(s: State) -> bool { ON && s.n == 3 }` with `ON` false, is that constant where it's called, and the branch on it folds too; so do `&&` and `||` of values where one side settles them, and a comparison of two integer constants. `wrela pipelines` lists what the build makes: it inlines and folds as a build does.
 - **The number of pipelines in a build isn't limited.** The time to create them counts in the cold start's budget, measured cold in Chrome.
@@ -2558,6 +2559,33 @@ The hosts can time each pass and dispatch on the GPU, they open the GPU with its
 - 64-bit atomics are not in toolchain 0.6: neither WebGPU's core nor a shipped browser has them.
 
 **Memory:** `std::gpu::memory()` gives the bytes of the program's buffers and textures, now and at their most. std counts them as it makes and drops each (a texture by its levels' blocks and its layers). Test mode's `memory.json` is the host's count, the same numbers. It has the `nondet` effect: the program's thread changes the count as it records GPU work, so another thread's read (a ticker's) would depend on timing, and `@deterministic` code takes it as data.
+
+### 18.11 Work and weight
+
+The compiler counts what each GPU function costs from its code, the same on every machine, and a function can be held to a budget of it.
+
+- **Work** is the most one call of a function can do, in units of about one 32-bit operation on one invocation. It's counted from the code before the shader compiler's own optimizations, walking it as it would run and knowing only what the code makes constant (constants, a pipeline's `const` parameters, and what's computed from them):
+  - a branch on a known condition counts the side it takes; on anything else, the costlier side;
+  - a loop counts each pass until an exit it's sure of: a `for` over a constant range, or a `while` whose counter reaches a constant (`while i < 32 && !hit` is sure to leave by 32). A loop with no sure exit within 65,536 passes has no bound, and nor does what holds it;
+  - a call counts its function's work, given what's known of its arguments.
+
+  | What | Work |
+  |---|---|
+  | Arithmetic, a comparison, a conversion or a `select`, a component | 1 |
+  | A division or a remainder, a square root or a transcendental, a component | 4 (`pow` 8) |
+  | A read of a uniform block | 1 |
+  | A read or a write of a storage buffer | 8 |
+  | A read or a write of workgroup memory | 2 |
+  | A texture sample or gather | 16 |
+  | A texel load, or a storage texture's write | 8 |
+  | An atomic | 16 |
+  | A local's or a parameter's read or write, building or taking apart a value | 0 |
+
+- **Weight** is how many statements a function comes to with every call written out in its place. A browser's shader compiler copies a function into each place it's called, so a big function called from many places weighs each time, and a pipeline's compile time grows with its weight, faster than in proportion. (The opening scene's far pass weighed 270,830 and took three quarters of its 21 pipelines' cold compile; its WGSL was not its largest.)
+- **`wrela pipelines`** gives each pipeline's work, an entry point at a time (`unbounded` for none), and its weight; `--json` gives them as `work` (`null` for unbounded) and `weight`.
+- **`@budget(work: n)`** holds a GPU function to at most `n` work a call, and **`@budget(weight: n)`** to at most `n` weight; one attribute may give both. Each instantiation that a pipeline reaches is checked, with what that pipeline makes constant; one over its budget, or whose work has no bound, is E0710 at the attribute, naming the calls that do the most of it.
+- **A shipped build's pipeline weighs at most 300,000** (E0707, at the command that records it), as its WGSL is at most 256 KiB (§18.9).
+- Work and weight are counts to compare code by and to hold it to, not times: a GPU's time depends on how its invocations diverge, on its memory and on its compiler.
 
 ## 19. Rooms
 

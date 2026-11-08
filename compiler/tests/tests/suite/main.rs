@@ -69,6 +69,7 @@ mod tool_threads;
 mod transport;
 mod unroll;
 mod warnings;
+mod work;
 mod workgroup;
 
 use std::path::{Path, PathBuf};

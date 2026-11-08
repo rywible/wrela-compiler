@@ -3,6 +3,17 @@
 Each release's changes a program or a tool can see. The pull request of each release holds the
 detail; `docs/release.md` says how a release is cut.
 
+## 0.25.0
+
+- **Work and weight** (language.md §18.11): the compiler counts each GPU function's most work in
+  one call (about one 32-bit operation on one invocation a unit, the costlier side of each branch
+  it can't decide, each pass of a loop to its sure exit) and its weight (its statements with every
+  call written out, what a browser's shader compiler works through). Both are the same on every
+  machine. `wrela pipelines` shows each pipeline's (`work`, `weight` in `--json`).
+- **`@budget(work: n, weight: m)`** holds a GPU function to them: over either, or with work that
+  has no bound, is E0710 at the attribute, naming the calls that do the most.
+- **A shipped build's pipeline weighs at most 300,000** (E0707), beside its 256 KiB of WGSL.
+
 ## 0.24.0
 
 - **A program tells its rooms from its instance `server`** (language.md §19.6):

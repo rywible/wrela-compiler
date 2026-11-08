@@ -1028,6 +1028,9 @@ pub struct FnAttrs {
     /// `@fuel(n)` on a `@test` of code: the work it may do, in place of a test's limit, and
     /// where it's written (§13).
     pub fuel: Option<(u64, Span)>,
+    /// `@budget(work: n, weight: m)` on GPU code (§18.11): the most work one call may do, and
+    /// the most its code may weigh with every call written out; and where it's written.
+    pub budget: Option<(Option<u64>, Option<u64>, Span)>,
     /// `@test(frames: n, gpu: true, golden: "frame.png", within: m)`: the screen after the
     /// frames is within a mean difference `m` of that PNG in the package (§13).
     pub test_golden: Option<Golden>,

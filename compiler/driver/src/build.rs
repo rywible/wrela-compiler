@@ -93,6 +93,11 @@ pub struct BuildOutput {
 /// How long a scene's pipelines take to create isn't counted here.
 pub const MAX_WGSL_BYTES: usize = 256 * 1024;
 
+/// A pipeline's weight at most (§18.11): its entry points' statements with every call written
+/// out, what predicts how long a browser's shader compiler takes over it (the opening's far pass
+/// weighed 270,830 and took three quarters of its cold compile, Nov 2026).
+pub const MAX_WEIGHT: u64 = 300_000;
+
 /// Runs the back ends over a lowered program. `sources` names the locations a trap reports.
 /// With `budgets`, a shipped build's, it's E0707 to have a pipeline whose WGSL is over
 /// `MAX_WGSL_BYTES`. `conditional[i]` says pipeline `i` is reached only under runtime
@@ -321,6 +326,20 @@ fn emit_in(
                 ),
                 "a browser compiles each pipeline's WGSL while the scene loads",
                 "move work that its own pass can do there, or keep a big function a call (`ir::opt`)",
+            ));
+        }
+        if budgets
+            && p.weight > MAX_WEIGHT
+            && let Some(&at) = p.sites.first()
+        {
+            diagnostics.push(over_budget(
+                at,
+                format!(
+                    "`{}` weighs {}, over the {} a pipeline may weigh",
+                    p.name, p.weight, MAX_WEIGHT
+                ),
+                "a pipeline's weight is its statements with every call written out, as a browser's shader compiler copies a function into each place it's called; its compile time grows faster than its weight (§18.11)",
+                "call a big function from fewer places (once in a loop, not once a step), or move work its own pass can do there; `wrela pipelines` shows each pipeline's weight",
             ));
         }
         if let Some(wgsl) = wgsl {

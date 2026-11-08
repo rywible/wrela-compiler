@@ -902,6 +902,41 @@ impl<'d, 'u> Collector<'d, 'u> {
                         out.audio = Some(a.span);
                     }
                 }
+                "budget" => {
+                    if out.budget.is_some() {
+                        self.diags.push(
+                            Diagnostic::new(
+                                codes::E0108,
+                                a.span,
+                                "a function's budget is set once",
+                            )
+                            .with_fix("remove it", a.span, ""),
+                        );
+                        continue;
+                    }
+                    let (mut work, mut weight, mut bad) = (None, None, a.args.is_none());
+                    for arg in a.args.iter().flatten() {
+                        let v = fuel_value(&arg.value).filter(|&v| v >= 1);
+                        match (arg.name.as_ref().map(|n| n.name.as_str()), v) {
+                            (Some("work"), Some(v)) if work.is_none() => work = Some(v),
+                            (Some("weight"), Some(v)) if weight.is_none() => weight = Some(v),
+                            _ => bad = true,
+                        }
+                    }
+                    if bad {
+                        self.diags.push(
+                            Diagnostic::new(
+                                codes::E0108,
+                                a.span,
+                                "`@budget` takes `work: n`, `weight: n` or both, each a whole number from 1",
+                            )
+                            .with_note("work is the most one call may do, about one 32-bit operation on one invocation a unit; weight is the statements its code comes to with every call written out (§18.11)")
+                            .with_help("write them as literals: `@budget(work: 4000, weight: 20000)`"),
+                        );
+                    } else {
+                        out.budget = Some((work, weight, a.span));
+                    }
+                }
                 "fuel" => {
                     let mut fuel = out.fuel.map(|(v, _)| v);
                     self.fuel_attr(a, &mut fuel, "a test's");
@@ -938,6 +973,7 @@ impl<'d, 'u> Collector<'d, 'u> {
                 }
                 _ => {
                     let known = [
+                        "budget",
                         "compute",
                         "vertex",
                         "fragment",

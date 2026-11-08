@@ -85,6 +85,11 @@ pub struct PipelineSummary {
     /// A render pipeline's colour attachments' bytes a sample, the most of its targets'
     /// (WebGPU's count, within its 32: §18); `None` for a compute pipeline.
     pub attachment_bytes: Option<u32>,
+    /// Each entry point's work (§18.11), as `entries`: `None` when it has no bound. Empty when
+    /// the compile didn't count it.
+    pub work: Vec<Option<u64>>,
+    /// Its weight (§18.11): its statements with every call written out. 0 when not counted.
+    pub weight: u64,
 }
 
 impl PipelineSummary {
@@ -1235,6 +1240,8 @@ fn summarize(
                     };
                     out.targets.iter().map(bytes).max().unwrap_or(0)
                 }),
+                work: out.work.clone(),
+                weight: out.weight,
             }
         })
         .collect()

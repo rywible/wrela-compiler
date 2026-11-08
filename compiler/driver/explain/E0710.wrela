@@ -1,0 +1,53 @@
+// A GPU function over its `@budget` (§18.11): the most work one call may do, or the most its
+// code may weigh with every call written out. Work is counted from the code, the costlier side
+// of each branch the count can't decide and each pass of a loop, about one 32-bit operation on
+// one invocation a unit, so it's the same on every machine. A loop with no exit the count is
+// sure of has no bound. Skip the costly calls where they can't matter, give a loop a constant
+// most passes, or raise the budget.
+// ---- wrong
+use std::gpu::{GlobalId, GpuBuffer, Slots, buffer, dispatch}
+
+/// A shape that's cheap where it matters, held to it.
+@budget(work: 200)
+fn shape(x: f32) -> f32 {
+    var a = x
+    for _i in 0..64 {
+        a = sin(a) + cos(a)
+    }
+    a
+}
+
+@compute(64)
+fn look(out: mut Slots<f32>, id: GlobalId) {
+    out[id] = shape(f32(id.x))
+}
+
+pub fn frame(time: f32, width: u32, height: u32) {
+    var out: GpuBuffer<f32> = buffer(64)
+    dispatch(look.bind(mut out), over: 64)
+}
+// ---- fixed
+use std::gpu::{GlobalId, GpuBuffer, Slots, buffer, dispatch}
+
+/// The same shape, its costly part skipped where it can't matter.
+@budget(work: 200)
+fn shape(x: f32) -> f32 {
+    if x > 8.0 {
+        return x
+    }
+    var a = x
+    for _i in 0..8 {
+        a = sin(a) + cos(a)
+    }
+    a
+}
+
+@compute(64)
+fn look(out: mut Slots<f32>, id: GlobalId) {
+    out[id] = shape(f32(id.x))
+}
+
+pub fn frame(time: f32, width: u32, height: u32) {
+    var out: GpuBuffer<f32> = buffer(64)
+    dispatch(look.bind(mut out), over: 64)
+}
