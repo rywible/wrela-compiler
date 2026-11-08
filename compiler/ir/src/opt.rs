@@ -48,6 +48,8 @@ pub fn flatten_gpu(m: &mut Module) -> Result<()> {
         if_convert(m, &mut f);
         cse(&mut f);
         dce(&mut f);
+        // Last: the calls left are the ones a browser's compiler writes out at each place.
+        crate::merge_calls::merge_calls(m, &mut f);
         m.functions[i] = f;
     }
     Ok(())

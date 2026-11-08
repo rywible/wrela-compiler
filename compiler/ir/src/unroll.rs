@@ -12,7 +12,9 @@
 //! - its counter is a local, stored a constant just before the loop, written in the loop only
 //!   by one store in its continuing block (a pure function of the counter and constants), and
 //!   never lent;
-//! - it runs at most `MOST_PASSES` times, and its copies come to at most `MOST_STATEMENTS`.
+//! - it runs at most `MOST_PASSES` times, and its copies come to at most `MOST_STATEMENTS`;
+//! - it calls no function (those left are big ones, written out once per call by a browser's
+//!   shader compiler: language.md §18.11's weight).
 //!
 //! The copies keep the counter's stores, so the counter holds what it would after the loop;
 //! inner loops are unrolled first.
@@ -69,6 +71,13 @@ fn block(f: &mut Function, b: Block, consts: &HashMap<ValueId, Const>) -> Block 
     out
 }
 
+/// Whether `b` calls a function.
+fn calls(b: &[Stmt]) -> bool {
+    let mut found = false;
+    visit::walk(b, &mut |s| found |= matches!(s.expr(), Some(Expr::Call(..))));
+    found
+}
+
 /// How many times the loop runs, if it qualifies; `before` is the code before it in its block.
 fn plan(
     before: &[Stmt],
@@ -76,6 +85,12 @@ fn plan(
     continuing: &Block,
     consts: &HashMap<ValueId, Const>,
 ) -> Option<u32> {
+    // A loop that calls a function stays a loop: the calls left after flattening are to big
+    // functions (`opt::outlined`), which a browser's shader compiler copies into each place
+    // they're called, so a copy per pass would cost far more to compile than the loop runs.
+    if calls(body) || calls(continuing) {
+        return None;
+    }
     // The exit test: pure statements, then `if cond { break }`.
     let test = body.iter().position(is_exit_test)?;
     let Stmt::If { cond, .. } = &body[test] else { return None };

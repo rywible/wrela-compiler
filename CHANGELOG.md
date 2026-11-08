@@ -3,6 +3,16 @@
 Each release's changes a program or a tool can see. The pull request of each release holds the
 detail; `docs/release.md` says how a release is cut.
 
+## 0.27.0
+
+- **Shaders compile faster** (language.md §18.11): a loop that calls a big function is no longer
+  written out a pass at a time, and back-to-back calls of a big function whose arguments don't
+  need each other's results (a normal's taps) merge into one call in a loop. The opening's far
+  pass compiles about 6x faster cold (22.6 s to under 4 s on SwiftShader), its noise cook 10x.
+- **A pipeline's weight is its WGSL's**, after the compiler's inlining and these rewrites, so
+  `wrela pipelines` and the 300,000 cap (E0707) count what a browser compiles. A function's
+  `@budget(weight: n)` still counts its code as written.
+
 ## 0.26.0
 
 - **Stand-ins** (language.md §18.12): `@standin(cheap)` on a `@compute` kernel or a `@fragment`

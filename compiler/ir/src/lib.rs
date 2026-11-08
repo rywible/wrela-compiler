@@ -17,6 +17,7 @@ pub mod derive;
 mod error;
 pub mod gpu_memory;
 pub mod layout;
+mod merge_calls;
 pub mod opt;
 pub mod print;
 pub mod scalarize;

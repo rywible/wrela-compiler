@@ -102,31 +102,41 @@ fn a_branch_counts_its_costlier_side_unless_its_condition_is_known() {
     assert!(never * 10 < plain, "a known branch counts the side it takes: {all:?}");
 }
 
+/// A function of about `n` hundred statements, called from many places: big enough that the
+/// shader is written with it as a function of its own (`opt::outlined`).
+fn big(n: usize) -> String {
+    let mut s = String::from("fn big(x: f32) -> f32 {\n    var a = x\n");
+    for k in 0..n * 25 {
+        s.push_str(&format!("    a = sin(a * {}.5) * cos(a) + sqrt(abs(a))\n", k % 7 + 1));
+    }
+    s.push_str("    a\n}\n");
+    s
+}
+
 #[test]
-fn a_function_called_from_more_places_weighs_more() {
-    let items = "fn big(x: f32) -> f32 {\n    var a = x\n    for _i in 0..4 {\n        a = sin(a) * cos(a) + sqrt(abs(a)) + exp(a * 0.1)\n    }\n    a\n}\n";
+fn a_function_called_from_more_places_weighs_more_unless_its_calls_merge() {
     let dir = kernels(
         "work_weight",
-        items,
+        &big(12),
         &[
+            // Each call needs the last's result: four copies.
+            ("chain", "    out[id] = big(big(big(big(x))))"),
+            // Four taps of it, none needing another's: one call in a loop (`merge_calls`).
+            ("taps", "    out[id] = big(x + 1.0) + big(x + 2.0) + big(x + 3.0) + big(x + 4.0)"),
+            // A loop that calls it stays a loop.
             (
-                "once",
-                "    var a = x\n    for _i in 0..4 {\n        a = big(a)\n    }\n    out[id] = a",
+                "looped",
+                "    var a = x\n    for _i in 0..4 {\n        a = a + big(x + f32(_i))\n    }\n    out[id] = a",
             ),
-            ("four", "    out[id] = big(big(big(big(x))))"),
         ],
     );
     let all = work(&dir);
-    let (once, four) = (of(&all, "once"), of(&all, "four"));
-    let (a, b) = (once.0.unwrap(), four.0.unwrap());
-    assert!(
-        a.abs_diff(b) * 10 < a,
-        "about the same work either way (the loop's counter aside): {all:?}"
-    );
-    assert!(
-        four.1 * 10 > once.1 * 18,
-        "four calls weigh four copies, a loop of one call one: {all:?}"
-    );
+    let (chain, taps, looped) = (of(&all, "chain").1, of(&all, "taps").1, of(&all, "looped").1);
+    assert!(chain > 3 * taps, "four copies against one: {all:?}");
+    assert!(chain > 3 * looped, "a loop of one call is one copy: {all:?}");
+    // About the same work either way: merging changes what's compiled, not what runs.
+    let (a, b) = (of(&all, "chain").0.unwrap(), of(&all, "taps").0.unwrap());
+    assert!(a.abs_diff(b) * 10 < a, "{all:?}");
 }
 
 #[test]
