@@ -65,7 +65,14 @@ pub struct EntryWork {
 /// budgets (once each). One count serves the module, so a function two entry points call is
 /// followed once for each set of known arguments.
 pub fn module_work(m: &Module) -> (Vec<EntryWork>, Vec<Breach>) {
-    let mut c = Counter { m, steps: 0, gave_up: false, memo: HashMap::new(), breaches: Vec::new() };
+    let mut c = Counter {
+        m,
+        steps: 0,
+        gave_up: false,
+        memo: HashMap::new(),
+        breaches: Vec::new(),
+        passes: HashMap::new(),
+    };
     let mut out = Vec::new();
     for e in &m.entry_points {
         (c.steps, c.gave_up) = (0, false);
@@ -78,10 +85,74 @@ pub fn module_work(m: &Module) -> (Vec<EntryWork>, Vec<Breach>) {
 
 /// The work of entry point `f` of module `m`, and the functions over their budgets.
 pub fn entry_work(m: &Module, f: FuncId) -> EntryWork {
-    let mut c = Counter { m, steps: 0, gave_up: false, memo: HashMap::new(), breaches: Vec::new() };
+    let mut c = Counter {
+        m,
+        steps: 0,
+        gave_up: false,
+        memo: HashMap::new(),
+        breaches: Vec::new(),
+        passes: HashMap::new(),
+    };
     let r = c.call(f, &[]);
     let work = if r.unbounded || c.gave_up { None } else { Some(r.work) };
     EntryWork { work, unbounded: r.loop_at, breaches: c.breaches }
+}
+
+/// The work of single expressions of a module's functions, knowing nothing of their values (a
+/// call's is its function's, given nothing of its arguments). One count serves each call, so
+/// a function called many times is followed once.
+pub struct ExprWork<'a> {
+    c: Counter<'a>,
+}
+
+impl<'a> ExprWork<'a> {
+    pub fn new(m: &'a Module) -> ExprWork<'a> {
+        ExprWork {
+            c: Counter {
+                m,
+                steps: 0,
+                gave_up: false,
+                memo: HashMap::new(),
+                breaches: Vec::new(),
+                passes: HashMap::new(),
+            },
+        }
+    }
+
+    /// The most work `e`, in `f`, can do: `None` when unbounded.
+    pub fn of(&mut self, f: &Function, e: &Expr) -> Option<u64> {
+        let mut fr = Frame {
+            f,
+            args: Vec::new(),
+            vals: HashMap::new(),
+            work: 0,
+            unbounded: false,
+            loop_at: None,
+            here: None,
+            ret: None,
+            calls: HashMap::new(),
+        };
+        (self.c.steps, self.c.gave_up) = (0, false);
+        self.c.expr(&mut fr, &mut State::default(), e);
+        (!fr.unbounded && !self.c.gave_up).then_some(fr.work)
+    }
+}
+
+/// The most passes each loop of function `f` makes, by its body's address (`as_ptr`), knowing
+/// nothing of `f`'s parameters: a loop missing ends after a number of passes the count can't
+/// bound.
+pub fn loop_passes(m: &Module, f: FuncId) -> HashMap<usize, u32> {
+    let mut c = Counter {
+        m,
+        steps: 0,
+        gave_up: false,
+        memo: HashMap::new(),
+        breaches: Vec::new(),
+        passes: HashMap::new(),
+    };
+    let args = vec![None; m.functions[f.0 as usize].params.len()];
+    c.call(f, &args);
+    if c.gave_up { HashMap::new() } else { c.passes }
 }
 
 #[derive(Clone, Debug)]
@@ -103,6 +174,8 @@ struct Counter<'a> {
     gave_up: bool,
     memo: HashMap<CallKey, Called>,
     breaches: Vec<Breach>,
+    /// The most passes each loop that ended made, by its body's address.
+    passes: HashMap<usize, u32>,
 }
 
 /// How a block ended, when it's sure.
@@ -339,7 +412,11 @@ impl<'a> Counter<'a> {
             passes += 1;
             let before = st.locals.clone();
             match self.block(fr, st, body) {
-                Flow::Break => return Flow::Normal,
+                Flow::Break => {
+                    let most = self.passes.entry(body.as_ptr() as usize).or_default();
+                    *most = (*most).max(passes);
+                    return Flow::Normal;
+                }
                 Flow::Return => return Flow::Return,
                 Flow::Normal | Flow::Continue => {}
             }

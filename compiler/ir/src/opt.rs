@@ -39,6 +39,10 @@ pub fn flatten_gpu(m: &mut Module) -> Result<()> {
         promote(m, &mut f);
         forward_stores(m, &mut f);
         dce(&mut f);
+        // What's computed from constants is computed now, once (§18.13).
+        if crate::const_fold::fold_constants(m, &mut f) {
+            dce(&mut f);
+        }
         // An inlined function given a constant `bool` keeps only the branch it takes (an
         // `isolate: false` argument), as the CPU's inlining does.
         fold_constant_branches(&mut f);
@@ -2140,7 +2144,7 @@ fn reuse_loads(m: &Module, f: &mut Function) {
 
 /// Which locals' addresses are taken: places in them that a pointer, a run, an atomic or a
 /// by-reference argument points to.
-fn address_taken(f: &Function) -> Vec<bool> {
+pub(crate) fn address_taken(f: &Function) -> Vec<bool> {
     let mut taken = vec![false; f.locals.len()];
     visit::walk(&f.body, &mut |s| {
         if let Some(e @ (Expr::Addr(_) | Expr::Run(_) | Expr::Atomic(..) | Expr::Call(..))) =

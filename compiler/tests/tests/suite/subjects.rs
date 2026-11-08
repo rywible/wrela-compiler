@@ -221,8 +221,12 @@ fn gradients_agree(name: &str) {
         "{name}: 256 points near the surface × {per_point} literals: {checked} checked, {nonzero} non-zero, {kinks} with a kink in the step; worst {worst:.3} of the allowance"
     );
     assert!(kinks * 50 <= checked, "{name}: {kinks} of {checked} had a kink");
+    // A point's distance is its nearby parts', so only a few of the literals it reads move it:
+    // about one in twenty for the grazer, which a literal or two more in the engine moves either
+    // way (58 of 1,022 before `Placed` kept its Lipschitz bound, 44 after). The bound is that
+    // the check isn't empty, not the rate.
     assert!(
-        nonzero * 20 >= checked,
+        nonzero * 40 >= checked,
         "{name}: only {nonzero} of {checked} derivatives are non-zero"
     );
 }

@@ -1930,13 +1930,10 @@ impl Noise for Fbm {
     }
 
     /// The sum of the octaves' amplitudes, each way: 2 − 2^(1 − octaves).
+    /// Closed form, rather than a loop over the octaves: every invocation that bounds a
+    /// displaced surface computes it, alike (§18.13), and a loop's passes have no bound here.
     fn range(self) -> Interval {
-        var r = 0.0
-        var a = 1.0
-        for _o in 0..self.octaves {
-            r += a
-            a *= 0.5
-        }
+        let r = 2.0 - exp2(1.0 - f32(self.octaves))
         Interval { lo: -r, hi: r }
     }
 

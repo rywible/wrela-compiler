@@ -342,6 +342,12 @@ fn emit_in(
                 "call a big function from fewer places (once in a loop, not once a step), or move work its own pass can do there; `wrela pipelines` shows each pipeline's weight",
             ));
         }
+        if budgets {
+            for w in &p.same {
+                let Some(at) = w.at else { continue };
+                diagnostics.push(same_work(at, w.work));
+            }
+        }
         if let Some(wgsl) = wgsl {
             files.push((shader.clone(), wgsl.text.into_bytes()));
         }
@@ -435,6 +441,22 @@ fn page(runtime: &[u8], manifest: &wrela_abi::Manifest) -> Vec<u8> {
         .collect();
     let page = String::from_utf8_lossy(runtime);
     page.replacen("</head>", &format!("{links}</head>"), 1).into_bytes()
+}
+
+/// E0712: a shipped build's GPU code computing, in every invocation, `work` of a value the same
+/// for all of them (§18.13), at the value.
+fn same_work(at: wrela_diag::Span, work: Option<u64>) -> Diagnostic {
+    let work = match work {
+        Some(w) => format!("{w} work"),
+        None => "work with no bound".to_string(),
+    };
+    Diagnostic::new(
+        wrela_diag::codes::E0712,
+        at,
+        format!("every invocation computes this again, the same for all of them: {work}"),
+    )
+    .with_note("it's computed only from what the command gives every invocation alike: its uniform block, the pipeline's constants, a buffer or a texture read at a same place (§18.13)")
+    .with_help("compute it once, on the CPU or in a kernel of one invocation (`@compute(1)`), and pass the result in")
 }
 
 /// E0707: a shipped build over one of its budgets, at the command that records what's over.

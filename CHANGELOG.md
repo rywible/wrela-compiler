@@ -3,6 +3,21 @@
 Each release's changes a program or a tool can see. The pull request of each release holds the
 detail; `docs/release.md` says how a release is cut.
 
+## 0.28.0
+
+- **GPU code computes constants as it's built** (language.md §18.13): a value computed only from
+  constants, and what a loop leaves when all it reads is constant, is a constant in the WGSL, no
+  longer computed by every invocation (`normalize(CUTS[i].xyz)` in the opening's rock).
+- **E0712: a shipped build's GPU code that computes, in every invocation, more than 256 work of
+  a value the same for all of them** (computed only from the uniform block, a buffer or a texture read at the same
+  place, and constants). Compute it once on the CPU, or in a `@compute(1)` kernel, and pass it
+  in. Kernels of one invocation a workgroup aren't checked. A loop's values count once a pass;
+  a loop's own counter arithmetic isn't counted.
+- `std::field`'s `Fbm::range` is its closed form, `2 − 2^(1 − octaves)`, not a loop: a displaced
+  surface's bounds no longer loop over the octaves in every invocation.
+- Breaking: shipped builds of the opening hit E0712 until its sites are hoisted (hero, weather,
+  paint, isle, yonder, skiff, aboard); stay on 0.27.0 until then.
+
 ## 0.27.0
 
 - **Shaders compile faster** (language.md §18.11): a loop that calls a big function is no longer
