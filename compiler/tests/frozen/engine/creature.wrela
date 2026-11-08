@@ -732,6 +732,9 @@ pub struct Placed<F>: Copy + GpuData {
     pub other_name: Text,
     /// How its mesh moves with the skeleton.
     pub skin: SkinBinding,
+    /// Its field's Lipschitz bound everywhere (`rough_over`'s), computed once where it's placed
+    /// rather than by every invocation that culls with it (language.md §18.13).
+    pub lipschitz: f32,
 }
 
 impl<F: Surface> Placed<F> {
@@ -781,7 +784,7 @@ impl<F: Surface> Placed<F> {
     /// `b`'s centre and a Lipschitz bound that holds everywhere (an exact distance's 1), if it
     /// has one; otherwise none (everything).
     fn rough_over(self, b: Box3) -> Interval {
-        let l = self.field.lipschitz(1.0e30)
+        let l = self.lipschitz
         if l >= 1.0e30 {
             return Interval { lo: -FAR, hi: FAR }
         }
@@ -2326,6 +2329,7 @@ fn place<F: Surface>(
     skin: SkinBinding = ON_BONE,
 ) -> Placed<F> {
     let other = sk.other(bone)
+    let lipschitz = field.lipschitz(1.0e30)
     Placed {
         field,
         at: space.local(sk.rest(bone)),
@@ -2337,6 +2341,7 @@ fn place<F: Surface>(
         bone_name: sk.name(bone),
         other_name: sk.name(other),
         skin,
+        lipschitz,
     }
 }
 

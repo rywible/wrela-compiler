@@ -1,0 +1,124 @@
+// GPU code that computes, in every invocation, more than 256 work of a value the same for all of
+// them (§18.13): one computed only from the uniform block, a buffer or a texture read at a place
+// that's the same too, and constants. Every pixel (or invocation) computes it again, to the same
+// result. Compute it once for the command, on the CPU or in a kernel of one invocation
+// (`@compute(1)`), and pass the result in.
+// ---- wrong
+use std::gpu::{GlobalId, GpuBuffer, Slots, buffer, dispatch}
+
+struct Given: Copy + GpuData {
+    time: f32,
+}
+
+@compute(64)
+fn shade(g: Given, out: mut Slots<f32>, id: GlobalId) {
+    var a = g.time
+    a = sin(a) + cos(a)
+    a = sin(a) + cos(a)
+    a = sin(a) + cos(a)
+    a = sin(a) + cos(a)
+    a = sin(a) + cos(a)
+    a = sin(a) + cos(a)
+    a = sin(a) + cos(a)
+    a = sin(a) + cos(a)
+    a = sin(a) + cos(a)
+    a = sin(a) + cos(a)
+    a = sin(a) + cos(a)
+    a = sin(a) + cos(a)
+    a = sin(a) + cos(a)
+    a = sin(a) + cos(a)
+    a = sin(a) + cos(a)
+    a = sin(a) + cos(a)
+    a = sin(a) + cos(a)
+    a = sin(a) + cos(a)
+    a = sin(a) + cos(a)
+    a = sin(a) + cos(a)
+    a = sin(a) + cos(a)
+    a = sin(a) + cos(a)
+    a = sin(a) + cos(a)
+    a = sin(a) + cos(a)
+    a = sin(a) + cos(a)
+    a = sin(a) + cos(a)
+    a = sin(a) + cos(a)
+    a = sin(a) + cos(a)
+    a = sin(a) + cos(a)
+    a = sin(a) + cos(a)
+    a = sin(a) + cos(a)
+    a = sin(a) + cos(a)
+    a = sin(a) + cos(a)
+    a = sin(a) + cos(a)
+    a = sin(a) + cos(a)
+    a = sin(a) + cos(a)
+    a = sin(a) + cos(a)
+    a = sin(a) + cos(a)
+    a = sin(a) + cos(a)
+    a = sin(a) + cos(a)
+    out[id] = a * f32(id.x)
+}
+
+pub fn frame(time: f32, width: u32, height: u32) {
+    var out: GpuBuffer<f32> = buffer(64)
+    dispatch(shade.bind(g: Given { time: time }, out: mut out), over: 64)
+}
+// ---- fixed
+use std::gpu::{GlobalId, GpuBuffer, Slots, buffer, dispatch}
+
+struct Given: Copy + GpuData {
+    a: f32,
+}
+
+@compute(64)
+fn shade(g: Given, out: mut Slots<f32>, id: GlobalId) {
+    out[id] = g.a * f32(id.x)
+}
+
+/// What every invocation would compute alike, computed once.
+fn rounds(time: f32) -> f32 {
+    var a = time
+    a = sin(a) + cos(a)
+    a = sin(a) + cos(a)
+    a = sin(a) + cos(a)
+    a = sin(a) + cos(a)
+    a = sin(a) + cos(a)
+    a = sin(a) + cos(a)
+    a = sin(a) + cos(a)
+    a = sin(a) + cos(a)
+    a = sin(a) + cos(a)
+    a = sin(a) + cos(a)
+    a = sin(a) + cos(a)
+    a = sin(a) + cos(a)
+    a = sin(a) + cos(a)
+    a = sin(a) + cos(a)
+    a = sin(a) + cos(a)
+    a = sin(a) + cos(a)
+    a = sin(a) + cos(a)
+    a = sin(a) + cos(a)
+    a = sin(a) + cos(a)
+    a = sin(a) + cos(a)
+    a = sin(a) + cos(a)
+    a = sin(a) + cos(a)
+    a = sin(a) + cos(a)
+    a = sin(a) + cos(a)
+    a = sin(a) + cos(a)
+    a = sin(a) + cos(a)
+    a = sin(a) + cos(a)
+    a = sin(a) + cos(a)
+    a = sin(a) + cos(a)
+    a = sin(a) + cos(a)
+    a = sin(a) + cos(a)
+    a = sin(a) + cos(a)
+    a = sin(a) + cos(a)
+    a = sin(a) + cos(a)
+    a = sin(a) + cos(a)
+    a = sin(a) + cos(a)
+    a = sin(a) + cos(a)
+    a = sin(a) + cos(a)
+    a = sin(a) + cos(a)
+    a = sin(a) + cos(a)
+    a
+}
+
+pub fn frame(time: f32, width: u32, height: u32) {
+    var out: GpuBuffer<f32> = buffer(64)
+    dispatch(shade.bind(g: Given { a: rounds(time) }, out: mut out), over: 64)
+}

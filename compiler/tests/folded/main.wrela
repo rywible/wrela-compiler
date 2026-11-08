@@ -1,0 +1,366 @@
+// Constant folding (language.md §18.13): a kernel's values computed only from constants
+// are computed as the shader is built. Each case below is written twice: from its literals,
+// which the build folds, and from the same numbers passed in the uniform block, which the GPU
+// computes. Both land in one buffer, the folded first; they must agree within the GPU's error.
+use std::gpu::{GlobalId, GpuBuffer, Slots, buffer, dispatch}
+
+pub const CASES: u32 = 50
+
+/// A loop that runs as the shader is built, given a constant.
+fn looped(s: f32) -> f32 {
+    var a = s
+    for _i in 0..64 {
+        a = sin(a) + cos(a)
+    }
+    a
+}
+
+/// A loop that leaves on its own value.
+fn halved(s: f32) -> f32 {
+    var a = s
+    var n = 0
+    while a > 1.0 {
+        a = a * 0.5
+        n = n + 1
+    }
+    a + f32(n)
+}
+
+struct Given: Copy + GpuData {
+    k: [f32; 128],
+}
+
+fn folded_case(g: Given, i: u32) -> f32 {
+    if i == 0 {
+        return sin(0.7)
+    }
+    if i == 1 {
+        return cos(0.7)
+    }
+    if i == 2 {
+        return tan(0.3)
+    }
+    if i == 3 {
+        return asin(0.4)
+    }
+    if i == 4 {
+        return acos(0.4)
+    }
+    if i == 5 {
+        return atan(2.0)
+    }
+    if i == 6 {
+        return atan2(1.0, -2.0)
+    }
+    if i == 7 {
+        return exp(1.3)
+    }
+    if i == 8 {
+        return exp2(3.3)
+    }
+    if i == 9 {
+        return log(5.0)
+    }
+    if i == 10 {
+        return log2(7.0)
+    }
+    if i == 11 {
+        return pow(2.3, 1.7)
+    }
+    if i == 12 {
+        return sqrt(2.0)
+    }
+    if i == 13 {
+        return inverse_sqrt(3.0)
+    }
+    if i == 14 {
+        return sinh(0.6)
+    }
+    if i == 15 {
+        return cosh(0.6)
+    }
+    if i == 16 {
+        return tanh(0.6)
+    }
+    if i == 17 {
+        return floor(-1.5)
+    }
+    if i == 18 {
+        return ceil(-1.5)
+    }
+    if i == 19 {
+        return round(2.5)
+    }
+    if i == 20 {
+        return round(-0.5)
+    }
+    if i == 21 {
+        return fract(-1.25)
+    }
+    if i == 22 {
+        return trunc(-2.7)
+    }
+    if i == 23 {
+        return abs(-3.5)
+    }
+    if i == 24 {
+        return sign(-0.2)
+    }
+    if i == 25 {
+        return min(1.5, 2.5)
+    }
+    if i == 26 {
+        return max(1.5, 2.5)
+    }
+    if i == 27 {
+        return clamp(4.0, 1.0, 3.0)
+    }
+    if i == 28 {
+        return saturate(1.4)
+    }
+    if i == 29 {
+        return mix(1.0, 3.0, 0.25)
+    }
+    if i == 30 {
+        return step(0.5, 0.25)
+    }
+    if i == 31 {
+        return smoothstep(0.2, 0.8, 0.5)
+    }
+    if i == 32 {
+        return smoothstep(1.0, 0.0, 0.3)
+    }
+    if i == 33 {
+        return length(vec3(0.8, -0.45, 0.25))
+    }
+    if i == 34 {
+        return normalize(vec3(0.8, -0.45, 0.25)).y
+    }
+    if i == 35 {
+        return dot(vec3(0.8, -0.45, 0.25), vec3(0.1, 2.0, -1.0))
+    }
+    if i == 36 {
+        return cross(vec3(0.8, -0.45, 0.25), vec3(0.1, 2.0, -1.0)).z
+    }
+    if i == 37 {
+        return distance(vec2(1.0, 2.0), vec2(4.0, 6.5))
+    }
+    if i == 38 {
+        return f32(i32(-2.7))
+    }
+    if i == 39 {
+        return f32(u32(3.9))
+    }
+    if i == 40 {
+        return 1.0 / 3.0
+    }
+    if i == 41 {
+        return 7.5 % 2.0
+    }
+    if i == 42 {
+        return f32(u32(17) / u32(5))
+    }
+    if i == 43 {
+        return f32(i32(-17) / 5)
+    }
+    if i == 44 {
+        return f32((u32(1) << u32(7)) | u32(3))
+    }
+    if i == 45 {
+        return select(1.0, 2.0, 0.3 < 0.2)
+    }
+    if i == 46 {
+        return looped(0.5)
+    }
+    if i == 47 {
+        return halved(37.0)
+    }
+    if i == 48 {
+        // The GPU's `x - y * trunc(x / y)`: 0.7 / 0.1 rounds to 7 in f32.
+        return 0.7 % 0.1
+    }
+    if i == 49 {
+        // Past i32's range: what the GPU gives, not Rust's clamp.
+        return f32(i32(3000000000.0) - 2147483000)
+    }
+    0.0
+}
+
+@compute(64)
+fn folded(g: Given, out: mut Slots<f32>, id: GlobalId) {
+    out[id] = folded_case(g, id.x)
+}
+
+fn computed_case(g: Given, i: u32) -> f32 {
+    if i == 0 {
+        return sin(g.k[0])
+    }
+    if i == 1 {
+        return cos(g.k[1])
+    }
+    if i == 2 {
+        return tan(g.k[2])
+    }
+    if i == 3 {
+        return asin(g.k[3])
+    }
+    if i == 4 {
+        return acos(g.k[4])
+    }
+    if i == 5 {
+        return atan(g.k[5])
+    }
+    if i == 6 {
+        return atan2(g.k[6], g.k[7])
+    }
+    if i == 7 {
+        return exp(g.k[8])
+    }
+    if i == 8 {
+        return exp2(g.k[9])
+    }
+    if i == 9 {
+        return log(g.k[10])
+    }
+    if i == 10 {
+        return log2(g.k[11])
+    }
+    if i == 11 {
+        return pow(g.k[12], g.k[13])
+    }
+    if i == 12 {
+        return sqrt(g.k[14])
+    }
+    if i == 13 {
+        return inverse_sqrt(g.k[15])
+    }
+    if i == 14 {
+        return sinh(g.k[16])
+    }
+    if i == 15 {
+        return cosh(g.k[17])
+    }
+    if i == 16 {
+        return tanh(g.k[18])
+    }
+    if i == 17 {
+        return floor(g.k[19])
+    }
+    if i == 18 {
+        return ceil(g.k[20])
+    }
+    if i == 19 {
+        return round(g.k[21])
+    }
+    if i == 20 {
+        return round(g.k[22])
+    }
+    if i == 21 {
+        return fract(g.k[23])
+    }
+    if i == 22 {
+        return trunc(g.k[24])
+    }
+    if i == 23 {
+        return abs(g.k[25])
+    }
+    if i == 24 {
+        return sign(g.k[26])
+    }
+    if i == 25 {
+        return min(g.k[27], g.k[28])
+    }
+    if i == 26 {
+        return max(g.k[29], g.k[30])
+    }
+    if i == 27 {
+        return clamp(g.k[31], g.k[32], g.k[33])
+    }
+    if i == 28 {
+        return saturate(g.k[34])
+    }
+    if i == 29 {
+        return mix(g.k[35], g.k[36], g.k[37])
+    }
+    if i == 30 {
+        return step(g.k[38], g.k[39])
+    }
+    if i == 31 {
+        return smoothstep(g.k[40], g.k[41], g.k[42])
+    }
+    if i == 32 {
+        return smoothstep(g.k[43], g.k[44], g.k[45])
+    }
+    if i == 33 {
+        return length(vec3(g.k[46], g.k[47], g.k[48]))
+    }
+    if i == 34 {
+        return normalize(vec3(g.k[49], g.k[50], g.k[51])).y
+    }
+    if i == 35 {
+        return dot(vec3(g.k[52], g.k[53], g.k[54]), vec3(g.k[55], g.k[56], g.k[57]))
+    }
+    if i == 36 {
+        return cross(vec3(g.k[58], g.k[59], g.k[60]), vec3(g.k[61], g.k[62], g.k[63])).z
+    }
+    if i == 37 {
+        return distance(vec2(g.k[64], g.k[65]), vec2(g.k[66], g.k[67]))
+    }
+    if i == 38 {
+        return f32(i32(g.k[68]))
+    }
+    if i == 39 {
+        return f32(u32(g.k[69]))
+    }
+    if i == 40 {
+        return g.k[70] / g.k[71]
+    }
+    if i == 41 {
+        return g.k[72] % g.k[73]
+    }
+    if i == 42 {
+        return f32(u32(17) / u32(5))
+    }
+    if i == 43 {
+        return f32(i32(-17) / 5)
+    }
+    if i == 44 {
+        return f32((u32(1) << u32(7)) | u32(3))
+    }
+    if i == 45 {
+        return select(g.k[74], g.k[75], g.k[76] < g.k[77])
+    }
+    if i == 46 {
+        return looped(g.k[78])
+    }
+    if i == 47 {
+        return halved(g.k[79])
+    }
+    if i == 48 {
+        return g.k[80] % g.k[81]
+    }
+    if i == 49 {
+        return f32(i32(g.k[82]) - 2147483000)
+    }
+    0.0
+}
+
+@compute(64)
+fn computed(g: Given, out: mut Slots<f32>, id: GlobalId) {
+    out[id] = computed_case(g, id.x)
+}
+
+pub struct State {
+    folded: GpuBuffer<f32>,
+    computed: GpuBuffer<f32>,
+}
+
+pub fn init() -> State {
+    State { folded: buffer(64), computed: buffer(64) }
+}
+
+pub fn frame(s: mut State, time: f32, width: u32, height: u32) {
+    let g = Given { k: [0.7, 0.7, 0.3, 0.4, 0.4, 2.0, 1.0, -2.0, 1.3, 3.3, 5.0, 7.0, 2.3, 1.7, 2.0, 3.0, 0.6, 0.6, 0.6, -1.5, -1.5, 2.5, -0.5, -1.25, -2.7, -3.5, -0.2, 1.5, 2.5, 1.5, 2.5, 4.0, 1.0, 3.0, 1.4, 1.0, 3.0, 0.25, 0.5, 0.25, 0.2, 0.8, 0.5, 1.0, 0.0, 0.3, 0.8, -0.45, 0.25, 0.8, -0.45, 0.25, 0.8, -0.45, 0.25, 0.1, 2.0, -1.0, 0.8, -0.45, 0.25, 0.1, 2.0, -1.0, 1.0, 2.0, 4.0, 6.5, -2.7, 3.9, 1.0, 3.0, 7.5, 2.0, 1.0, 2.0, 0.3, 0.2, 0.5, 37.0, 0.7, 0.1, 3000000000.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0] }
+    dispatch(folded.bind(g: g, out: mut s.folded), groups: 1)
+    dispatch(computed.bind(g: g, out: mut s.computed), groups: 1)
+}

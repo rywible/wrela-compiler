@@ -98,6 +98,9 @@ pub struct PipelineOut {
     /// Its entry points' weight together (§18.11): their statements with every call written
     /// out, what the browser's shader compiler works through.
     pub weight: u64,
+    /// What its entry points compute in every invocation, more than [`MOST_SAME_WORK`] work of
+    /// a value the same for all of them (§18.13): a shipped build's E0712.
+    pub same: Vec<ir::same::SameWork>,
     /// The pipeline of its entry point's `@standin` (§18.12): what the browser runs in its
     /// place until it's built.
     pub standin: Option<u32>,
@@ -3017,7 +3020,7 @@ fn lower_compute(cx: &mut Cx, iface: Rc<Interface>, consts: Vec<ir::Const>) -> O
         function: entry,
         inputs,
     });
-    let (work, unbounded, weight) = verify(cx, &mut mb, name)?;
+    let (work, unbounded, weight, same) = verify(cx, &mut mb, name)?;
     non_filtering(&mb.m, &mut bindings);
     let instances = mb.fn_instances();
     Some(PipelineOut {
@@ -3039,6 +3042,7 @@ fn lower_compute(cx: &mut Cx, iface: Rc<Interface>, consts: Vec<ir::Const>) -> O
         work,
         unbounded,
         weight,
+        same,
         standin: None,
         stands_in: false,
     })
@@ -3105,7 +3109,7 @@ fn lower_render(cx: &mut Cx, iface: Rc<Interface>, consts: Vec<ir::Const>) -> Op
         inputs: finputs,
     });
     let name = format!("{}_{}", ir::ident(&vdef.name), ir::ident(&fdef.name));
-    let (work, unbounded, weight) = verify(cx, &mut mb, &name)?;
+    let (work, unbounded, weight, same) = verify(cx, &mut mb, &name)?;
     non_filtering(&mb.m, &mut bindings);
     let instances = mb.fn_instances();
     Some(PipelineOut {
@@ -3127,6 +3131,7 @@ fn lower_render(cx: &mut Cx, iface: Rc<Interface>, consts: Vec<ir::Const>) -> Op
         work,
         unbounded,
         weight,
+        same,
         standin: None,
         stands_in: false,
     })
@@ -3478,8 +3483,8 @@ pub(crate) fn debug_checks(cx: &mut Cx, out: &mut PipelineOut, code: u32) {
 }
 
 /// A pipeline's counts (§18.11): each entry point's work and the loop that leaves it unbounded,
-/// and its weight.
-type Counts = (Vec<Option<u64>>, Vec<Option<Span>>, u64);
+/// its weight, and the work its invocations do alike (§18.13).
+type Counts = (Vec<Option<u64>>, Vec<Option<Span>>, u64, Vec<ir::same::SameWork>);
 
 /// Checks a pipeline's module and, if it'll be emitted, flattens it (`ir::opt::flatten_gpu`)
 /// and lays out its memory as the CPU's (`ir::gpu_memory`).
@@ -3491,6 +3496,7 @@ fn verify(cx: &mut Cx, mb: &mut ModuleBuilder, name: &str) -> Option<Counts> {
     // Work is counted before flattening, while each function is still its own (§18.11).
     let (mut work, mut unbounded) = (Vec::new(), Vec::new());
     let mut weight = 0u64;
+    let mut same = Vec::new();
     if checked.is_ok() {
         for e in &mb.m.entry_points {
             weight = weight.saturating_add(ir::work::weight(&mb.m, e.function));
@@ -3518,6 +3524,7 @@ fn verify(cx: &mut Cx, mb: &mut ModuleBuilder, name: &str) -> Option<Counts> {
             .and_then(|()| ir::verify(&mb.m));
         if checked.is_ok() {
             weight = written_weight(&mb.m);
+            same = ir::same::same_work(&mb.m, MOST_SAME_WORK + 1);
         }
     } else if checked.is_ok() {
         // The pipeline's weight is its WGSL's, as flattening writes it (§18.11).
@@ -3527,6 +3534,7 @@ fn verify(cx: &mut Cx, mb: &mut ModuleBuilder, name: &str) -> Option<Counts> {
             .is_ok()
         {
             weight = written_weight(&flat);
+            same = ir::same::same_work(&flat, MOST_SAME_WORK + 1);
         }
     }
     if let Err(e) = checked {
@@ -3536,7 +3544,7 @@ fn verify(cx: &mut Cx, mb: &mut ModuleBuilder, name: &str) -> Option<Counts> {
     if wrela_diag::has_errors(&cx.diags) {
         return None;
     }
-    Some((work, unbounded, weight))
+    Some((work, unbounded, weight, same))
 }
 
 /// A flattened module's weight (§18.11): its entry points' statements with each call to a
@@ -3544,6 +3552,10 @@ fn verify(cx: &mut Cx, mb: &mut ModuleBuilder, name: &str) -> Option<Counts> {
 fn written_weight(m: &ir::Module) -> u64 {
     m.entry_points.iter().fold(0u64, |w, e| w.saturating_add(ir::work::weight(m, e.function)))
 }
+
+/// The most work a shipped build's GPU code may do, each invocation again, to compute one value
+/// the same for every invocation (§18.13): E0712 past it.
+pub const MOST_SAME_WORK: u64 = 256;
 
 /// E0710 for a function's weight over its `@budget(weight: n)` (§18.11), once.
 fn over_weight_budget(cx: &mut Cx, name: &str, w: u64, most: u64, at: Span) {
