@@ -344,6 +344,8 @@ fn unused_items(p: &Program, mir: &BTreeMap<ty::FnId, mir::Body>) -> Vec<Diagnos
             });
         }
     }
+    // An entry point's `@standin` is used by it (§18.12).
+    fns.extend(p.fns.iter().filter_map(|f| f.attrs.standin.map(|(g, _)| g)));
     let mut out = Vec::new();
     let unused = |name: &str, kind: &str, span| {
         Diagnostic::new(

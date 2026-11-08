@@ -154,6 +154,9 @@ export type Pipeline = Stage & {
   /** Reached only under runtime conditions: tier 1, built once tier 0 is (or when a command
    * needs it first). */
   conditional: boolean;
+  /** The pipeline run in its place until it's built (its entry point's `@standin`, §18.12):
+   * one of the same kind, bindings and uniform block, by its index; null for none. */
+  standin: number | null;
   /** A legacy build's pipeline-overridable constants, by their names in its WGSL (a bool is 0 or 1). */
   constants: [string, number][];
 };
@@ -368,6 +371,9 @@ function pipeline(v: unknown, i: number): Pipeline {
   const requires: string[] = names(o, "requires", where, FEATURES, "a feature this host knows", true);
   // A missing `conditional` is tier 0.
   const conditional = flag(o, "conditional", where, false);
+  // A missing `standin` is none.
+  const si = o["standin"] ?? null;
+  const standin = si === null ? null : asU32(si, `${where}.standin`);
   // A legacy build's overrides (missing: none).
   const constants: [string, number][] = [];
   if (o["constants"] !== undefined) {
@@ -378,7 +384,7 @@ function pipeline(v: unknown, i: number): Pipeline {
       else throw new ManifestError(`${where}.constants.${k} must be true, false or a number`);
     }
   }
-  return { ...stage, name, shader, uniform, bindings, debug_flag, requires, conditional, constants };
+  return { ...stage, name, shader, uniform, bindings, debug_flag, requires, conditional, standin, constants };
 }
 
 /** The manifest's `wasm_abi`. */
@@ -463,6 +469,15 @@ export function validateManifest(m: Manifest): void {
   if (m.wasm === "") throw err("no WASM file");
   if (!plainFileName(m.wasm)) throw err("the WASM file's name isn't a file name in the build directory");
   m.pipelines.forEach((p, i) => {
+    // A stand-in runs the commands recorded for its pipeline: the same kind, bindings and
+    // uniform block, and none of its own.
+    if (p.standin !== null) {
+      const s = m.pipelines[p.standin];
+      const same = s !== undefined && p.standin !== i && s.standin === null && s.kind === p.kind
+        && (s.kind !== "compute" || p.kind !== "compute" || s.workgroup_size.join() === p.workgroup_size.join())
+        && JSON.stringify(s.bindings) === JSON.stringify(p.bindings) && JSON.stringify(s.uniform) === JSON.stringify(p.uniform);
+      if (!same) throw err(`pipeline ${i}'s stand-in must be another pipeline of its kind, bindings and uniform block, with no stand-in of its own`);
+    }
     if (p.shader === "") throw err(`pipeline ${i} has no shader`);
     if (!plainFileName(p.shader)) {
       throw err(`pipeline ${i}'s shader name isn't a file name in the build directory`);

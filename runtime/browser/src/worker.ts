@@ -712,12 +712,14 @@ function runNext(program: Program, tickFrom: number | null, schedule: number, fp
 
 /** What a start waited for (`results/starts.json`): each pipeline's name and when it was built
  * (ms since the epoch, as `frames.json`'s `began_ms`; null if it never was), and each time a
- * command waited for one, its frame, the pipeline and when it began waiting. */
+ * command waited for one, its frame, the pipeline and when it began waiting; and each frame a
+ * pipeline's commands ran on its stand-in (§18.12). */
 function startsJson(build: Build, executor: GpuExecutor): string {
   const epoch = (ms: number | null) => (ms === null ? null : performance.timeOrigin + ms);
   return JSON.stringify({
     built: build.manifest.pipelines.map((p, i) => ({ name: p.name, conditional: p.conditional, ms: epoch(executor.builtAt[i] ?? null) })),
     waits: executor.waits.map((w) => ({ frame: w.frame, pipeline: w.pipeline, ms: epoch(w.at) })),
+    stood_in: executor.stoodIn,
   });
 }
 
@@ -829,6 +831,7 @@ async function runTest(canvas: OffscreenCanvas, device: GPUDevice, build: Build,
         },
         cache: pipelineCache,
         hashWasm: tickHashes,
+        standins: params.standins !== 0,
       },
     );
   running = salted;

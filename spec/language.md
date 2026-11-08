@@ -1111,6 +1111,7 @@ All attributes except `@diagnostic`, `@intrinsic` and `@fuel` are part of a type
 | `@job` | functions | A job: a function whose body runs over several frames, to each `yield` (§16.3) |
 | `@test`, `@test(frames: n)`, `@test(tool)` | functions | A test. `wrela test` runs it as the build runs constants, or after `n` of the program's frames (§13.2). With `gpu: true` it runs on the GPU, and with `golden: "frame.png"` it compares its screen with a PNG. `@test(tool)` goes on a function, which runs on the package's tool build. |
 | `@budget(work: n, weight: m)` | GPU functions | The most work one call may do, and the most its code may weigh with every call written out (§18.11) |
+| `@standin(name)` | `@compute` kernels and `@fragment` shaders | The cheap entry point the browser runs in its place until its pipeline is built (§18.12) |
 | `@fuel(n)` | constants, tests of code | The work that the build may do to compute the constant or run the test (§13.1) |
 | `@client`, `@server`, `@tool` | functions | Only that role's build may run the function (§15.3). Reaching it from another role's entries is E0708. A function has one role (E0204). |
 | `@testing` | exports | An export that only a test build has. See below. |
@@ -2586,6 +2587,40 @@ The compiler counts what each GPU function costs from its code, the same on ever
 - **`@budget(work: n)`** holds a GPU function to at most `n` work a call, and **`@budget(weight: n)`** to at most `n` weight; one attribute may give both. Each instantiation that a pipeline reaches is checked, with what that pipeline makes constant; one over its budget, or whose work has no bound, is E0710 at the attribute, naming the calls that do the most of it.
 - **A shipped build's pipeline weighs at most 300,000** (E0707, at the command that records it), as its WGSL is at most 256 KiB (§18.9).
 - Work and weight are counts to compare code by and to hold it to, not times: a GPU's time depends on how its invocations diverge, on its memory and on its compiler.
+
+### 18.12 Stand-ins
+
+A pipeline whose shader the browser takes long to compile can have a stand-in: a cheap entry point that runs in its place until it's built, so a start doesn't wait for it.
+
+```wrela
+use std::gpu::{FragCoord, Rgba16Float, Sampler, Texture3d}
+
+struct Shot: Copy + GpuData {
+    horizon: vec4,
+    eye: vec3,
+}
+
+@fragment
+@standin(far_flat)
+fn far(pixel: FragCoord, shot: Shot, field: Texture3d<Rgba16Float>, smp: Sampler) -> vec4 {
+    var t = 0.0
+    for _i in 0..256 {   // a long march: seconds to compile
+        t += field.sample_level(smp, shot.eye + vec3(pixel.position.xy * 0.001, t), 0.0).x
+    }
+    shot.horizon * t
+}
+
+/// The horizon's colour, until `far` is built.
+@fragment
+fn far_flat(_pixel: FragCoord, shot: Shot, _field: Texture3d<Rgba16Float>, _smp: Sampler) -> vec4 {
+    shot.horizon
+}
+```
+
+- **`@standin(name)`** goes on a `@compute` kernel or a `@fragment` shader, and names another of the same stage (a kernel of the same workgroup size) that takes parameters of the same types, modes and kinds (`const` or not) and returns the same type: their names may differ, so the stand-in's unused ones start with `_`. A generic one's stand-in has as many generic parameters, instantiated with the same arguments, and the types are compared in each instantiation. A stand-in has none of its own. Anything else is E0711. The stand-in counts as used.
+- **The compiler builds each pipeline's stand-in beside it:** the same bindings and uniform block, so a command recorded for the one runs the other (a render pipeline's stand-in keeps its vertex shader and draws into its targets). The manifest names it (`"standin": j`, pipeline `j`), and `wrela pipelines` shows it (`stand-in far_flat`, and the stand-in's own line; in `--json`, `"standin": j` and `"stands_in": true`). CPU code can't tell them apart: it records the same commands either way.
+- **The browser builds stand-ins first**, then the rest as §18.9 says. A command whose pipeline isn't built runs on its stand-in once that is, and waits only while neither is (a command that needs one starts its stand-in's build, not its own). Once its own pipeline is built, the next command runs on it. So the first frames may draw what the stand-ins draw: what a stand-in draws should be something a player may see for a moment, such as a flat colour or the scene's last bake. Test mode waits for each command's own pipeline, so the frames are the native host's, unless `standins=1`; its `starts.json` lists each frame a pipeline's commands ran on its stand-in (`stood_in`). The native host builds every pipeline before the first frame and runs none on its stand-in.
+- What a stand-in draws or computes is presentation, never state: a readback is `nondet` already (§17.1), and a GPU result reaches the simulation only through a tick's input.
 
 ## 19. Rooms
 

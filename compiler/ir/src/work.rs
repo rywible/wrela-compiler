@@ -92,13 +92,16 @@ struct Called {
     ret: Option<Const>,
 }
 
+/// A call, by its function and what's known of its arguments (a kind and a value each).
+type CallKey = (u32, Vec<Option<(u8, u32)>>);
+
 struct Counter<'a> {
     m: &'a Module,
     steps: u64,
     /// The count went past [`MOST_STEPS`]: what it found after is not the code's, so no
     /// function is reported over its budget from then on.
     gave_up: bool,
-    memo: HashMap<(u32, Vec<Option<(u8, u32)>>), Called>,
+    memo: HashMap<CallKey, Called>,
     breaches: Vec<Breach>,
 }
 

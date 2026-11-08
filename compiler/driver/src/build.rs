@@ -363,6 +363,7 @@ fn emit_in(
             debug_flag: p.debug_flag,
             requires,
             conditional: conditional.get(i).copied().unwrap_or(false),
+            standin: p.standin,
             constants: Vec::new(),
         });
     }

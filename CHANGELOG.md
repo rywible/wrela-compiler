@@ -3,6 +3,17 @@
 Each release's changes a program or a tool can see. The pull request of each release holds the
 detail; `docs/release.md` says how a release is cut.
 
+## 0.26.0
+
+- **Stand-ins** (language.md §18.12): `@standin(cheap)` on a `@compute` kernel or a `@fragment`
+  shader names a cheap entry point of the same stage and parameters. The compiler builds its
+  pipeline beside the real one, with the same bindings, and the manifest names it (`standin`).
+  The browser builds stand-ins first and runs a command on its pipeline's stand-in until that
+  pipeline is built, so a start no longer waits for its slowest shaders. A stand-in that can't
+  stand in is E0711. Test mode waits for each pipeline as before unless `standins=1`; its
+  `starts.json` lists the frames that ran on a stand-in (`stood_in`). `wrela pipelines` shows
+  each pipeline's stand-in.
+
 ## 0.25.0
 
 - **Work and weight** (language.md §18.11): the compiler counts each GPU function's most work in

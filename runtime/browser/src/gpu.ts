@@ -371,10 +371,11 @@ export type PipelineCache = Map<string, Promise<BuiltPipeline>>;
 
 /** FNV-1a 64 of a pipeline's manifest entry and its WGSL, as hex. Not its WGSL file's name,
  * which is its place among the build's pipelines (`pipeline_3.wgsl`): a pipeline added or
- * dropped before it moves it, and the next build keeps it all the same. */
+ * dropped before it moves it, and the next build keeps it all the same. Nor its stand-in's
+ * place (`standin`), which isn't what's built. */
 function pipelineKey(p: Pipeline, source: string): string {
   const hash = new StateHash();
-  hash.update(ENCODER.encode(`${JSON.stringify({ ...p, shader: "" })}\n${source}`));
+  hash.update(ENCODER.encode(`${JSON.stringify({ ...p, shader: "", standin: null })}\n${source}`));
   return hash.hex();
 }
 
@@ -430,6 +431,9 @@ export function preparePipelines(
  * order the builds started in. */
 export interface Building {
   each: Promise<BuiltPipeline>[];
+  /** Each pipeline's stand-in (`Pipeline.standin`, §18.12), run in its place until it's built;
+   * all null when stand-ins are off. */
+  standins: (number | null)[];
   tier0: Promise<unknown>;
   start(i: number): void;
   release(): void;
@@ -465,8 +469,13 @@ export function buildPipelines(
   screenFormat: GPUTextureFormat,
   cache?: PipelineCache,
   held = false,
+  useStandins = true,
 ): Building {
-  const order = biggestFirst(shaders);
+  const standins = manifest.pipelines.map((p) => (useStandins ? p.standin : null));
+  // Stand-ins first, then the rest biggest first: a stand-in is what a frame runs meanwhile.
+  const isStandin = new Set(standins.filter((j): j is number => j !== null));
+  const biggest = biggestFirst(shaders);
+  const order = [...biggest.filter((i) => isStandin.has(i)), ...biggest.filter((i) => !isStandin.has(i))];
   const each: Promise<BuiltPipeline>[] = [];
   const started: number[] = [];
   // The pipelines not started yet, in the order they start: tier 0's, then tier 1's.
@@ -563,7 +572,7 @@ export function buildPipelines(
     released = true;
     pump();
   };
-  return { each, tier0, start, release, order: started };
+  return { each, standins, tier0, start, release, order: started };
 }
 
 /** What a pass records, waiting for it to end: draws, with their own copies of their uniform
@@ -1014,6 +1023,13 @@ export class GpuExecutor {
    * pipeline, and when): test mode's `starts.json`, what a start waited for. */
   readonly builtAt: (number | null)[];
   readonly waits: { frame: number; pipeline: number; at: number }[] = [];
+  /** Each frame a pipeline's commands ran on its stand-in (§18.12), as `{frame, pipeline}`,
+   * first first: test mode's `starts.json`. */
+  readonly stoodIn: { frame: number; pipeline: number }[] = [];
+  /** The last frame each pipeline's commands ran on its stand-in. */
+  readonly #stoodInLast = new Map<number, number>();
+  /** Each pipeline's stand-in (`Building.standins`): none unless the executor was given them. */
+  readonly #standins: (number | null)[];
   /** How the screen is shown, as `wrela.limit`'s `SCREEN_LIMIT` gives it: bit 0 HDR, bit 1
    * Display P3 (`ScreenTarget.state`). It changes once a `ConfigureScreen` is done. */
   get screenState(): number {
@@ -1053,7 +1069,7 @@ export class GpuExecutor {
     readonly screen: ScreenTarget,
     timing: Timing = "off",
     debug = pipelines.some((p) => !(p instanceof Promise) && p.debugFlag !== null),
-    tiers?: Pick<Building, "tier0" | "start" | "release">,
+    tiers?: Pick<Building, "tier0" | "start" | "release"> & Partial<Pick<Building, "standins">>,
   ) {
     this.#deferred = timing === "serial" ? [] : null;
     this.#pipelines = pipelines.map((p) => (p instanceof Promise ? undefined : p));
@@ -1061,6 +1077,7 @@ export class GpuExecutor {
     this.#building = pipelines.map((p) => Promise.resolve(p));
     this.#start = tiers?.start ?? (() => {});
     this.#release = tiers?.release ?? (() => {});
+    this.#standins = tiers?.standins ?? [];
     this.built = (tiers ? tiers.tier0 : Promise.all(this.#building)).then(
       () => {},
       (e: unknown) => {
@@ -1217,9 +1234,11 @@ export class GpuExecutor {
     if ("pipeline" in cmd && cmd.pipeline >= this.#pipelines.length) {
       throw new CommandError(cmd.op, `there's no pipeline ${cmd.pipeline} (the manifest has ${this.#pipelines.length})`);
     }
-    // A tier-1 pipeline a command needs before its tier's turn starts building now.
+    // A tier-1 pipeline a command needs before its tier's turn starts building now: its
+    // stand-in, if it has one, which the command runs on meanwhile.
     if ("pipeline" in cmd && !this.#ready(cmd)) {
-      this.#start(cmd.pipeline);
+      // The serial mode runs each command on its own pipeline (`drain` waits for it).
+      this.#start(this.#deferred === null ? (this.#standins[cmd.pipeline] ?? cmd.pipeline) : cmd.pipeline);
       this.waits.push({ frame: this.#frame, pipeline: cmd.pipeline, at: performance.now() });
     }
     const queue = this.#deferred ?? (this.#waitingAt < this.#waiting.length || !this.#ready(cmd) ? this.#waiting : null);
@@ -1270,9 +1289,31 @@ export class GpuExecutor {
     return this.#idle.promise;
   }
 
-  /** Whether `cmd`'s pipeline, if it has one, is built. */
+  /** Whether `cmd`'s pipeline, if it has one, can run: it's built, or its stand-in is. */
   #ready(cmd: Command): boolean {
-    return !("pipeline" in cmd) || this.#pipelines[cmd.pipeline] !== undefined;
+    return !("pipeline" in cmd) || this.#runsOn(cmd.pipeline) !== undefined;
+  }
+
+  /** The pipeline a command recorded for pipeline `i` runs on now: `i` once it's built, else its
+   * stand-in once that is (§18.12); undefined while neither is. */
+  #runsOn(i: number): number | undefined {
+    if (this.#pipelines[i] !== undefined) return i;
+    const j = this.#standins[i] ?? null;
+    return j !== null && this.#pipelines[j] !== undefined ? j : undefined;
+  }
+
+  /** `cmd`, on the pipeline it runs on now (`#runsOn`): a copy on its stand-in while its own
+   * pipeline isn't built, counted in `stoodIn`. */
+  #onto(cmd: Command): Command {
+    if (!("pipeline" in cmd)) return cmd;
+    const j = this.#runsOn(cmd.pipeline);
+    if (j === undefined || j === cmd.pipeline) return cmd;
+    const frame = this.#running?.frame ?? this.#frame;
+    if (this.#stoodInLast.get(cmd.pipeline) !== frame) {
+      this.#stoodInLast.set(cmd.pipeline, frame);
+      this.stoodIn.push({ frame, pipeline: cmd.pipeline });
+    }
+    return { ...cmd, pipeline: j } as Command;
   }
 
   /** A pipeline was built: the commands waiting run, up to the next that needs one not built,
@@ -1346,6 +1387,7 @@ export class GpuExecutor {
   }
 
   #run(cmd: Command, ownedUniforms = false): void {
+    cmd = this.#onto(cmd);
     // A label names the passes and dispatches after it in its own frame: the first command of
     // another frame starts with none.
     const generation = this.#running?.generation ?? this.#generation;

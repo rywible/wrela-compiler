@@ -200,6 +200,10 @@ pub struct Pipeline {
     /// (or at once, when a command needs it first).
     #[serde(skip_serializing_if = "std::ops::Not::not")]
     pub conditional: bool,
+    /// The pipeline a host may run in its place until it's built (§18.12): its entry point's
+    /// `@standin`, with the same bindings and uniform block. Its index in the manifest.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub standin: Option<u32>,
     /// A [`LEGACY_VERSION`] build's pipeline-overridable constants, by their names in its WGSL,
     /// which the host sets when it makes the pipeline (a bool is 0 or 1). A build of this
     /// version folds them into its WGSL and names none.
@@ -754,6 +758,28 @@ impl Manifest {
             return err("the WASM file's name isn't a file name in the build directory".into());
         }
         for (i, p) in self.pipelines.iter().enumerate() {
+            // A stand-in runs the commands recorded for its pipeline: the same kind, bindings
+            // and uniform block, and none of its own (§18.12).
+            if let Some(j) = p.standin {
+                let same = self.pipelines.get(j as usize).is_some_and(|s| {
+                    j as usize != i
+                        && s.standin.is_none()
+                        && s.bindings == p.bindings
+                        && s.uniform == p.uniform
+                        && match (&s.stage, &p.stage) {
+                            (
+                                Stage::Compute { workgroup_size: a, .. },
+                                Stage::Compute { workgroup_size: b, .. },
+                            ) => a == b,
+                            (a, b) => std::mem::discriminant(a) == std::mem::discriminant(b),
+                        }
+                });
+                if !same {
+                    return err(format!(
+                        "pipeline {i}'s stand-in must be another pipeline of its kind, bindings and uniform block, with no stand-in of its own"
+                    ));
+                }
+            }
             if p.shader.is_empty() {
                 return err(format!("pipeline {i} has no shader"));
             }
@@ -1294,6 +1320,11 @@ mod read {
         })?;
         // A missing `conditional` is tier 0.
         let conditional = flag(o, "conditional", &place, false)?;
+        // A missing `standin` is none.
+        let standin = match o.get("standin").unwrap_or(&Value::Null) {
+            Value::Null => None,
+            v => Some(as_u32(v, &format!("{place}.standin"))?),
+        };
         // A legacy build's overrides (missing: none).
         let constants = match o.get("constants") {
             None => Vec::new(),
@@ -1320,6 +1351,7 @@ mod read {
             debug_flag,
             requires,
             conditional,
+            standin,
             constants,
         })
     }
@@ -1330,15 +1362,13 @@ mod read {
         let Value::Array(pipelines) = field(o, "pipelines", "the manifest")? else {
             return fail("pipelines must be an array".into());
         };
+        let pipelines: Vec<Pipeline> =
+            pipelines.iter().enumerate().map(|(i, p)| pipeline(p, i)).collect::<Result<_>>()?;
         Ok(Manifest {
             manifest_version: u32(o, "manifest_version", "the manifest")?,
             stream_version: u32(o, "stream_version", "the manifest")?,
             wasm: string(o, "wasm", "the manifest")?,
-            pipelines: pipelines
-                .iter()
-                .enumerate()
-                .map(|(i, p)| pipeline(p, i))
-                .collect::<Result<_>>()?,
+            pipelines,
             wasm_abi: match o.get("wasm_abi") {
                 None => None,
                 Some(v) => Some(wasm_abi(v)?),

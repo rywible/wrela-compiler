@@ -316,6 +316,9 @@ export interface GpuOptions {
   cache?: PipelineCache | undefined;
   /** Whether the WASM's bytes are hashed as it compiles (the tick log's header). */
   hashWasm?: boolean;
+  /** Whether a pipeline's stand-in (§18.12) runs in its place until it's built (the default);
+   * otherwise a command waits for its own pipeline. */
+  standins?: boolean;
 }
 
 /** Gets every pipeline ready to build, the first frame's first (`buildPipelines`, held), compiles the WASM meanwhile (unless the build comes compiled:
@@ -333,7 +336,7 @@ export async function startProgram(
 ): Promise<Program> {
   const started = performance.now();
   // Held: the first frame's pipelines build first, alone (`GpuExecutor` releases the rest).
-  const pipelines = buildPipelines(device, build.manifest, build.shaders, screen.format, gpu.cache, true);
+  const pipelines = buildPipelines(device, build.manifest, build.shaders, screen.format, gpu.cache, true, gpu.standins ?? true);
   const compiled = (build.compiled ??= await Program.compile(build.wasm, build.manifest.wasm_abi, gpu.hashWasm ?? false));
   const debug = build.manifest.pipelines.some((p) => p.debug_flag !== null);
   const executor = new GpuExecutor(device, pipelines.each, screen, gpu.timing, debug, pipelines);
