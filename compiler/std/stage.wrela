@@ -13,7 +13,7 @@
 
 use std::derive::{Box2, Box3, Interval, interval}
 use std::math::is_finite
-use std::field::{Surface, lattice, lattice_coord, smin, value_noise, value_noise_box}
+use std::field::{Bound, Surface, UNBOUNDED, lattice, lattice_coord, smin, value_noise, value_noise_box}
 use std::hash::pcg
 
 /// The most operations a `Tape` holds, and the most constants in its table.
@@ -673,6 +673,12 @@ fn integer(op: Op, x: u32, y: u32, z: u32) -> f32 {
 impl<const N: u32, const K: u32> Surface for Taped<N, K> {
     fn distance(self, p: vec3) -> f32 {
         interpret(self, p)
+    }
+
+    /// Unbounded: a tape is built at run time and records no shape's bound. The surface it was
+    /// taped from states one (`bound()` before `to_tape()`).
+    fn bound(self) -> Bound {
+        UNBOUNDED
     }
 
     /// The interval derived through `interpret_unboxed`: every number's where a box noise

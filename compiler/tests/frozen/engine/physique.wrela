@@ -11,6 +11,7 @@ use creature::{Bone, Creature, Parts}
 use std::derive::{Box3, interval}
 use std::field::Bound
 use std::hash::StateHash
+use std::field::{UNBOUNDED}
 
 /// What a quantity is gathered per.
 pub enum Per: Copy + Eq {
@@ -508,6 +509,11 @@ fn physique_keeps_disconnected_parts_with_known_bounds() {
 struct UnknownBoundSphere: Copy + GpuData {}
 
 impl std::field::Surface for UnknownBoundSphere {
+    /// No bound stated: unbounded (what a surface was before every one stated its own).
+    fn bound(self) -> Bound {
+        UNBOUNDED
+    }
+
     fn distance(self, p: vec3) -> f32 {
         length(p) - 0.5
     }

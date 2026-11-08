@@ -1320,6 +1320,11 @@ impl<P: PartList> Group<P> {
 /// A group alone is a surface: what a modifier reads of a part of the creature (the wolf's fur
 /// thins on its head). Its seams that give no width are hard here.
 impl<P: PartList> Surface for Group<P> {
+    /// No bound stated: unbounded (what a surface was before every one stated its own).
+    fn bound(self) -> Bound {
+        UNBOUNDED
+    }
+
     fn distance(self, p: vec3) -> f32 {
         self.value(p, 0.0)
     }
@@ -2089,6 +2094,11 @@ pub struct CreatureField<P>: Copy + GpuData {
 }
 
 impl<P: PartList> Surface for CreatureField<P> {
+    /// No bound stated: unbounded (what a surface was before every one stated its own).
+    fn bound(self) -> Bound {
+        UNBOUNDED
+    }
+
     fn distance(self, p: vec3) -> f32 {
         self.parts.fold_plain(p, FAR, self.k)
     }

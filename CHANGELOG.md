@@ -3,6 +3,18 @@
 Each release's changes a program or a tool can see. The pull request of each release holds the
 detail; `docs/release.md` says how a release is cut.
 
+## 0.29.0
+
+- **Breaking: every surface states where it is** (language.md §20.3). `Surface::bound()` has no
+  default: an impl without one is E0401. A surface that has none says so, `UNBOUNDED`, with its
+  reason (closures, half-spaces, `Sampled3d`, taped fields and `ToBound` do). std's `Tube`,
+  `UnionAll`, `SmoothUnionAll`, `SmoothSubtract`, `SmoothIntersect`, `Mirror` and a rotated
+  surface (`Turn`) now state real bounds, so culling and LOD can skip them; `PointMap::bound` is
+  required too.
+- `std::field::check_bound` (and `bound_broken`): a search of the boxes round a stated bound for
+  one whose every distance is below what it allows. Debug builds run it where a surface is stepped
+  by (`to_bound`), beside `check_lipschitz`.
+
 ## 0.28.1
 
 - E0712 no longer counts what's computed only from constants and loops' counters, whatever it

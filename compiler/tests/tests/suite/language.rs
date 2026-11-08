@@ -333,8 +333,8 @@ impl Scene {
         ..NONE
     },
     Context { first: "use std::derive::{Interval, interval}", ..NONE },
-    Context { first: "use std::field::{Surface, sphere}", ..NONE },
-    Context { first: "use std::field::{Noise, Surface}", ..NONE },
+    Context { first: "use std::field::{Bound, Surface, sphere}", ..NONE },
+    Context { first: "use std::field::{Bound, Noise, Surface}", ..NONE },
     Context { first: "use std::field::{Surface, cuboid, round_cone}", ..NONE },
     // §16.2's examples are whole programs.
     Context { first: "use std::tick::{Ticked, start}", ..NONE },

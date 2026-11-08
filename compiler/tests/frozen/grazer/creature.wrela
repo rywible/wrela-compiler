@@ -21,6 +21,7 @@ use round1::shapes::{
 }
 use std::field::{Blend, Color, Surface, cuboid, rgb, round_cone, smax, sphere}
 use std::quat::Quat
+use std::field::{Bound, UNBOUNDED}
 
 // ---- channels: a coat per part ------------------------------------------------------------------
 
@@ -153,6 +154,11 @@ pub fn muscle(a: vec3, b: vec3, at: vec3, t: f32, off: vec2, r: vec3) -> Muscle 
 }
 
 impl Surface for Muscle {
+    /// No bound stated: unbounded (what a surface was before every one stated its own).
+    fn bound(self) -> Bound {
+        UNBOUNDED
+    }
+
     fn distance(self, p: vec3) -> f32 {
         let q = bone_space(p, self.a, self.b)
         let d = ell(self.r).distance(
@@ -176,6 +182,11 @@ pub struct Hoof: Copy + GpuData {
 }
 
 impl Surface for Hoof {
+    /// No bound stated: unbounded (what a surface was before every one stated its own).
+    fn bound(self) -> Bound {
+        UNBOUNDED
+    }
+
     fn distance(self, p: vec3) -> f32 {
         let q = p + vec3(0.0, self.drop, 0.0)
         var h = round_cone(
@@ -211,6 +222,11 @@ pub struct Ear: Copy + GpuData {
 }
 
 impl Surface for Ear {
+    /// No bound stated: unbounded (what a surface was before every one stated its own).
+    fn bound(self) -> Bound {
+        UNBOUNDED
+    }
+
     fn distance(self, h: vec3) -> f32 {
         let e = ear_space(h)
         let d = round_cone(

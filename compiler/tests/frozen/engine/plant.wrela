@@ -26,6 +26,7 @@ use std::gpu::{
     begin_pass, draw, texture,
 }
 use std::math::{PI, TAU}
+use std::field::{Bound, UNBOUNDED}
 
 /// A clump of leaves on a limb: a sphere of them `radius` across, or, `squash` below 1, a
 /// cushion: as wide, `squash` as tall, so a broad lit top over a flat shaded underside.
@@ -331,6 +332,11 @@ impl Plant {
 
 /// A plant's field: its limbs, and its crown as one soft solid. The lens draws it as clay.
 impl Surface for Plant {
+    /// No bound stated: unbounded (what a surface was before every one stated its own).
+    fn bound(self) -> Bound {
+        UNBOUNDED
+    }
+
     fn distance(self, p: vec3) -> f32 {
         let (crown, _) = self.crown(p)
         min(self.wood(p), crown)

@@ -15,11 +15,11 @@
           "message": "declared here without `pub`",
           "span": {
             "column": 5,
-            "end": 1931,
+            "end": 1961,
             "end_column": 16,
             "end_line": 29,
             "line": 29,
-            "start": 1920
+            "start": 1950
           }
         }
       ],

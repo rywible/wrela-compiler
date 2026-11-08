@@ -5,6 +5,7 @@
 // up to rounding. Each shape states a Lipschitz bound, derived in its comment.
 
 use std::field::{Surface, RoundCone, round_cone}
+use std::field::{Bound, UNBOUNDED}
 
 /// WGSL's `smoothstep(from, to, x)`, as its formula, for either order of the edges: round 1's
 /// authors wrote some with `from > to`, a falling step, which WGSL leaves to the platform.
@@ -144,6 +145,11 @@ pub fn ell(r: vec3) -> Ell {
 }
 
 impl Surface for Ell {
+    /// No bound stated: unbounded (what a surface was before every one stated its own).
+    fn bound(self) -> Bound {
+        UNBOUNDED
+    }
+
     fn distance(self, p: vec3) -> f32 {
         let k0 = length(p / self.r)
         if k0 < 1.0 {
@@ -186,6 +192,11 @@ pub fn flat_cone(a: vec3, b: vec3, r1: f32, r2: f32, sx: f32, scale_ends: bool =
 }
 
 impl Surface for FlatCone {
+    /// No bound stated: unbounded (what a surface was before every one stated its own).
+    fn bound(self) -> Bound {
+        UNBOUNDED
+    }
+
     fn distance(self, p: vec3) -> f32 {
         self.cone.distance(vec3(p.x * self.sx, p.y, p.z)) / self.sx
     }
@@ -211,6 +222,11 @@ pub struct FurredEll: Copy + GpuData {
 }
 
 impl Surface for FurredEll {
+    /// No bound stated: unbounded (what a surface was before every one stated its own).
+    fn bound(self) -> Bound {
+        UNBOUNDED
+    }
+
     fn distance(self, p: vec3) -> f32 {
         let fur = fbm3((p + self.origin) * self.freq + self.offset, self.octaves)
         ell(self.r).distance(p - self.centre) - self.amp * fur
