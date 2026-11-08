@@ -91,6 +91,13 @@ pub struct PipelineOut {
     pub targets: Vec<wrela_abi::manifest::RenderTarget>,
     /// The functions its module instantiates, with their type arguments (`wrela query`).
     pub instances: Vec<(FnId, Vec<TyId>)>,
+    /// Each entry point's work (§18.11), in the module's order: `None` when it has no bound.
+    pub work: Vec<Option<u64>>,
+    /// For each entry point whose work has no bound, the loop that has no sure exit.
+    pub unbounded: Vec<Option<Span>>,
+    /// Its entry points' weight together (§18.11): their statements with every call written
+    /// out, what the browser's shader compiler works through.
+    pub weight: u64,
 }
 
 /// What a GPU module is for, while it's lowered.
@@ -1742,7 +1749,7 @@ const SUBGROUP_OPS: [(Lang, ir::SubgroupOp); 13] = [
     (Lang::SubgroupShuffle, ir::SubgroupOp::Shuffle),
 ];
 
-/// A subgroup operation (`std::gpu::subgroup_add` and the rest, §18.10): kernels only, of the
+/// A subgroup operation (`std::gpu::subgroup_add` and the rest, §18.11): kernels only, of the
 /// types WGSL's take (E0607). The module then needs the device's `subgroups`.
 fn subgroup_op(
     fl: &mut Fl,
@@ -1757,7 +1764,7 @@ fn subgroup_op(
     let kernel = |s| matches!(s, Entry::Compute(_));
     let ok = stage_only(fl, kernel, None, at, |what| {
         Diagnostic::new(codes::E0607, at, format!("`{name}` is for kernels, and this is {what}"))
-            .with_note("a subgroup is a kernel's invocations that run in lockstep (§18.10)")
+            .with_note("a subgroup is a kernel's invocations that run in lockstep (§18.11)")
             .with_help("call it in a `@compute` function, on a device with `features().subgroups`")
     });
     if !ok {
@@ -2870,7 +2877,7 @@ fn lower_compute(cx: &mut Cx, iface: Rc<Interface>, consts: Vec<ir::Const>) -> O
         function: entry,
         inputs,
     });
-    verify(cx, &mut mb, name)?;
+    let (work, unbounded, weight) = verify(cx, &mut mb, name)?;
     non_filtering(&mb.m, &mut bindings);
     let instances = mb.fn_instances();
     Some(PipelineOut {
@@ -2889,6 +2896,9 @@ fn lower_compute(cx: &mut Cx, iface: Rc<Interface>, consts: Vec<ir::Const>) -> O
         debug_flag: None,
         targets: Vec::new(),
         instances,
+        work,
+        unbounded,
+        weight,
     })
 }
 
@@ -2953,7 +2963,7 @@ fn lower_render(cx: &mut Cx, iface: Rc<Interface>, consts: Vec<ir::Const>) -> Op
         inputs: finputs,
     });
     let name = format!("{}_{}", ir::ident(&vdef.name), ir::ident(&fdef.name));
-    verify(cx, &mut mb, &name)?;
+    let (work, unbounded, weight) = verify(cx, &mut mb, &name)?;
     non_filtering(&mb.m, &mut bindings);
     let instances = mb.fn_instances();
     Some(PipelineOut {
@@ -2972,6 +2982,9 @@ fn lower_render(cx: &mut Cx, iface: Rc<Interface>, consts: Vec<ir::Const>) -> Op
         debug_flag: None,
         targets: Vec::new(),
         instances,
+        work,
+        unbounded,
+        weight,
     })
 }
 
@@ -3322,15 +3335,37 @@ pub(crate) fn debug_checks(cx: &mut Cx, out: &mut PipelineOut, code: u32) {
 
 /// Checks a pipeline's module and, if it'll be emitted, flattens it (`ir::opt::flatten_gpu`)
 /// and lays out its memory as the CPU's (`ir::gpu_memory`).
-fn verify(cx: &mut Cx, mb: &mut ModuleBuilder, name: &str) -> Option<()> {
+fn verify(
+    cx: &mut Cx,
+    mb: &mut ModuleBuilder,
+    name: &str,
+) -> Option<(Vec<Option<u64>>, Vec<Option<Span>>, u64)> {
     if wrela_diag::has_errors(&cx.diags) {
         return None;
     }
     let mut checked = ir::verify(&mb.m);
-    // For the compiler's own debugging: `WRELA_DUMP_IR=gpu:<pipeline>` prints that pipeline's
-    // module before it's flattened.
-    if std::env::var("WRELA_DUMP_IR").is_ok_and(|d| d.strip_prefix("gpu:") == Some(name)) {
-        eprintln!("{}", ir::print::print(&mb.m));
+    // Work is counted before flattening, while each function is still its own (§18.11).
+    let (mut work, mut unbounded) = (Vec::new(), Vec::new());
+    let mut weight = 0u64;
+    if checked.is_ok() {
+        for e in &mb.m.entry_points {
+            weight = weight.saturating_add(ir::work::weight(&mb.m, e.function));
+        }
+        for (i, f) in mb.m.functions.iter().enumerate() {
+            if let Some(ir::Budget { weight: Some(most), at, .. }) = f.budget {
+                let w = ir::work::weight(&mb.m, ir::FuncId(i as u32));
+                if w > most {
+                    over_weight_budget(cx, &f.name, w, most, at);
+                }
+            }
+        }
+        let (each, breaches) = ir::work::module_work(&mb.m);
+        for b in &breaches {
+            over_work_budget(cx, b);
+        }
+        unbounded =
+            each.iter().map(|w| if w.work.is_none() { w.unbounded } else { None }).collect();
+        work = each.into_iter().map(|w| w.work).collect();
     }
     if cx.emit {
         checked = checked
@@ -3342,7 +3377,74 @@ fn verify(cx: &mut Cx, mb: &mut ModuleBuilder, name: &str) -> Option<()> {
         cx.err(Diagnostic::internal(format!("the IR for `{name}` is malformed: {e}")));
         return None;
     }
-    Some(())
+    if wrela_diag::has_errors(&cx.diags) {
+        return None;
+    }
+    Some((work, unbounded, weight))
+}
+
+/// E0710 for a function's weight over its `@budget(weight: n)` (§18.11), once.
+fn over_weight_budget(cx: &mut Cx, name: &str, w: u64, most: u64, at: Span) {
+    if cx.diags.iter().any(|d| d.code == codes::E0710 && d.span() == Some(at)) {
+        return;
+    }
+    let name = match name.rsplit_once('_') {
+        Some((head, tail)) if !head.is_empty() && tail.chars().all(|c| c.is_ascii_digit()) => head,
+        _ => name,
+    };
+    cx.err(
+        Diagnostic::new(
+            codes::E0710,
+            at,
+            format!("`{name}` weighs {w} with every call written out, over its budget of {most}"),
+        )
+        .with_note("a browser's shader compiler copies a function into each place it's called, so a big function called from many places weighs each time (§18.11)")
+        .with_help("call the big functions from fewer places (once in a loop, not once a step), or raise the budget"),
+    );
+}
+
+/// E0710: a function over its `@budget` (§18.11), once for each `@budget` however many
+/// pipelines reach it.
+fn over_work_budget(cx: &mut Cx, b: &ir::work::Breach) {
+    if cx.diags.iter().any(|d| d.code == codes::E0710 && d.span() == Some(b.at)) {
+        return;
+    }
+    let plain = |n: &str| match n.rsplit_once('_') {
+        Some((head, tail)) if !head.is_empty() && tail.chars().all(|c| c.is_ascii_digit()) => {
+            head.to_string()
+        }
+        _ => n.to_string(),
+    };
+    let name = plain(&b.function);
+    let mut d = match b.work {
+        Some(w) => Diagnostic::new(
+            codes::E0710,
+            b.at,
+            format!("`{name}` can do {w} work in one call, over its budget of {}", b.budget),
+        ),
+        None => Diagnostic::new(
+            codes::E0710,
+            b.at,
+            format!(
+                "`{name}`'s work has no bound, so it can't be held to its budget of {}",
+                b.budget
+            ),
+        ),
+    };
+    if let Some(at) = b.unbounded {
+        d = d.with_secondary(at, "this loop has no exit the count is sure of");
+    }
+    if !b.biggest.is_empty() {
+        let parts: Vec<String> =
+            b.biggest.iter().map(|(n, w)| format!("`{}` {w}", plain(n))).collect();
+        d = d.with_note(format!("the calls that do the most of it: {}", parts.join(", ")));
+    }
+    d = d.with_note("work is counted from the code, the costlier side of each branch it can't decide and each pass of a loop: about one 32-bit operation on one invocation a unit (§18.11)");
+    d = d.with_help(match b.work {
+        Some(_) => "skip the costly calls where they can't matter (a test of a bound round them), or raise the budget",
+        None => "give the loop a constant most passes: `for i in 0..64 { if done { break } ... }`",
+    });
+    cx.err(d);
 }
 
 /// What a `@gpu` function's parameter of type `t` is bound to for its check: a resource of its

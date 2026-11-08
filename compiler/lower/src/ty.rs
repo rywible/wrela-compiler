@@ -582,6 +582,10 @@ impl<'a> Cx<'a> {
                 let ret_t = self.concrete(def.ret, &subst);
                 let ret = self.lower_ty(mb, ret_t, def.sig_span);
                 let mut f = ir::Function::new(self.instance_name(mb, key), params, ret);
+                if mb.target() == ir::Target::Gpu {
+                    f.budget =
+                        def.attrs.budget.map(|(work, weight, at)| ir::Budget { work, weight, at });
+                }
                 // A run result is a view already: it's returned as one, not by a pointer.
                 let run = ret.is_some_and(|t| matches!(mb.m.types.get(t), ir::TypeDef::Run(_)));
                 if def.ret_mode != RetMode::Owned && !run {

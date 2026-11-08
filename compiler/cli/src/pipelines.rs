@@ -60,8 +60,23 @@ pub fn text(pipelines: &[PipelineSummary]) -> String {
         for p in ps {
             let verb = if p.kind == "compute" { "dispatched" } else { "drawn" };
             let tier = if p.tier() == 1 { ", tier 1" } else { "" };
+            let work = if p.work.is_empty() {
+                String::new()
+            } else {
+                let each: Vec<String> = p
+                    .work
+                    .iter()
+                    .enumerate()
+                    .map(|(i, w)| match (w, p.unbounded.get(i).filter(|s| !s.is_empty())) {
+                        (Some(w), _) => w.to_string(),
+                        (None, Some(at)) => format!("unbounded (the loop at {at})"),
+                        (None, None) => "unbounded".to_string(),
+                    })
+                    .collect();
+                format!(", work {}, weight {}", each.join(" + "), p.weight)
+            };
             s.push_str(&format!(
-                "  {} ({}{tier}), {verb} at {}\n",
+                "  {} ({}{tier}{work}), {verb} at {}\n",
                 p.entries.join(" + "),
                 p.kind,
                 (p.sites.iter().enumerate())
@@ -86,13 +101,19 @@ pub fn json(pipelines: &[PipelineSummary]) -> String {
         .iter()
         .map(|p| {
             format!(
-                "{{\"kind\": {}, \"entries\": {}, \"sites\": {}, \"conditional\": [{}], \"tier\": {}{}}}",
+                "{{\"kind\": {}, \"entries\": {}, \"sites\": {}, \"conditional\": [{}], \"tier\": {}{}, \"work\": [{}], \"weight\": {}}}",
                 q(p.kind),
                 list(&p.entries),
                 list(&p.sites),
                 p.conditional.iter().map(|c| c.to_string()).collect::<Vec<_>>().join(", "),
                 p.tier(),
-                p.attachment_bytes.map_or_else(String::new, |b| format!(", \"attachment_bytes\": {b}"))
+                p.attachment_bytes.map_or_else(String::new, |b| format!(", \"attachment_bytes\": {b}")),
+                p.work
+                    .iter()
+                    .map(|w| w.map_or_else(|| "null".to_string(), |w| w.to_string()))
+                    .collect::<Vec<_>>()
+                    .join(", "),
+                p.weight
             )
         })
         .collect();
@@ -116,6 +137,9 @@ mod tests {
             sites: vec!["main.wrela:3:5".into(), "main.wrela:9:5".into()],
             conditional: Vec::new(),
             attachment_bytes: None,
+            work: Vec::new(),
+            weight: 0,
+            unbounded: Vec::new(),
         };
         assert!(text(std::slice::from_ref(&p)).contains("at main.wrela:3:5, main.wrela:9:5\n"));
         let p = PipelineSummary { conditional: vec![false, true], ..p };

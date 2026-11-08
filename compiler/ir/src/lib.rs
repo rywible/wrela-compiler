@@ -26,6 +26,7 @@ pub mod uniformity;
 mod unroll;
 mod verify;
 pub mod visit;
+pub mod work;
 pub mod workgroup;
 
 pub use error::{Error, Result};
@@ -757,6 +758,17 @@ pub struct Function {
     /// `--relaxed-simd`, its vector arithmetic may use relaxed SIMD (a fused multiply-add),
     /// which can differ from engine to engine in its last bit.
     pub relaxable: bool,
+    /// GPU only: `@budget(work: n, weight: m)` (`work`, language.md §18.11).
+    pub budget: Option<Budget>,
+}
+
+/// A GPU function's `@budget` (language.md §18.11): the most work one call may do, the most
+/// its code may weigh with every call written out, and where it's written.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Budget {
+    pub work: Option<u64>,
+    pub weight: Option<u64>,
+    pub at: wrela_diag::Span,
 }
 
 /// A function of std's that a tape holds as one of its operations rather than as its body.
@@ -814,6 +826,7 @@ impl Function {
             interval: false,
             known: None,
             relaxable: false,
+            budget: self.budget,
         }
     }
 
