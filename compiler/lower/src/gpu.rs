@@ -3516,6 +3516,18 @@ fn verify(cx: &mut Cx, mb: &mut ModuleBuilder, name: &str) -> Option<Counts> {
             .and_then(|()| ir::opt::flatten_gpu(&mut mb.m))
             .and_then(|()| ir::gpu_memory::lay_out_gpu_memory(&mut mb.m))
             .and_then(|()| ir::verify(&mb.m));
+        if checked.is_ok() {
+            weight = written_weight(&mb.m);
+        }
+    } else if checked.is_ok() {
+        // The pipeline's weight is its WGSL's, as flattening writes it (§18.11).
+        let mut flat = mb.m.clone();
+        if ir::opt::flatten_gpu(&mut flat)
+            .and_then(|()| ir::gpu_memory::lay_out_gpu_memory(&mut flat))
+            .is_ok()
+        {
+            weight = written_weight(&flat);
+        }
     }
     if let Err(e) = checked {
         cx.err(Diagnostic::internal(format!("the IR for `{name}` is malformed: {e}")));
@@ -3525,6 +3537,12 @@ fn verify(cx: &mut Cx, mb: &mut ModuleBuilder, name: &str) -> Option<Counts> {
         return None;
     }
     Some((work, unbounded, weight))
+}
+
+/// A flattened module's weight (§18.11): its entry points' statements with each call to a
+/// function it keeps written out, as a browser's shader compiler writes them.
+fn written_weight(m: &ir::Module) -> u64 {
+    m.entry_points.iter().fold(0u64, |w, e| w.saturating_add(ir::work::weight(m, e.function)))
 }
 
 /// E0710 for a function's weight over its `@budget(weight: n)` (§18.11), once.
