@@ -229,10 +229,6 @@ pub struct SameWork {
     pub work: Option<u64>,
 }
 
-/// The most work a value computed only from constants and a loop's counter can be and not be
-/// counted: one plain operation on a vector's components (a division or a transcendental is more).
-const CHEAP: u64 = 3 * crate::work::OP;
-
 /// The work each entry point of `m` does more than once to compute a value the same for every
 /// invocation, at each place a varying computation reads one, of at least `least` work, most
 /// first. A function that entry points reach with the same parameters same is looked at once.
@@ -334,51 +330,12 @@ impl Sites<'_> {
         // that share such a value are reported once, at the read value with the costliest
         // cone, which is the work reported: values that only share a cheap one are no bigger
         // a computation together than apart.
-        // The same values computed only from constants, through pure operations and locals
-        // only such values are stored to: a loop's counter and what's computed from it. Where
-        // one is a few plain operations (`vec3i(dx - 1, dy - 1, dz - 1)`), it's the loop's own
-        // structure, not counted. (This looks only at what's stored, not where, so it may take
-        // a value a uniform steers for one: only ever a cheap one, and what's computed from it
-        // at more cost is counted.)
-        let mut fixed: HashSet<ValueId> = def.keys().copied().collect();
-        loop {
-            let before = fixed.len();
-            let keep: Vec<ValueId> = fixed
-                .iter()
-                .copied()
-                .filter(|x| {
-                    let (e, _) = def[x];
-                    let pure = match e {
-                        Expr::Const(_) | Expr::Zero(_) => return true,
-                        Expr::Load(p) => match p.root {
-                            PlaceRoot::Local(l) => {
-                                stored.get(&l).into_iter().flatten().all(|v| fixed.contains(v))
-                            }
-                            _ => false,
-                        },
-                        Expr::Unary(..)
-                        | Expr::Binary(..)
-                        | Expr::Builtin(..)
-                        | Expr::Construct(..)
-                        | Expr::Extract(..)
-                        | Expr::ExtractDyn(..)
-                        | Expr::Splat(..)
-                        | Expr::Swizzle(..)
-                        | Expr::Convert(..)
-                        | Expr::Bitcast(..)
-                        | Expr::Select { .. } => true,
-                        _ => false,
-                    };
-                    let mut all = pure;
-                    e.for_each_value(&mut |y| all &= fixed.contains(&y));
-                    all
-                })
-                .collect();
-            fixed = keep.into_iter().collect();
-            if fixed.len() == before {
-                break;
-            }
-        }
+        // The same values computed only from constants and loops' counters: through pure
+        // operations, and locals whose every store is of such a value, at such indices, under
+        // such conditions only, in loops left on such conditions only. They're the loop's own
+        // structure (`(f32(i) + 1.0) / f32(steps)`): computed from nothing the command gives,
+        // so nothing to compute once and pass in (§18.13). Not counted.
+        let fixed = fixed_values(f, &def);
         let mut cost: std::collections::HashMap<ValueId, Option<u64>> =
             std::collections::HashMap::new();
         // How many times each value is computed an invocation: the passes of the loops it's
@@ -424,12 +381,10 @@ impl Sites<'_> {
                 if !matches!(e, Expr::Load(_) | Expr::Const(_) | Expr::Zero(_)) {
                     let k = times.get(&x).copied().unwrap_or(1);
                     let w = *cost.entry(x).or_insert_with(|| {
-                        let w = self.work.of(f, e)?;
-                        // A loop's counter arithmetic: a few plain operations, not counted.
-                        if fixed.contains(&x) && w <= CHEAP {
+                        if fixed.contains(&x) {
                             return Some(0);
                         }
-                        Some(w.saturating_mul(k))
+                        self.work.of(f, e).map(|w| w.saturating_mul(k))
                     });
                     if w != Some(0) {
                         costed.push(x);
@@ -497,5 +452,147 @@ impl Sites<'_> {
         for (g, bits) in calls {
             self.function(g, bits);
         }
+    }
+}
+
+/// A store to a local, with the values it depends on beyond the one stored: its indices, the
+/// conditions of the branches it's in, and those of the exits of the loops it's in.
+struct LocalStore {
+    local: LocalId,
+    value: ValueId,
+    on: Vec<ValueId>,
+}
+
+/// The values of `def` (a function's same values) computed only from constants and locals
+/// that only ever hold such values, whichever invocation, pass or path: see `Sites::function`.
+fn fixed_values(
+    f: &Function,
+    def: &std::collections::HashMap<ValueId, (&Expr, Option<wrela_diag::Span>)>,
+) -> HashSet<ValueId> {
+    // The conditions of the branches in `b` that leave a loop (or the function) under them.
+    fn exits(b: &[Stmt], out: &mut Vec<ValueId>) {
+        fn leaves(b: &[Stmt]) -> bool {
+            b.iter().any(|s| match s {
+                Stmt::Break | Stmt::Continue | Stmt::Return(_) => true,
+                Stmt::If { then, else_, .. } => leaves(then) || leaves(else_),
+                Stmt::Loop { body, continuing } => leaves(body) || leaves(continuing),
+                _ => false,
+            })
+        }
+        for s in b {
+            match s {
+                Stmt::If { cond, then, else_ } => {
+                    if leaves(then) || leaves(else_) {
+                        out.push(*cond);
+                    }
+                    exits(then, out);
+                    exits(else_, out);
+                }
+                Stmt::Loop { body, continuing } => {
+                    exits(body, out);
+                    exits(continuing, out);
+                }
+                _ => {}
+            }
+        }
+    }
+    fn walk(b: &[Stmt], on: &mut Vec<ValueId>, out: &mut Vec<LocalStore>) {
+        for s in b {
+            match s {
+                Stmt::If { cond, then, else_ } => {
+                    on.push(*cond);
+                    walk(then, on, out);
+                    walk(else_, on, out);
+                    on.pop();
+                }
+                Stmt::Loop { body, continuing } => {
+                    let n = on.len();
+                    exits(body, on);
+                    exits(continuing, on);
+                    walk(body, on, out);
+                    walk(continuing, on, out);
+                    on.truncate(n);
+                }
+                Stmt::Store(p, v) => {
+                    if let PlaceRoot::Local(l) = p.root {
+                        let mut deps = on.clone();
+                        for q in &p.path {
+                            if let crate::Proj::Index(i) = q {
+                                deps.push(*i);
+                            }
+                        }
+                        out.push(LocalStore { local: l, value: *v, on: deps });
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+    let mut stores = Vec::new();
+    walk(&f.body, &mut Vec::new(), &mut stores);
+    // A local reached other than by a load and a store (lent, its address taken) is never
+    // fixed.
+    let mut reached: HashSet<LocalId> = HashSet::new();
+    visit::walk(&f.body, &mut |s| {
+        let (Stmt::Let(_, e) | Stmt::Eval(e)) = s else { return };
+        let mut place = |p: &Place| {
+            if let PlaceRoot::Local(l) = p.root {
+                reached.insert(l);
+            }
+        };
+        match e {
+            Expr::Addr(p) | Expr::Run(p) | Expr::ArrayLength(p) | Expr::Atomic(_, p, _) => place(p),
+            Expr::Call(_, args) => {
+                for a in args {
+                    if let Arg::Place(p) = a {
+                        place(p);
+                    }
+                }
+            }
+            _ => {}
+        }
+    });
+    let mut fixed: HashSet<ValueId> = def.keys().copied().collect();
+    loop {
+        let local_fixed = |l: LocalId, fixed: &HashSet<ValueId>| {
+            !reached.contains(&l)
+                && stores
+                    .iter()
+                    .filter(|st| st.local == l)
+                    .all(|st| fixed.contains(&st.value) && st.on.iter().all(|c| fixed.contains(c)))
+        };
+        let keep: HashSet<ValueId> = fixed
+            .iter()
+            .copied()
+            .filter(|x| {
+                let (e, _) = def[x];
+                let pure = match e {
+                    Expr::Const(_) | Expr::Zero(_) => return true,
+                    Expr::Load(p) => match p.root {
+                        PlaceRoot::Local(l) => local_fixed(l, &fixed),
+                        _ => false,
+                    },
+                    Expr::Unary(..)
+                    | Expr::Binary(..)
+                    | Expr::Builtin(..)
+                    | Expr::Construct(..)
+                    | Expr::Extract(..)
+                    | Expr::ExtractDyn(..)
+                    | Expr::Splat(..)
+                    | Expr::Swizzle(..)
+                    | Expr::Convert(..)
+                    | Expr::Bitcast(..)
+                    | Expr::Select { .. } => true,
+                    _ => false,
+                };
+                let mut all = pure;
+                e.for_each_value(&mut |y| all &= fixed.contains(&y));
+                all
+            })
+            .collect();
+        if keep.len() == fixed.len() {
+            return fixed;
+        }
+        fixed = keep;
     }
 }

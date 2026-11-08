@@ -3,6 +3,14 @@
 Each release's changes a program or a tool can see. The pull request of each release holds the
 detail; `docs/release.md` says how a release is cut.
 
+## 0.28.1
+
+- E0712 no longer counts what's computed only from constants and loops' counters, whatever it
+  costs (`(f32(i) + 1.0) / f32(steps)` in `engine::air`'s march): nothing the command gives, so
+  nothing to pass in. A counter is only that while every store to it, the index it's stored at,
+  the branches it's under and its loop's exits are too: a uniform-bounded loop, a uniform-picked
+  element or a uniform-chosen constant still count.
+
 ## 0.28.0
 
 - **GPU code computes constants as it's built** (language.md §18.13): a value computed only from

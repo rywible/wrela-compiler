@@ -145,3 +145,21 @@ fn constants_a_uniform_chooses_between_are_same_not_constant() {
     );
     assert_eq!(e0712(&kernel("same_steered", 64, &steered)).len(), 1);
 }
+
+#[test]
+fn a_loop_s_counter_is_its_structure_unless_a_uniform_bounds_or_indexes_it() {
+    // Directions from a constant loop's counters, divisions and all: computed from nothing the
+    // command gives, so nothing to pass in.
+    let counted = "    var acc = 0.0\n    for i in 0..8 {\n        for j in 0..8 {\n            let ct = 1.0 - 2.0 * (f32(i) + 0.5) / 8.0\n            let phi = 6.2831853 * (f32(j) + 0.5) / 8.0\n            let st = sqrt(max(1.0 - ct * ct, 0.0))\n            acc += dot(vec3(st * cos(phi), ct, st * sin(phi)), vec3(x, 1.0, 0.5))\n        }\n    }\n    out[id] = acc";
+    assert_eq!(e0712(&kernel("same_counted", 64, counted)), Vec::<String>::new());
+    // A counter the uniform bounds: what it reaches is the uniform's to say.
+    let bounded = format!(
+        "    var s = 0.0\n    var i = 0\n    while i < i32(g.u) {{\n        s = s + 1.0\n        i = i + 1\n    }}\n{}",
+        chain("s")
+    );
+    assert_eq!(e0712(&kernel("same_bounded", 64, &bounded)).len(), 1);
+    // An element the uniform picks.
+    let indexed =
+        format!("    var t = [0.0, 0.0, 0.0, 0.0]\n    t[i32(g.u) % 4] = 1.0\n{}", chain("t[0]"));
+    assert_eq!(e0712(&kernel("same_indexed", 64, &indexed)).len(), 1);
+}
