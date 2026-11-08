@@ -18,6 +18,7 @@ use grazer::{bounds, grazer, params}
 use std::derive::{Box3, Box4, Interval, gradient, interval}
 use std::field::{Surface, cuboid, ellipsoid, fbm, round_cone, sphere}
 use std::gpu::{GlobalId, GpuBuffer, Slots, buffer, dispatch}
+use std::field::{Bound, UNBOUNDED}
 
 // ---- fields ------------------------------------------------------------------------------------
 /// examples/hello-field's creature, at a breath in [-1, 1].
@@ -45,6 +46,11 @@ struct Cuboid: Copy + GpuData {
 }
 
 impl Surface for Cuboid {
+    /// No bound stated: unbounded (what a surface was before every one stated its own).
+    fn bound(self) -> Bound {
+        UNBOUNDED
+    }
+
     fn distance(self, p: vec3) -> f32 {
         let q = abs(p) - self.half
         length(max(q, 0.0)) + min(max(q.x, max(q.y, q.z)), 0.0)
@@ -74,6 +80,11 @@ struct Blend<A, B>: Copy + GpuData {
 }
 
 impl<A: Surface, B: Surface> Surface for Blend<A, B> {
+    /// No bound stated: unbounded (what a surface was before every one stated its own).
+    fn bound(self) -> Bound {
+        UNBOUNDED
+    }
+
     fn distance(self, p: vec3) -> f32 {
         smin_if(self.a.distance(p), self.b.distance(p), self.k)
     }
@@ -95,6 +106,11 @@ struct SafeEllipsoid: Copy + GpuData {
 }
 
 impl Surface for SafeEllipsoid {
+    /// No bound stated: unbounded (what a surface was before every one stated its own).
+    fn bound(self) -> Bound {
+        UNBOUNDED
+    }
+
     fn distance(self, p: vec3) -> f32 {
         let k0 = length(p / self.radii)
         if k0 < 0.5 {
@@ -120,6 +136,11 @@ struct IfCuboid: Copy + GpuData {
 }
 
 impl Surface for IfCuboid {
+    /// No bound stated: unbounded (what a surface was before every one stated its own).
+    fn bound(self) -> Bound {
+        UNBOUNDED
+    }
+
     fn distance(self, p: vec3) -> f32 {
         let q = abs(p) - self.half
         let m = max(q.x, max(q.y, q.z))

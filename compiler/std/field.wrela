@@ -60,10 +60,11 @@ pub trait Surface: Copy + GpuData {
     }
 
     /// A sphere outside which its distance has a lower bound (`Bound::below`): what culling and
-    /// sampling read to skip a surface that can't matter at a point. The default bounds nothing.
-    fn bound(self) -> Bound {
-        UNBOUNDED
-    }
+    /// sampling read to skip a surface that can't matter at a point, and LOD to size it by.
+    /// Every surface states one (language.md §20.3): a surface that has none says so with
+    /// `UNBOUNDED`, and why. A debug build checks it against the derived interval
+    /// (`check_bound`) where the surface is stepped by (`to_bound`).
+    fn bound(self) -> Bound
 
     /// A range holding every distance in `over`, derived by interval arithmetic.
     fn interval(self, over: Box3) -> Interval {
@@ -113,6 +114,7 @@ pub trait Surface: Copy + GpuData {
         let l = self.lipschitz(near)
         if debug_build() {
             check_lipschitz(self, near, l)
+            check_bound(self, self.bound())
         }
         ToBound { inner: self, near, scale: 1.0 / l }
     }
@@ -598,6 +600,12 @@ impl<F: Copy + GpuData + fn(vec3) -> f32> Surface for F {
     fn distance(self, p: vec3) -> f32 {
         self(p)
     }
+
+    /// A closure states nothing of where it is: unbounded. A surface culling should skip is
+    /// built from primitives, which state theirs.
+    fn bound(self) -> Bound {
+        UNBOUNDED
+    }
 }
 
 /// A sphere centred at the origin. Exact.
@@ -720,8 +728,11 @@ impl Surface for Sampled3d {
         }
         (d, g / self.voxel)
     }
-    // No `bound`: the texels may hold distances below zero at the grid's edge, which reach past
-    // it, so the sphere round the grid holds nothing out (the default, unbounded).
+    /// Unbounded: the texels may hold distances below zero at the grid's edge, which reach
+    /// past it, so the sphere round the grid holds nothing out.
+    fn bound(self) -> Bound {
+        UNBOUNDED
+    }
 }
 
 /// An ellipsoid centred at the origin. No exact distance exists; this is the usual bound.
@@ -843,6 +854,21 @@ impl<const N: u32> Surface for Tube<N> {
         d
     }
 
+    /// Its cones' bounds, joined.
+    fn bound(self) -> Bound {
+        var b = Bound { centre: self.points[0], radius: self.radii[0], slope: 1.0 }
+        for i in 1..N {
+            let c = round_cone(
+                self.points[i - 1],
+                self.points[i],
+                r_top: self.radii[i - 1],
+                r_bottom: self.radii[i],
+            )
+            b = b.and(c.bound())
+        }
+        b
+    }
+
     /// A union of exact distances: 1.
     fn lipschitz(self, near: f32) -> f32 {
         1.0
@@ -957,6 +983,11 @@ pub fn half_space(normal: vec3, offset: f32) -> HalfSpace {
 impl Surface for HalfSpace {
     fn distance(self, p: vec3) -> f32 {
         dot(p, self.normal) - self.offset
+    }
+
+    /// Unbounded: it reaches to infinity.
+    fn bound(self) -> Bound {
+        UNBOUNDED
     }
 
     /// Exact: `half_space` makes its normal a unit vector.
@@ -1185,6 +1216,18 @@ impl<S: Surface, const N: u32> Surface for UnionAll<S, N> {
         d
     }
 
+    /// Its parts' bounds, joined (with no parts, unbounded: nothing to say where it is).
+    fn bound(self) -> Bound {
+        if N == 0 {
+            return UNBOUNDED
+        }
+        var b = self.parts[0].bound()
+        for i in 1..N {
+            b = b.and(self.parts[i].bound())
+        }
+        b
+    }
+
     fn filtered(self, p: vec3, footprint: f32) -> f32 {
         var d = EMPTY
         for i in 0..N {
@@ -1258,6 +1301,18 @@ impl<S: Surface, const N: u32> Surface for SmoothUnionAll<S, N> {
             d = smin(d, self.parts[i].distance(p), self.k)
         }
         d
+    }
+
+    /// Its parts' bounds, joined, and lowered by each seam's most (a quarter of `k`).
+    fn bound(self) -> Bound {
+        if N == 0 {
+            return UNBOUNDED
+        }
+        var b = self.parts[0].bound()
+        for i in 1..N {
+            b = b.and(self.parts[i].bound()).lowered(0.25 * max(self.k, 0.0))
+        }
+        b
     }
 
     fn filtered(self, p: vec3, footprint: f32) -> f32 {
@@ -1402,10 +1457,9 @@ pub trait PointMap: Copy + GpuData {
         x
     }
 
-    /// The surface's bound (`Surface::bound`), in this space: by default, none.
-    fn bound(self, b: Bound) -> Bound {
-        UNBOUNDED
-    }
+    /// The surface's bound (`Surface::bound`), in this space. Every map states it, as every
+    /// surface does.
+    fn bound(self, b: Bound) -> Bound
 }
 
 /// A surface whose points are moved before it's asked about them: `s.translate(by)`,
@@ -1495,6 +1549,13 @@ impl PointMap for Turn {
         let m = self.to_local
         m[0] * p.x + m[1] * p.y + m[2] * p.z
     }
+
+    /// Its centre turned back: `to_local` is a rotation, so its inverse is its transpose, and
+    /// the radius and slope stay.
+    fn bound(self, b: Bound) -> Bound {
+        let m = self.to_local
+        Bound { centre: vec3(dot(m[0], b.centre), dot(m[1], b.centre), dot(m[2], b.centre)), ..b }
+    }
 }
 
 /// Scaled by `by` about the origin.
@@ -1519,7 +1580,11 @@ impl PointMap for Size {
         x / abs(self.by)
     }
 
+    /// Scaled with it; an unbounded surface stays unbounded (its radius isn't a size).
     fn bound(self, b: Bound) -> Bound {
+        if b.radius >= 1.0e30 {
+            return UNBOUNDED
+        }
         Bound { centre: b.centre * self.by, radius: b.radius * abs(self.by), slope: b.slope }
     }
 }
@@ -1606,6 +1671,11 @@ impl<A: Surface, B: Surface> Surface for SmoothSubtract<A, B> {
         smax(self.a.distance(p), -self.b.distance(p), self.k)
     }
 
+    /// `a`'s: the smooth maximum is at least the larger, so at least `a`'s distance.
+    fn bound(self) -> Bound {
+        self.a.bound()
+    }
+
     fn filtered(self, p: vec3, footprint: f32) -> f32 {
         smax(self.a.filtered(p, footprint), -self.b.filtered(p, footprint), self.k)
     }
@@ -1656,6 +1726,12 @@ impl<A: Surface, B: Surface> Surface for SmoothIntersect<A, B> {
         smax(self.a.distance(p), self.b.distance(p), self.k)
     }
 
+    /// The tighter operand's: the smooth maximum is at least each distance.
+    fn bound(self) -> Bound {
+        let (a, b) = (self.a.bound(), self.b.bound())
+        if a.radius <= b.radius { a } else { b }
+    }
+
     fn filtered(self, p: vec3, footprint: f32) -> f32 {
         smax(self.a.filtered(p, footprint), self.b.filtered(p, footprint), self.k)
     }
@@ -1700,9 +1776,20 @@ fn mirrored(p: vec3) -> vec3 {
     vec3(abs(p.x), p.y, p.z)
 }
 
+/// A point's image in x = 0.
+fn mirrored_centre(c: vec3) -> vec3 {
+    vec3(-c.x, c.y, c.z)
+}
+
 impl<S: Surface> Surface for Mirror<S> {
     fn distance(self, p: vec3) -> f32 {
         self.inner.distance(mirrored(p))
+    }
+
+    /// The surface's bound and its image's, joined.
+    fn bound(self) -> Bound {
+        let b = self.inner.bound()
+        b.and(Bound { centre: mirrored_centre(b.centre), ..b })
     }
 
     fn filtered(self, p: vec3, footprint: f32) -> f32 {
@@ -1991,6 +2078,12 @@ impl<S: Surface> Surface for ToBound<S> {
         clamp(self.inner.distance(p), -self.near, self.near) * self.scale
     }
 
+    /// Unbounded: held within ±`near`, its distance stops growing, which no sphere's bound
+    /// (growing without end) holds. Cull by the surface it bounds (`inner.bound()`).
+    fn bound(self) -> Bound {
+        UNBOUNDED
+    }
+
     fn filtered(self, p: vec3, footprint: f32) -> f32 {
         clamp(self.inner.filtered(p, footprint), -self.near, self.near) * self.scale
     }
@@ -2072,6 +2165,67 @@ pub fn check_lipschitz<S: Surface>(s: S, near: f32, l: f32) {
             )
         }
     }
+}
+
+/// A debug build's check of a stated bound (`Surface::bound`): over the boxes round the
+/// bound's sphere (out to twice its radius and a unit more), refined where the derived interval
+/// can't settle it to boxes about a 32nd of its radius wide, a box whose every distance (the derived interval) is below the least the bound
+/// allows anywhere in the box panics: the bound claims more room than the surface leaves. (As
+/// `check_lipschitz`, a box can only prove a bound wrong, not right.)
+pub fn check_bound<S: Surface>(s: S, b: Bound) {
+    match bound_broken(s, b) {
+        Some((x, most, least)) => panic(
+            f"a bound of radius {b.radius} round ({b.centre.x}, {b.centre.y}, {b.centre.z}) is too large: the distance is at most {most} over the box from ({x.lo.x}, {x.lo.y}, {x.lo.z}) to ({x.hi.x}, {x.hi.y}, {x.hi.z}), where the bound says at least {least}",
+        ),
+        None => {}
+    }
+}
+
+/// `check_bound`'s search: a box that proves `b` wrong, the most distance there and the least
+/// the bound allows, if it finds one.
+pub fn bound_broken<S: Surface>(s: S, b: Bound) -> Option<(Box3, f32, f32)> {
+    if b.radius >= 1.0e30 {
+        return None
+    }
+    let reach = 2.0 * b.radius + 1.0
+    let fine = max(b.radius / 32.0, 1.0 / 64.0)
+    var stack: Vec<Box3> = Vec::new()
+    stack.push(Box3 { lo: b.centre - vec3(reach), hi: b.centre + vec3(reach) })
+    var visited = 0
+    while stack.len() > 0 && visited < 20000 {
+        visited += 1
+        let x = stack.pop().unwrap()
+        // The box's nearest and farthest points from the bound's centre.
+        let nearest = length(clamp(b.centre, x.lo, x.hi) - b.centre)
+        let farthest = length(max(abs(x.lo - b.centre), abs(x.hi - b.centre)))
+        if farthest <= b.radius {
+            continue
+        }
+        if nearest > b.radius {
+            let least = b.slope * (nearest - b.radius)
+            let room = 1.0e-4 * (1.0 + abs(least))
+            let d = s.interval(x)
+            // Every distance in the box is at least the bound's: it holds there.
+            if d.lo >= least - room {
+                continue
+            }
+            if d.hi < least - room {
+                return Some((x, d.hi, least))
+            }
+        }
+        if x.hi.x - x.lo.x > fine {
+            let mid = (x.lo + x.hi) * 0.5
+            for i in 0..8 {
+                let lo = vec3(
+                    if i & 1 == 0 { x.lo.x } else { mid.x },
+                    if i & 2 == 0 { x.lo.y } else { mid.y },
+                    if i & 4 == 0 { x.lo.z } else { mid.z },
+                )
+                stack.push(Box3 { lo, hi: lo + (mid - x.lo) })
+            }
+        }
+    }
+    None
 }
 
 /// The least |x| for x in `i`.
@@ -2510,6 +2664,11 @@ impl Surface for SteepInside {
         if p.x < -1.0 { 100.0 * (p.x + 1.0) - 1.0 } else { p.x }
     }
 
+    /// Unbounded: a plane.
+    fn bound(self) -> Bound {
+        UNBOUNDED
+    }
+
     fn lipschitz(self, near: f32) -> f32 {
         if near <= 1.0 { 1.0 } else { 100.0 }
     }
@@ -2590,6 +2749,52 @@ fn stated_bounds_hold_near_the_surface() {
         }
     }
     assert(checked > 50, "too few samples near the surface")
+}
+
+/// `s`'s stated bound holds: at sampled points, and where `check_bound` looks.
+fn bound_holds<S: Surface>(s: S) {
+    let b = s.bound()
+    assert(b.radius < 1.0e30, "bounded")
+    let r = 2.0 * b.radius + 1.0
+    let around = Box3 { lo: b.centre - vec3(r), hi: b.centre + vec3(r) }
+    for i in 0..2048 {
+        let p = around.sample(7, i)
+        let d = s.distance(p)
+        let below = b.below(p)
+        // (Inside its sphere the bound says nothing.)
+        assert(below <= 0.0 || d >= below - 1.0e-4 * (1.0 + abs(below)), f"at ({p.x}, {p.y}, {p.z}): {d} < {below}")
+    }
+    assert(bound_broken(s, b).is_none(), "check_bound finds no box against it")
+}
+
+@test
+fn every_stated_bound_holds_outside_its_sphere() {
+    let a = round_cone(vec3(0.5, -0.2, 0.0), vec3(1.4, 0.6, 0.2), r_top: 0.15, r_bottom: 0.3)
+    let c = cuboid(vec3(0.3)).translate(vec3(-0.9, 0.4, 0.1))
+    bound_holds(test_blob())
+    bound_holds(tube([vec3(), vec3(0.0, 1.0, 0.0), vec3(0.5, 1.5, 0.0)], [0.2, 0.15, 0.1]))
+    bound_holds([sphere(0.3).translate(vec3()), sphere(0.5).translate(vec3(1.0, 0.0, 0.0))].union())
+    bound_holds([a.translate(vec3()), a.translate(vec3(0.0, 0.0, 0.5))].smooth_union(k: 0.3))
+    bound_holds(ellipsoid(vec3(1.0, 0.6, 0.8)).smooth_subtract(sphere(0.5), k: 0.2))
+    bound_holds(ellipsoid(vec3(1.0, 0.6, 0.8)).smooth_intersect(c, k: 0.2))
+    bound_holds(a.mirror_x())
+    bound_holds(oval(vec3(0.4, 0.2, 0.3)).scale(1.5).rotate(Quat::axis_angle(vec3(0.0, 1.0, 0.0), 0.7)))
+}
+
+@test
+fn a_bound_claiming_more_room_than_the_surface_leaves_is_found() {
+    let s = sphere(1.0).translate(vec3(0.5, 0.0, 0.0))
+    assert(bound_broken(s, s.bound()).is_none())
+    assert(bound_broken(s, Bound { centre: vec3(0.5, 0.0, 0.0), radius: 0.6, slope: 1.0 }).is_some())
+    assert(bound_broken(s, Bound { centre: vec3(), radius: 1.0, slope: 1.0 }).is_some())
+}
+
+@test
+fn an_unbounded_surface_stays_unbounded_through_its_maps() {
+    let h = half_space(vec3(0.0, 1.0, 0.0), 0.0)
+    assert(h.scale(0.5).bound().radius >= 1.0e30)
+    assert(h.translate(vec3(1.0)).rotate(Quat::axis_angle(vec3(1.0, 0.0, 0.0), 0.3)).bound().radius >= 1.0e30)
+    assert(sphere(1.0).union(h.scale(0.5)).bound().radius >= 1.0e30)
 }
 
 @test

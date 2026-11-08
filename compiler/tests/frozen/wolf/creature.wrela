@@ -20,6 +20,7 @@ use round1::shapes::{
 }
 use std::field::{Blend, Color, Surface, rgb, round_cone, smax, smin, sphere}
 use std::quat::Quat
+use std::field::{Bound, UNBOUNDED}
 
 // ---- channels: a coat per part ------------------------------------------------------------------
 
@@ -109,6 +110,11 @@ pub struct Paw: Copy + GpuData {
 }
 
 impl Surface for Paw {
+    /// No bound stated: unbounded (what a surface was before every one stated its own).
+    fn bound(self) -> Bound {
+        UNBOUNDED
+    }
+
     fn distance(self, q: vec3) -> f32 {
         let s = self.s
         var d = ell(vec3(0.030, 0.024, 0.034) * s).distance(q - vec3(0.0, 0.022, -0.012) * s)
@@ -140,6 +146,11 @@ pub struct Muzzle: Copy + GpuData {
 }
 
 impl Surface for Muzzle {
+    /// No bound stated: unbounded (what a surface was before every one stated its own).
+    fn bound(self) -> Bound {
+        UNBOUNDED
+    }
+
     fn distance(self, q: vec3) -> f32 {
         let (z0, z1) = (self.z0, self.z1)
         let t = clamp((q.z - z0) / (z1 - z0), 0.0, 1.0)
@@ -186,6 +197,11 @@ pub struct Ear: Copy + GpuData {
 }
 
 impl Surface for Ear {
+    /// No bound stated: unbounded (what a surface was before every one stated its own).
+    fn bound(self) -> Bound {
+        UNBOUNDED
+    }
+
     fn distance(self, m: vec3) -> f32 {
         let e = ear_local(m)
         let outer = round_cone(
@@ -215,6 +231,11 @@ pub struct CheekRuff: Copy + GpuData {
 }
 
 impl Surface for CheekRuff {
+    /// No bound stated: unbounded (what a surface was before every one stated its own).
+    fn bound(self) -> Bound {
+        UNBOUNDED
+    }
+
     fn distance(self, q: vec3) -> f32 {
         ell(self.r).distance(mirror_x(q) - self.centre) - 0.004 * fbm3(q * 40.0, 2)
     }

@@ -8,6 +8,7 @@ use std::field::{
     Surface, ellipsoid, fbm, half_space, hash_u32, oval, round_cone, sphere, tube, value_noise,
 }
 use std::stage::Tape
+use std::field::{Bound, UNBOUNDED}
 
 /// The creature from examples/hello-field (shape.wrela), mid-breath.
 pub fn creature() -> Surface {
@@ -26,6 +27,11 @@ pub struct Noise: Copy + GpuData {
 }
 
 impl Surface for Noise {
+    /// No bound stated: unbounded (what a surface was before every one stated its own).
+    fn bound(self) -> Bound {
+        UNBOUNDED
+    }
+
     fn distance(self, p: vec3) -> f32 {
         value_noise(p * self.freq)
     }
@@ -37,6 +43,11 @@ pub struct Waves: Copy + GpuData {
 }
 
 impl Surface for Waves {
+    /// No bound stated: unbounded (what a surface was before every one stated its own).
+    fn bound(self) -> Bound {
+        UNBOUNDED
+    }
+
     fn distance(self, p: vec3) -> f32 {
         sin(self.s * p.x) * cos(2.0 * p.y) + exp(0.3 * p.z) - sqrt(p.x * p.x + 1.0)
     }
@@ -48,6 +59,11 @@ pub struct Hyperbolic: Copy + GpuData {
 }
 
 impl Surface for Hyperbolic {
+    /// No bound stated: unbounded (what a surface was before every one stated its own).
+    fn bound(self) -> Bound {
+        UNBOUNDED
+    }
+
     fn distance(self, p: vec3) -> f32 {
         tanh(self.s * p.x) * cosh(0.5 * p.y) + 0.1 * sinh(self.s * p.z) - 0.3
     }
@@ -59,6 +75,11 @@ pub struct Logs: Copy + GpuData {
 }
 
 impl Surface for Logs {
+    /// No bound stated: unbounded (what a surface was before every one stated its own).
+    fn bound(self) -> Bound {
+        UNBOUNDED
+    }
+
     fn distance(self, p: vec3) -> f32 {
         log(1.0 + p.x * p.x) +
             log2(2.0 + sin(p.y)) * pow(1.5 + 0.5 * cos(p.z), self.s) +
@@ -73,6 +94,11 @@ pub struct Trig: Copy + GpuData {
 }
 
 impl Surface for Trig {
+    /// No bound stated: unbounded (what a surface was before every one stated its own).
+    fn bound(self) -> Bound {
+        UNBOUNDED
+    }
+
     fn distance(self, p: vec3) -> f32 {
         tan(self.s * p.x) +
             atan(p.y) +
@@ -88,6 +114,11 @@ pub struct Rational: Copy + GpuData {
 }
 
 impl Surface for Rational {
+    /// No bound stated: unbounded (what a surface was before every one stated its own).
+    fn bound(self) -> Bound {
+        UNBOUNDED
+    }
+
     fn distance(self, p: vec3) -> f32 {
         (p.x * p.y - p.z) / (1.0 + p.x * p.x + p.y * p.y) +
             self.s * p.x * p.y * p.z +
@@ -102,6 +133,11 @@ pub struct Pieces: Copy + GpuData {
 }
 
 impl Surface for Pieces {
+    /// No bound stated: unbounded (what a surface was before every one stated its own).
+    fn bound(self) -> Bound {
+        UNBOUNDED
+    }
+
     fn distance(self, p: vec3) -> f32 {
         smoothstep(-1.0, 1.0, p.x) * mix(p.y, p.z, smoothstep(0.0, 1.0, p.x * p.x)) +
             clamp(p.z, -0.5, 0.5) +
@@ -122,6 +158,11 @@ pub struct Vectors: Copy + GpuData {
 }
 
 impl Surface for Vectors {
+    /// No bound stated: unbounded (what a surface was before every one stated its own).
+    fn bound(self) -> Bound {
+        UNBOUNDED
+    }
+
     fn distance(self, p: vec3) -> f32 {
         let n = normalize(p + vec3(3.0, 0.5, 0.0))
         length(p - self.c) +
@@ -138,6 +179,11 @@ pub struct Branchy: Copy + GpuData {
 }
 
 impl Surface for Branchy {
+    /// No bound stated: unbounded (what a surface was before every one stated its own).
+    fn bound(self) -> Bound {
+        UNBOUNDED
+    }
+
     fn distance(self, p: vec3) -> f32 {
         if p.z > 1.0 {
             return 2.0 * p.z - p.x
@@ -160,6 +206,11 @@ pub struct Cells: Copy + GpuData {
 }
 
 impl Surface for Cells {
+    /// No bound stated: unbounded (what a surface was before every one stated its own).
+    fn bound(self) -> Bound {
+        UNBOUNDED
+    }
+
     fn distance(self, p: vec3) -> f32 {
         let i = i32(floor(self.s * p.x))
         let j = i32(floor(self.s * p.y)) * 3 + i
@@ -176,6 +227,11 @@ pub struct Table: Copy + GpuData {
 }
 
 impl Surface for Table {
+    /// No bound stated: unbounded (what a surface was before every one stated its own).
+    fn bound(self) -> Bound {
+        UNBOUNDED
+    }
+
     fn distance(self, p: vec3) -> f32 {
         let ts = saturate(p.z * 0.5 + 0.5) * 5.0
         let i0 = min(u32(ts), 4)
@@ -200,6 +256,11 @@ pub struct Powers: Copy + GpuData {
 }
 
 impl Surface for Powers {
+    /// No bound stated: unbounded (what a surface was before every one stated its own).
+    fn bound(self) -> Bound {
+        UNBOUNDED
+    }
+
     fn distance(self, p: vec3) -> f32 {
         let x = pow(abs(sin(3.0 * p.x)), self.n)
         let y = pow(abs(cos(2.0 * p.y)) / 0.9, 1.5)
@@ -217,6 +278,11 @@ pub struct March: Copy + GpuData {
 }
 
 impl Surface for March {
+    /// No bound stated: unbounded (what a surface was before every one stated its own).
+    fn bound(self) -> Bound {
+        UNBOUNDED
+    }
+
     fn distance(self, p: vec3) -> f32 {
         var t = 0.0
         var steps = 0.0

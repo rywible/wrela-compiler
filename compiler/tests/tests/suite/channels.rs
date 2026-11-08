@@ -88,7 +88,7 @@ fn the_gpu_computes_the_same_channels() {
 /// a marker constant, so its evaluations can be counted in the WGSL.
 #[test]
 fn channels_evaluate_each_part_once() {
-    let src = "use std::field::{Blend, Field, Surface}
+    let src = "use std::field::{Blend, Bound, Field, Surface}
 use std::gpu::{GlobalId, GpuBuffer, Slots, buffer, dispatch}
 
 struct Tint: Copy + GpuData + Blend {
@@ -103,6 +103,10 @@ struct Ball: Copy + GpuData {
 impl Surface for Ball {
     fn distance(self, p: vec3) -> f32 {
         length(p - self.at) * 1.375 - self.r
+    }
+
+    fn bound(self) -> Bound {
+        Bound { centre: self.at, radius: self.r / 1.375, slope: 1.375 }
     }
 }
 

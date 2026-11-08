@@ -25,6 +25,7 @@ use std::gpu::{
 use std::math::TAU
 use std::transform::{rotate_y, translate}
 use view::{Camera, ROCK}
+use std::field::{Bound, UNBOUNDED}
 
 /// What a point of a stone carries: its colour (linear).
 pub struct Rock: Copy + GpuData + Blend {
@@ -48,6 +49,11 @@ pub struct Facets: Copy + GpuData {
 }
 
 impl Surface for Facets {
+    /// No bound stated: unbounded (what a surface was before every one stated its own).
+    fn bound(self) -> Bound {
+        UNBOUNDED
+    }
+
     fn distance(self, p: vec3) -> f32 {
         var d = -1.0e9
         for q in self.planes {
@@ -398,6 +404,11 @@ pub struct Bed: Copy + GpuData {
 }
 
 impl Surface for Bed {
+    /// No bound stated: unbounded (what a surface was before every one stated its own).
+    fn bound(self) -> Bound {
+        UNBOUNDED
+    }
+
     fn distance(self, p: vec3) -> f32 {
         var d = -1.0e9
         for q in self.planes {
@@ -463,6 +474,11 @@ pub struct Block: Copy + GpuData {
 }
 
 impl Surface for Block {
+    /// No bound stated: unbounded (what a surface was before every one stated its own).
+    fn bound(self) -> Bound {
+        UNBOUNDED
+    }
+
     fn distance(self, p: vec3) -> f32 {
         var d = -1.0e9
         for q in self.planes {

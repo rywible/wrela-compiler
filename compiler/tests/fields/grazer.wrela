@@ -9,6 +9,7 @@
 //   spike's own params-seed1.f32.
 // - `Grazer` is the field (spike 01's field.wgsl, `grazer_d`): twenty parts smooth-unioned in a
 //   fixed order, built from those numbers. Its structure is its type; the numbers are data.
+use std::field::{Bound, UNBOUNDED}
 use std::field::{
     Displace, Ellipsoid, Fbm, HalfSpace, Intersect, Surface, RoundCone, SmoothUnion, Translate,
     ellipsoid, fbm, half_space, round_cone, smin,
@@ -234,6 +235,11 @@ pub struct Grazer: Copy + GpuData {
 }
 
 impl Surface for Grazer {
+    /// No bound stated: unbounded (what a surface was before every one stated its own).
+    fn bound(self) -> Bound {
+        UNBOUNDED
+    }
+
     fn distance(self, p: vec3) -> f32 {
         var d = smin(1000000.0, self.torso.distance(p), self.k)
         d = smin(d, self.neck.distance(p), self.k)

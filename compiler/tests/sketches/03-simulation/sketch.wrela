@@ -15,6 +15,7 @@ use std::field::Surface
 use std::hash::StateHash
 use std::serialize::{LoadError, Reader, Serialize, Writer}
 use std::units::m
+use std::field::{Bound, UNBOUNDED}
 
 // ---- §1 The world -----------------------------------------------------------------------------
 
@@ -50,6 +51,11 @@ pub struct TerrainField: Copy + GpuData + SimState + StateHash + Serialize {
 }
 
 impl Surface for TerrainField {
+    /// No bound stated: unbounded (what a surface was before every one stated its own).
+    fn bound(self) -> Bound {
+        UNBOUNDED
+    }
+
     fn distance(self, p: vec3) -> f32 {
         let w = self.wavelength
         (p.y - self.height - self.roll * sin(p.x / w) * sin(p.z / w)) * 0.7

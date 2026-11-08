@@ -17,11 +17,11 @@
       "severity": "error",
       "span": {
         "column": 1,
-        "end": 201,
+        "end": 276,
         "end_column": 2,
-        "end_line": 10,
+        "end_line": 14,
         "line": 6,
-        "start": 105
+        "start": 125
       },
       "title": "an impl outside the trait's or the type's module tree (orphan rule)"
     }

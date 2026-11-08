@@ -2936,7 +2936,7 @@ A field is ordinary std code: its trait, its primitives and its combinators are 
 - **A new primitive is a type that implements `Surface`.** It must be `Copy` and `GpuData`, because it travels to the GPU as data. The combinators and derived methods come with it:
 
   ```wrela
-  use std::field::{Surface, sphere}
+  use std::field::{Bound, Surface, sphere}
 
   struct Cuboid: Copy + GpuData {
       half: vec3,
@@ -2947,19 +2947,24 @@ A field is ordinary std code: its trait, its primitives and its combinators are 
           let q = abs(p) - self.half
           length(max(q, 0.0)) + min(max(q.x, max(q.y, q.z)), 0.0)
       }
+
+      fn bound(self) -> Bound {
+          Bound { centre: vec3(), radius: length(self.half), slope: 1.0 }
+      }
   }
 
   fn rounded() -> Surface {
       Cuboid { half: vec3(0.5, 0.3, 0.2) }.smooth_union(sphere(0.4), k: 0.05)
   }
   ```
+- **Every surface states where it is.** `Surface`'s `bound()` is required: a sphere (`centre`, `radius`) and a `slope`, outside which the distance is at least `slope × (|p − centre| − radius)`. Culling, empty-space skipping and LOD read it, so no scene has to remember to give one. Primitives state theirs, and combinators compose their operands' in ordinary code (a union joins its parts' spheres, a blend's is lowered by its seam's most, a displacement's by its noise's reach, a translate, turn or scale maps it). A surface that has none says so, `UNBOUNDED`, with its reason: a closure of a point, a half-space, a texture's grid whose texels may reach past it, a tape built at run time, and `.to_bound()`'s clamped distance (which is culled by the surface it bounds). Missing, it is E0401, as any trait method is. A debug build checks the bound where a surface is stepped by (`to_bound`) with `std::field::check_bound`, which searches boxes round the sphere for one whose every distance (the derived interval) is below what the bound allows, and panics there; as with Lipschitz bounds, a box can prove a bound wrong, not right.
 - **A field's data can be a texture.** `std::gpu::Texture3dHandle<F>` is a 3D texture's handle as data, `Copy` and `GpuData` (`t.to_handle()`), so a primitive can hold one: `std::field::Sampled3d` is a surface whose distances are an `R32Float` texture's texels on a grid (its corner `origin`, each texel `voxel` on a side), read between the eight texels round a point, with the trilinear's own gradient (through the clamps at the grid's edge, and past it the box's), and no bound (the texels may hold negative distances at the edge, which reach past the grid). Where an entry point takes a value that holds a handle, at any depth of its fields (a `Sampled3d`, or a `Union` of one and an analytic field), the compiler binds the texture beside it as it binds a group's (§18): its other fields are the entry point's uniforms. Only a struct's fields hold a handle the compiler can bind: one in a tuple, an array or an enum's variant is E0602. So a march generic over `Surface` takes a cooked field as it takes an analytic one. GPU code reads the texels; CPU code only the size (E0607). A handle names its texture while the texture lives; its owner keeps it, and a host refuses a command that binds a dropped texture's handle. GPU code binds a handle to a local once (E0702): which texture a second binding names would depend on the path taken. GPU code builds a value that holds a handle as a struct literal where it's used (`Union { a: s, b: ball }`); a function that returns one, such as a combinator's method, is E0702 there for now, so such a value is built on the CPU's side and passed in. A closure in GPU code can't capture such a value yet (E0702), so a derived gradient of a combinator over one is computed on the CPU's side of the program or by the primitive's own `gradient`.
 - **A closure of a point is a surface.** `let both = |p| min(ball(p), slab(p))` is a `Surface`, written where it is used, with the derived gradient and interval and every combinator (std's `impl<F: Copy + GpuData + fn(vec3) -> f32> Surface for F`). A closure states no Lipschitz bound (below): its `lipschitz` is infinite, and a field with an unbounded part is unbounded. So a field that is sphere traced is built from primitives, which state their bounds.
 - **A field returns a distance plus channels.** A channel struct opts in to `Blend`, a fieldwise trait, so each member's type decides how it blends: `Color` in linear space, `f32` linearly, `UnitVec3` renormalized, and `Cat<T>` from the winner.
 - **A field's step safety is a method, not a kind or a fact that the compiler knows** (§14.5, §21.4). `Surface`'s `lipschitz(near)` bounds the field's gradient where |distance| < `near`:
 
   ```wrela
-  use std::field::{Noise, Surface}
+  use std::field::{Bound, Noise, Surface}
 
   /// A bump on a sphere: its bound is the sphere's, plus the bump's steepness.
   struct Bumpy<N>: Copy + GpuData {
@@ -2970,6 +2975,12 @@ A field is ordinary std code: its trait, its primitives and its combinators are 
   impl<N: Noise> Surface for Bumpy<N> {
       fn distance(self, p: vec3) -> f32 {
           length(p) - 1.0 + self.amp * self.noise.value(p)
+      }
+
+      fn bound(self) -> Bound {
+          let r = self.noise.range()
+          let unit = Bound { centre: vec3(), radius: 1.0, slope: 1.0 }
+          unit.lowered(abs(self.amp) * max(abs(r.lo), abs(r.hi)))
       }
 
       fn lipschitz(self, near: f32) -> f32 {
