@@ -721,6 +721,54 @@ test("a command whose pipeline is still being built waits for it, and the comman
   expect((await answer).length).toBe(4);
 });
 
+test("a command whose pipeline is still being built runs on its stand-in meanwhile, then on its own", async () => {
+  const device = new FakeDevice();
+  const m = shapes();
+  m.pipelines.push({ ...m.pipelines[1]!, name: "quick" });
+  const [draw, compute, quick] = await buildAll(device, m);
+  const later = Promise.withResolvers<BuiltPipeline>();
+  const tiers = { tier0: Promise.resolve(), start: () => {}, release: () => {}, standins: [null, 2, null] };
+  const executor = new GpuExecutor(device.gpu, [draw!, later.promise, quick!], SCREEN_TARGET, "off", false, tiers);
+  const run = (e: Encoder) => {
+    for (const cmd of decode(e.finish())) executor.execute(cmd);
+  };
+  run(new Encoder().createBuffer(1, 64).createBuffer(2, 64).dispatch(1, [1, 1, 1], [1, 2], u(0)));
+  executor.flush();
+  // Nothing waits: the dispatch ran on the stand-in.
+  expect(executor.waiting).toBe(false);
+  expect(executor.waits).toEqual([]);
+  expect(executor.stoodIn).toEqual([{ frame: 0, pipeline: 1 }]);
+  const dispatched = () => device.events.flatMap((e) => (e.kind === "dispatch" ? [e.pipeline] : []));
+  expect(dispatched()).toEqual(["quick"]);
+  later.resolve(compute!);
+  await later.promise;
+  await Promise.resolve();
+  run(new Encoder().dispatch(1, [1, 1, 1], [1, 2], u(1)));
+  executor.flush();
+  expect(dispatched()).toEqual(["quick", m.pipelines[1]!.name]);
+  expect(executor.stoodIn).toHaveLength(1);
+});
+
+test("with no stand-in built either, a command starts its stand-in's build and waits for it", async () => {
+  const device = new FakeDevice();
+  const m = shapes();
+  m.pipelines.push({ ...m.pipelines[1]!, name: "quick" });
+  const [draw, compute, quick] = await buildAll(device, m);
+  const real = Promise.withResolvers<BuiltPipeline>();
+  const stand = Promise.withResolvers<BuiltPipeline>();
+  const started: number[] = [];
+  const tiers = { tier0: Promise.resolve(), start: (i: number) => started.push(i), release: () => {}, standins: [null, 2, null] };
+  const executor = new GpuExecutor(device.gpu, [draw!, real.promise, stand.promise], SCREEN_TARGET, "off", false, tiers);
+  for (const cmd of decode(new Encoder().createBuffer(1, 64).createBuffer(2, 64).dispatch(1, [1, 1, 1], [1, 2], u(0)).finish())) executor.execute(cmd);
+  expect(started).toEqual([2]);
+  expect(executor.waiting).toBe(true);
+  const caughtUp = executor.caughtUp();
+  stand.resolve(quick!);
+  await caughtUp;
+  expect(device.events.flatMap((e) => (e.kind === "dispatch" ? [e.pipeline] : []))).toEqual(["quick"]);
+  real.resolve(compute!);
+});
+
 test.each(["off", "serial"] as const)("unchecked, a dispatch or draw of a pipeline the manifest doesn't have fails at once (timing %s)", async (timing) => {
   const device = new FakeDevice();
   const executor = new GpuExecutor(device.gpu, await buildAll(device, shapes()), SCREEN_TARGET, timing);
@@ -1463,6 +1511,21 @@ describe("pipeline tiers", () => {
     expect(building.order).toEqual(tier0.slice(0, BUILDS_AT_ONCE));
     await Promise.all(building.each);
     expect(building.order).toEqual([...tier0, n - 1]);
+  });
+
+  test("stand-ins build first, and only where they're on", async () => {
+    const device = new FakeDevice();
+    const { m, n, shaders } = many();
+    // Pipeline 0, the smallest, stands in for the biggest of tier 0.
+    m.pipelines[n - 2] = { ...m.pipelines[n - 2]!, standin: 0 };
+    const building = buildPipelines(device.gpu, m, shaders, SCREEN_FORMAT);
+    expect(building.order[0]).toBe(0);
+    expect(building.standins[n - 2]).toBe(0);
+    await Promise.all(building.each);
+    const off = buildPipelines(new FakeDevice().gpu, m, shaders, SCREEN_FORMAT, undefined, false, false);
+    expect(off.order[0]).toBe(n - 2);
+    expect(off.standins.every((j) => j === null)).toBe(true);
+    await Promise.all(off.each);
   });
 
   test("a command that needs a pipeline not started starts it at once, and runs when it's built", async () => {

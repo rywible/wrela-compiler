@@ -113,6 +113,9 @@ export interface TestParams {
   /** 1: a software adapter (WebGPU's fallback, such as SwiftShader) may run the program, on a
    * machine with no GPU; its timings are a CPU's (the native host's `WRELA_ALLOW_SOFTWARE`). */
   software: number;
+  /** 1: a pipeline's stand-in (§18.12) runs in its place until it's built, as a shipped page
+   * does. Otherwise a command waits for its own pipeline, so the frames are the native host's. */
+  standins: number;
 }
 
 export const TEST_DEFAULTS: TestParams = {
@@ -144,6 +147,7 @@ export const TEST_DEFAULTS: TestParams = {
   show: 0,
   hdr: 0,
   software: 0,
+  standins: 0,
 };
 /** Every parameter's name, in order. */
 const NAMES = Object.keys(TEST_DEFAULTS) as (keyof TestParams)[];

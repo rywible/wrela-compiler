@@ -93,6 +93,11 @@ pub struct PipelineSummary {
     pub unbounded: Vec<String>,
     /// Its weight (§18.11): its statements with every call written out. 0 when not counted.
     pub weight: u64,
+    /// The pipeline a host runs in its place until it's built (its entry point's `@standin`,
+    /// §18.12), by its index among the pipelines.
+    pub standin: Option<usize>,
+    /// It's another pipeline's stand-in.
+    pub stands_in: bool,
 }
 
 impl PipelineSummary {
@@ -1211,7 +1216,7 @@ fn summarize(
             .copied()
             .unwrap_or_else(|| c.iter().find(|&(&k, _)| holds_site(k, s)).is_some_and(|(_, &u)| u))
     };
-    lowered
+    let mut out: Vec<PipelineSummary> = lowered
         .pipelines
         .iter()
         .map(|out| {
@@ -1245,6 +1250,8 @@ fn summarize(
                 }),
                 work: out.work.clone(),
                 weight: out.weight,
+                standin: out.standin.map(|j| j as usize),
+                stands_in: out.stands_in,
                 unbounded: out
                     .unbounded
                     .iter()
@@ -1252,7 +1259,18 @@ fn summarize(
                     .collect(),
             }
         })
-        .collect()
+        .collect();
+    // A stand-in (§18.12) runs where the pipelines it stands in for do: their tier, as their
+    // sites' conditions together.
+    for i in 0..out.len() {
+        if let Some(j) = out[i].standin
+            && out[j].sites.is_empty()
+        {
+            let c = out[i].conditional.clone();
+            out[j].conditional.extend(c);
+        }
+    }
+    out
 }
 
 /// The program package's own files, and where each is.

@@ -1,0 +1,50 @@
+// A `@standin` that can't stand in for its entry point (§18.12). A stand-in is a cheap entry
+// point the browser runs in its place until its pipeline is built, with the same arguments:
+// so it's a kernel of the same workgroup size, or a fragment shader, taking parameters of the
+// same types, modes and kinds and returning the same type. Its parameters' names may differ;
+// those it doesn't read start with `_`.
+// ---- wrong
+use std::gpu::{GlobalId, GpuBuffer, Slots, buffer, dispatch}
+
+@compute(64)
+@standin(blank)
+fn shade(out: mut Slots<f32>, id: GlobalId, scale: f32) {
+    var a = f32(id.x)
+    for _i in 0..64 {
+        a = sin(a) * scale + cos(a)
+    }
+    out[id] = a
+}
+
+@compute(64)
+fn blank(out: mut Slots<f32>, id: GlobalId) {
+    out[id] = 0.0
+}
+
+pub fn frame(time: f32, width: u32, height: u32) {
+    var out: GpuBuffer<f32> = buffer(64)
+    dispatch(shade.bind(mut out, scale: time), over: 64)
+}
+// ---- fixed
+use std::gpu::{GlobalId, GpuBuffer, Slots, buffer, dispatch}
+
+@compute(64)
+@standin(blank)
+fn shade(out: mut Slots<f32>, id: GlobalId, scale: f32) {
+    var a = f32(id.x)
+    for _i in 0..64 {
+        a = sin(a) * scale + cos(a)
+    }
+    out[id] = a
+}
+
+/// What `shade` gives until it's built.
+@compute(64)
+fn blank(out: mut Slots<f32>, id: GlobalId, _scale: f32) {
+    out[id] = 0.0
+}
+
+pub fn frame(time: f32, width: u32, height: u32) {
+    var out: GpuBuffer<f32> = buffer(64)
+    dispatch(shade.bind(mut out, scale: time), over: 64)
+}

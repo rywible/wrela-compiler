@@ -937,6 +937,28 @@ impl<'d, 'u> Collector<'d, 'u> {
                         out.budget = Some((work, weight, a.span));
                     }
                 }
+                "standin" => {
+                    let path = match a.args.as_deref() {
+                        Some([arg]) if arg.name.is_none() => match &arg.value.kind {
+                            ast::ExprKind::Path(p) => Some(p.clone()),
+                            _ => None,
+                        },
+                        _ => None,
+                    };
+                    match path {
+                        Some(p) if out.standin_path.is_none() => {
+                            out.standin_path = Some((p, a.span))
+                        }
+                        _ => self.diags.push(
+                            Diagnostic::new(
+                                codes::E0108,
+                                a.span,
+                                "`@standin` names one entry point, once: `@standin(cheap)`",
+                            )
+                            .with_note("the stand-in runs in the entry point's place until its own pipeline is built (§18.12)"),
+                        ),
+                    }
+                }
                 "fuel" => {
                     let mut fuel = out.fuel.map(|(v, _)| v);
                     self.fuel_attr(a, &mut fuel, "a test's");
@@ -974,6 +996,7 @@ impl<'d, 'u> Collector<'d, 'u> {
                 _ => {
                     let known = [
                         "budget",
+                        "standin",
                         "compute",
                         "vertex",
                         "fragment",
@@ -1903,6 +1926,7 @@ impl<'d, 'u> Collector<'d, 'u> {
                     }
                 }
                 PendingItem::Fn(id, _) => {
+                    self.standin(*id);
                     self.test_signature(*id);
                     self.test_input(*id);
                     self.testing_export(*id);
@@ -2134,6 +2158,81 @@ impl<'d, 'u> Collector<'d, 'u> {
             }
             self.implied_clone(&scope, &t.traits);
             self.p.trait_sets[id.index()].traits = traits;
+        }
+    }
+
+    /// E0711: `@standin(cheap)` names another entry point of the same stage that takes what
+    /// this one takes (§18.12); its types are compared per instance, where they're known.
+    fn standin(&mut self, id: FnId) {
+        let def = self.p.func(id);
+        let Some((path, at)) = def.attrs.standin_path.clone() else { return };
+        let name = def.name.clone();
+        let err = |why: String| {
+            Diagnostic::new(codes::E0711, at, format!("`{name}` can't have this stand-in: {why}"))
+                .with_note("a stand-in is a cheap entry point the browser runs in this one's place, with the same arguments, until this one's pipeline is built (§18.12)")
+        };
+        let entry = match def.attrs.entry {
+            Some((e @ (Entry::Compute(_) | Entry::Fragment), _)) => e,
+            _ => {
+                let d = err("only a `@compute` kernel or a `@fragment` shader has one".into())
+                    .with_fix("remove it", at, "");
+                return self.diags.push(d);
+            }
+        };
+        let Some(Res::Fn(g)) = resolve::resolve_value_item(&self.p, def.module, &path) else {
+            let shown = (path.segments.iter())
+                .map(|s| s.ident.name.as_str())
+                .collect::<Vec<_>>()
+                .join("::");
+            let d = err(format!("there's no function `{shown}` here"))
+                .with_help("name a cheap entry point of this one's stage, in scope here");
+            return self.diags.push(d);
+        };
+        let (gdef, fgen, ggen) =
+            (self.p.func(g), self.p.fn_all_generics(id), self.p.fn_all_generics(g));
+        let why = if g == id {
+            Some("it names itself".to_string())
+        } else if gdef.attrs.entry.map(|e| e.0) != Some(entry) {
+            Some(format!(
+                "`{}` isn't {}",
+                gdef.name,
+                match entry {
+                    Entry::Compute(wg) => format!(
+                        "a `@compute` kernel of its workgroup size ({})",
+                        wg.map(|n| n.to_string()).join(", ")
+                    ),
+                    _ => "a `@fragment` shader".into(),
+                }
+            ))
+        } else if gdef.attrs.standin_path.is_some() {
+            Some(format!("`{}` has a stand-in of its own", gdef.name))
+        } else if fgen.len() != ggen.len() {
+            Some(format!(
+                "`{}` takes {} generic parameters, and this {}",
+                gdef.name,
+                ggen.len(),
+                fgen.len()
+            ))
+        } else if gdef.params.len() != def.params.len()
+            || (gdef.params.iter().zip(&def.params))
+                .any(|(a, b)| a.mode != b.mode || a.is_const != b.is_const)
+        {
+            Some(format!(
+                "`{}`'s parameters aren't this one's, by number, mode and kind",
+                gdef.name
+            ))
+        } else {
+            None
+        };
+        match why {
+            Some(why) => {
+                let help = format!(
+                    "make `{}` an entry point of this one's stage that takes its parameters (those it doesn't read named with `_`) and returns what it does",
+                    gdef.name
+                );
+                self.diags.push(err(why).with_help(help))
+            }
+            None => self.p.fns[id.index()].attrs.standin = Some((g, at)),
         }
     }
 

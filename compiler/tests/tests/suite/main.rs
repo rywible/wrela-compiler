@@ -57,6 +57,7 @@ mod sketches;
 mod snapshots;
 mod spike13;
 mod stage;
+mod standin;
 mod std_docs;
 mod subjects;
 mod test_items;

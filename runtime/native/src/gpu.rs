@@ -3036,6 +3036,7 @@ mod tests {
             debug_flag: None,
             requires: Vec::new(),
             conditional: false,
+            standin: None,
             constants: Vec::new(),
         });
         let shader = "@group(0) @binding(0) var<storage, read_write> count: array<u32>;\n\
@@ -3304,6 +3305,7 @@ mod tests {
             debug_flag: None,
             requires: Vec::new(),
             conditional: false,
+            standin: None,
             constants: Vec::new(),
         };
         let key = pipeline_key(&p("pipeline_0.wgsl", "main"), "fn main() {}");

@@ -538,6 +538,7 @@ pub fn check_manifest() -> Manifest {
         debug_flag: None,
         requires: Vec::new(),
         conditional: false,
+        standin: None,
         constants: Vec::new(),
     };
     let render = target_bound(false, false);
@@ -1304,6 +1305,7 @@ pub(crate) fn sample_manifest() -> Manifest {
         debug_flag: None,
         requires: Vec::new(),
         conditional: false,
+        standin: None,
         constants: Vec::new(),
     });
     m.pipelines.push(Pipeline {
@@ -1315,6 +1317,7 @@ pub(crate) fn sample_manifest() -> Manifest {
         debug_flag: None,
         requires: Vec::new(),
         conditional: false,
+        standin: None,
         constants: Vec::new(),
     });
     m
@@ -1373,6 +1376,17 @@ fn manifests() -> Vec<Value> {
         manifest("too wide a workgroup", edited(&|m| compute(m, [512, 1, 1]))),
         manifest("a workgroup product over u64", edited(&|m| compute(m, [u32::MAX; 3]))),
         manifest("too many invocations", edited(&|m| compute(m, [16, 16, 2]))),
+        manifest(
+            "a stand-in",
+            edited(&|m| {
+                let quick = Pipeline { name: "quick".into(), ..m.pipelines[0].clone() };
+                m.pipelines.push(quick);
+                m.pipelines[0].standin = Some(2);
+            }),
+        ),
+        manifest("a stand-in of another kind", edited(&|m| m.pipelines[1].standin = Some(0))),
+        manifest("a stand-in of itself", edited(&|m| m.pipelines[0].standin = Some(0))),
+        manifest("a stand-in past the pipelines", edited(&|m| m.pipelines[0].standin = Some(9))),
         manifest("a binding used twice", edited(&|m| m.pipelines[0].bindings[0].binding = 0)),
         manifest(
             "the last binding in a bind group",

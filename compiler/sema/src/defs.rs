@@ -1031,6 +1031,11 @@ pub struct FnAttrs {
     /// `@budget(work: n, weight: m)` on GPU code (§18.11): the most work one call may do, and
     /// the most its code may weigh with every call written out; and where it's written.
     pub budget: Option<(Option<u64>, Option<u64>, Span)>,
+    /// `@standin(cheap)` on a `@compute` kernel or `@fragment` shader (§18.12): the entry point
+    /// the browser runs in its place until its own pipeline is built, as written (`standin_path`)
+    /// and as resolved once the signatures are (`standin`).
+    pub standin_path: Option<(ast::Path, Span)>,
+    pub standin: Option<(FnId, Span)>,
     /// `@test(frames: n, gpu: true, golden: "frame.png", within: m)`: the screen after the
     /// frames is within a mean difference `m` of that PNG in the package (§13).
     pub test_golden: Option<Golden>,

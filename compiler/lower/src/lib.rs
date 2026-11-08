@@ -535,7 +535,8 @@ fn lower_in(
     if emit && !wrela_diag::has_errors(&cx.diags) {
         recorded_pipelines_only(&mut cx, &mut cpu.m);
     }
-    // Pipelines: those CPU code records, then the standalone GPU checks.
+    // Pipelines: those CPU code records and their stand-ins, then the standalone GPU checks.
+    let standins = gpu::add_standins(&mut cx);
     let mut pipelines = Vec::new();
     let mut i = 0;
     while i < cx.pipelines.len() {
@@ -549,6 +550,11 @@ fn lower_in(
             pipelines.push(out);
         }
         i += 1;
+    }
+    if pipelines.len() == cx.pipelines.len() {
+        for &(i, j) in &standins {
+            gpu::match_standin(&mut cx, &mut pipelines, i as usize, j as usize);
+        }
     }
     for (f, substs) in &roots.gpu_checks {
         let already = cx.pipelines.iter().any(|(k, _)| k.mentions(*f));

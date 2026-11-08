@@ -75,8 +75,20 @@ pub fn text(pipelines: &[PipelineSummary]) -> String {
                     .collect();
                 format!(", work {}, weight {}", each.join(" + "), p.weight)
             };
+            if p.stands_in && p.sites.is_empty() {
+                s.push_str(&format!(
+                    "  {} ({}, a stand-in{tier}{work}), run in another's place until it's built\n",
+                    p.entries.join(" + "),
+                    p.kind
+                ));
+                continue;
+            }
+            let standin = match p.standin.and_then(|j| pipelines.get(j)) {
+                Some(c) => format!(", stand-in {}", c.names.last().map_or("", |n| n.as_str())),
+                None => String::new(),
+            };
             s.push_str(&format!(
-                "  {} ({}{tier}{work}), {verb} at {}\n",
+                "  {} ({}{tier}{work}{standin}), {verb} at {}\n",
                 p.entries.join(" + "),
                 p.kind,
                 (p.sites.iter().enumerate())
@@ -101,7 +113,7 @@ pub fn json(pipelines: &[PipelineSummary]) -> String {
         .iter()
         .map(|p| {
             format!(
-                "{{\"kind\": {}, \"entries\": {}, \"sites\": {}, \"conditional\": [{}], \"tier\": {}{}, \"work\": [{}], \"weight\": {}}}",
+                "{{\"kind\": {}, \"entries\": {}, \"sites\": {}, \"conditional\": [{}], \"tier\": {}{}, \"work\": [{}], \"weight\": {}{}}}",
                 q(p.kind),
                 list(&p.entries),
                 list(&p.sites),
@@ -113,7 +125,12 @@ pub fn json(pipelines: &[PipelineSummary]) -> String {
                     .map(|w| w.map_or_else(|| "null".to_string(), |w| w.to_string()))
                     .collect::<Vec<_>>()
                     .join(", "),
-                p.weight
+                p.weight,
+                match (p.standin, p.stands_in) {
+                    (Some(j), _) => format!(", \"standin\": {j}"),
+                    (None, true) => ", \"stands_in\": true".to_string(),
+                    _ => String::new(),
+                }
             )
         })
         .collect();
@@ -140,6 +157,8 @@ mod tests {
             work: Vec::new(),
             weight: 0,
             unbounded: Vec::new(),
+            standin: None,
+            stands_in: false,
         };
         assert!(text(std::slice::from_ref(&p)).contains("at main.wrela:3:5, main.wrela:9:5\n"));
         let p = PipelineSummary { conditional: vec![false, true], ..p };

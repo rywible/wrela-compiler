@@ -98,6 +98,11 @@ pub struct PipelineOut {
     /// Its entry points' weight together (§18.11): their statements with every call written
     /// out, what the browser's shader compiler works through.
     pub weight: u64,
+    /// The pipeline of its entry point's `@standin` (§18.12): what the browser runs in its
+    /// place until it's built.
+    pub standin: Option<u32>,
+    /// It's another pipeline's stand-in.
+    pub stands_in: bool,
 }
 
 /// What a GPU module is for, while it's lowered.
@@ -379,7 +384,7 @@ fn bind_at(b: &mut Bound, path: &[u32], r: ir::ResourceId) {
 }
 
 /// One entry point of a pipeline.
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 pub(crate) struct EntryParams {
     pub func: FnId,
     /// Concrete types for the function's generics.
@@ -426,7 +431,7 @@ impl Leaf {
 /// and the pipeline's module both read it, so the buffer handles a command passes are the
 /// buffers the module binds, in order, and the uniform values it packs are the module's
 /// uniform block.
-#[derive(Debug, Default)]
+#[derive(Clone, Debug, Default)]
 pub(crate) struct Interface {
     /// The entry points: a kernel, or a vertex shader then a fragment shader.
     pub entries: Vec<EntryParams>,
@@ -645,6 +650,141 @@ fn ret_type(cx: &mut Cx, f: FnId, substs: &[TyId]) -> TyId {
     let subst = Subst::from_pairs(&generics, substs);
     let r = cx.checked.program.func(f).ret;
     cx.concrete(r, &subst)
+}
+
+// ---- Stand-ins (§18.12) ---------------------------------------------------------------------
+
+/// Adds each recorded pipeline's stand-in, the pipeline of its kernel's or fragment shader's
+/// `@standin` with the same arguments: the same interface, so a command recorded for the one
+/// runs the other. Returns each `(pipeline, its stand-in)`. A stand-in CPU code records too is
+/// that pipeline; a render stand-in draws into its pipeline's targets as well.
+pub(crate) fn add_standins(cx: &mut Cx) -> Vec<(u32, u32)> {
+    let mut out = Vec::new();
+    for i in 0..cx.pipelines.len() {
+        let (key, iface) = cx.pipelines[i].clone();
+        let (real, substs) = match &key {
+            PipelineKey::Compute { kernel, substs, .. } => (*kernel, substs.clone()),
+            PipelineKey::Render { fragment, .. } => fragment.clone(),
+        };
+        let Some((cheap, at)) = cx.checked.program.func(real).attrs.standin else { continue };
+        // The same types, each passed the same way (a generic parameter's way is its
+        // declared type's, so compare the stand-in's own interface's).
+        let own = |cx: &mut Cx, f: FnId| {
+            let p = param_types(cx, f, &substs);
+            let classes: Vec<ParamClass> = (p.iter().enumerate())
+                .map(|(k, &t)| {
+                    let varyings = match &key {
+                        PipelineKey::Render { vertex, .. } => {
+                            Some(ret_type(cx, vertex.0, &vertex.1))
+                        }
+                        PipelineKey::Compute { .. } => None,
+                    };
+                    classify(cx, f, k, t, varyings)
+                })
+                .collect();
+            (p, classes, ret_type(cx, f, &substs))
+        };
+        if own(cx, real) != own(cx, cheap) {
+            let program = &cx.checked.program;
+            let (a, b) = (&program.func(real).name, &program.func(cheap).name);
+            cx.err(
+                Diagnostic::new(
+                    codes::E0711,
+                    at,
+                    format!("`{a}` can't have this stand-in: `{b}` doesn't take and return what `{a}` does"),
+                )
+                .with_secondary(program.func(cheap).sig_span, "the stand-in's signature")
+                .with_note("a stand-in is a cheap entry point the browser runs in this one's place, with the same arguments, until this one's pipeline is built (§18.12)")
+                .with_help(format!("give `{b}` `{a}`'s parameter types and result")),
+            );
+            continue;
+        }
+        let swapped = match &key {
+            PipelineKey::Compute { kernel: _, substs, over, consts } => PipelineKey::Compute {
+                kernel: cheap,
+                substs: substs.clone(),
+                over: *over,
+                consts: consts.clone(),
+            },
+            PipelineKey::Render { vertex, fragment, state, consts } => PipelineKey::Render {
+                vertex: vertex.clone(),
+                fragment: (cheap, fragment.1.clone()),
+                state: *state,
+                consts: consts.clone(),
+            },
+        };
+        let j = match cx.pipelines.iter().position(|(k, _)| *k == swapped) {
+            Some(j) => j,
+            None => {
+                let mut same = (*iface).clone();
+                let e = same.entries.len() - 1;
+                same.entries[e].func = cheap;
+                cx.pipelines.push((swapped, Rc::new(same)));
+                cx.pipeline_sites.push(Vec::new());
+                cx.pipeline_targets.push(Vec::new());
+                cx.pipelines.len() - 1
+            }
+        };
+        for t in cx.pipeline_targets[i].clone() {
+            if !cx.pipeline_targets[j].contains(&t) {
+                cx.pipeline_targets[j].push(t);
+            }
+        }
+        out.push((i as u32, j as u32));
+    }
+    out
+}
+
+/// Marks pipeline `j` pipeline `i`'s stand-in. Their bindings come from one interface, but a
+/// sampler either gathers a depth texture through binds as one that doesn't filter (its module's
+/// own code says, `non_filtering`): so binds it in both. Bindings that still differ are E0711.
+pub(crate) fn match_standin(cx: &mut Cx, pipelines: &mut [PipelineOut], i: usize, j: usize) {
+    let (a, b) = (&pipelines[i].bindings, &pipelines[j].bindings);
+    let joined: Option<Vec<ResourceBinding>> = (a.len() == b.len())
+        .then(|| {
+            a.iter()
+                .zip(b)
+                .map(|(x, y)| match (x.kind, y.kind) {
+                    _ if x == y => Some(x.clone()),
+                    (BindingKind::Sampler, BindingKind::NonFilteringSampler)
+                    | (BindingKind::NonFilteringSampler, BindingKind::Sampler)
+                        if (x.binding, x.stage, x.format) == (y.binding, y.stage, y.format) =>
+                    {
+                        Some(ResourceBinding {
+                            kind: BindingKind::NonFilteringSampler,
+                            ..x.clone()
+                        })
+                    }
+                    _ => None,
+                })
+                .collect()
+        })
+        .flatten();
+    match joined {
+        Some(joined) if pipelines[i].uniform == pipelines[j].uniform => {
+            pipelines[i].bindings = joined.clone();
+            pipelines[j].bindings = joined;
+            pipelines[i].standin = Some(j as u32);
+            pipelines[j].stands_in = true;
+        }
+        _ => {
+            let (real, cheap) = (&pipelines[i].name, &pipelines[j].name);
+            let real_fn = match &pipelines[i].key {
+                PipelineKey::Compute { kernel, .. } => *kernel,
+                PipelineKey::Render { fragment, .. } => fragment.0,
+            };
+            let Some((_, at)) = cx.checked.program.func(real_fn).attrs.standin else { return };
+            cx.err(
+                Diagnostic::new(
+                    codes::E0711,
+                    at,
+                    format!("`{cheap}` can't stand in for `{real}`: they bind their resources differently"),
+                )
+                .with_note("a stand-in runs the commands recorded for its pipeline, so it binds what that does, the same way (§18.12)")
+                .with_help("sample each texture the stand-in reads as the entry point does (a depth texture gathered in one is gathered, or not read, in the other)"),
+            );
+        }
+    }
 }
 
 // ---- CPU side: recording ------------------------------------------------------------------------
@@ -2899,6 +3039,8 @@ fn lower_compute(cx: &mut Cx, iface: Rc<Interface>, consts: Vec<ir::Const>) -> O
         work,
         unbounded,
         weight,
+        standin: None,
+        stands_in: false,
     })
 }
 
@@ -2985,6 +3127,8 @@ fn lower_render(cx: &mut Cx, iface: Rc<Interface>, consts: Vec<ir::Const>) -> Op
         work,
         unbounded,
         weight,
+        standin: None,
+        stands_in: false,
     })
 }
 
@@ -3333,13 +3477,13 @@ pub(crate) fn debug_checks(cx: &mut Cx, out: &mut PipelineOut, code: u32) {
     }
 }
 
+/// A pipeline's counts (§18.11): each entry point's work and the loop that leaves it unbounded,
+/// and its weight.
+type Counts = (Vec<Option<u64>>, Vec<Option<Span>>, u64);
+
 /// Checks a pipeline's module and, if it'll be emitted, flattens it (`ir::opt::flatten_gpu`)
 /// and lays out its memory as the CPU's (`ir::gpu_memory`).
-fn verify(
-    cx: &mut Cx,
-    mb: &mut ModuleBuilder,
-    name: &str,
-) -> Option<(Vec<Option<u64>>, Vec<Option<Span>>, u64)> {
+fn verify(cx: &mut Cx, mb: &mut ModuleBuilder, name: &str) -> Option<Counts> {
     if wrela_diag::has_errors(&cx.diags) {
         return None;
     }
