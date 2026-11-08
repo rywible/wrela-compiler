@@ -93,6 +93,8 @@ pub struct PipelineOut {
     pub instances: Vec<(FnId, Vec<TyId>)>,
     /// Each entry point's work (§18.11), in the module's order: `None` when it has no bound.
     pub work: Vec<Option<u64>>,
+    /// For each entry point whose work has no bound, the loop that has no sure exit.
+    pub unbounded: Vec<Option<Span>>,
     /// Its entry points' weight together (§18.11): their statements with every call written
     /// out, what the browser's shader compiler works through.
     pub weight: u64,
@@ -2875,7 +2877,7 @@ fn lower_compute(cx: &mut Cx, iface: Rc<Interface>, consts: Vec<ir::Const>) -> O
         function: entry,
         inputs,
     });
-    let (work, weight) = verify(cx, &mut mb, name)?;
+    let (work, unbounded, weight) = verify(cx, &mut mb, name)?;
     non_filtering(&mb.m, &mut bindings);
     let instances = mb.fn_instances();
     Some(PipelineOut {
@@ -2895,6 +2897,7 @@ fn lower_compute(cx: &mut Cx, iface: Rc<Interface>, consts: Vec<ir::Const>) -> O
         targets: Vec::new(),
         instances,
         work,
+        unbounded,
         weight,
     })
 }
@@ -2960,7 +2963,7 @@ fn lower_render(cx: &mut Cx, iface: Rc<Interface>, consts: Vec<ir::Const>) -> Op
         inputs: finputs,
     });
     let name = format!("{}_{}", ir::ident(&vdef.name), ir::ident(&fdef.name));
-    let (work, weight) = verify(cx, &mut mb, &name)?;
+    let (work, unbounded, weight) = verify(cx, &mut mb, &name)?;
     non_filtering(&mb.m, &mut bindings);
     let instances = mb.fn_instances();
     Some(PipelineOut {
@@ -2980,6 +2983,7 @@ fn lower_render(cx: &mut Cx, iface: Rc<Interface>, consts: Vec<ir::Const>) -> Op
         targets: Vec::new(),
         instances,
         work,
+        unbounded,
         weight,
     })
 }
@@ -3331,36 +3335,37 @@ pub(crate) fn debug_checks(cx: &mut Cx, out: &mut PipelineOut, code: u32) {
 
 /// Checks a pipeline's module and, if it'll be emitted, flattens it (`ir::opt::flatten_gpu`)
 /// and lays out its memory as the CPU's (`ir::gpu_memory`).
-fn verify(cx: &mut Cx, mb: &mut ModuleBuilder, name: &str) -> Option<(Vec<Option<u64>>, u64)> {
+fn verify(
+    cx: &mut Cx,
+    mb: &mut ModuleBuilder,
+    name: &str,
+) -> Option<(Vec<Option<u64>>, Vec<Option<Span>>, u64)> {
     if wrela_diag::has_errors(&cx.diags) {
         return None;
     }
     let mut checked = ir::verify(&mb.m);
     // Work is counted before flattening, while each function is still its own (§18.11).
-    let mut work = Vec::new();
+    let (mut work, mut unbounded) = (Vec::new(), Vec::new());
     let mut weight = 0u64;
     if checked.is_ok() {
-        for e in mb.m.entry_points.clone() {
+        for e in &mb.m.entry_points {
             weight = weight.saturating_add(ir::work::weight(&mb.m, e.function));
-            for (i, f) in mb.m.functions.iter().enumerate() {
-                if let Some(ir::Budget { weight: Some(most), at, .. }) = f.budget {
-                    let w = ir::work::weight(&mb.m, ir::FuncId(i as u32));
-                    if w > most {
-                        over_weight_budget(cx, &f.name, w, most, at);
-                    }
+        }
+        for (i, f) in mb.m.functions.iter().enumerate() {
+            if let Some(ir::Budget { weight: Some(most), at, .. }) = f.budget {
+                let w = ir::work::weight(&mb.m, ir::FuncId(i as u32));
+                if w > most {
+                    over_weight_budget(cx, &f.name, w, most, at);
                 }
             }
-            let w = ir::work::entry_work(&mb.m, e.function);
-            for b in &w.breaches {
-                over_work_budget(cx, b);
-            }
-            work.push(w.work);
         }
-    }
-    // For the compiler's own debugging: `WRELA_DUMP_IR=gpu:<pipeline>` prints that pipeline's
-    // module before it's flattened.
-    if std::env::var("WRELA_DUMP_IR").is_ok_and(|d| d.strip_prefix("gpu:") == Some(name)) {
-        eprintln!("{}", ir::print::print(&mb.m));
+        let (each, breaches) = ir::work::module_work(&mb.m);
+        for b in &breaches {
+            over_work_budget(cx, b);
+        }
+        unbounded =
+            each.iter().map(|w| if w.work.is_none() { w.unbounded } else { None }).collect();
+        work = each.into_iter().map(|w| w.work).collect();
     }
     if cx.emit {
         checked = checked
@@ -3375,7 +3380,7 @@ fn verify(cx: &mut Cx, mb: &mut ModuleBuilder, name: &str) -> Option<(Vec<Option
     if wrela_diag::has_errors(&cx.diags) {
         return None;
     }
-    Some((work, weight))
+    Some((work, unbounded, weight))
 }
 
 /// E0710 for a function's weight over its `@budget(weight: n)` (§18.11), once.

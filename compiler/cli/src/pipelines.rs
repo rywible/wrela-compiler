@@ -66,7 +66,12 @@ pub fn text(pipelines: &[PipelineSummary]) -> String {
                 let each: Vec<String> = p
                     .work
                     .iter()
-                    .map(|w| w.map_or_else(|| "unbounded".to_string(), |w| w.to_string()))
+                    .enumerate()
+                    .map(|(i, w)| match (w, p.unbounded.get(i).filter(|s| !s.is_empty())) {
+                        (Some(w), _) => w.to_string(),
+                        (None, Some(at)) => format!("unbounded (the loop at {at})"),
+                        (None, None) => "unbounded".to_string(),
+                    })
                     .collect();
                 format!(", work {}, weight {}", each.join(" + "), p.weight)
             };
@@ -134,6 +139,7 @@ mod tests {
             attachment_bytes: None,
             work: Vec::new(),
             weight: 0,
+            unbounded: Vec::new(),
         };
         assert!(text(std::slice::from_ref(&p)).contains("at main.wrela:3:5, main.wrela:9:5\n"));
         let p = PipelineSummary { conditional: vec![false, true], ..p };

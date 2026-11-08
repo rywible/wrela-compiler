@@ -2566,7 +2566,7 @@ The compiler counts what each GPU function costs from its code, the same on ever
 
 - **Work** is the most one call of a function can do, in units of about one 32-bit operation on one invocation. It's counted from the code before the shader compiler's own optimizations, walking it as it would run and knowing only what the code makes constant (constants, a pipeline's `const` parameters, and what's computed from them):
   - a branch on a known condition counts the side it takes; on anything else, the costlier side;
-  - a loop counts each pass until an exit it's sure of: a `for` over a constant range, or a `while` whose counter reaches a constant (`while i < 32 && !hit` is sure to leave by 32). A loop with no sure exit within 65,536 passes has no bound, and nor does what holds it;
+  - a loop counts each pass until an exit it's sure of: a `for` over a constant range, or a `while` whose counter reaches a constant (`while i < 32 && !hit` is sure to leave by 32). A loop with no sure exit within 4,096 passes has no bound (a pass an invocation makes past that is a shader to split up anyway), and nor does what holds it;
   - a call counts its function's work, given what's known of its arguments.
 
   | What | Work |
@@ -2582,7 +2582,7 @@ The compiler counts what each GPU function costs from its code, the same on ever
   | A local's or a parameter's read or write, building or taking apart a value | 0 |
 
 - **Weight** is how many statements a function comes to with every call written out in its place. A browser's shader compiler copies a function into each place it's called, so a big function called from many places weighs each time, and a pipeline's compile time grows with its weight, faster than in proportion. (The opening scene's far pass weighed 270,830 and took three quarters of its 21 pipelines' cold compile; its WGSL was not its largest.)
-- **`wrela pipelines`** gives each pipeline's work, an entry point at a time (`unbounded` for none), and its weight; `--json` gives them as `work` (`null` for unbounded) and `weight`.
+- **`wrela pipelines`** gives each pipeline's work, an entry point at a time (`unbounded` for none, with the loop that has no sure exit), and its weight; `--json` gives them as `work` (`null` for unbounded) and `weight`.
 - **`@budget(work: n)`** holds a GPU function to at most `n` work a call, and **`@budget(weight: n)`** to at most `n` weight; one attribute may give both. Each instantiation that a pipeline reaches is checked, with what that pipeline makes constant; one over its budget, or whose work has no bound, is E0710 at the attribute, naming the calls that do the most of it.
 - **A shipped build's pipeline weighs at most 300,000** (E0707, at the command that records it), as its WGSL is at most 256 KiB (§18.9).
 - Work and weight are counts to compare code by and to hold it to, not times: a GPU's time depends on how its invocations diverge, on its memory and on its compiler.

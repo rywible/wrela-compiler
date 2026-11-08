@@ -18,11 +18,11 @@ use std::collections::HashMap;
 use wrela_diag::Span;
 
 /// The most passes a loop is followed for: past it, the loop's work is unbounded.
-pub const MOST_PASSES: u32 = 1 << 16;
+pub const MOST_PASSES: u32 = 1 << 12;
 
 /// The most statements the count follows for one entry point (a guard on the count's own time):
 /// past it, the work is unbounded.
-pub const MOST_STEPS: u64 = 1 << 26;
+pub const MOST_STEPS: u64 = 1 << 24;
 
 /// Work units: arithmetic on one component.
 pub const OP: u64 = 1;
@@ -61,11 +61,26 @@ pub struct EntryWork {
     pub breaches: Vec<Breach>,
 }
 
+/// The work of each entry point of module `m`, in its order, and the functions over their
+/// budgets (once each). One count serves the module, so a function two entry points call is
+/// followed once for each set of known arguments.
+pub fn module_work(m: &Module) -> (Vec<EntryWork>, Vec<Breach>) {
+    let mut c = Counter { m, steps: 0, gave_up: false, memo: HashMap::new(), breaches: Vec::new() };
+    let mut out = Vec::new();
+    for e in &m.entry_points {
+        (c.steps, c.gave_up) = (0, false);
+        let r = c.call(e.function, &[]);
+        let work = if r.unbounded || c.gave_up { None } else { Some(r.work) };
+        out.push(EntryWork { work, unbounded: r.loop_at, breaches: Vec::new() });
+    }
+    (out, c.breaches)
+}
+
 /// The work of entry point `f` of module `m`, and the functions over their budgets.
 pub fn entry_work(m: &Module, f: FuncId) -> EntryWork {
-    let mut c = Counter { m, steps: 0, memo: HashMap::new(), breaches: Vec::new() };
+    let mut c = Counter { m, steps: 0, gave_up: false, memo: HashMap::new(), breaches: Vec::new() };
     let r = c.call(f, &[]);
-    let work = if r.unbounded || c.steps > MOST_STEPS { None } else { Some(r.work) };
+    let work = if r.unbounded || c.gave_up { None } else { Some(r.work) };
     EntryWork { work, unbounded: r.loop_at, breaches: c.breaches }
 }
 
@@ -80,7 +95,10 @@ struct Called {
 struct Counter<'a> {
     m: &'a Module,
     steps: u64,
-    memo: HashMap<(u32, String), Called>,
+    /// The count went past [`MOST_STEPS`]: what it found after is not the code's, so no
+    /// function is reported over its budget from then on.
+    gave_up: bool,
+    memo: HashMap<(u32, Vec<Option<(u8, u32)>>), Called>,
     breaches: Vec<Breach>,
 }
 
@@ -115,8 +133,8 @@ struct Frame<'f> {
     here: Option<Span>,
     /// What each sure return gave: `Some(None)` once two differ or one isn't known.
     ret: Option<Option<Const>>,
-    /// Work of each function it calls itself, by name.
-    calls: HashMap<String, u64>,
+    /// Work of each function it calls itself.
+    calls: HashMap<u32, u64>,
 }
 
 impl<'a> Counter<'a> {
@@ -128,7 +146,17 @@ impl<'a> Counter<'a> {
                 a.clone().filter(|c| matches!(c, Const::Bool(_) | Const::I32(_) | Const::U32(_)))
             })
             .collect();
-        let key = (id.0, format!("{args:?}"));
+        let key = (
+            id.0,
+            args.iter()
+                .map(|a| match a {
+                    Some(Const::Bool(b)) => Some((0, u32::from(*b))),
+                    Some(Const::I32(i)) => Some((1, *i as u32)),
+                    Some(Const::U32(u)) => Some((2, *u)),
+                    _ => None,
+                })
+                .collect::<Vec<_>>(),
+        );
         if let Some(c) = self.memo.get(&key) {
             return c.clone();
         }
@@ -152,10 +180,16 @@ impl<'a> Counter<'a> {
             loop_at: fr.loop_at,
             ret: fr.ret.flatten(),
         };
-        if let Some(Budget { work: Some(budget), at, .. }) = f.budget {
+        if let Some(Budget { work: Some(budget), at, .. }) = f.budget
+            && !self.gave_up
+        {
             let over = called.unbounded || called.work > budget;
             if over {
-                let mut biggest: Vec<(String, u64)> = fr.calls.into_iter().collect();
+                let mut biggest: Vec<(String, u64)> = fr
+                    .calls
+                    .into_iter()
+                    .map(|(c, w)| (self.m.functions[c as usize].name.clone(), w))
+                    .collect();
                 biggest.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(&b.0)));
                 biggest.truncate(3);
                 let b = Breach {
@@ -177,7 +211,9 @@ impl<'a> Counter<'a> {
                 }
             }
         }
-        self.memo.insert(key, called.clone());
+        if !self.gave_up {
+            self.memo.insert(key, called.clone());
+        }
         called
     }
 
@@ -185,6 +221,7 @@ impl<'a> Counter<'a> {
         for s in b {
             self.steps += 1;
             if self.steps > MOST_STEPS {
+                self.gave_up = true;
                 fr.unbounded = true;
                 return Flow::Return;
             }
@@ -200,9 +237,11 @@ impl<'a> Counter<'a> {
         match s {
             Stmt::At(span) => fr.here = Some(*span),
             Stmt::Let(v, e) => {
-                if let Some(c) = self.expr(fr, st, e) {
-                    fr.vals.insert(*v, c);
-                }
+                // A value a loop's pass defines again forgets what an earlier pass gave it.
+                match self.expr(fr, st, e) {
+                    Some(c) => fr.vals.insert(*v, c),
+                    None => fr.vals.remove(v),
+                };
             }
             Stmt::Eval(e) => {
                 self.expr(fr, st, e);
@@ -394,8 +433,7 @@ impl<'a> Counter<'a> {
                         fr.loop_at = c.loop_at;
                     }
                 }
-                let name = m.functions[id.0 as usize].name.clone();
-                let e = fr.calls.entry(name).or_insert(0);
+                let e = fr.calls.entry(id.0).or_insert(0);
                 *e = e.saturating_add(c.work);
                 (c.work, c.ret)
             }

@@ -58,6 +58,12 @@ fn loops_count_each_pass_and_unbounded_ones_have_no_work() {
                 "capped",
                 "    var a = 0.0\n    var i = 0\n    var done = false\n    while i < 32 && !done {\n        a = a + sin(x + a)\n        done = a > 10.0\n        i = i + 1\n    }\n    out[id] = a",
             ),
+            // A bound the loop itself moves by the invocation's value: what the first pass knew
+            // of it isn't known on the next.
+            (
+                "moved",
+                "    var i: u32 = 0\n    var n: u32 = 4\n    while i < n {\n        i = i + 1\n        n = n + id.x\n    }\n    out[id] = f32(i)",
+            ),
             // Left only on the invocation's own value: no sure exit.
             (
                 "open",
@@ -74,6 +80,7 @@ fn loops_count_each_pass_and_unbounded_ones_have_no_work() {
     let capped = of(&all, "capped").0.expect("a counter that reaches 32 bounds it");
     assert!(capped >= 32 * 4, "{all:?}");
     assert_eq!(of(&all, "open").0, None, "{all:?}");
+    assert_eq!(of(&all, "moved").0, None, "{all:?}");
 }
 
 #[test]
