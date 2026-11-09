@@ -1831,8 +1831,15 @@ impl<'c, 'a> Fl<'c, 'a> {
         }
     }
 
-    /// Fields and components of a temporary's value.
-    fn extract_path(&mut self, mut v: ir::ValueId, p: &mir::Place) -> Option<ir::ValueId> {
+    /// Fields and components of a temporary's value. Past a borrow struct's projection field
+    /// (a pointer, which `place_parts` follows too) the rest is a place, and only what's asked
+    /// for is loaded from it, never the whole borrowed value.
+    fn extract_path(&mut self, v: ir::ValueId, p: &mir::Place) -> Option<ir::ValueId> {
+        enum At {
+            Value(ir::ValueId),
+            Place(ir::Place),
+        }
+        let mut at = At::Value(v);
         let mut ty = self.concrete(self.local_ty(p.local));
         for proj in &p.proj {
             match proj {
@@ -1840,31 +1847,56 @@ impl<'c, 'a> Fl<'c, 'a> {
                     let projected = self.borrow_projection(ty, *i);
                     let (fi, ft) = self.cx.field(self.mb, ty, None, *i, self.code.span)?;
                     ty = ft;
-                    let it = self.cx.lower_ty(self.mb, ty, self.code.span)?;
-                    v = if projected {
-                        // A borrow struct's projection field holds a pointer (`place_parts`
-                        // follows it too): the value is what's at the place it points at.
-                        let pt = self.mb.m.types.intern(ir::TypeDef::Ptr(it));
-                        let ptr = self.value(pt, ir::Expr::Extract(v, fi));
-                        self.load(ir::Place { root: ir::PlaceRoot::Ptr(ptr), path: Vec::new() }, it)
-                    } else {
-                        self.value(it, ir::Expr::Extract(v, fi))
+                    let mut it = self.cx.lower_ty(self.mb, ty, self.code.span)?;
+                    if projected {
+                        it = self.mb.m.types.intern(ir::TypeDef::Ptr(it));
+                    }
+                    at = match at {
+                        At::Value(v) => At::Value(self.value(it, ir::Expr::Extract(v, fi))),
+                        At::Place(place) if projected => {
+                            At::Value(self.load(place.with(ir::Proj::Field(fi)), it))
+                        }
+                        At::Place(place) => At::Place(place.with(ir::Proj::Field(fi))),
                     };
+                    if let (true, At::Value(ptr)) = (projected, &at) {
+                        at = At::Place(ir::Place {
+                            root: ir::PlaceRoot::Ptr(*ptr),
+                            path: Vec::new(),
+                        });
+                    }
                 }
                 mir::Proj::Comp(c) => {
                     ty = self.proj_ty(ty, proj);
-                    let ct = self.cx.lower_ty(self.mb, ty, self.code.span)?;
-                    v = self.value(ct, ir::Expr::Extract(v, *c as u32));
+                    at = match at {
+                        At::Value(v) => {
+                            let ct = self.cx.lower_ty(self.mb, ty, self.code.span)?;
+                            At::Value(self.value(ct, ir::Expr::Extract(v, *c as u32)))
+                        }
+                        At::Place(place) => At::Place(place.with(ir::Proj::Comp(*c))),
+                    };
                 }
                 mir::Proj::Swizzle(cs) => {
+                    let v = match at {
+                        At::Value(v) => v,
+                        At::Place(place) => {
+                            let vt = self.cx.lower_ty(self.mb, ty, self.code.span)?;
+                            self.load(place, vt)
+                        }
+                    };
                     ty = self.proj_ty(ty, proj);
                     let vt = self.cx.lower_ty(self.mb, ty, self.code.span)?;
-                    v = self.value(vt, ir::Expr::Swizzle(v, cs.clone()));
+                    at = At::Value(self.value(vt, ir::Expr::Swizzle(v, cs.clone())));
                 }
                 _ => return None,
             }
         }
-        Some(v)
+        Some(match at {
+            At::Value(v) => v,
+            At::Place(place) => {
+                let it = self.cx.lower_ty(self.mb, ty, self.code.span)?;
+                self.load(place, it)
+            }
+        })
     }
 
     /// Writes `v` to a place; a swizzle's components one by one.

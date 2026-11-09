@@ -5,10 +5,11 @@ detail; `docs/release.md` says how a release is cut.
 
 ## 0.31.1
 
-- A group (a borrow struct, language.md §18.6) given to `bind` as a call's result or written out
-  where it's bound (`paint.bind(waves: waves_of(ocean), ...)`) builds: its textures and samplers
-  are read through the group's projection fields, as a named group's are. It was I0001, the CPU
-  module's IR malformed, and the way round it a `let`.
+- A borrow struct that is a temporary (a call's result, or written out where it's used) reads
+  through its projection fields as a named one does: `ctx_of(world).world.count`, and a group
+  (language.md §18.6) given to `bind` in place (`paint.bind(waves: waves_of(ocean), ...)`). It
+  was I0001, the CPU module's IR malformed, and the way round it a `let`. Such a read loads only
+  what's asked for, not the whole borrowed value.
 
 ## 0.31.0
 
