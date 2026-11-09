@@ -201,29 +201,99 @@ pub struct SiteRuns {
     pub times: u64,
     /// All those runs' work, each given what's known of its arguments then.
     pub work: u64,
-    /// A run's work is unbounded. (A loop that is counts one pass.)
+    /// A run's work is unbounded, or the count gave up before it was sure of them all.
     pub unbounded: bool,
-    /// What's known of its arguments, each way it differs between runs, with how many runs.
+    /// What's known of its arguments, each way it differs between runs, with how many runs (a
+    /// way may be left with none).
     pub known: Vec<(Known, u64)>,
 }
 
-impl SiteRuns {
-    /// Scales the runs a loop added since `before` down to one of its `passes`: the count can't
-    /// bound the loop.
-    fn one_pass(&mut self, before: Option<&SiteRuns>, passes: u64) {
-        let less = |now: u64, then: u64| then + (now - then).div_ceil(passes.max(1));
-        let then = before.cloned().unwrap_or_default();
-        if self.times == then.times {
-            return;
+/// What a [`CallRuns`] count has found so far: each call's runs, and each run's record (the
+/// call, which of its `known`, how many runs, their work), so a loop the count can't bound can
+/// take back all but a pass of what it added.
+#[derive(Default)]
+struct SiteLog {
+    runs: HashMap<usize, SiteRuns>,
+    log: Vec<(usize, u32, u64, u64)>,
+    /// The loops found unbounded (by their bodies' addresses): met again, each runs one pass.
+    endless: std::collections::HashSet<usize>,
+}
+
+impl SiteLog {
+    fn record(&mut self, at: usize, known: Known, work: u64, unbounded: bool) {
+        let r = self.runs.entry(at).or_default();
+        r.times = r.times.saturating_add(1);
+        r.work = r.work.saturating_add(work);
+        r.unbounded |= unbounded;
+        let k = match r.known.iter().position(|(j, _)| *j == known) {
+            Some(k) => k,
+            None => {
+                r.known.push((known, 0));
+                r.known.len() - 1
+            }
+        };
+        r.known[k].1 += 1;
+        self.log.push((at, k as u32, 1, work));
+    }
+
+    /// Scales the runs recorded since `from` down to one of the loop's `passes`: the count can't
+    /// bound it. What was known of a call's arguments then is what all of those runs agree on.
+    fn one_pass(&mut self, from: usize, passes: u64) {
+        let tail = self.log.split_off(from);
+        // (Each call: its runs, their work, and how many of them each way of `known` had.)
+        type Added = (usize, u64, u64, Vec<(u32, u64)>);
+        let mut each: Vec<Added> = Vec::new();
+        for (at, k, n, w) in tail {
+            let e = match each.iter().position(|e| e.0 == at) {
+                Some(i) => &mut each[i],
+                None => {
+                    each.push((at, 0, 0, Vec::new()));
+                    each.last_mut().expect("pushed")
+                }
+            };
+            e.1 += n;
+            e.2 = e.2.saturating_add(w);
+            match e.3.iter_mut().find(|(j, _)| *j == k) {
+                Some((_, m)) => *m += n,
+                None => e.3.push((k, n)),
+            }
         }
-        self.times = less(self.times, then.times);
-        self.work = less(self.work, then.work);
-        for (k, n) in &mut self.known {
-            let was = then.known.iter().find(|(j, _)| j == k).map_or(0, |(_, n)| *n);
-            *n = less(*n, was);
+        let passes = passes.max(1);
+        for (at, n, w, ks) in each {
+            let r = self.runs.get_mut(&at).expect("a recorded call");
+            let (n1, w1) = (n.div_ceil(passes), w.div_ceil(passes));
+            r.times = r.times - n + n1;
+            r.work = r.work - w + w1;
+            let mut agreed: Option<Known> = None;
+            for (k, m) in ks {
+                let (known, count) = &mut r.known[k as usize];
+                *count -= m;
+                agreed = Some(match agreed {
+                    None => known.clone(),
+                    Some(a) => a
+                        .iter()
+                        .zip(known.iter())
+                        .map(|(x, y)| if x == y { *x } else { None })
+                        .collect(),
+                });
+            }
+            let agreed = agreed.expect("a run");
+            let k = match r.known.iter().position(|(j, _)| *j == agreed) {
+                Some(k) => k,
+                None => {
+                    r.known.push((agreed, 0));
+                    r.known.len() - 1
+                }
+            };
+            r.known[k].1 += n1;
+            self.log.push((at, k as u32, n1, w1));
         }
     }
 }
+
+/// The most statements a [`CallRuns`] follows in all (a guard on the count's own time): past
+/// it, the calls of what's counted after are unbounded.
+pub const MOST_CALL_RUN_STEPS: u64 = 1 << 26;
 
 /// How each call in a function runs in one call of it, knowing what the count knows: its
 /// constants, what's known of its arguments, and the values computed from them. One count
@@ -231,6 +301,8 @@ impl SiteRuns {
 /// known arguments.
 pub struct CallRuns<'a> {
     c: Counter<'a>,
+    /// The statements followed so far, over every `of`.
+    steps: u64,
 }
 
 impl<'a> CallRuns<'a> {
@@ -244,13 +316,25 @@ impl<'a> CallRuns<'a> {
                 breaches: Vec::new(),
                 passes: HashMap::new(),
             },
+            steps: 0,
         }
     }
 
+    /// The most work one call of `f` can do given `known` of its arguments (`None`: unbounded).
+    pub fn work_of(&mut self, f: FuncId, known: &Known) -> Option<u64> {
+        (self.c.steps, self.c.gave_up) = (0, false);
+        let c = self.c.call(f, &consts_of(known));
+        (!c.unbounded && !self.c.gave_up).then_some(c.work)
+    }
+
     /// Each call in function `f`'s own body, by the call expression's address, with its runs
-    /// in one call of `f` given `known` of its arguments. A call missing doesn't run. (All
-    /// unbounded when the count goes past [`MOST_STEPS`].)
-    pub fn of(&mut self, f: FuncId, known: &Known) -> HashMap<usize, SiteRuns> {
+    /// in one call of `f` given `known` of its arguments, and whether the count was sure of them
+    /// all. Sure, a call missing doesn't run; not (past [`MOST_STEPS`] in `f`, or
+    /// [`MOST_CALL_RUN_STEPS`] in all), each found is unbounded and one missing may run.
+    pub fn of(&mut self, f: FuncId, known: &Known) -> (HashMap<usize, SiteRuns>, bool) {
+        if self.steps > MOST_CALL_RUN_STEPS {
+            return (HashMap::new(), false);
+        }
         let func = &self.c.m.functions[f.0 as usize];
         let mut args = consts_of(known);
         args.resize(func.params.len(), None);
@@ -264,17 +348,19 @@ impl<'a> CallRuns<'a> {
             here: None,
             ret: None,
             calls: HashMap::new(),
-            sites: Some(HashMap::new()),
+            sites: Some(SiteLog::default()),
         };
         (self.c.steps, self.c.gave_up) = (0, false);
         self.c.block(&mut fr, &mut State::default(), &func.body);
-        let mut sites = fr.sites.unwrap_or_default();
-        if self.c.gave_up {
-            for r in sites.values_mut() {
+        self.steps = self.steps.saturating_add(self.c.steps);
+        let mut runs = fr.sites.map(|s| s.runs).unwrap_or_default();
+        let sure = !self.c.gave_up;
+        if !sure {
+            for r in runs.values_mut() {
                 r.unbounded = true;
             }
         }
-        sites
+        (runs, sure)
     }
 }
 
@@ -324,7 +410,7 @@ struct Frame<'f> {
     /// Work of each function it calls itself.
     calls: HashMap<u32, u64>,
     /// Each call in its own body, by the call's address, and its runs ([`CallRuns`] only).
-    sites: Option<HashMap<usize, SiteRuns>>,
+    sites: Option<SiteLog>,
 }
 
 impl<'a> Counter<'a> {
@@ -501,19 +587,28 @@ impl<'a> Counter<'a> {
         let at = fr.here;
         let mut passes = 0u32;
         // (Counting its calls' runs, a loop goes on past an unbounded call in it: its passes
-        // are still sure. Unbounded itself, each call in it counts one pass.)
-        let before = fr.sites.clone();
+        // are still sure. Unbounded itself, each call in it counts one pass, and met again, it
+        // runs one.)
+        let mark = fr.sites.as_ref().map(|s| s.log.len());
+        let body_at = body.as_ptr() as usize;
+        let endless = fr.sites.as_ref().is_some_and(|s| s.endless.contains(&body_at));
         let mut ran = 0u64;
         loop {
-            if passes >= MOST_PASSES || (fr.unbounded && before.is_none()) {
+            let done = if mark.is_some() {
+                passes >= MOST_PASSES || (endless && passes >= 1)
+            } else {
+                passes >= MOST_PASSES || fr.unbounded
+            };
+            if done {
                 fr.unbounded = true;
                 if fr.loop_at.is_none() {
                     fr.loop_at = at;
                 }
-                if let (Some(sites), Some(before)) = (fr.sites.as_mut(), before.as_ref()) {
-                    for (k, r) in sites.iter_mut() {
-                        r.one_pass(before.get(k), ran);
-                    }
+                if let (Some(sites), Some(mark)) = (fr.sites.as_mut(), mark)
+                    && !endless
+                {
+                    sites.one_pass(mark, ran);
+                    sites.endless.insert(body_at);
                 }
                 return Flow::Normal;
             }
@@ -623,15 +718,7 @@ impl<'a> Counter<'a> {
                     }
                 }
                 if let Some(sites) = fr.sites.as_mut() {
-                    let r = sites.entry(e as *const Expr as usize).or_default();
-                    r.times = r.times.saturating_add(1);
-                    r.work = r.work.saturating_add(c.work);
-                    r.unbounded |= c.unbounded;
-                    let k = known_of(&vals);
-                    match r.known.iter_mut().find(|(j, _)| *j == k) {
-                        Some((_, n)) => *n += 1,
-                        None => r.known.push((k, 1)),
-                    }
+                    sites.record(e as *const Expr as usize, known_of(&vals), c.work, c.unbounded);
                 }
                 let e = fr.calls.entry(id.0).or_insert(0);
                 *e = e.saturating_add(c.work);

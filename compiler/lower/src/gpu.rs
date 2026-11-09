@@ -3498,6 +3498,20 @@ type Counts = (
     Vec<Vec<ir::same::FewInputs>>,
 );
 
+/// A function's IR name without the `_<n>` and `_d<n>` tags lowering gives each instance and
+/// derivation (`Placed_F_seen_63_d3` is `Placed_F_seen`).
+fn untagged(name: &str) -> String {
+    let mut n = name;
+    while let Some((head, tail)) = n.rsplit_once('_') {
+        let digits = tail.strip_prefix('d').unwrap_or(tail);
+        if head.is_empty() || digits.is_empty() || !digits.chars().all(|c| c.is_ascii_digit()) {
+            break;
+        }
+        n = head;
+    }
+    n.to_string()
+}
+
 /// Checks a pipeline's module and, if it'll be emitted, flattens it (`ir::opt::flatten_gpu`)
 /// and lays out its memory as the CPU's (`ir::gpu_memory`).
 fn verify(cx: &mut Cx, mb: &mut ModuleBuilder, name: &str) -> Option<Counts> {
@@ -3523,7 +3537,13 @@ fn verify(cx: &mut Cx, mb: &mut ModuleBuilder, name: &str) -> Option<Counts> {
             }
         }
         if cx.data.few {
-            few = ir::same::few_input_calls(&mb.m, FEW_INPUTS_LEAST, &|id| mb.display_name(id));
+            // (A derived function has no source name: its IR name, less the numbers lowering gives
+            // each instance and derivation.)
+            let name = |id: ir::FuncId| match mb.source_names.get(&id) {
+                Some(n) => n.clone(),
+                None => untagged(&mb.m.functions[id.index()].name),
+            };
+            few = ir::same::few_input_calls(&mb.m, FEW_INPUTS_LEAST, &name);
         }
         let (each, breaches) = ir::work::module_work(&mb.m);
         for b in &breaches {

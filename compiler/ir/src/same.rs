@@ -482,8 +482,9 @@ pub struct FewInputs {
     /// The most numbers that vary at any of its calls (a `vec3`'s three; a struct's all, if any
     /// of it varies).
     pub varying: u32,
-    /// How many times an invocation calls it: each call's loops' passes (one, for a loop the
-    /// count can't bound), every side of a branch the count doesn't know taken (§18.11's count).
+    /// How many times an invocation calls it, as §18.11's count walks the code: each call's
+    /// loops' passes (one, for a loop the count can't bound), but every side of a branch it
+    /// doesn't know taken (not only the costlier).
     pub calls: u64,
     /// All those calls' work, each given what's known of its arguments (`None`: unbounded).
     pub work: Option<u64>,
@@ -615,11 +616,33 @@ impl Few<'_> {
             }
             None => out.push(h),
         };
+        let (runs, sure) = runs;
         for (addr, site) in sites.iter() {
-            // (A call that doesn't run, on a side of a branch on a constant not taken.)
-            let Some(r) = runs.get(addr) else { continue };
-            let each = r.work / r.times.max(1);
-            if site.hit && (r.unbounded || each > TABLE_READ) {
+            // (A call that doesn't run, on a side of a branch on a constant not taken; or, the
+            // count not sure, one it didn't reach: once, at least.)
+            let unknown;
+            let r = match runs.get(addr) {
+                Some(r) => r,
+                None if sure => continue,
+                None => {
+                    let n = self.m.functions[site.g.0 as usize].params.len();
+                    unknown = crate::work::SiteRuns {
+                        times: 1,
+                        work: 0,
+                        unbounded: true,
+                        known: vec![(vec![None; n], 1)],
+                    };
+                    &unknown
+                }
+            };
+            // (Unbounded, a call's own work given nothing of its arguments says if it's cheap.)
+            let each = if r.unbounded {
+                let n = self.m.functions[site.g.0 as usize].params.len();
+                self.runs.work_of(site.g, &vec![None; n])
+            } else {
+                Some(r.work / r.times.max(1))
+            };
+            if site.hit && each.is_none_or(|w| w > TABLE_READ) {
                 let h = Hit {
                     g: site.g,
                     varying: site.varying,
@@ -631,7 +654,7 @@ impl Few<'_> {
                 add(&mut out, h);
                 continue;
             }
-            for (k, n) in &r.known {
+            for (k, n) in r.known.iter().filter(|(_, n)| *n > 0) {
                 for h in self.calls(site.g, site.given.clone(), k.clone()).iter() {
                     let h = Hit {
                         calls: h.calls.saturating_mul(*n),
