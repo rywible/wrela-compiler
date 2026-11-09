@@ -1837,10 +1837,19 @@ impl<'c, 'a> Fl<'c, 'a> {
         for proj in &p.proj {
             match proj {
                 mir::Proj::Field(i) => {
+                    let projected = self.borrow_projection(ty, *i);
                     let (fi, ft) = self.cx.field(self.mb, ty, None, *i, self.code.span)?;
                     ty = ft;
                     let it = self.cx.lower_ty(self.mb, ty, self.code.span)?;
-                    v = self.value(it, ir::Expr::Extract(v, fi));
+                    v = if projected {
+                        // A borrow struct's projection field holds a pointer (`place_parts`
+                        // follows it too): the value is what's at the place it points at.
+                        let pt = self.mb.m.types.intern(ir::TypeDef::Ptr(it));
+                        let ptr = self.value(pt, ir::Expr::Extract(v, fi));
+                        self.load(ir::Place { root: ir::PlaceRoot::Ptr(ptr), path: Vec::new() }, it)
+                    } else {
+                        self.value(it, ir::Expr::Extract(v, fi))
+                    };
                 }
                 mir::Proj::Comp(c) => {
                     ty = self.proj_ty(ty, proj);

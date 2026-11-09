@@ -3,6 +3,13 @@
 Each release's changes a program or a tool can see. The pull request of each release holds the
 detail; `docs/release.md` says how a release is cut.
 
+## 0.31.1
+
+- A group (a borrow struct, language.md §18.6) given to `bind` as a call's result or written out
+  where it's bound (`paint.bind(waves: waves_of(ocean), ...)`) builds: its textures and samplers
+  are read through the group's projection fields, as a named group's are. It was I0001, the CPU
+  module's IR malformed, and the way round it a `let`.
+
 ## 0.31.0
 
 - **Calls a table could answer** (language.md §18.13): `wrela pipelines` lists, under each

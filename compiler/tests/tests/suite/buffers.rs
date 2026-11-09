@@ -165,6 +165,80 @@ pub fn frame(time: f32, width: u32, height: u32) {
 }
 
 #[test]
+fn a_group_built_where_its_bound_binds_what_a_named_one_binds() {
+    // A group (a borrow struct, §18.6) given to `bind` as a call's result or written out in
+    // place is a temporary: its texture and sampler are read through the pointers its
+    // projection fields hold, as a named group's are. (They were read as the pointers
+    // themselves: I0001, the CPU module's IR malformed.)
+    let src = "use std::gpu::{
+    GlobalId, GpuBuffer, GpuSpan, Rgba16Float, Sampler, Slots, Texture, buffer, dispatch, sampler,
+    texture,
+}
+
+borrow struct Inputs {
+    albedo: borrow Texture<Rgba16Float>,
+    s: borrow Sampler,
+    weights: GpuSpan<f32>,
+    scale: f32,
+}
+
+pub struct Held {
+    albedo: Texture<Rgba16Float>,
+    s: Sampler,
+    weights: GpuBuffer<f32>,
+}
+
+pub struct Kept {
+    held: Held,
+    out: GpuBuffer<f32>,
+}
+
+@compute(64)
+fn shade(g: Inputs, out: mut Slots<f32>, id: GlobalId) {
+    out[id] = g.albedo.sample_level(g.s, vec2(0.5), level: 0.0).x * g.scale + g.weights[id.x]
+}
+
+fn inputs_of(h: Held) -> Inputs {
+    Inputs { albedo: h.albedo, s: h.s, weights: h.weights.span(start: 0, count: 64), scale: 2.0 }
+}
+
+pub fn init() -> Kept {
+    Kept {
+        held: Held { albedo: texture(width: 4, height: 4), s: sampler(), weights: buffer(64) },
+        out: buffer(64),
+    }
+}
+
+pub fn frame(k: mut Kept, time: f32, width: u32, height: u32) {
+    let g = inputs_of(k.held)
+    dispatch(shade.bind(g, out: mut k.out), groups: 1)
+    dispatch(shade.bind(inputs_of(k.held), out: mut k.out), groups: 1)
+    dispatch(
+        shade.bind(
+            Inputs {
+                albedo: k.held.albedo,
+                s: k.held.s,
+                weights: k.held.weights.span(start: 0, count: 64),
+                scale: 2.0,
+            },
+            out: mut k.out,
+        ),
+        groups: 1,
+    )
+}
+";
+    let mut host = load("group_in_place", src);
+    host.frame(0.0, 64, 64).expect("frame");
+    let work = commands(&mut host, |c| match c {
+        Command::Dispatch { bindings, .. } => Some(format!("{bindings:?}")),
+        _ => None,
+    });
+    assert_eq!(work.len(), 3);
+    assert_eq!(work[1], work[0], "a call's result");
+    assert_eq!(work[2], work[0], "written in place");
+}
+
+#[test]
 fn an_empty_buffer_has_room_for_one_element() {
     let mut host = load("empty-buffers", SRC);
     host.call_export("empty", &[]).expect("empty");
