@@ -3,6 +3,15 @@
 Each release's changes a program or a tool can see. The pull request of each release holds the
 detail; `docs/release.md` says how a release is cut.
 
+## 0.31.1
+
+- A borrow struct that is a temporary (a call's result, or written out where it's used) reads
+  through its projection fields as a named one does: `ctx_of(world).world.count`, and a group
+  (language.md §18.6) given to `bind` in place (`paint.bind(waves: waves_of(ocean), ...)`). It
+  was I0001, the CPU module's IR malformed, and the way round it a `let`. A field, a component or
+  a swizzle read this way loads only itself; lending such a field whole (`count_of(ctx_of(w).world)`)
+  still copies what it borrows, where a named struct's doesn't.
+
 ## 0.31.0
 
 - **Calls a table could answer** (language.md §18.13): `wrela pipelines` lists, under each

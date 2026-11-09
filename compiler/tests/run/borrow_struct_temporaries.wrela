@@ -1,0 +1,97 @@
+// run: a borrow struct that is a temporary (a call's result, written in place, a field of one)
+// reads through its fields what a named one reads, and loads only what's asked for
+// expect: named() = 46
+// expect: temporary() = 46
+// expect: nested() = 15
+// expect: big() = 6
+
+struct World {
+    heights: [f32; 4],
+    scale: f32,
+    wind: vec3,
+}
+
+borrow struct Ctx {
+    world: borrow World,
+    extra: [f32],
+    dt: f32,
+}
+
+fn ctx_of(w: World, extra: [f32], dt: f32) -> Ctx {
+    Ctx { world: w, extra, dt }
+}
+
+fn world() -> World {
+    World { heights: [1.0, 2.0, 3.0, 4.0], scale: 10.0, wind: vec3(1.0, 2.0, 3.0) }
+}
+
+pub fn named() -> u32 {
+    let w = world()
+    let extra = [0.0, 1.0, 2.0, 3.0]
+    let c = ctx_of(w, extra, 0.5)
+    let xz = c.world.wind.xz
+    u32(
+        c.world.heights[2] * c.world.scale +
+            c.world.wind.y +
+            xz.x +
+            xz.y +
+            c.extra[3] * 2.0 +
+            c.dt * 8.0,
+    )
+}
+
+pub fn temporary() -> u32 {
+    let w = world()
+    let extra = [0.0, 1.0, 2.0, 3.0]
+    let xz = ctx_of(w, extra, 0.5).world.wind.xz
+    u32(
+        ctx_of(w, extra, 0.5).world.heights[2] * Ctx { world: w, extra, dt: 0.5 }.world.scale +
+            ctx_of(w, extra, 0.5).world.wind.y +
+            xz.x +
+            xz.y +
+            ctx_of(w, extra, 0.5).extra[3] * 2.0 +
+            ctx_of(w, extra, 0.5).dt * 8.0,
+    )
+}
+
+borrow struct Outer {
+    inner: Ctx,
+    bonus: borrow u32,
+}
+
+fn outer_of(w: World, extra: [f32], bonus: u32) -> Outer {
+    Outer { inner: ctx_of(w, extra, 1.0), bonus }
+}
+
+pub fn nested() -> u32 {
+    let w = world()
+    let extra = [0.0, 0.0, 0.0, 0.0]
+    let bonus = 4
+    u32(outer_of(w, extra, bonus).inner.world.scale) +
+        outer_of(w, extra, bonus).bonus +
+        u32(outer_of(w, extra, bonus).inner.dt)
+}
+
+struct Wide {
+    count: u32,
+    big: [f32; 524288],
+}
+
+borrow struct Wider {
+    wide: borrow Wide,
+}
+
+fn wider_of(w: Wide) -> Wider {
+    Wider { wide: w }
+}
+
+// Each read loads `count` alone: copying the 2 MiB it's part of six times would end the stack.
+pub fn big() -> u32 {
+    let w = Wide { count: 1, big: [0.0; 524288] }
+    wider_of(w).wide.count +
+        wider_of(w).wide.count +
+        wider_of(w).wide.count +
+        wider_of(w).wide.count +
+        wider_of(w).wide.count +
+        wider_of(w).wide.count
+}
