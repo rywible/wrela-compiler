@@ -21,19 +21,19 @@
   },
   "creature": {
     "decided": 0.9551,
-    "ratio": 2.2023
+    "ratio": 2.0979
   },
   "ellipsoid": {
     "decided": 0.9766,
     "ratio": 2.1113
   },
   "fbm": {
-    "decided": 0.9219,
-    "ratio": 2.7594
+    "decided": 0.9238,
+    "ratio": 2.1495
   },
   "grazer": {
     "decided": 0.9121,
-    "ratio": 1.4455
+    "ratio": 1.4416
   },
   "hoof": {
     "decided": 0.9961,
@@ -84,8 +84,8 @@
     "ratio": 14.3268
   },
   "value noise": {
-    "decided": 0.2832,
-    "ratio": 2.2134
+    "decided": 0.4355,
+    "ratio": 1.0136
   },
   "vectors": {
     "decided": 0.8047,

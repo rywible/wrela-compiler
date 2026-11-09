@@ -1362,6 +1362,14 @@ impl<'a> Ivx<'a> {
             out.push(let_or_eval(v, Expr::Call(g, args.to_vec())));
             return self.sync_hi(out, sync);
         }
+        if let Some(v) = v
+            && self.m.functions[g.index()].known == Some(Known::ValueNoise)
+            && self.report.is_none()
+        {
+            let r = self.value_noise_range(out, g, &args[0])?;
+            self.iv.insert(v, r);
+            return Ok(());
+        }
         let dg = derive(
             self.m,
             self.cache,
@@ -1405,6 +1413,131 @@ impl<'a> Ivx<'a> {
             (v, _) => out.push(let_or_eval(v, Expr::Call(dg, new_args))),
         }
         self.sync_hi(out, sync)
+    }
+
+    /// `std::field::value_noise`'s range over a box, exactly up to rounding, where the box
+    /// crosses at most one lattice plane on each axis; its whole range, [-1, 1], where it crosses
+    /// more. Within a cell the noise is trilinear in each axis's fade, and each fade rises with
+    /// its coordinate, so the noise over a box in the cell takes its extremes at the box's
+    /// corners: the extremes over the box are among the noise's values at the 27 points each
+    /// axis's two ends and the plane between them (if any) make. Deriving the body instead
+    /// bounds each of the seven mixes alone, and each fade's polynomial step by step, which over
+    /// a tenth of a cell is three times the noise's true range.
+    ///
+    /// Rounding: each point is evaluated as the target evaluates it, and rounding is monotone,
+    /// so only the noise's own rounding inside a cell (a few ulps of values at most 1, through
+    /// the fades and the mixes) and its rounding across a lattice plane (where the cells meet,
+    /// `mix(a, b, 1)` may not be `b`) separate the points between from the corners: 2⁻¹⁶ covers
+    /// both, on either target. A box with an infinite or NaN end gets every number.
+    fn value_noise_range(&mut self, out: &mut Block, g: FuncId, arg: &Arg) -> R<Iv> {
+        let (lo, hi) = match arg {
+            Arg::Value(x) => self.range(*x),
+            Arg::Place(p) if self.act.place(self.m, self.f, p) => {
+                let (lp, hp) = self.places(p)?;
+                let ty = place_type(self.m, &self.nf, p)?;
+                (self.emit(out, ty, Expr::Load(lp)), self.emit(out, ty, Expr::Load(hp)))
+            }
+            Arg::Place(p) => {
+                let ty = place_type(self.m, &self.nf, p)?;
+                let x = self.emit(out, ty, Expr::Load(p.clone()));
+                (x, x)
+            }
+        };
+        let vty = self.ty(lo);
+        let f32t = self.m.types.f32();
+        let bt = self.bool_ty();
+        let by_ref = self.m.functions[g.index()].params[0].by_ref;
+        let one = self.fc(out, f32t, 1.0);
+        let two = self.fc(out, f32t, 2.0);
+        let big = self.fc(out, f32t, f32::MAX as f64);
+        let mut points: Vec<[ValueId; 3]> = Vec::new();
+        let mut ok = None;
+        let mut finite = None;
+        for c in 0..3u32 {
+            let l = self.emit(out, f32t, Expr::Extract(lo, c));
+            let h = self.emit(out, f32t, Expr::Extract(hi, c));
+            let fl = self.builtin(out, Builtin::Floor, vec![l], f32t);
+            let next = self.bin(out, BinOp::Add, fl, one, f32t);
+            let mid = self.builtin(out, Builtin::Min, vec![next, h], f32t);
+            let last = self.bin(out, BinOp::Add, fl, two, f32t);
+            let fits = self.cmp(out, BinOp::Le, h, last);
+            let al = self.builtin(out, Builtin::Abs, vec![l], f32t);
+            let ah = self.builtin(out, Builtin::Abs, vec![h], f32t);
+            let fl_ = self.cmp(out, BinOp::Le, al, big);
+            let fh = self.cmp(out, BinOp::Le, ah, big);
+            let fin = self.bin(out, BinOp::And, fl_, fh, bt);
+            ok = Some(match ok {
+                None => fits,
+                Some(o) => self.bin(out, BinOp::And, o, fits, bt),
+            });
+            finite = Some(match finite {
+                None => fin,
+                Some(o) => self.bin(out, BinOp::And, o, fin, bt),
+            });
+            points.push([l, mid, h]);
+        }
+        let (ok, finite) = (ok.unwrap(), finite.unwrap());
+        // The 27 points in a loop, not 27 inlined copies of the noise (a shipped GPU pipeline
+        // has at most 256 KiB of WGSL).
+        let u32t = self.m.types.u32();
+        let k = self.nf.new_local("corner", u32t);
+        let acc_lo = self.nf.new_local("noise_lo", f32t);
+        let acc_hi = self.nf.new_local("noise_hi", f32t);
+        let zero = self.emit(out, u32t, Expr::Const(Const::U32(0)));
+        out.push(Stmt::Store(Place::local(k), zero));
+        let start_lo = self.fc(out, f32t, f32::MAX as f64);
+        let start_hi = self.fc(out, f32t, -(f32::MAX as f64));
+        out.push(Stmt::Store(Place::local(acc_lo), start_lo));
+        out.push(Stmt::Store(Place::local(acc_hi), start_hi));
+        let mut body = Vec::new();
+        let b = &mut body;
+        let i = self.emit(b, u32t, Expr::Load(Place::local(k)));
+        let n = self.emit(b, u32t, Expr::Const(Const::U32(27)));
+        let done = self.cmp(b, BinOp::Ge, i, n);
+        b.push(Stmt::If { cond: done, then: vec![Stmt::Break], else_: Vec::new() });
+        let three = self.emit(b, u32t, Expr::Const(Const::U32(3)));
+        let one_u = self.emit(b, u32t, Expr::Const(Const::U32(1)));
+        let zero_u = self.emit(b, u32t, Expr::Const(Const::U32(0)));
+        let mut coords = Vec::new();
+        let mut rest = i;
+        for axis in points.iter() {
+            let digit = self.emit(b, u32t, Expr::Binary(BinOp::Rem, rest, three));
+            rest = self.emit(b, u32t, Expr::Binary(BinOp::Div, rest, three));
+            let is0 = self.cmp(b, BinOp::Eq, digit, zero_u);
+            let is1 = self.cmp(b, BinOp::Eq, digit, one_u);
+            let hm = self.select(b, is1, axis[1], axis[2]);
+            coords.push(self.select(b, is0, axis[0], hm));
+        }
+        let p = self.emit(b, vty, Expr::Construct(vty, coords));
+        let a = if by_ref {
+            let local = self.nf.new_local("noise_at", vty);
+            b.push(Stmt::Store(Place::local(local), p));
+            Arg::Place(Place::local(local))
+        } else {
+            Arg::Value(p)
+        };
+        let v = self.emit(b, f32t, Expr::Call(g, vec![a]));
+        let cl = self.emit(b, f32t, Expr::Load(Place::local(acc_lo)));
+        let ch = self.emit(b, f32t, Expr::Load(Place::local(acc_hi)));
+        let nl = self.builtin(b, Builtin::Min, vec![cl, v], f32t);
+        let nh = self.builtin(b, Builtin::Max, vec![ch, v], f32t);
+        b.push(Stmt::Store(Place::local(acc_lo), nl));
+        b.push(Stmt::Store(Place::local(acc_hi), nh));
+        let next = self.emit(b, u32t, Expr::Binary(BinOp::Add, i, one_u));
+        b.push(Stmt::Store(Place::local(k), next));
+        out.push(Stmt::Loop { body, continuing: Vec::new() });
+        let mut l = self.emit(out, f32t, Expr::Load(Place::local(acc_lo)));
+        let mut h = self.emit(out, f32t, Expr::Load(Place::local(acc_hi)));
+        let slack = 1.0 / 65536.0;
+        let s = self.fc(out, f32t, slack);
+        l = self.bin(out, BinOp::Sub, l, s, f32t);
+        h = self.bin(out, BinOp::Add, h, s, f32t);
+        let wl = self.fc(out, f32t, -1.0 - slack);
+        let wh = self.fc(out, f32t, 1.0 + slack);
+        let l = self.select(out, ok, l, wl);
+        let h = self.select(out, ok, h, wh);
+        let (al, ah) = self.full(out, f32t);
+        Ok((self.select(out, finite, l, al), self.select(out, finite, h, ah)))
     }
 
     /// Whether `p` is an inactive part of an active local or parameter.
