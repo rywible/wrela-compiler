@@ -131,6 +131,7 @@ impl<'a> ExprWork<'a> {
             here: None,
             ret: None,
             calls: HashMap::new(),
+            sites: None,
         };
         (self.c.steps, self.c.gave_up) = (0, false);
         self.c.expr(&mut fr, &mut State::default(), e);
@@ -163,8 +164,205 @@ struct Called {
     ret: Option<Const>,
 }
 
-/// A call, by its function and what's known of its arguments (a kind and a value each).
-type CallKey = (u32, Vec<Option<(u8, u32)>>);
+/// A call, by its function and what's known of its arguments.
+type CallKey = (u32, Known);
+
+/// What's known of a call's arguments: of each, a kind and a value. Only what control can
+/// depend on is told apart: integers and `bool`s.
+pub type Known = Vec<Option<(u8, u32)>>;
+
+fn known_of(args: &[Option<Const>]) -> Known {
+    args.iter()
+        .map(|a| match a {
+            Some(Const::Bool(b)) => Some((0, u32::from(*b))),
+            Some(Const::I32(i)) => Some((1, *i as u32)),
+            Some(Const::U32(u)) => Some((2, *u)),
+            _ => None,
+        })
+        .collect()
+}
+
+fn consts_of(k: &Known) -> Vec<Option<Const>> {
+    k.iter()
+        .map(|a| match a {
+            Some((0, b)) => Some(Const::Bool(*b != 0)),
+            Some((1, i)) => Some(Const::I32(*i as i32)),
+            Some((2, u)) => Some(Const::U32(*u)),
+            _ => None,
+        })
+        .collect()
+}
+
+/// A call's runs in one call of the function it's in ([`CallRuns`]).
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct SiteRuns {
+    /// How many times it runs: each of its loops' passes (one, for a loop the count can't
+    /// bound), every side of a branch the count doesn't know taken.
+    pub times: u64,
+    /// All those runs' work, each given what's known of its arguments then.
+    pub work: u64,
+    /// A run's work is unbounded, or the count gave up before it was sure of them all.
+    pub unbounded: bool,
+    /// What's known of its arguments, each way it differs between runs, with how many runs (a
+    /// way may be left with none).
+    pub known: Vec<(Known, u64)>,
+}
+
+/// What a [`CallRuns`] count has found so far: each call's runs, and each run's record (the
+/// call, which of its `known`, how many runs, their work), so a loop the count can't bound can
+/// take back all but a pass of what it added.
+#[derive(Default)]
+struct SiteLog {
+    runs: HashMap<usize, SiteRuns>,
+    log: Vec<(usize, u32, u64, u64)>,
+    /// The loops found unbounded (by their bodies' addresses): met again, each runs one pass.
+    endless: std::collections::HashSet<usize>,
+}
+
+impl SiteLog {
+    fn record(&mut self, at: usize, known: Known, work: u64, unbounded: bool) {
+        let r = self.runs.entry(at).or_default();
+        r.times = r.times.saturating_add(1);
+        r.work = r.work.saturating_add(work);
+        r.unbounded |= unbounded;
+        let k = match r.known.iter().position(|(j, _)| *j == known) {
+            Some(k) => k,
+            None => {
+                r.known.push((known, 0));
+                r.known.len() - 1
+            }
+        };
+        r.known[k].1 += 1;
+        self.log.push((at, k as u32, 1, work));
+    }
+
+    /// Scales the runs recorded since `from` down to one of the loop's `passes`: the count can't
+    /// bound it. What was known of a call's arguments then is what all of those runs agree on.
+    fn one_pass(&mut self, from: usize, passes: u64) {
+        let tail = self.log.split_off(from);
+        // (Each call: its runs, their work, and how many of them each way of `known` had.)
+        type Added = (usize, u64, u64, Vec<(u32, u64)>);
+        let mut each: Vec<Added> = Vec::new();
+        for (at, k, n, w) in tail {
+            let e = match each.iter().position(|e| e.0 == at) {
+                Some(i) => &mut each[i],
+                None => {
+                    each.push((at, 0, 0, Vec::new()));
+                    each.last_mut().expect("pushed")
+                }
+            };
+            e.1 += n;
+            e.2 = e.2.saturating_add(w);
+            match e.3.iter_mut().find(|(j, _)| *j == k) {
+                Some((_, m)) => *m += n,
+                None => e.3.push((k, n)),
+            }
+        }
+        let passes = passes.max(1);
+        for (at, n, w, ks) in each {
+            let r = self.runs.get_mut(&at).expect("a recorded call");
+            let (n1, w1) = (n.div_ceil(passes), w.div_ceil(passes));
+            r.times = r.times - n + n1;
+            r.work = r.work - w + w1;
+            let mut agreed: Option<Known> = None;
+            for (k, m) in ks {
+                let (known, count) = &mut r.known[k as usize];
+                *count -= m;
+                agreed = Some(match agreed {
+                    None => known.clone(),
+                    Some(a) => a
+                        .iter()
+                        .zip(known.iter())
+                        .map(|(x, y)| if x == y { *x } else { None })
+                        .collect(),
+                });
+            }
+            let agreed = agreed.expect("a run");
+            let k = match r.known.iter().position(|(j, _)| *j == agreed) {
+                Some(k) => k,
+                None => {
+                    r.known.push((agreed, 0));
+                    r.known.len() - 1
+                }
+            };
+            r.known[k].1 += n1;
+            self.log.push((at, k as u32, n1, w1));
+        }
+    }
+}
+
+/// The most statements a [`CallRuns`] follows in all (a guard on the count's own time): past
+/// it, the calls of what's counted after are unbounded.
+pub const MOST_CALL_RUN_STEPS: u64 = 1 << 26;
+
+/// How each call in a function runs in one call of it, knowing what the count knows: its
+/// constants, what's known of its arguments, and the values computed from them. One count
+/// serves the calls it makes, so a function called many times is followed once for each set of
+/// known arguments.
+pub struct CallRuns<'a> {
+    c: Counter<'a>,
+    /// The statements followed so far, over every `of`.
+    steps: u64,
+}
+
+impl<'a> CallRuns<'a> {
+    pub fn new(m: &'a Module) -> CallRuns<'a> {
+        CallRuns {
+            c: Counter {
+                m,
+                steps: 0,
+                gave_up: false,
+                memo: HashMap::new(),
+                breaches: Vec::new(),
+                passes: HashMap::new(),
+            },
+            steps: 0,
+        }
+    }
+
+    /// The most work one call of `f` can do given `known` of its arguments (`None`: unbounded).
+    pub fn work_of(&mut self, f: FuncId, known: &Known) -> Option<u64> {
+        (self.c.steps, self.c.gave_up) = (0, false);
+        let c = self.c.call(f, &consts_of(known));
+        (!c.unbounded && !self.c.gave_up).then_some(c.work)
+    }
+
+    /// Each call in function `f`'s own body, by the call expression's address, with its runs
+    /// in one call of `f` given `known` of its arguments, and whether the count was sure of them
+    /// all. Sure, a call missing doesn't run; not (past [`MOST_STEPS`] in `f`, or
+    /// [`MOST_CALL_RUN_STEPS`] in all), each found is unbounded and one missing may run.
+    pub fn of(&mut self, f: FuncId, known: &Known) -> (HashMap<usize, SiteRuns>, bool) {
+        if self.steps > MOST_CALL_RUN_STEPS {
+            return (HashMap::new(), false);
+        }
+        let func = &self.c.m.functions[f.0 as usize];
+        let mut args = consts_of(known);
+        args.resize(func.params.len(), None);
+        let mut fr = Frame {
+            f: func,
+            args,
+            vals: HashMap::new(),
+            work: 0,
+            unbounded: false,
+            loop_at: None,
+            here: None,
+            ret: None,
+            calls: HashMap::new(),
+            sites: Some(SiteLog::default()),
+        };
+        (self.c.steps, self.c.gave_up) = (0, false);
+        self.c.block(&mut fr, &mut State::default(), &func.body);
+        self.steps = self.steps.saturating_add(self.c.steps);
+        let mut runs = fr.sites.map(|s| s.runs).unwrap_or_default();
+        let sure = !self.c.gave_up;
+        if !sure {
+            for r in runs.values_mut() {
+                r.unbounded = true;
+            }
+        }
+        (runs, sure)
+    }
+}
 
 struct Counter<'a> {
     m: &'a Module,
@@ -211,28 +409,14 @@ struct Frame<'f> {
     ret: Option<Option<Const>>,
     /// Work of each function it calls itself.
     calls: HashMap<u32, u64>,
+    /// Each call in its own body, by the call's address, and its runs ([`CallRuns`] only).
+    sites: Option<SiteLog>,
 }
 
 impl<'a> Counter<'a> {
     fn call(&mut self, id: FuncId, args: &[Option<Const>]) -> Called {
-        // Only what control can depend on is told apart: integers and `bool`s.
-        let args: Vec<Option<Const>> = args
-            .iter()
-            .map(|a| {
-                a.clone().filter(|c| matches!(c, Const::Bool(_) | Const::I32(_) | Const::U32(_)))
-            })
-            .collect();
-        let key = (
-            id.0,
-            args.iter()
-                .map(|a| match a {
-                    Some(Const::Bool(b)) => Some((0, u32::from(*b))),
-                    Some(Const::I32(i)) => Some((1, *i as u32)),
-                    Some(Const::U32(u)) => Some((2, *u)),
-                    _ => None,
-                })
-                .collect::<Vec<_>>(),
-        );
+        let key = (id.0, known_of(args));
+        let args = consts_of(&key.1);
         if let Some(c) = self.memo.get(&key) {
             return c.clone();
         }
@@ -247,6 +431,7 @@ impl<'a> Counter<'a> {
             here: None,
             ret: None,
             calls: HashMap::new(),
+            sites: None,
         };
         let mut st = State::default();
         self.block(&mut fr, &mut st, &f.body);
@@ -401,15 +586,34 @@ impl<'a> Counter<'a> {
     fn lp(&mut self, fr: &mut Frame, st: &mut State, body: &[Stmt], continuing: &[Stmt]) -> Flow {
         let at = fr.here;
         let mut passes = 0u32;
+        // (Counting its calls' runs, a loop goes on past an unbounded call in it: its passes
+        // are still sure. Unbounded itself, each call in it counts one pass, and met again, it
+        // runs one.)
+        let mark = fr.sites.as_ref().map(|s| s.log.len());
+        let body_at = body.as_ptr() as usize;
+        let endless = fr.sites.as_ref().is_some_and(|s| s.endless.contains(&body_at));
+        let mut ran = 0u64;
         loop {
-            if passes >= MOST_PASSES || fr.unbounded {
+            let done = if mark.is_some() {
+                passes >= MOST_PASSES || (endless && passes >= 1)
+            } else {
+                passes >= MOST_PASSES || fr.unbounded
+            };
+            if done {
                 fr.unbounded = true;
                 if fr.loop_at.is_none() {
                     fr.loop_at = at;
                 }
+                if let (Some(sites), Some(mark)) = (fr.sites.as_mut(), mark)
+                    && !endless
+                {
+                    sites.one_pass(mark, ran);
+                    sites.endless.insert(body_at);
+                }
                 return Flow::Normal;
             }
             passes += 1;
+            ran += 1;
             let before = st.locals.clone();
             match self.block(fr, st, body) {
                 Flow::Break => {
@@ -512,6 +716,9 @@ impl<'a> Counter<'a> {
                     if fr.loop_at.is_none() {
                         fr.loop_at = c.loop_at;
                     }
+                }
+                if let Some(sites) = fr.sites.as_mut() {
+                    sites.record(e as *const Expr as usize, known_of(&vals), c.work, c.unbounded);
                 }
                 let e = fr.calls.entry(id.0).or_insert(0);
                 *e = e.saturating_add(c.work);

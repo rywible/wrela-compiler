@@ -22,15 +22,22 @@ use std::collections::HashSet;
 /// The values of `f` that are the same for every invocation, given which of its parameters
 /// are (`args[i]`; a parameter not given varies).
 pub fn same_values(m: &Module, f: &Function, args: &[bool]) -> HashSet<ValueId> {
-    analyse(m, f, args).0
+    analyse(m, f, args, &HashSet::new()).0
 }
 
-/// The same values, and the locals that vary.
-fn analyse(m: &Module, f: &Function, args: &[bool]) -> (HashSet<ValueId>, HashSet<LocalId>) {
+/// The same values, and the locals that vary. A call to a function in `unsteady` varies,
+/// whatever it's given (before flattening, a function that reads what an invocation writes).
+fn analyse(
+    m: &Module,
+    f: &Function,
+    args: &[bool],
+    unsteady: &HashSet<u32>,
+) -> (HashSet<ValueId>, HashSet<LocalId>) {
     let mut a = Analysis {
         m,
         f,
         args,
+        unsteady,
         same: HashSet::new(),
         varying_locals: HashSet::new(),
         changed: true,
@@ -50,6 +57,7 @@ struct Analysis<'a> {
     m: &'a Module,
     f: &'a Function,
     args: &'a [bool],
+    unsteady: &'a HashSet<u32>,
     same: HashSet<ValueId>,
     varying_locals: HashSet<LocalId>,
     changed: bool,
@@ -202,8 +210,9 @@ impl Analysis<'_> {
             // A sample takes its detail from the pixels around it, which a same coordinate
             // makes the same too.
             Expr::Texture(..) => self.all_same(e),
-            Expr::Call(_, args) => {
-                args.iter().all(|a| matches!(a, Arg::Value(v) if self.same.contains(v)))
+            Expr::Call(g, args) => {
+                !self.unsteady.contains(&g.0)
+                    && args.iter().all(|a| matches!(a, Arg::Value(v) if self.same.contains(v)))
             }
             Expr::Run(_)
             | Expr::Addr(_)
@@ -271,7 +280,7 @@ impl Sites<'_> {
         }
         let m = self.m;
         let f = &m.functions[id.0 as usize];
-        let (same, varying) = analyse(m, f, &args);
+        let (same, varying) = analyse(m, f, &args, &HashSet::new());
         // Each same value's expression and where it is; what's stored to each local.
         let mut def: std::collections::HashMap<ValueId, (&Expr, Option<wrela_diag::Span>)> =
             std::collections::HashMap::new();
@@ -340,34 +349,7 @@ impl Sites<'_> {
             std::collections::HashMap::new();
         // How many times each value is computed an invocation: the passes of the loops it's
         // in, where the count bounds them (§18.11). A loop it can't bound counts once here.
-        let passes = crate::work::loop_passes(m, id);
-        let mut times: std::collections::HashMap<ValueId, u64> = std::collections::HashMap::new();
-        fn times_in(
-            b: &[Stmt],
-            k: u64,
-            passes: &std::collections::HashMap<usize, u32>,
-            out: &mut std::collections::HashMap<ValueId, u64>,
-        ) {
-            for s in b {
-                match s {
-                    Stmt::Let(v, _) => {
-                        out.insert(*v, k);
-                    }
-                    Stmt::If { then, else_, .. } => {
-                        times_in(then, k, passes, out);
-                        times_in(else_, k, passes, out);
-                    }
-                    Stmt::Loop { body, continuing } => {
-                        let p = passes.get(&(body.as_ptr() as usize)).copied().unwrap_or(1);
-                        let k = k.saturating_mul(u64::from(p.max(1)));
-                        times_in(body, k, passes, out);
-                        times_in(continuing, k, passes, out);
-                    }
-                    _ => {}
-                }
-            }
-        }
-        times_in(&f.body, 1, &passes, &mut times);
+        let times = times_computed(m, id, f);
         let mut cones: Vec<(ValueId, Vec<ValueId>)> = Vec::new();
         for v in firsts {
             let mut stack = vec![v];
@@ -455,20 +437,529 @@ impl Sites<'_> {
     }
 }
 
-/// A store to a local, with the values it depends on beyond the one stored: its indices, the
-/// conditions of the branches it's in, and those of the exits of the loops it's in.
-struct LocalStore {
-    local: LocalId,
-    value: ValueId,
-    on: Vec<ValueId>,
+/// How many times each value of `f` (function `id` of `m`) is computed an invocation: the passes
+/// of the loops it's in, where the count bounds them (§18.11). A loop it can't bound counts once.
+fn times_computed(m: &Module, id: FuncId, f: &Function) -> std::collections::HashMap<ValueId, u64> {
+    fn times_in(
+        b: &[Stmt],
+        k: u64,
+        passes: &std::collections::HashMap<usize, u32>,
+        out: &mut std::collections::HashMap<ValueId, u64>,
+    ) {
+        for s in b {
+            match s {
+                Stmt::Let(v, _) => {
+                    out.insert(*v, k);
+                }
+                Stmt::If { then, else_, .. } => {
+                    times_in(then, k, passes, out);
+                    times_in(else_, k, passes, out);
+                }
+                Stmt::Loop { body, continuing } => {
+                    let p = passes.get(&(body.as_ptr() as usize)).copied().unwrap_or(1);
+                    let k = k.saturating_mul(u64::from(p.max(1)));
+                    times_in(body, k, passes, out);
+                    times_in(continuing, k, passes, out);
+                }
+                _ => {}
+            }
+        }
+    }
+    let passes = crate::work::loop_passes(m, id);
+    let mut times = std::collections::HashMap::new();
+    times_in(&f.body, 1, &passes, &mut times);
+    times
 }
 
-/// The values of `def` (a function's same values) computed only from constants and locals
-/// that only ever hold such values, whichever invocation, pass or path: see `Sites::function`.
-fn fixed_values(
+/// A function GPU code calls, each invocation, with few numbers that vary between invocations
+/// (§18.13): all else it's given is the same for every invocation. Such a call is a function of
+/// those few numbers for the whole command (a direction's three, a distance's one): computed
+/// once over their range into a table, each invocation could read it instead.
+#[derive(Clone, Debug, PartialEq)]
+pub struct FewInputs {
+    /// The function called, as `name` names it.
+    pub function: String,
+    /// The most numbers that vary at any of its calls (a `vec3`'s three; a struct's all, if any
+    /// of it varies).
+    pub varying: u32,
+    /// How many times an invocation calls it, as §18.11's count walks the code: each call's
+    /// loops' passes (one, for a loop the count can't bound), but every side of a branch it
+    /// doesn't know taken (not only the costlier).
+    pub calls: u64,
+    /// All those calls' work, each given what's known of its arguments (`None`: unbounded).
+    pub work: Option<u64>,
+    /// Its first call, where it is.
+    pub at: Option<wrela_diag::Span>,
+}
+
+/// The most varying numbers a call may take for [`few_input_calls`].
+pub const FEW: u32 = 3;
+
+/// The least work a call must do, each, for [`few_input_calls`]: more than a table's read (a
+/// sample, and its coordinates worked out).
+pub const TABLE_READ: u64 = 2 * crate::work::SAMPLE;
+
+/// The functions each entry point of `m` calls with at most [`FEW`] numbers that vary (and at
+/// least one), each call more work than [`TABLE_READ`] and all of them at least `least` an
+/// invocation, most work first: what a table over those numbers could replace. `name` names a
+/// function (calls to functions it names alike are one). Such a call is reported whole, not
+/// the calls in it; a call lent a place, given only the invocation's place, returning nothing,
+/// or to a function that writes, synchronises, takes derivatives or reads what the command
+/// writes, is looked into instead.
+pub fn few_input_calls(
+    m: &Module,
+    least: u64,
+    name: &dyn Fn(FuncId) -> String,
+) -> Vec<Vec<FewInputs>> {
+    let mut few = Few {
+        m,
+        runs: crate::work::CallRuns::new(m),
+        pure: std::collections::HashMap::new(),
+        shapes: std::collections::HashMap::new(),
+        memo: std::collections::HashMap::new(),
+    };
+    let mut out = Vec::new();
+    for e in &m.entry_points {
+        let mut found: Vec<FewInputs> = Vec::new();
+        if !matches!(e.stage, Stage::Compute { workgroup_size: [1, 1, 1] }) {
+            let given = Given { same: Vec::new(), placed: Vec::new() };
+            let known = vec![None; m.functions[e.function.0 as usize].params.len()];
+            for h in few.calls(e.function, given, known).iter() {
+                let function = name(h.g);
+                let work = (!h.unbounded).then_some(h.work);
+                match found.iter_mut().find(|c| c.function == function) {
+                    Some(c) => {
+                        c.varying = c.varying.max(h.varying);
+                        c.calls = c.calls.saturating_add(h.calls);
+                        c.work = c.work.zip(work).map(|(a, b)| a.saturating_add(b));
+                    }
+                    None => found.push(FewInputs {
+                        function,
+                        varying: h.varying,
+                        calls: h.calls,
+                        work,
+                        at: h.at,
+                    }),
+                }
+            }
+        }
+        found.retain(|c| c.work.is_none_or(|w| w >= least));
+        found.sort_by(|a, b| {
+            let w = |x: &FewInputs| x.work.unwrap_or(u64::MAX);
+            w(b).cmp(&w(a)).then(a.function.cmp(&b.function))
+        });
+        out.push(found);
+    }
+    out
+}
+
+/// A call `few_input_calls` reports, by the function called: in one call of the function it's
+/// found from.
+#[derive(Clone)]
+struct Hit {
+    g: FuncId,
+    varying: u32,
+    calls: u64,
+    work: u64,
+    unbounded: bool,
+    at: Option<wrela_diag::Span>,
+}
+
+/// A call in a function, as `few_input_calls` sees it, given what the function's given: the
+/// function called, the numbers that vary in what it's given, whether it's reported (else
+/// what its function's given), and where it is.
+struct Site {
+    g: FuncId,
+    varying: u32,
+    hit: bool,
+    given: Given,
+    at: Option<wrela_diag::Span>,
+}
+
+/// A function's calls, by each call's address.
+type CallSites = std::rc::Rc<Vec<(usize, Site)>>;
+
+struct Few<'a> {
+    m: &'a Module,
+    runs: crate::work::CallRuns<'a>,
+    /// `pure_or_math`'s memo.
+    pure: std::collections::HashMap<u32, bool>,
+    /// Each function's calls, by the call's address, given what it's given.
+    shapes: std::collections::HashMap<(u32, Given), CallSites>,
+    /// The calls reported in one call of a function, given what it's given and what's known of
+    /// its arguments.
+    memo: std::collections::HashMap<(u32, Given, crate::work::Known), std::rc::Rc<Vec<Hit>>>,
+}
+
+impl Few<'_> {
+    /// The calls reported in one call of function `id`, given which of its parameters are same
+    /// and placed, and what's known of its arguments: each function's calls summed.
+    fn calls(
+        &mut self,
+        id: FuncId,
+        given: Given,
+        known: crate::work::Known,
+    ) -> std::rc::Rc<Vec<Hit>> {
+        let key = (id.0, given.clone(), known.clone());
+        if let Some(h) = self.memo.get(&key) {
+            return h.clone();
+        }
+        let sites = self.shape(id, &given);
+        let runs = self.runs.of(id, &known);
+        let mut out: Vec<Hit> = Vec::new();
+        let add = |out: &mut Vec<Hit>, h: Hit| match out.iter_mut().find(|x| x.g == h.g) {
+            Some(x) => {
+                x.varying = x.varying.max(h.varying);
+                x.calls = x.calls.saturating_add(h.calls);
+                x.work = x.work.saturating_add(h.work);
+                x.unbounded |= h.unbounded;
+            }
+            None => out.push(h),
+        };
+        let (runs, sure) = runs;
+        for (addr, site) in sites.iter() {
+            // (A call that doesn't run, on a side of a branch on a constant not taken; or, the
+            // count not sure, one it didn't reach: once, at least.)
+            let unknown;
+            let r = match runs.get(addr) {
+                Some(r) => r,
+                None if sure => continue,
+                None => {
+                    let n = self.m.functions[site.g.0 as usize].params.len();
+                    unknown = crate::work::SiteRuns {
+                        times: 1,
+                        work: 0,
+                        unbounded: true,
+                        known: vec![(vec![None; n], 1)],
+                    };
+                    &unknown
+                }
+            };
+            // (Unbounded, a call's own work given nothing of its arguments says if it's cheap.)
+            let each = if r.unbounded {
+                let n = self.m.functions[site.g.0 as usize].params.len();
+                self.runs.work_of(site.g, &vec![None; n])
+            } else {
+                Some(r.work / r.times.max(1))
+            };
+            if site.hit && each.is_none_or(|w| w > TABLE_READ) {
+                let h = Hit {
+                    g: site.g,
+                    varying: site.varying,
+                    calls: r.times,
+                    work: r.work,
+                    unbounded: r.unbounded,
+                    at: site.at,
+                };
+                add(&mut out, h);
+                continue;
+            }
+            for (k, n) in r.known.iter().filter(|(_, n)| *n > 0) {
+                for h in self.calls(site.g, site.given.clone(), k.clone()).iter() {
+                    let h = Hit {
+                        calls: h.calls.saturating_mul(*n),
+                        work: h.work.saturating_mul(*n),
+                        ..h.clone()
+                    };
+                    add(&mut out, h);
+                }
+            }
+        }
+        let out = std::rc::Rc::new(out);
+        self.memo.insert(key, out.clone());
+        out
+    }
+
+    /// Function `id`'s calls, given which of its parameters are same and placed.
+    fn shape(&mut self, id: FuncId, given: &Given) -> CallSites {
+        let key = (id.0, given.clone());
+        if let Some(s) = self.shapes.get(&key) {
+            return s.clone();
+        }
+        let m = self.m;
+        let f = &m.functions[id.0 as usize];
+        // (Before flattening, a call may read what an invocation writes: its result varies.)
+        let mut unsteady = HashSet::new();
+        visit::walk(&f.body, &mut |s| {
+            if let Stmt::Let(_, Expr::Call(g, _)) | Stmt::Eval(Expr::Call(g, _)) = s {
+                unsteady.insert(g.0);
+            }
+        });
+        let pure = &mut self.pure;
+        unsteady.retain(|g| !steady_fn(m, FuncId(*g), pure));
+        let (same, _) = analyse(m, f, &given.same, &unsteady);
+        let placed = placed_values(m, f, &given.placed, &same, pure);
+        let mut sites = Vec::new();
+        let mut here = None;
+        let mut found = Vec::new();
+        visit::walk(&f.body, &mut |s| {
+            let (v, e) = match s {
+                Stmt::At(span) => {
+                    here = Some(*span);
+                    return;
+                }
+                Stmt::Let(v, e @ Expr::Call(..)) => (Some(*v), e),
+                Stmt::Eval(e @ Expr::Call(..)) => (None, e),
+                _ => return,
+            };
+            found.push((v, e, here));
+        });
+        for (v, e, at) in found {
+            let Expr::Call(g, a) = e else { continue };
+            let bits: Vec<bool> =
+                a.iter().map(|a| matches!(a, Arg::Value(x) if same.contains(x))).collect();
+            let at_place: Vec<bool> =
+                a.iter().map(|a| matches!(a, Arg::Value(x) if placed.contains(x))).collect();
+            // (Given only the invocation's place and same values: a function of the place.)
+            let of_place = a.iter().all(|a| match a {
+                Arg::Value(x) => same.contains(x) || placed.contains(x),
+                Arg::Place(_) => false,
+            });
+            let lent = a.iter().any(|a| matches!(a, Arg::Place(_)));
+            let varying: u32 = a
+                .iter()
+                .map(|a| match a {
+                    Arg::Value(x) if !same.contains(x) => scalars(m, f.value_ty(*x)),
+                    _ => 0,
+                })
+                .sum();
+            // (A call that returns nothing is for its effect: no table holds that.)
+            let hit = v.is_some()
+                && !lent
+                && !of_place
+                && (1..=FEW).contains(&varying)
+                && pure_fn(m, *g, pure);
+            let given = Given { same: bits, placed: at_place };
+            sites.push((e as *const Expr as usize, Site { g: *g, varying, hit, given, at }));
+        }
+        let sites = std::rc::Rc::new(sites);
+        self.shapes.insert(key, sites.clone());
+        sites
+    }
+}
+
+/// What a function is given, for `few_input_calls`: which of its parameters are same, and which
+/// are the invocation's place (`placed`).
+#[derive(Clone, PartialEq, Eq, Hash)]
+struct Given {
+    same: Vec<bool>,
+    placed: Vec<bool>,
+}
+
+/// The values of `f` computed by arithmetic from the invocation's place (its builtin inputs,
+/// and the parameters `placed` says), and same values: a function of the place alone, where a
+/// table over them is as large as the dispatch (a fragment shader's pixel, a direction through
+/// it). Calls given only those are looked into rather than reported.
+fn placed_values(
+    m: &Module,
     f: &Function,
-    def: &std::collections::HashMap<ValueId, (&Expr, Option<wrela_diag::Span>)>,
+    placed: &[bool],
+    same: &HashSet<ValueId>,
+    pure: &mut std::collections::HashMap<u32, bool>,
 ) -> HashSet<ValueId> {
+    let (stores, reached) = local_stores(f);
+    // Optimistic about locals: one each of whose stores is of a placed or same value, at placed or
+    // same indices, under placed or same conditions, is placed; each round finds more that
+    // aren't, until a round finds none.
+    let mut locals: HashSet<LocalId> =
+        stores.iter().map(|st| st.local).filter(|l| !reached.contains(l)).collect();
+    loop {
+        let out = placed_round(m, f, placed, same, pure, &locals);
+        let ok = |v: &ValueId| out.contains(v) || same.contains(v);
+        let keep: HashSet<LocalId> = locals
+            .iter()
+            .copied()
+            .filter(|l| {
+                stores
+                    .iter()
+                    .filter(|st| st.local == *l)
+                    .all(|st| ok(&st.value) && st.on.iter().all(ok))
+            })
+            .collect();
+        if keep.len() == locals.len() {
+            return out;
+        }
+        locals = keep;
+    }
+}
+
+/// One round of `placed_values`, given the locals taken as placed.
+fn placed_round(
+    m: &Module,
+    f: &Function,
+    placed: &[bool],
+    same: &HashSet<ValueId>,
+    pure: &mut std::collections::HashMap<u32, bool>,
+    locals: &HashSet<LocalId>,
+) -> HashSet<ValueId> {
+    let mut out: HashSet<ValueId> = HashSet::new();
+    visit::walk(&f.body, &mut |s| {
+        let Stmt::Let(v, e) = s else { return };
+        if let Expr::Load(p) = e
+            && let PlaceRoot::Local(l) = p.root
+            && locals.contains(&l)
+            && !same.contains(v)
+            && p.path.iter().all(|x| match x {
+                Proj::Index(i) => out.contains(i) || same.contains(i),
+                Proj::Field(_) | Proj::Comp(_) => true,
+            })
+        {
+            out.insert(*v);
+            return;
+        }
+        let mut some = false;
+        let mut all = true;
+        e.for_each_value(&mut |x| {
+            if out.contains(&x) {
+                some = true;
+            } else if !same.contains(&x) {
+                all = false;
+            }
+        });
+        let ok = match e {
+            Expr::EntryInput(_) => true,
+            Expr::Param(i) => placed.get(*i as usize).copied().unwrap_or(false),
+            Expr::Unary(..)
+            | Expr::Binary(..)
+            | Expr::Construct(..)
+            | Expr::Extract(..)
+            | Expr::Splat(..)
+            | Expr::Swizzle(..)
+            | Expr::Convert(..)
+            | Expr::Bitcast(..)
+            | Expr::Select { .. }
+            | Expr::Builtin(..) => some && all,
+            // (A pure function of the place is too: a hash of the pixel, a jitter.)
+            Expr::Call(g, a) => {
+                some && all && a.iter().all(|a| matches!(a, Arg::Value(_))) && math_fn(m, *g, pure)
+            }
+            _ => false,
+        };
+        if ok {
+            out.insert(*v);
+        }
+    });
+    out
+}
+
+/// How many numbers a value of type `t` holds.
+fn scalars(m: &Module, t: TypeId) -> u32 {
+    match m.types.get(t) {
+        TypeDef::Scalar(_) | TypeDef::Atomic(_) => 1,
+        TypeDef::Vector(_, n) => u32::from(*n),
+        TypeDef::Matrix(c, r) => u32::from(*c) * u32::from(*r),
+        TypeDef::Struct { fields, .. } => fields.iter().map(|(_, f)| scalars(m, *f)).sum(),
+        TypeDef::Enum { variants, .. } => {
+            1 + variants.iter().filter_map(|(_, p)| p.map(|p| scalars(m, p))).sum::<u32>()
+        }
+        TypeDef::Array(e, n) => scalars(m, *e).saturating_mul(*n),
+        TypeDef::RuntimeArray(_) | TypeDef::Run(_) | TypeDef::Ptr(_) => u32::MAX / 4,
+    }
+}
+
+/// Whether function `g`, and all it calls, computes a value from its parameters and what a
+/// command gives every invocation alike, and nothing else: no writes but to its own locals, no
+/// reads of what the command writes, no derivatives, no subgroups, no barriers, no discards.
+fn pure_fn(m: &Module, g: FuncId, memo: &mut std::collections::HashMap<u32, bool>) -> bool {
+    pure_or(m, g, memo, Pureness::Pure)
+}
+
+/// Whether function `g`, and all it calls, is [`pure_fn`] and reads nothing but its parameters
+/// and uniform blocks (`math`): no texture, no buffer. Given only the invocation's place, its
+/// result is a function of the place.
+fn math_fn(m: &Module, g: FuncId, memo: &mut std::collections::HashMap<u32, bool>) -> bool {
+    pure_or(m, g, memo, Pureness::Math)
+}
+
+/// Whether function `g`, and all it calls, reads nothing that varies but its parameters: given
+/// same values, its result is the same for every invocation (it may sample, take derivatives
+/// and discard, as [`pure_fn`] may not).
+fn steady_fn(m: &Module, g: FuncId, memo: &mut std::collections::HashMap<u32, bool>) -> bool {
+    pure_or(m, g, memo, Pureness::Steady)
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Pureness {
+    Steady,
+    Pure,
+    Math,
+}
+
+fn pure_or(
+    m: &Module,
+    g: FuncId,
+    memo: &mut std::collections::HashMap<u32, bool>,
+    how: Pureness,
+) -> bool {
+    // (The memo holds all three: each under the function's index with its own top bits.)
+    let key = g.0
+        | match how {
+            Pureness::Pure => 0,
+            Pureness::Math => 1 << 31,
+            Pureness::Steady => 1 << 30,
+        };
+    if let Some(&p) = memo.get(&key) {
+        return p;
+    }
+    // (Recursion isn't GPU code's: a cycle reads as pure while it's looked at.)
+    memo.insert(key, true);
+    let f = &m.functions[g.0 as usize];
+    let math = how == Pureness::Math;
+    let steady = how == Pureness::Steady;
+    let mut ok = true;
+    let mut callees = Vec::new();
+    let readable = |p: &Place| match p.root {
+        PlaceRoot::Resource(r) => match m.resources[r.0 as usize].kind {
+            ResourceKind::Uniform { .. } => true,
+            ResourceKind::StorageRead | ResourceKind::Texture { .. } => !math,
+            _ => false,
+        },
+        PlaceRoot::Local(_) | PlaceRoot::Param(_) => true,
+        PlaceRoot::Ptr(_) | PlaceRoot::Data(_) => false,
+    };
+    visit::walk(&f.body, &mut |s| match s {
+        Stmt::Store(p, _) => ok &= matches!(p.root, PlaceRoot::Local(_)),
+        Stmt::Let(_, e) | Stmt::Eval(e) => match e {
+            Expr::Load(p) => ok &= readable(p),
+            Expr::Call(h, a) => {
+                ok &= a.iter().all(|a| matches!(a, Arg::Value(_)));
+                callees.push(*h);
+            }
+            Expr::Builtin(b, _) => {
+                ok &= steady || !matches!(b, Builtin::Dpdx | Builtin::Dpdy | Builtin::Fwidth)
+            }
+            Expr::Texture(op, ..) => {
+                ok &= steady
+                    || !math
+                        && !matches!(
+                            op,
+                            TextureOp::Sample | TextureOp::SampleBias | TextureOp::SampleCompare
+                        )
+            }
+            Expr::Discard => ok &= steady,
+            Expr::EntryInput(_)
+            | Expr::Run(_)
+            | Expr::Addr(_)
+            | Expr::Host(..)
+            | Expr::Mem(..)
+            | Expr::TextureStore(..)
+            | Expr::Atomic(..)
+            | Expr::Subgroup(..)
+            | Expr::Barrier => ok = false,
+            _ => {}
+        },
+        _ => {}
+    });
+    for h in callees {
+        ok = ok && pure_or(m, h, memo, how);
+    }
+    memo.insert(key, ok);
+    ok
+}
+
+/// Each store to a local of `f`, with what it depends on beyond the value stored, and the locals
+/// reached other than by loads and stores (lent, their address taken).
+fn local_stores(f: &Function) -> (Vec<LocalStore>, HashSet<LocalId>) {
     // The conditions of the branches in `b` that leave a loop (or the function) under them.
     fn exits(b: &[Stmt], out: &mut Vec<ValueId>) {
         fn leaves(b: &[Stmt]) -> bool {
@@ -530,8 +1021,6 @@ fn fixed_values(
     }
     let mut stores = Vec::new();
     walk(&f.body, &mut Vec::new(), &mut stores);
-    // A local reached other than by a load and a store (lent, its address taken) is never
-    // fixed.
     let mut reached: HashSet<LocalId> = HashSet::new();
     visit::walk(&f.body, &mut |s| {
         let (Stmt::Let(_, e) | Stmt::Eval(e)) = s else { return };
@@ -552,6 +1041,24 @@ fn fixed_values(
             _ => {}
         }
     });
+    (stores, reached)
+}
+
+/// A store to a local, with the values it depends on beyond the one stored: its indices, the
+/// conditions of the branches it's in, and those of the exits of the loops it's in.
+struct LocalStore {
+    local: LocalId,
+    value: ValueId,
+    on: Vec<ValueId>,
+}
+
+/// The values of `def` (a function's same values) computed only from constants and locals
+/// that only ever hold such values, whichever invocation, pass or path: see `Sites::function`.
+fn fixed_values(
+    f: &Function,
+    def: &std::collections::HashMap<ValueId, (&Expr, Option<wrela_diag::Span>)>,
+) -> HashSet<ValueId> {
+    let (stores, reached) = local_stores(f);
     let mut fixed: HashSet<ValueId> = def.keys().copied().collect();
     loop {
         let local_fixed = |l: LocalId, fixed: &HashSet<ValueId>| {

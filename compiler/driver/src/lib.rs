@@ -98,6 +98,24 @@ pub struct PipelineSummary {
     pub standin: Option<usize>,
     /// It's another pipeline's stand-in.
     pub stands_in: bool,
+    /// For each entry point, as `entries`, the functions it calls with few numbers that vary
+    /// between invocations, all else alike (§18.13): what a table over those numbers could
+    /// replace, costliest first. Empty when the compile didn't count it.
+    pub few: Vec<Vec<FewCall>>,
+}
+
+/// A function an entry point calls with few numbers that vary between invocations (§18.13).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct FewCall {
+    pub function: String,
+    /// The most numbers that vary at any of its calls.
+    pub varying: u32,
+    /// How many times an invocation calls it, each loop's passes counted.
+    pub calls: u64,
+    /// All those calls' work an invocation (`None`: unbounded).
+    pub work: Option<u64>,
+    /// Its first call, as `file:line:column` (empty if unknown).
+    pub at: String,
 }
 
 impl PipelineSummary {
@@ -969,6 +987,7 @@ fn compile_loaded_in(
         no_simd: mode.no_simd,
         testing: mode.testing,
         relaxed_simd: mode.relaxed_simd,
+        few: mode.conditions && !mode.emit,
         ..Default::default()
     };
     let cache = scope.cache_of(root);
@@ -1256,6 +1275,23 @@ fn summarize(
                     .unbounded
                     .iter()
                     .map(|s| s.map_or_else(String::new, |s| sources.file(s.file).location(s.start)))
+                    .collect(),
+                few: out
+                    .few
+                    .iter()
+                    .map(|each| {
+                        each.iter()
+                            .map(|c| FewCall {
+                                function: c.function.clone(),
+                                varying: c.varying,
+                                calls: c.calls,
+                                work: c.work,
+                                at: c.at.map_or_else(String::new, |s| {
+                                    sources.file(s.file).location(s.start)
+                                }),
+                            })
+                            .collect()
+                    })
                     .collect(),
             }
         })

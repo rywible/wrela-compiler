@@ -163,3 +163,109 @@ fn a_loop_s_counter_is_its_structure_unless_a_uniform_bounds_or_indexes_it() {
         format!("    var t = [0.0, 0.0, 0.0, 0.0]\n    t[i32(g.u) % 4] = 1.0\n{}", chain("t[0]"));
     assert_eq!(e0712(&kernel("same_indexed", 64, &indexed)).len(), 1);
 }
+
+/// A kernel whose invocations call `sky` (40 rounds of math) with a direction read from a
+/// buffer, and with one computed from the invocation's own index; and `cheap` with the buffer's.
+fn few_kernel(name: &str) -> std::path::PathBuf {
+    let dir = scratch(name);
+    let src = "use std::gpu::{GlobalId, GpuBuffer, LocalId, Shared, Slots, barrier, buffer, dispatch}
+
+struct Given: Copy + GpuData {
+    u: f32,
+}
+
+fn sky(d: vec3, u: f32) -> f32 {
+    var a = d.x + u
+    for _i in 0..40 {
+        a = sin(a) + cos(a * d.y + d.z)
+    }
+    a
+}
+
+fn cheap(d: vec3) -> f32 {
+    d.x * 2.0 + d.y
+}
+
+// Six numbers vary: looked into.
+fn shade(p: vec3, n: vec3, u: f32) -> f32 {
+    sky(n, u) + p.x
+}
+
+// Lent a place, returning nothing: looked into.
+fn add_sky(acc: mut f32, d: vec3, u: f32) {
+    acc += sky(d, u)
+}
+
+// Bounded by what it's given: cheap at two passes.
+fn bumps(d: vec3, n: u32) -> f32 {
+    var a = 0.0
+    for i in 0..n {
+        a += d.x * f32(i)
+    }
+    a
+}
+
+@compute(64)
+fn k(g: Given, dirs: [vec4], out: mut Slots<f32>, id: GlobalId) {
+    let x = f32(id.x)
+    let d = dirs[id.x].xyz
+    let q = dirs[id.x + 1].xyz
+    var acc = 0.0
+    for i in 0..3 {
+        acc = acc + sky(d * f32(i + 1), g.u)
+    }
+    add_sky(mut acc, q, g.u)
+    let a = shade(q, d, g.u)
+    let b = shade(d, q, g.u)
+    out[id] = acc + a + b + sky(vec3(x, x * 2.0, 1.0), g.u) + cheap(d) + bumps(d, 2)
+}
+
+@compute(64)
+fn wide(g: Given, dirs: [vec4], out: mut Slots<f32>, shared: mut Shared<f32, 64>, id: GlobalId, lid: LocalId) {
+    let d = dirs[id.x].xyz
+    let c = shared.chunk(lid)
+    shared.write(c, 0, dirs[id.x].w)
+    barrier(mut shared)
+    // (The workgroup's first: it differs from workgroup to workgroup.)
+    let w = shared.get(0)
+    out[id] = sky(d.xy.xxy, w)
+}
+
+pub fn frame(time: f32, width: u32, height: u32) {
+    let dirs: GpuBuffer<vec4> = buffer(64)
+    var out: GpuBuffer<f32> = buffer(64)
+    dispatch(k.bind(Given { u: time }, dirs, out: mut out), over: 64)
+    dispatch(wide.bind(Given { u: time }, dirs, out: mut out), groups: 1)
+}
+";
+    write_package(&dir, name, src);
+    dir
+}
+
+/// `wrela pipelines` lists a costly function called with a few numbers that vary, all else the
+/// same, with each of its runs counted (a loop's passes, each call of a function it's called
+/// through): what a table could replace. A call given only the invocation's own place isn't one
+/// (a table of it is as large as the dispatch), nor is a cheap one, nor one given what an
+/// invocation writes.
+#[test]
+fn calls_with_few_varying_numbers_are_listed_for_tables() {
+    let dir = few_kernel("few_inputs");
+    let out = wrela_driver::check_pipelines(&dir);
+    assert!(!out.has_errors(), "{:?}", out.diagnostics);
+    let p = out.pipelines.iter().find(|p| p.names[0] == "k").expect("k's pipeline");
+    let few = &p.few[0];
+    assert_eq!(few.len(), 1, "{few:?}");
+    assert_eq!(few[0].function, "sky");
+    assert_eq!(few[0].varying, 3);
+    // Each pass of the loop, the call through `add_sky` and each through `shade`; not the call
+    // at the invocation's own place, which would make seven.
+    assert_eq!(few[0].calls, 6, "{few:?}");
+    assert!(few[0].work.is_some_and(|w| w % 6 == 0 && w >= 6 * 40 * 4), "{few:?}");
+    assert!(few[0].at.contains("main.wrela"), "{few:?}");
+    // Workgroup memory differs between workgroups: given it, `sky` takes four varying numbers.
+    let wide = out.pipelines.iter().find(|p| p.names[0] == "wide").expect("wide's pipeline");
+    assert!(wide.few[0].is_empty(), "{:?}", wide.few);
+    // A build doesn't look for them.
+    let built = wrela_driver::check(&dir);
+    assert!(built.pipelines.iter().all(|p| p.few.iter().all(|c| c.is_empty())));
+}
