@@ -81,6 +81,7 @@ pub fn text(pipelines: &[PipelineSummary]) -> String {
                     p.entries.join(" + "),
                     p.kind
                 ));
+                s.push_str(&few_text(p));
                 continue;
             }
             let standin = match p.standin.and_then(|j| pipelines.get(j)) {

@@ -22,15 +22,22 @@ use std::collections::HashSet;
 /// The values of `f` that are the same for every invocation, given which of its parameters
 /// are (`args[i]`; a parameter not given varies).
 pub fn same_values(m: &Module, f: &Function, args: &[bool]) -> HashSet<ValueId> {
-    analyse(m, f, args).0
+    analyse(m, f, args, &HashSet::new()).0
 }
 
-/// The same values, and the locals that vary.
-fn analyse(m: &Module, f: &Function, args: &[bool]) -> (HashSet<ValueId>, HashSet<LocalId>) {
+/// The same values, and the locals that vary. A call to a function in `unsteady` varies,
+/// whatever it's given (before flattening, a function that reads what an invocation writes).
+fn analyse(
+    m: &Module,
+    f: &Function,
+    args: &[bool],
+    unsteady: &HashSet<u32>,
+) -> (HashSet<ValueId>, HashSet<LocalId>) {
     let mut a = Analysis {
         m,
         f,
         args,
+        unsteady,
         same: HashSet::new(),
         varying_locals: HashSet::new(),
         changed: true,
@@ -50,6 +57,7 @@ struct Analysis<'a> {
     m: &'a Module,
     f: &'a Function,
     args: &'a [bool],
+    unsteady: &'a HashSet<u32>,
     same: HashSet<ValueId>,
     varying_locals: HashSet<LocalId>,
     changed: bool,
@@ -202,8 +210,9 @@ impl Analysis<'_> {
             // A sample takes its detail from the pixels around it, which a same coordinate
             // makes the same too.
             Expr::Texture(..) => self.all_same(e),
-            Expr::Call(_, args) => {
-                args.iter().all(|a| matches!(a, Arg::Value(v) if self.same.contains(v)))
+            Expr::Call(g, args) => {
+                !self.unsteady.contains(&g.0)
+                    && args.iter().all(|a| matches!(a, Arg::Value(v) if self.same.contains(v)))
             }
             Expr::Run(_)
             | Expr::Addr(_)
@@ -271,7 +280,7 @@ impl Sites<'_> {
         }
         let m = self.m;
         let f = &m.functions[id.0 as usize];
-        let (same, varying) = analyse(m, f, &args);
+        let (same, varying) = analyse(m, f, &args, &HashSet::new());
         // Each same value's expression and where it is; what's stored to each local.
         let mut def: std::collections::HashMap<ValueId, (&Expr, Option<wrela_diag::Span>)> =
             std::collections::HashMap::new();
@@ -468,14 +477,15 @@ fn times_computed(m: &Module, id: FuncId, f: &Function) -> std::collections::Has
 /// once over their range into a table, each invocation could read it instead.
 #[derive(Clone, Debug, PartialEq)]
 pub struct FewInputs {
-    /// The function called, by name.
+    /// The function called, as `name` names it.
     pub function: String,
     /// The most numbers that vary at any of its calls (a `vec3`'s three; a struct's all, if any
     /// of it varies).
     pub varying: u32,
-    /// How many times an invocation calls it: each call's loops' passes, every branch taken.
+    /// How many times an invocation calls it: each call's loops' passes (one, for a loop the
+    /// count can't bound), every side of a branch the count doesn't know taken (§18.11's count).
     pub calls: u64,
-    /// All those calls' work (`None`: unbounded).
+    /// All those calls' work, each given what's known of its arguments (`None`: unbounded).
     pub work: Option<u64>,
     /// Its first call, where it is.
     pub at: Option<wrela_diag::Span>,
@@ -484,21 +494,53 @@ pub struct FewInputs {
 /// The most varying numbers a call may take for [`few_input_calls`].
 pub const FEW: u32 = 3;
 
+/// The least work a call must do, each, for [`few_input_calls`]: more than a table's read (a
+/// sample, and its coordinates worked out).
+pub const TABLE_READ: u64 = 2 * crate::work::SAMPLE;
+
 /// The functions each entry point of `m` calls with at most [`FEW`] numbers that vary (and at
-/// least one), doing at least `least` work an invocation in all, most work first: what a table
-/// over those numbers could replace. Such a call is reported whole, not the calls in it; a call
-/// lent a place, or to a function that writes, synchronises or takes derivatives, is passed by
-/// (the calls in it are looked at).
-pub fn few_input_calls(m: &Module, least: u64) -> Vec<Vec<FewInputs>> {
-    let mut work = crate::work::ExprWork::new(m);
-    let mut pure: std::collections::HashMap<u32, bool> = std::collections::HashMap::new();
+/// least one), each call more work than [`TABLE_READ`] and all of them at least `least` an
+/// invocation, most work first: what a table over those numbers could replace. `name` names a
+/// function (calls to functions it names alike are one). Such a call is reported whole, not
+/// the calls in it; a call lent a place, given only the invocation's place, returning nothing,
+/// or to a function that writes, synchronises, takes derivatives or reads what the command
+/// writes, is looked into instead.
+pub fn few_input_calls(
+    m: &Module,
+    least: u64,
+    name: &dyn Fn(FuncId) -> String,
+) -> Vec<Vec<FewInputs>> {
+    let mut few = Few {
+        m,
+        runs: crate::work::CallRuns::new(m),
+        pure: std::collections::HashMap::new(),
+        shapes: std::collections::HashMap::new(),
+        memo: std::collections::HashMap::new(),
+    };
     let mut out = Vec::new();
     for e in &m.entry_points {
         let mut found: Vec<FewInputs> = Vec::new();
         if !matches!(e.stage, Stage::Compute { workgroup_size: [1, 1, 1] }) {
-            let mut seen = HashSet::new();
             let given = Given { same: Vec::new(), placed: Vec::new() };
-            few_in(m, e.function, given, 1, &mut work, &mut pure, &mut seen, &mut found);
+            let known = vec![None; m.functions[e.function.0 as usize].params.len()];
+            for h in few.calls(e.function, given, known).iter() {
+                let function = name(h.g);
+                let work = (!h.unbounded).then_some(h.work);
+                match found.iter_mut().find(|c| c.function == function) {
+                    Some(c) => {
+                        c.varying = c.varying.max(h.varying);
+                        c.calls = c.calls.saturating_add(h.calls);
+                        c.work = c.work.zip(work).map(|(a, b)| a.saturating_add(b));
+                    }
+                    None => found.push(FewInputs {
+                        function,
+                        varying: h.varying,
+                        calls: h.calls,
+                        work,
+                        at: h.at,
+                    }),
+                }
+            }
         }
         found.retain(|c| c.work.is_none_or(|w| w >= least));
         found.sort_by(|a, b| {
@@ -508,6 +550,166 @@ pub fn few_input_calls(m: &Module, least: u64) -> Vec<Vec<FewInputs>> {
         out.push(found);
     }
     out
+}
+
+/// A call `few_input_calls` reports, by the function called: in one call of the function it's
+/// found from.
+#[derive(Clone)]
+struct Hit {
+    g: FuncId,
+    varying: u32,
+    calls: u64,
+    work: u64,
+    unbounded: bool,
+    at: Option<wrela_diag::Span>,
+}
+
+/// A call in a function, as `few_input_calls` sees it, given what the function's given: the
+/// function called, the numbers that vary in what it's given, whether it's reported (else
+/// what its function's given), and where it is.
+struct Site {
+    g: FuncId,
+    varying: u32,
+    hit: bool,
+    given: Given,
+    at: Option<wrela_diag::Span>,
+}
+
+struct Few<'a> {
+    m: &'a Module,
+    runs: crate::work::CallRuns<'a>,
+    /// `pure_or_math`'s memo.
+    pure: std::collections::HashMap<u32, bool>,
+    /// Each function's calls, by the call's address, given what it's given.
+    shapes: std::collections::HashMap<(u32, Given), std::rc::Rc<Vec<(usize, Site)>>>,
+    /// The calls reported in one call of a function, given what it's given and what's known of
+    /// its arguments.
+    memo: std::collections::HashMap<(u32, Given, crate::work::Known), std::rc::Rc<Vec<Hit>>>,
+}
+
+impl Few<'_> {
+    /// The calls reported in one call of function `id`, given which of its parameters are same
+    /// and placed, and what's known of its arguments: each function's calls summed.
+    fn calls(
+        &mut self,
+        id: FuncId,
+        given: Given,
+        known: crate::work::Known,
+    ) -> std::rc::Rc<Vec<Hit>> {
+        let key = (id.0, given.clone(), known.clone());
+        if let Some(h) = self.memo.get(&key) {
+            return h.clone();
+        }
+        let sites = self.shape(id, &given);
+        let runs = self.runs.of(id, &known);
+        let mut out: Vec<Hit> = Vec::new();
+        let add = |out: &mut Vec<Hit>, h: Hit| match out.iter_mut().find(|x| x.g == h.g) {
+            Some(x) => {
+                x.varying = x.varying.max(h.varying);
+                x.calls = x.calls.saturating_add(h.calls);
+                x.work = x.work.saturating_add(h.work);
+                x.unbounded |= h.unbounded;
+            }
+            None => out.push(h),
+        };
+        for (addr, site) in sites.iter() {
+            // (A call that doesn't run, on a side of a branch on a constant not taken.)
+            let Some(r) = runs.get(addr) else { continue };
+            let each = r.work / r.times.max(1);
+            if site.hit && (r.unbounded || each > TABLE_READ) {
+                let h = Hit {
+                    g: site.g,
+                    varying: site.varying,
+                    calls: r.times,
+                    work: r.work,
+                    unbounded: r.unbounded,
+                    at: site.at,
+                };
+                add(&mut out, h);
+                continue;
+            }
+            for (k, n) in &r.known {
+                for h in self.calls(site.g, site.given.clone(), k.clone()).iter() {
+                    let h = Hit {
+                        calls: h.calls.saturating_mul(*n),
+                        work: h.work.saturating_mul(*n),
+                        ..h.clone()
+                    };
+                    add(&mut out, h);
+                }
+            }
+        }
+        let out = std::rc::Rc::new(out);
+        self.memo.insert(key, out.clone());
+        out
+    }
+
+    /// Function `id`'s calls, given which of its parameters are same and placed.
+    fn shape(&mut self, id: FuncId, given: &Given) -> std::rc::Rc<Vec<(usize, Site)>> {
+        let key = (id.0, given.clone());
+        if let Some(s) = self.shapes.get(&key) {
+            return s.clone();
+        }
+        let m = self.m;
+        let f = &m.functions[id.0 as usize];
+        // (Before flattening, a call may read what an invocation writes: its result varies.)
+        let mut unsteady = HashSet::new();
+        visit::walk(&f.body, &mut |s| {
+            if let Stmt::Let(_, Expr::Call(g, _)) | Stmt::Eval(Expr::Call(g, _)) = s {
+                unsteady.insert(g.0);
+            }
+        });
+        let pure = &mut self.pure;
+        unsteady.retain(|g| !steady_fn(m, FuncId(*g), pure));
+        let (same, _) = analyse(m, f, &given.same, &unsteady);
+        let placed = placed_values(m, f, &given.placed, &same, pure);
+        let mut sites = Vec::new();
+        let mut here = None;
+        let mut found = Vec::new();
+        visit::walk(&f.body, &mut |s| {
+            let (v, e) = match s {
+                Stmt::At(span) => {
+                    here = Some(*span);
+                    return;
+                }
+                Stmt::Let(v, e @ Expr::Call(..)) => (Some(*v), e),
+                Stmt::Eval(e @ Expr::Call(..)) => (None, e),
+                _ => return,
+            };
+            found.push((v, e, here));
+        });
+        for (v, e, at) in found {
+            let Expr::Call(g, a) = e else { continue };
+            let bits: Vec<bool> =
+                a.iter().map(|a| matches!(a, Arg::Value(x) if same.contains(x))).collect();
+            let at_place: Vec<bool> =
+                a.iter().map(|a| matches!(a, Arg::Value(x) if placed.contains(x))).collect();
+            // (Given only the invocation's place and same values: a function of the place.)
+            let of_place = a.iter().all(|a| match a {
+                Arg::Value(x) => same.contains(x) || placed.contains(x),
+                Arg::Place(_) => false,
+            });
+            let lent = a.iter().any(|a| matches!(a, Arg::Place(_)));
+            let varying: u32 = a
+                .iter()
+                .map(|a| match a {
+                    Arg::Value(x) if !same.contains(x) => scalars(m, f.value_ty(*x)),
+                    _ => 0,
+                })
+                .sum();
+            // (A call that returns nothing is for its effect: no table holds that.)
+            let hit = v.is_some()
+                && !lent
+                && !of_place
+                && (1..=FEW).contains(&varying)
+                && pure_fn(m, *g, pure);
+            let given = Given { same: bits, placed: at_place };
+            sites.push((e as *const Expr as usize, Site { g: *g, varying, hit, given, at }));
+        }
+        let sites = std::rc::Rc::new(sites);
+        self.shapes.insert(key, sites.clone());
+        sites
+    }
 }
 
 /// What a function is given, for `few_input_calls`: which of its parameters are same, and which
@@ -614,94 +816,6 @@ fn placed_round(
     out
 }
 
-/// `few_input_calls` in function `id`, given which of its parameters are same and placed,
-/// called `k` times an invocation.
-#[allow(clippy::too_many_arguments)]
-fn few_in(
-    m: &Module,
-    id: FuncId,
-    given: Given,
-    k: u64,
-    work: &mut crate::work::ExprWork,
-    pure: &mut std::collections::HashMap<u32, bool>,
-    seen: &mut HashSet<(u32, Given, u64)>,
-    found: &mut Vec<FewInputs>,
-) {
-    if !seen.insert((id.0, given.clone(), k)) {
-        return;
-    }
-    let f = &m.functions[id.0 as usize];
-    let (same, _) = analyse(m, f, &given.same);
-    let placed = placed_values(m, f, &given.placed, &same, pure);
-    let times = times_computed(m, id, f);
-    let mut here = None;
-    let mut calls: Vec<(FuncId, Given, u64)> = Vec::new();
-    // Each call found: the function, its varying numbers, its times, their work, where.
-    type Hit = (FuncId, u32, u64, Option<u64>, Option<wrela_diag::Span>);
-    let mut hits: Vec<Hit> = Vec::new();
-    // (A call that returns nothing is for its effect: no table holds that.)
-    visit::walk(&f.body, &mut |s| {
-        let (v, e) = match s {
-            Stmt::At(span) => {
-                here = Some(*span);
-                return;
-            }
-            Stmt::Let(v, e @ Expr::Call(..)) => (Some(*v), e),
-            Stmt::Eval(e @ Expr::Call(..)) => (None, e),
-            _ => return,
-        };
-        let Expr::Call(g, a) = e else { return };
-        let bits: Vec<bool> =
-            a.iter().map(|a| matches!(a, Arg::Value(x) if same.contains(x))).collect();
-        let at_place: Vec<bool> =
-            a.iter().map(|a| matches!(a, Arg::Value(x) if placed.contains(x))).collect();
-        // (Given only the invocation's place and same values: a function of the place.)
-        let of_place = a.iter().all(|a| match a {
-            Arg::Value(x) => same.contains(x) || placed.contains(x),
-            Arg::Place(_) => false,
-        });
-        let n = v.and_then(|v| times.get(&v).copied()).unwrap_or(1).saturating_mul(k);
-        let lent = a.iter().any(|a| matches!(a, Arg::Place(_)));
-        let varying: u32 = a
-            .iter()
-            .map(|a| match a {
-                Arg::Value(x) if !same.contains(x) => scalars(m, f.value_ty(*x)),
-                _ => 0,
-            })
-            .sum();
-        if v.is_some() && !lent && !of_place && (1..=FEW).contains(&varying) && pure_fn(m, *g, pure)
-        {
-            hits.push((*g, varying, n, work.of(f, e).map(|w| w.saturating_mul(n)), here));
-        } else {
-            calls.push((*g, Given { same: bits, placed: at_place }, n));
-        }
-    });
-    for (g, varying, n, w, at) in hits {
-        let name = plain(&m.functions[g.0 as usize].name);
-        match found.iter_mut().find(|c| c.function == name) {
-            Some(c) => {
-                c.varying = c.varying.max(varying);
-                c.calls = c.calls.saturating_add(n);
-                c.work = c.work.zip(w).map(|(a, b)| a.saturating_add(b));
-            }
-            None => found.push(FewInputs { function: name, varying, calls: n, work: w, at }),
-        }
-    }
-    for (g, given, n) in calls {
-        few_in(m, g, given, n, work, pure, seen, found);
-    }
-}
-
-/// A function's name without the `_<n>` lowering gives each instantiation.
-fn plain(n: &str) -> String {
-    match n.rsplit_once('_') {
-        Some((head, tail)) if !head.is_empty() && tail.chars().all(|c| c.is_ascii_digit()) => {
-            head.to_string()
-        }
-        _ => n.to_string(),
-    }
-}
-
 /// How many numbers a value of type `t` holds.
 fn scalars(m: &Module, t: TypeId) -> u32 {
     match m.types.get(t) {
@@ -721,30 +835,51 @@ fn scalars(m: &Module, t: TypeId) -> u32 {
 /// command gives every invocation alike, and nothing else: no writes but to its own locals, no
 /// reads of what the command writes, no derivatives, no subgroups, no barriers, no discards.
 fn pure_fn(m: &Module, g: FuncId, memo: &mut std::collections::HashMap<u32, bool>) -> bool {
-    pure_or_math(m, g, memo, false)
+    pure_or(m, g, memo, Pureness::Pure)
 }
 
 /// Whether function `g`, and all it calls, is [`pure_fn`] and reads nothing but its parameters
 /// and uniform blocks (`math`): no texture, no buffer. Given only the invocation's place, its
 /// result is a function of the place.
 fn math_fn(m: &Module, g: FuncId, memo: &mut std::collections::HashMap<u32, bool>) -> bool {
-    pure_or_math(m, g, memo, true)
+    pure_or(m, g, memo, Pureness::Math)
 }
 
-fn pure_or_math(
+/// Whether function `g`, and all it calls, reads nothing that varies but its parameters: given
+/// same values, its result is the same for every invocation (it may sample, take derivatives
+/// and discard, as [`pure_fn`] may not).
+fn steady_fn(m: &Module, g: FuncId, memo: &mut std::collections::HashMap<u32, bool>) -> bool {
+    pure_or(m, g, memo, Pureness::Steady)
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Pureness {
+    Steady,
+    Pure,
+    Math,
+}
+
+fn pure_or(
     m: &Module,
     g: FuncId,
     memo: &mut std::collections::HashMap<u32, bool>,
-    math: bool,
+    how: Pureness,
 ) -> bool {
-    // (The memo holds both: `math`'s under the function's index with the top bit set.)
-    let key = if math { g.0 | 1 << 31 } else { g.0 };
+    // (The memo holds all three: each under the function's index with its own top bits.)
+    let key = g.0
+        | match how {
+            Pureness::Pure => 0,
+            Pureness::Math => 1 << 31,
+            Pureness::Steady => 1 << 30,
+        };
     if let Some(&p) = memo.get(&key) {
         return p;
     }
     // (Recursion isn't GPU code's: a cycle reads as pure while it's looked at.)
     memo.insert(key, true);
     let f = &m.functions[g.0 as usize];
+    let math = how == Pureness::Math;
+    let steady = how == Pureness::Steady;
     let mut ok = true;
     let mut callees = Vec::new();
     let readable = |p: &Place| match p.root {
@@ -765,15 +900,17 @@ fn pure_or_math(
                 callees.push(*h);
             }
             Expr::Builtin(b, _) => {
-                ok &= !matches!(b, Builtin::Dpdx | Builtin::Dpdy | Builtin::Fwidth)
+                ok &= steady || !matches!(b, Builtin::Dpdx | Builtin::Dpdy | Builtin::Fwidth)
             }
             Expr::Texture(op, ..) => {
-                ok &= !math
-                    && !matches!(
-                        op,
-                        TextureOp::Sample | TextureOp::SampleBias | TextureOp::SampleCompare
-                    )
+                ok &= steady
+                    || !math
+                        && !matches!(
+                            op,
+                            TextureOp::Sample | TextureOp::SampleBias | TextureOp::SampleCompare
+                        )
             }
+            Expr::Discard => ok &= steady,
             Expr::EntryInput(_)
             | Expr::Run(_)
             | Expr::Addr(_)
@@ -782,14 +919,13 @@ fn pure_or_math(
             | Expr::TextureStore(..)
             | Expr::Atomic(..)
             | Expr::Subgroup(..)
-            | Expr::Barrier
-            | Expr::Discard => ok = false,
+            | Expr::Barrier => ok = false,
             _ => {}
         },
         _ => {}
     });
     for h in callees {
-        ok = ok && pure_or_math(m, h, memo, math);
+        ok = ok && pure_or(m, h, memo, how);
     }
     memo.insert(key, ok);
     ok

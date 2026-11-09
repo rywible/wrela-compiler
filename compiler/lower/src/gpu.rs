@@ -3523,7 +3523,7 @@ fn verify(cx: &mut Cx, mb: &mut ModuleBuilder, name: &str) -> Option<Counts> {
             }
         }
         if cx.data.few {
-            few = ir::same::few_input_calls(&mb.m, FEW_INPUTS_LEAST);
+            few = ir::same::few_input_calls(&mb.m, FEW_INPUTS_LEAST, &|id| mb.display_name(id));
         }
         let (each, breaches) = ir::work::module_work(&mb.m);
         for b in &breaches {
