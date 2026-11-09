@@ -2870,6 +2870,48 @@ fn array_blend_provenance_matches_the_binary_fold() {
 }
 
 @test
+fn value_noise_intervals_hold_every_sample_and_are_exact_within_two_cells() {
+    // Boxes across 0, 1 or 2 lattice planes on each axis, some at large coordinates. Each holds
+    // every value at a grid through the box and at its lattice planes; one that crosses at
+    // most one plane on each axis is as wide as the values at those points (its corners and
+    // its planes'), give or take the rounding allowance.
+    for k in 0..240 {
+        let w = [0.003, 0.04, 0.3, 0.97, 1.6, 2.5][k % 6]
+        let lo = vec3(
+            f32(k) * 0.731 - 80.0,
+            f32(k % 7) * 1.37 - 4.0,
+            f32(k % 11) * 0.913 + if k % 5 == 0 { 3000000.0 } else { 0.0 },
+        )
+        let b = Box3 { lo, hi: lo + vec3(w, 0.5 * w, w) }
+        let r = interval(|q: vec3| value_noise(q), b)
+        var slo = 1.0e9
+        var shi = -1.0e9
+        for i in 0..9 {
+            for j in 0..9 {
+                for l in 0..9 {
+                    let t = vec3(f32(i), f32(j), f32(l)) / 8.0
+                    var q = mix(b.lo, b.hi, t)
+                    // A lattice plane inside the box, on each axis that has one.
+                    let plane = floor(b.lo) + 1.0
+                    if i == 4 && plane.x < b.hi.x { q.x = plane.x }
+                    if j == 4 && plane.y < b.hi.y { q.y = plane.y }
+                    if l == 4 && plane.z < b.hi.z { q.z = plane.z }
+                    let v = value_noise(q)
+                    assert(r.lo <= v && v <= r.hi, f"box {k}: {v} outside [{r.lo}, {r.hi}]")
+                    slo = min(slo, v)
+                    shi = max(shi, v)
+                }
+            }
+        }
+        let crossings = floor(b.hi) - floor(b.lo)
+        if max(crossings.x, max(crossings.y, crossings.z)) <= 1.0 {
+            let excess = (r.hi - r.lo) - (shi - slo)
+            assert(excess < 0.0001, f"box {k}: interval wider than its values by {excess}")
+        }
+    }
+}
+
+@test
 fn noise_boxes_keep_lattice_steps_at_large_coordinates() {
     for x in [16777216.0, 33554432.0, -33554432.0] {
         let p = vec3(x, 0.0, 0.0)

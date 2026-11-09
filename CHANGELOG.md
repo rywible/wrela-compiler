@@ -3,6 +3,15 @@
 Each release's changes a program or a tool can see. The pull request of each release holds the
 detail; `docs/release.md` says how a release is cut.
 
+## 0.30.0
+
+- **Tighter ranges over noise** (language.md §14.2): the interval of `std::field::value_noise`
+  over a box is exact (up to 2⁻¹⁶ of rounding) where the box crosses at most one lattice plane on
+  each axis, from the noise at its corners and planes, not derived from its body. Over a tenth of
+  a cell it was three to five times too wide; a displaced stone's interval over 12.5 cm blocks is
+  now half as wide, and 20% fewer of those blocks look like they might hold its surface. Taped
+  fields (`NOISE3`) get it too.
+
 ## 0.29.0
 
 - **Breaking: every surface states where it is** (language.md §20.3). `Surface::bound()` has no
