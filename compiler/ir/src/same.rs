@@ -575,13 +575,16 @@ struct Site {
     at: Option<wrela_diag::Span>,
 }
 
+/// A function's calls, by each call's address.
+type CallSites = std::rc::Rc<Vec<(usize, Site)>>;
+
 struct Few<'a> {
     m: &'a Module,
     runs: crate::work::CallRuns<'a>,
     /// `pure_or_math`'s memo.
     pure: std::collections::HashMap<u32, bool>,
     /// Each function's calls, by the call's address, given what it's given.
-    shapes: std::collections::HashMap<(u32, Given), std::rc::Rc<Vec<(usize, Site)>>>,
+    shapes: std::collections::HashMap<(u32, Given), CallSites>,
     /// The calls reported in one call of a function, given what it's given and what's known of
     /// its arguments.
     memo: std::collections::HashMap<(u32, Given, crate::work::Known), std::rc::Rc<Vec<Hit>>>,
@@ -645,7 +648,7 @@ impl Few<'_> {
     }
 
     /// Function `id`'s calls, given which of its parameters are same and placed.
-    fn shape(&mut self, id: FuncId, given: &Given) -> std::rc::Rc<Vec<(usize, Site)>> {
+    fn shape(&mut self, id: FuncId, given: &Given) -> CallSites {
         let key = (id.0, given.clone());
         if let Some(s) = self.shapes.get(&key) {
             return s.clone();
