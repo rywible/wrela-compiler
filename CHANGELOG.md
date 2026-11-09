@@ -3,6 +3,15 @@
 Each release's changes a program or a tool can see. The pull request of each release holds the
 detail; `docs/release.md` says how a release is cut.
 
+## 0.31.0
+
+- **Calls a table could answer** (language.md §18.13): `wrela pipelines` lists, under each
+  pipeline, the costly functions its entry points call with at most three numbers that vary
+  between invocations, all else the same for every invocation (the sky along a direction, a
+  noise at a point): how many times an invocation calls each, how many numbers vary, and their
+  work. `--json` gives them as `few`. A call given only the invocation's own place isn't listed.
+  The query alone looks for them; a build doesn't.
+
 ## 0.30.0
 
 - **Tighter ranges over noise** (language.md §14.2): the interval of `std::field::value_noise`

@@ -163,3 +163,70 @@ fn a_loop_s_counter_is_its_structure_unless_a_uniform_bounds_or_indexes_it() {
         format!("    var t = [0.0, 0.0, 0.0, 0.0]\n    t[i32(g.u) % 4] = 1.0\n{}", chain("t[0]"));
     assert_eq!(e0712(&kernel("same_indexed", 64, &indexed)).len(), 1);
 }
+
+/// A kernel whose invocations call `sky` (40 rounds of math) with a direction read from a
+/// buffer, and with one computed from the invocation's own index; and `cheap` with the buffer's.
+fn few_kernel(name: &str) -> std::path::PathBuf {
+    let dir = scratch(name);
+    let src = "use std::gpu::{GlobalId, GpuBuffer, Slots, buffer, dispatch}
+
+struct Given: Copy + GpuData {
+    u: f32,
+}
+
+fn sky(d: vec3, u: f32) -> f32 {
+    var a = d.x + u
+    for _i in 0..40 {
+        a = sin(a) + cos(a * d.y + d.z)
+    }
+    a
+}
+
+fn cheap(d: vec3) -> f32 {
+    d.x * 2.0 + d.y
+}
+
+@compute(64)
+fn k(g: Given, dirs: [vec4], out: mut Slots<f32>, id: GlobalId) {
+    let x = f32(id.x)
+    let d = dirs[id.x].xyz
+    var acc = 0.0
+    for i in 0..3 {
+        acc = acc + sky(d * f32(i + 1), g.u)
+    }
+    out[id] = acc + sky(vec3(x, x * 2.0, 1.0), g.u) + cheap(d)
+}
+
+pub fn frame(time: f32, width: u32, height: u32) {
+    let dirs: GpuBuffer<vec4> = buffer(64)
+    var out: GpuBuffer<f32> = buffer(64)
+    dispatch(k.bind(Given { u: time }, dirs, out: mut out), over: 64)
+}
+";
+    write_package(&dir, name, src);
+    dir
+}
+
+/// `wrela pipelines` lists a costly function called with a few numbers that vary, all else the
+/// same, with each pass of its loop counted: what a table could replace. A call given only the
+/// invocation's own place isn't one (a table of it is as large as the dispatch), nor is a cheap
+/// one.
+#[test]
+fn calls_with_few_varying_numbers_are_listed_for_tables() {
+    let dir = few_kernel("few_inputs");
+    let out = wrela_driver::check_pipelines(&dir);
+    assert!(!out.has_errors(), "{:?}", out.diagnostics);
+    let p = out.pipelines.iter().find(|p| p.names[0] == "k").expect("k's pipeline");
+    let few = &p.few[0];
+    assert_eq!(few.len(), 1, "{few:?}");
+    assert_eq!(few[0].function, "sky");
+    assert_eq!(few[0].varying, 3);
+    // Each pass of the loop, as §18.11 counts them (`0..3` makes four: the last leaves at its
+    // top); not the call at the invocation's own place, which would make five.
+    assert_eq!(few[0].calls, 4);
+    assert!(few[0].work.is_some_and(|w| w >= 3 * 40), "{few:?}");
+    assert!(few[0].at.contains("main.wrela"), "{few:?}");
+    // A build doesn't look for them.
+    let built = wrela_driver::check(&dir);
+    assert!(built.pipelines.iter().all(|p| p.few.iter().all(|c| c.is_empty())));
+}

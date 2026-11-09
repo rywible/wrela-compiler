@@ -62,6 +62,9 @@ pub struct BuildData {
     pub lift: Option<crate::LiftTable>,
     /// Which host runs the build (§15.3): its entries, and what it may reach.
     pub role: wrela_sema::defs::Role,
+    /// The pipeline-count query's (`wrela pipelines`, §18.9): each pipeline's calls with few
+    /// numbers that vary are found (§18.13). No other compile pays for that.
+    pub few: bool,
 }
 
 /// The module the build runs to compute some constants.

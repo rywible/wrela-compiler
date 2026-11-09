@@ -101,6 +101,9 @@ pub struct PipelineOut {
     /// What its entry points compute in every invocation, more than [`MOST_SAME_WORK`] work of
     /// a value the same for all of them (§18.13): a shipped build's E0712.
     pub same: Vec<ir::same::SameWork>,
+    /// For each entry point, the calls it makes with few numbers that vary, all else alike,
+    /// costliest first (`ir::same::few_input_calls`, §18.13): what a table could replace.
+    pub few: Vec<Vec<ir::same::FewInputs>>,
     /// The pipeline of its entry point's `@standin` (§18.12): what the browser runs in its
     /// place until it's built.
     pub standin: Option<u32>,
@@ -3020,7 +3023,7 @@ fn lower_compute(cx: &mut Cx, iface: Rc<Interface>, consts: Vec<ir::Const>) -> O
         function: entry,
         inputs,
     });
-    let (work, unbounded, weight, same) = verify(cx, &mut mb, name)?;
+    let (work, unbounded, weight, same, few) = verify(cx, &mut mb, name)?;
     non_filtering(&mb.m, &mut bindings);
     let instances = mb.fn_instances();
     Some(PipelineOut {
@@ -3043,6 +3046,7 @@ fn lower_compute(cx: &mut Cx, iface: Rc<Interface>, consts: Vec<ir::Const>) -> O
         unbounded,
         weight,
         same,
+        few,
         standin: None,
         stands_in: false,
     })
@@ -3109,7 +3113,7 @@ fn lower_render(cx: &mut Cx, iface: Rc<Interface>, consts: Vec<ir::Const>) -> Op
         inputs: finputs,
     });
     let name = format!("{}_{}", ir::ident(&vdef.name), ir::ident(&fdef.name));
-    let (work, unbounded, weight, same) = verify(cx, &mut mb, &name)?;
+    let (work, unbounded, weight, same, few) = verify(cx, &mut mb, &name)?;
     non_filtering(&mb.m, &mut bindings);
     let instances = mb.fn_instances();
     Some(PipelineOut {
@@ -3132,6 +3136,7 @@ fn lower_render(cx: &mut Cx, iface: Rc<Interface>, consts: Vec<ir::Const>) -> Op
         unbounded,
         weight,
         same,
+        few,
         standin: None,
         stands_in: false,
     })
@@ -3483,8 +3488,15 @@ pub(crate) fn debug_checks(cx: &mut Cx, out: &mut PipelineOut, code: u32) {
 }
 
 /// A pipeline's counts (§18.11): each entry point's work and the loop that leaves it unbounded,
-/// its weight, and the work its invocations do alike (§18.13).
-type Counts = (Vec<Option<u64>>, Vec<Option<Span>>, u64, Vec<ir::same::SameWork>);
+/// its weight, the work its invocations do alike (§18.13), and the calls they make with few
+/// numbers that vary.
+type Counts = (
+    Vec<Option<u64>>,
+    Vec<Option<Span>>,
+    u64,
+    Vec<ir::same::SameWork>,
+    Vec<Vec<ir::same::FewInputs>>,
+);
 
 /// Checks a pipeline's module and, if it'll be emitted, flattens it (`ir::opt::flatten_gpu`)
 /// and lays out its memory as the CPU's (`ir::gpu_memory`).
@@ -3497,6 +3509,7 @@ fn verify(cx: &mut Cx, mb: &mut ModuleBuilder, name: &str) -> Option<Counts> {
     let (mut work, mut unbounded) = (Vec::new(), Vec::new());
     let mut weight = 0u64;
     let mut same = Vec::new();
+    let mut few = Vec::new();
     if checked.is_ok() {
         for e in &mb.m.entry_points {
             weight = weight.saturating_add(ir::work::weight(&mb.m, e.function));
@@ -3508,6 +3521,9 @@ fn verify(cx: &mut Cx, mb: &mut ModuleBuilder, name: &str) -> Option<Counts> {
                     over_weight_budget(cx, &f.name, w, most, at);
                 }
             }
+        }
+        if cx.data.few {
+            few = ir::same::few_input_calls(&mb.m, FEW_INPUTS_LEAST);
         }
         let (each, breaches) = ir::work::module_work(&mb.m);
         for b in &breaches {
@@ -3544,7 +3560,7 @@ fn verify(cx: &mut Cx, mb: &mut ModuleBuilder, name: &str) -> Option<Counts> {
     if wrela_diag::has_errors(&cx.diags) {
         return None;
     }
-    Some((work, unbounded, weight, same))
+    Some((work, unbounded, weight, same, few))
 }
 
 /// A flattened module's weight (§18.11): its entry points' statements with each call to a
@@ -3556,6 +3572,10 @@ fn written_weight(m: &ir::Module) -> u64 {
 /// The most work a shipped build's GPU code may do, each invocation again, to compute one value
 /// the same for every invocation (§18.13): E0712 past it.
 pub const MOST_SAME_WORK: u64 = 256;
+
+/// The least work an invocation's calls to one function, with few numbers that vary, must do
+/// for `wrela pipelines` to show them (§18.13): a table read costs about 20.
+pub const FEW_INPUTS_LEAST: u64 = 100;
 
 /// E0710 for a function's weight over its `@budget(weight: n)` (§18.11), once.
 fn over_weight_budget(cx: &mut Cx, name: &str, w: u64, most: u64, at: Span) {

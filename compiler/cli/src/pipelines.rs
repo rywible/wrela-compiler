@@ -99,10 +99,45 @@ pub fn text(pipelines: &[PipelineSummary]) -> String {
                     .collect::<Vec<_>>()
                     .join(", ")
             ));
+            s.push_str(&few_text(p));
         }
     }
     s
 }
+
+/// Each entry point's calls with few numbers that vary (§18.13), one line each, under the
+/// pipeline: what a table over those numbers could replace.
+fn few_text(p: &PipelineSummary) -> String {
+    let mut s = String::new();
+    for (i, calls) in p.few.iter().enumerate() {
+        for c in calls.iter().take(FEW_SHOWN) {
+            let work = c.work.map_or_else(|| "unbounded".to_string(), |w| w.to_string());
+            let times =
+                if c.calls == 1 { "once".to_string() } else { format!("{} times", c.calls) };
+            let of = if p.few.len() > 1 {
+                format!(" ({})", p.names.get(i).map_or("", |n| n.as_str()))
+            } else {
+                String::new()
+            };
+            let at = if c.at.is_empty() { String::new() } else { format!(", first at {}", c.at) };
+            s.push_str(&format!(
+                "    `{}`{of}: {times} an invocation, {} varying, work {work}{at}\n",
+                c.function,
+                crate::count(c.varying as usize, "number", "numbers"),
+            ));
+        }
+        if calls.len() > FEW_SHOWN {
+            s.push_str(&format!(
+                "    and {} more (`--json` lists them)\n",
+                calls.len() - FEW_SHOWN
+            ));
+        }
+    }
+    s
+}
+
+/// The most of an entry point's calls with few varying numbers the report shows.
+const FEW_SHOWN: usize = 6;
 
 /// The report as JSON, for tools: `{"pipelines": [...], "entry_points": [...]}`.
 pub fn json(pipelines: &[PipelineSummary]) -> String {
@@ -113,7 +148,7 @@ pub fn json(pipelines: &[PipelineSummary]) -> String {
         .iter()
         .map(|p| {
             format!(
-                "{{\"kind\": {}, \"entries\": {}, \"sites\": {}, \"conditional\": [{}], \"tier\": {}{}, \"work\": [{}], \"weight\": {}{}}}",
+                "{{\"kind\": {}, \"entries\": {}, \"sites\": {}, \"conditional\": [{}], \"tier\": {}{}, \"work\": [{}], \"weight\": {}{}{}}}",
                 q(p.kind),
                 list(&p.entries),
                 list(&p.sites),
@@ -130,6 +165,32 @@ pub fn json(pipelines: &[PipelineSummary]) -> String {
                     (Some(j), _) => format!(", \"standin\": {j}"),
                     (None, true) => ", \"stands_in\": true".to_string(),
                     _ => String::new(),
+                },
+                if p.few.iter().all(|c| c.is_empty()) {
+                    String::new()
+                } else {
+                    format!(
+                        ", \"few\": [{}]",
+                        p.few
+                            .iter()
+                            .map(|calls| format!(
+                                "[{}]",
+                                calls
+                                    .iter()
+                                    .map(|c| format!(
+                                        "{{\"function\": {}, \"varying\": {}, \"calls\": {}, \"work\": {}, \"at\": {}}}",
+                                        q(&c.function),
+                                        c.varying,
+                                        c.calls,
+                                        c.work.map_or_else(|| "null".to_string(), |w| w.to_string()),
+                                        q(&c.at)
+                                    ))
+                                    .collect::<Vec<_>>()
+                                    .join(", ")
+                            ))
+                            .collect::<Vec<_>>()
+                            .join(", ")
+                    )
                 }
             )
         })
@@ -159,6 +220,7 @@ mod tests {
             unbounded: Vec::new(),
             standin: None,
             stands_in: false,
+            few: Vec::new(),
         };
         assert!(text(std::slice::from_ref(&p)).contains("at main.wrela:3:5, main.wrela:9:5\n"));
         let p = PipelineSummary { conditional: vec![false, true], ..p };
@@ -170,6 +232,27 @@ mod tests {
         // Every site under a condition: tier 1.
         let p = PipelineSummary { conditional: vec![true, true], ..p };
         assert!(text(std::slice::from_ref(&p)).contains("  fill (compute, tier 1), dispatched at"));
-        assert!(json(&[p]).contains("\"tier\": 1"));
+        assert!(json(std::slice::from_ref(&p)).contains("\"tier\": 1"));
+        assert!(!json(std::slice::from_ref(&p)).contains("\"few\""));
+        // Its calls with few varying numbers, under it.
+        let sky = wrela_driver::FewCall {
+            function: "sky".into(),
+            varying: 3,
+            calls: 4,
+            work: Some(1600),
+            at: "main.wrela:7:9".into(),
+        };
+        let p = PipelineSummary { few: vec![vec![sky; 8]], ..p };
+        let t = text(std::slice::from_ref(&p));
+        assert!(
+            t.contains(
+                "    `sky`: 4 times an invocation, 3 numbers varying, work 1600, first at main.wrela:7:9\n"
+            ),
+            "{t}"
+        );
+        assert!(t.contains("    and 2 more (`--json` lists them)\n"), "{t}");
+        assert!(json(&[p]).contains(
+            "\"few\": [[{\"function\": \"sky\", \"varying\": 3, \"calls\": 4, \"work\": 1600, \"at\": \"main.wrela:7:9\"}"
+        ));
     }
 }
