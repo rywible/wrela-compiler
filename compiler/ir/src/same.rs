@@ -341,9 +341,11 @@ impl Sites<'_> {
         // a computation together than apart.
         // The same values computed only from constants and loops' counters: through pure
         // operations, and locals whose every store is of such a value, at such indices, under
-        // such conditions only, in loops left on such conditions only. They're the loop's own
-        // structure (`(f32(i) + 1.0) / f32(steps)`): computed from nothing the command gives,
-        // so nothing to compute once and pass in (§18.13). Not counted.
+        // such conditions only, in loops left on such conditions only (conditions since the
+        // block the local lives in alone was entered: what led there doesn't change what it
+        // holds). They're the loop's own structure (`(f32(i) + 1.0) / f32(steps)`): computed
+        // from nothing the command gives, so nothing to compute once and pass in (§18.13).
+        // Not counted.
         let fixed = fixed_values(f, &def);
         let mut cost: std::collections::HashMap<ValueId, Option<u64>> =
             std::collections::HashMap::new();
@@ -987,40 +989,78 @@ fn local_stores(f: &Function) -> (Vec<LocalStore>, HashSet<LocalId>) {
             }
         }
     }
-    fn walk(b: &[Stmt], on: &mut Vec<ValueId>, out: &mut Vec<LocalStore>) {
+    // The locals that live in `b` alone: every mention of one (`mentions`, the function's) is
+    // in `b` or nested in it, and the first statement of `b` to mention it sets the whole of
+    // it. Whenever `b` is entered such a local starts afresh, so what it holds there doesn't
+    // depend on what led to `b`.
+    fn own(b: &[Stmt], mentions: &[u32]) -> Vec<LocalId> {
+        // By local: whether its first mention sets the whole of it, and its mentions.
+        let mut here: std::collections::HashMap<LocalId, (bool, u32)> = Default::default();
+        for s in b {
+            let whole = match s {
+                Stmt::Store(p, _) if p.path.is_empty() => p.root_local(),
+                _ => None,
+            };
+            visit::walk(std::slice::from_ref(s), &mut |t| {
+                t.for_each_place(&mut |p| {
+                    if let Some(l) = p.root_local() {
+                        here.entry(l).or_insert((whole == Some(l), 0)).1 += 1;
+                    }
+                })
+            });
+        }
+        here.into_iter()
+            .filter(|&(l, (set, n))| set && n == mentions[l.index()])
+            .map(|(l, _)| l)
+            .collect()
+    }
+    struct Walk<'a> {
+        mentions: &'a [u32],
+        // By local: how many of the conditions leading to the innermost block it lives in
+        // alone (`own`) there are. A store to it doesn't depend on those.
+        led: Vec<usize>,
+        out: Vec<LocalStore>,
+    }
+    fn walk(b: &[Stmt], on: &mut Vec<ValueId>, w: &mut Walk) {
+        for l in own(b, w.mentions) {
+            w.led[l.index()] = on.len();
+        }
         for s in b {
             match s {
                 Stmt::If { cond, then, else_ } => {
                     on.push(*cond);
-                    walk(then, on, out);
-                    walk(else_, on, out);
+                    walk(then, on, w);
+                    walk(else_, on, w);
                     on.pop();
                 }
                 Stmt::Loop { body, continuing } => {
                     let n = on.len();
                     exits(body, on);
                     exits(continuing, on);
-                    walk(body, on, out);
-                    walk(continuing, on, out);
+                    walk(body, on, w);
+                    walk(continuing, on, w);
                     on.truncate(n);
                 }
                 Stmt::Store(p, v) => {
                     if let PlaceRoot::Local(l) = p.root {
-                        let mut deps = on.clone();
+                        let mut deps = on[w.led[l.index()]..].to_vec();
                         for q in &p.path {
                             if let crate::Proj::Index(i) = q {
                                 deps.push(*i);
                             }
                         }
-                        out.push(LocalStore { local: l, value: *v, on: deps });
+                        w.out.push(LocalStore { local: l, value: *v, on: deps });
                     }
                 }
                 _ => {}
             }
         }
     }
-    let mut stores = Vec::new();
-    walk(&f.body, &mut Vec::new(), &mut stores);
+    let mut mentions = vec![0; f.locals.len()];
+    visit::count_local_mentions(&f.body, &mut mentions);
+    let mut w = Walk { mentions: &mentions, led: vec![0; f.locals.len()], out: Vec::new() };
+    walk(&f.body, &mut Vec::new(), &mut w);
+    let stores = w.out;
     let mut reached: HashSet<LocalId> = HashSet::new();
     visit::walk(&f.body, &mut |s| {
         let (Stmt::Let(_, e) | Stmt::Eval(e)) = s else { return };
@@ -1045,7 +1085,9 @@ fn local_stores(f: &Function) -> (Vec<LocalStore>, HashSet<LocalId>) {
 }
 
 /// A store to a local, with the values it depends on beyond the one stored: its indices, the
-/// conditions of the branches it's in, and those of the exits of the loops it's in.
+/// conditions of the branches it's in, and those of the exits of the loops it's in. Not the
+/// conditions that lead to a block the local lives in alone (`local_stores`' `own`): a loop
+/// under `if r.learned != 0 { .. }` counts as it would outside.
 struct LocalStore {
     local: LocalId,
     value: ValueId,

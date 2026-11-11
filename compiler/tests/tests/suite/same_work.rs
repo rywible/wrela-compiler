@@ -77,9 +77,17 @@ fn chain(start: &str) -> String {
     body
 }
 
-/// A shipped build's E0712s (a check or a test's build reports none, as E0707).
+/// A shipped build's E0712s (a check or a test's build reports none, as E0707), its only
+/// errors.
 fn e0712(dir: &std::path::Path) -> Vec<String> {
     let out = wrela_driver::build(dir);
+    let others: Vec<_> = out
+        .diagnostics
+        .iter()
+        .filter(|d| d.is_error() && d.code != wrela_diag::codes::E0712)
+        .map(|d| &d.message)
+        .collect();
+    assert!(others.is_empty(), "{others:?}");
     out.diagnostics
         .iter()
         .filter(|d| d.code == wrela_diag::codes::E0712)
@@ -162,6 +170,53 @@ fn a_loop_s_counter_is_its_structure_unless_a_uniform_bounds_or_indexes_it() {
     let indexed =
         format!("    var t = [0.0, 0.0, 0.0, 0.0]\n    t[i32(g.u) % 4] = 1.0\n{}", chain("t[0]"));
     assert_eq!(e0712(&kernel("same_indexed", 64, &indexed)).len(), 1);
+}
+
+/// A program of one kernel given a uniform `u: f32` and a table `w`, computing `out[id]` with
+/// `body` (which has `x`, the invocation's own `f32`).
+fn table_kernel(name: &str, body: &str) -> std::path::PathBuf {
+    let dir = scratch(name);
+    let src = format!(
+        "use std::gpu::{{GlobalId, GpuBuffer, Slots, buffer, dispatch}}
+
+struct Given: Copy + GpuData {{
+    u: f32,
+}}
+
+@compute(64)
+fn k(g: Given, w: [f32], out: mut Slots<f32>, id: GlobalId) {{
+    let x = f32(id.x)
+{body}
+}}
+
+pub fn frame(time: f32, width: u32, height: u32) {{
+    let w: GpuBuffer<f32> = buffer(1024)
+    var out: GpuBuffer<f32> = buffer(64)
+    dispatch(k.bind(Given {{ u: time }}, w, out: mut out), over: 64)
+}}
+"
+    );
+    write_package(&dir, name, &src);
+    dir
+}
+
+#[test]
+fn a_loop_under_a_uniform_s_branch_counts_as_it_would_outside() {
+    // A table walked by a loop's counters (a net's weights by row and column), the whole loop
+    // run only where the uniform says: the counters are variables of the branch alone, so the
+    // index sums are the loop's structure there as they are outside.
+    let walk = "        for r in 0..16 {\n            var s = w[640 + r]\n            for c in 0..40 {\n                s += w[r * 40 + c] * x\n            }\n            acc += max(s, 0.0)\n        }\n";
+    let outside = format!("    var acc = 0.0\n{walk}    out[id] = acc");
+    let inside = format!("    var acc = 0.0\n    if g.u > 0.5 {{\n{walk}    }}\n    out[id] = acc");
+    assert_eq!(e0712(&table_kernel("same_walk", &outside)), Vec::<String>::new());
+    assert_eq!(e0712(&table_kernel("same_walk_switched", &inside)), Vec::<String>::new());
+    // A variable from outside the branch that counts the passes the uniform lets through:
+    // what it holds is the uniform's to say, and the rounds from it are counted.
+    let let_through = format!(
+        "    var s = 0.0\n    for i in 0..4 {{\n        if g.u > f32(i) {{\n            s = s + 1.0\n        }}\n    }}\n{}",
+        chain("s")
+    );
+    assert_eq!(e0712(&kernel("same_let_through", 64, &let_through)).len(), 1);
 }
 
 /// A kernel whose invocations call `sky` (40 rounds of math) with a direction read from a

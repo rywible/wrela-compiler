@@ -3,6 +3,14 @@
 Each release's changes a program or a tool can see. The pull request of each release holds the
 detail; `docs/release.md` says how a release is cut.
 
+## 0.31.2
+
+- E0712 (language.md §18.13) no longer counts a loop's counter math when the whole loop is under
+  a branch the command chooses (`if r.learned != 0 { .. }` round a net walking its weights,
+  `w[first + r * inputs + c]`): a counter that is a variable of that branch alone is the loop's
+  structure there as it is outside. A variable from outside the branch that the branch sets is
+  still the command's to say, and counted.
+
 ## 0.31.1
 
 - A borrow struct that is a temporary (a call's result, or written out where it's used) reads
