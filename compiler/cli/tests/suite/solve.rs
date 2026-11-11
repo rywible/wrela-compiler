@@ -20,6 +20,50 @@ pub fn miss() -> f32 {
 }
 ";
 
+const MISSES: &str = "use std::field::{Surface, sphere}
+
+/// The ball's radius, and where it sits.
+pub const R: f32 = 0.50
+pub const AT: vec3 = vec3(0.0, 0.3, 0.0)
+
+/// How far the ball's surface is from each of four points.
+pub fn misses() -> [f32; 4] {
+    let b = sphere(R).translate(AT)
+    [
+        b.distance(vec3(0.9, 0.3, 0.0)),
+        b.distance(vec3(0.0, 1.0, 0.0)),
+        b.distance(vec3(-0.2, 0.5, 0.6)),
+        b.distance(vec3(0.1, -0.4, -0.3)),
+    ]
+}
+";
+
+/// A least-squares fit (`--fit`): the function gives each point's miss, and Levenberg–Marquardt
+/// brings the sum of their squares down in a few steps.
+#[test]
+fn a_fit_is_solved_by_least_squares_in_a_few_steps() {
+    let dir = common::package(
+        "solve-ball-fit",
+        &[
+            ("wrela.toml", &common::manifest("ball")),
+            ("fit.wrela", MISSES),
+            ("main.wrela", common::FRAME),
+        ],
+    );
+    let a = common::answer(common::wrela().arg("solve").arg(&dir).args([
+        "--fit",
+        "fit::misses",
+        "--free",
+        "fit.wrela:4-5",
+        "--json",
+    ]));
+    let (before, after) = (a["loss_before"].as_f64().unwrap(), a["loss_after"].as_f64().unwrap());
+    assert!(before > 0.1 && after < 1e-3, "{a}");
+    assert_eq!(a["fit"], true, "{a}");
+    assert!(a["steps"].as_u64().unwrap() <= 12, "a fit of four literals takes a few steps: {a}");
+    assert_eq!(a["literals"].as_array().unwrap().len(), 4, "R and AT's three: {a}");
+}
+
 fn package() -> PathBuf {
     common::package(
         "solve-ball",

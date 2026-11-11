@@ -1,5 +1,7 @@
 //! Parameter gradients (language.md §23): how a function's value changes with a lifted build's
-//! literals, by the same forward-mode derivation as `gradient` (§14).
+//! literals, by the same forward-mode derivation as `gradient` (§14). The value is an `f32`
+//! (`std::lift::gradient`) or any value a derivation carries tangents of, such as an array of
+//! `f32` (`std::lift::jacobian`): each literal's derivative is a value of the same type.
 //!
 //! A lifted literal is a read of the program's table (`Load(table[i])`), deep in whatever code
 //! reads it. The derivation makes the table an input: each function the derived one reaches
@@ -13,9 +15,9 @@
 use super::*;
 
 /// A function of `f`'s parameters (its captures) and `which` (`[Literal; N]`, each a struct
-/// whose first field is its index in `table`), returning `ret`, `(f32, [f32; N])`: `f`'s value
-/// and its derivative by each of the `N` literals. Without a table (a build that isn't lifted),
-/// or where `f` reads none, every derivative is 0.
+/// whose first field is its index in `table`), returning `ret`, `(R, [R; N])` for `f`'s result
+/// type `R`: `f`'s value and its derivative by each of the `N` literals. Without a table (a
+/// build that isn't lifted), or where `f` reads none, every derivative is 0.
 pub fn literal_gradient(
     m: &mut Module,
     cache: &mut DeriveCache,
@@ -35,13 +37,16 @@ pub fn literal_gradient(
         ));
     }
     let func = m.functions[f.index()].clone_signature();
-    if func.ret != Some(m.types.f32()) || func.ret_ref {
-        return Err(Error::not_derivable(
-            "a parameter gradient needs a function that returns an `f32`",
-        ));
-    }
+    let value_t = match func.ret {
+        Some(r) if !func.ret_ref => r,
+        _ => {
+            return Err(Error::not_derivable(
+                "a parameter gradient needs a function that returns a value",
+            ));
+        }
+    };
     let f32_t = m.types.f32();
-    let grads_t = m.types.intern(TypeDef::Array(f32_t, n));
+    let grads_t = m.types.intern(TypeDef::Array(value_t, n));
     // What reads the table, and the copies that take it.
     let readers = match table {
         Some(t) => readers(m, f, t),
@@ -52,7 +57,7 @@ pub fn literal_gradient(
     w.params.push(Param::value("which", which_ty));
     let mut body = Vec::new();
     let args: Vec<Arg> = (0..func.params.len() as u32).map(|i| w.param_arg(i, &mut body)).collect();
-    let zero = w.let_(&mut body, f32_t, Expr::Const(Const::F32(0.0)));
+    let zero = w.let_(&mut body, value_t, Expr::Zero(value_t));
     let (value, grads) = match (table, readers.get(&f)) {
         (Some(table), Some(&copy)) if n > 0 => {
             let table_t = m.data[table.index()].ty;
@@ -80,16 +85,16 @@ pub fn literal_gradient(
                 .ok_or_else(|| Error::internal("a derived function returns nothing"))?;
             let r = w.let_(&mut body, dual, Expr::Call(d, args));
             if returns {
-                let v = w.let_(&mut body, f32_t, Expr::Extract(r, 0));
+                let v = w.let_(&mut body, value_t, Expr::Extract(r, 0));
                 let ds =
-                    (0..n).map(|k| w.let_(&mut body, f32_t, Expr::Extract(r, 1 + k))).collect();
+                    (0..n).map(|k| w.let_(&mut body, value_t, Expr::Extract(r, 1 + k))).collect();
                 (v, ds)
             } else {
                 (r, vec![zero; n as usize])
             }
         }
         _ => {
-            let v = w.let_(&mut body, f32_t, Expr::Call(f, args));
+            let v = w.let_(&mut body, value_t, Expr::Call(f, args));
             (v, vec![zero; n as usize])
         }
     };

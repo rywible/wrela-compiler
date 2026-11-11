@@ -1398,6 +1398,7 @@ pub(crate) fn intrinsic(
         }
         Some(
             l @ (Lang::LiftGradient
+            | Lang::LiftJacobian
             | Lang::LiftReads
             | Lang::LiftCount
             | Lang::LiftValue
@@ -1416,7 +1417,7 @@ pub(crate) fn intrinsic(
                 ));
                 return None;
             }
-            if matches!(l, Lang::LiftGradient | Lang::LiftReads) {
+            if matches!(l, Lang::LiftGradient | Lang::LiftJacobian | Lang::LiftReads) {
                 return crate::derive::call(fl, l, substs, c, ty);
             }
             return crate::lift::intrinsic(fl, l, c, ty);

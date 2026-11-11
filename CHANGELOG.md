@@ -3,6 +3,19 @@
 Each release's changes a program or a tool can see. The pull request of each release holds the
 detail; `docs/release.md` says how a release is cut.
 
+## Unreleased
+
+- **Least-squares fits** (language.md §23): `wrela solve <package> --fit <module>::<function>`
+  makes the sum of the squares of the numbers a function gives (`fn() -> [f32; M]`: how far each
+  of `M` things misses) as small as it gets, by Levenberg–Marquardt (`std::lift::Minimize::fit`).
+  A fit that `--minimize` took hundreds of BFGS steps over takes a dozen or so.
+- **`std::lift::jacobian(f, which)`**: `gradient` of a function that gives more than one number.
+  It gives `f`'s value, and for each literal of `which` how every part of the value changes with
+  it, from one derived evaluation.
+- **`wrela solve` rounds all the literals at once** where that costs no more than 5% of the
+  solved value, and only otherwise one at a time with the rest solved again. A solve of many
+  literals spent most of its time in those solves.
+
 ## 0.31.2
 
 - E0712 (language.md §18.13) no longer counts a loop's counter math when the whole loop is under

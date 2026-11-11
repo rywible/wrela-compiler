@@ -571,7 +571,8 @@ fn derived_callables(p: &Program, f: FnId, body: &Body) -> Vec<(BodyId, Span)> {
                     | Lang::TapeOf
                     | Lang::TapeWith
                     | Lang::TapeSized
-                    | Lang::LiftGradient,
+                    | Lang::LiftGradient
+                    | Lang::LiftJacobian,
             )
         );
         if derived
