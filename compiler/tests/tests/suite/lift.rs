@@ -263,6 +263,26 @@ fn several_literals_derived_at_once_each_get_their_own() {
 }
 
 #[test]
+fn a_jacobian_gives_each_number_its_own_derivative() {
+    let dir = built("lift-jacobian", true);
+    let mut host = CpuHost::load(&dir).expect("load");
+    let n = one_u32(&mut host, "literals", &[]);
+    for k in 0..32 {
+        let p = sample(&mut host, k);
+        let i = (k * 7) % n;
+        let at = |q: [f32; 3]| {
+            [Value::F32(q[0]), Value::F32(q[1]), Value::F32(q[2]), Value::I32(i as i32)]
+        };
+        let three = host.call_export("derivatives_of3", &at(p)).expect("derivatives_of3");
+        let points = [p, [p[0] + 0.1, p[1], p[2]], [p[0], p[1] + 0.1, p[2]]];
+        for (j, d) in three.iter().enumerate() {
+            let one = one_f32(&mut host, "derivative", &at(points[j]));
+            assert_eq!(*d, Value::F32(one), "literal {i} at {:?}", points[j]);
+        }
+    }
+}
+
+#[test]
 fn a_normal_build_has_no_literals_and_no_derivatives() {
     let mut host = CpuHost::load(built("lift-none", false)).expect("load");
     assert_eq!(one_u32(&mut host, "literals", &[]), 0);

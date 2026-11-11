@@ -23,7 +23,7 @@ pub(crate) fn call(
         Lang::IntervalOf => DeriveKind::Interval,
         Lang::Precision => DeriveKind::Precision,
         Lang::Filtered => DeriveKind::Filtered,
-        Lang::LiftGradient => DeriveKind::Literals,
+        Lang::LiftGradient | Lang::LiftJacobian => DeriveKind::Literals,
         Lang::LiftReads => DeriveKind::Reads,
         Lang::TapeOf | Lang::TapeWith | Lang::TapeSized => DeriveKind::Tape,
         _ => DeriveKind::ValueAndGradient,

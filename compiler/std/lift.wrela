@@ -105,6 +105,13 @@ pub fn file_hash(i: u32) -> Text {
 @intrinsic
 pub fn gradient<const N: u32>(f: fn() -> f32, which: [Literal; N]) -> (f32, [f32; N]) {}
 
+/// `gradient` of a function that gives more than one number (an array of `f32`, a vector, a
+/// struct of them): what `f` gives, and for each literal of `which`, in order, how every part of
+/// it changes with that literal, as a value of the same type. One derived evaluation gives all of
+/// them, where a `gradient` of each part would run `f` again for each.
+@intrinsic
+pub fn jacobian<const N: u32, R>(f: fn() -> R, which: [Literal; N]) -> (R, [R; N]) {}
+
 /// The literals `f`'s code can read, through everything it calls on the CPU, in index order:
 /// those that can change what it gives. (GPU work it records reads its own literals when it
 /// runs.)
@@ -273,12 +280,18 @@ impl Checks for Report {
 // ---- minimizing (`wrela solve`) ---------------------------------------------------------------
 
 /// A function of the literals made as small as it gets by changing some of them (`wrela solve`,
-/// §23): BFGS from their values now, each step along a line searched until the value falls
-/// enough (Armijo's rule), the derivatives from `gradient`, 16 literals at a time. Then each is
-/// rounded to its source's decimals, the one that changed most first and the rest solved again
-/// with it held; a literal gets more decimals while rounding would cost more than 5% of the
-/// value (the last one, against the solved value; each before it, up to three more, against the
-/// value before rounding it).
+/// §23), from their values now:
+/// - `run`, any function: BFGS, each step along a line searched until the value falls enough
+///   (Armijo's rule), the derivatives from `gradient`, 16 literals at a time.
+/// - `fit`, a sum of squares (the function gives the numbers squared): Levenberg–Marquardt, the
+///   derivatives of every number from `jacobian`, 16 literals at a time. Each step has what BFGS
+///   learns over many, so it takes far fewer.
+///
+/// Then the literals are rounded to their sources' decimals: all at once where that costs no
+/// more than 5% of the solved value; else one at a time, the one that changed most first and
+/// the rest solved again with it held, a literal getting more decimals while rounding would
+/// cost more than 5% of the value (the last one, against the solved value; each before it, up
+/// to three more, against the value before rounding it).
 pub struct Minimize {
     free: Vec<Literal>,
     decimals: Vec<u32>,
@@ -330,26 +343,74 @@ impl Minimize {
         )
         self.steps = taken
         self.solved = f32(loss_at(self.free, f, x))
-        self.finish = if exact { take x } else { self.rounded(f, x, steps) }
+        self.finish = if exact { take x } else {
+            round_solution(
+                self.free,
+                self.start,
+                self.decimals,
+                self.units,
+                solved: f64(self.solved),
+                solved_x: x,
+                steps: steps,
+                f: f,
+                numbers: || [0.0],
+                fit: false,
+            )
+        }
         self.after = f32(loss_at(self.free, f, self.finish))
     }
 
-    /// `f` at the literals' values before.
+    /// Makes the sum of the squares of the numbers `f` gives as small as it gets over the free
+    /// literals (a least-squares fit: each number is how far something misses), in `steps`
+    /// steps of Levenberg–Marquardt at most, then rounds them to their decimals unless `exact`.
+    /// The literals are left where it ends. `before`, `solved` and `after` are that sum.
+    pub fn fit<const M: u32>(mut self, f: fn() -> [f32; M], steps: u32, exact: bool) {
+        let n = self.free.len()
+        self.start = Vec::from_fn(n, |i| self.free[i].value())
+        self.before = f32(squares_at(self.free, f, self.start))
+        let (x, taken) = least_squares(
+            self.free,
+            f,
+            self.start,
+            moves: Vec::filled(n, value: true),
+            steps: steps,
+        )
+        self.steps = taken
+        self.solved = f32(squares_at(self.free, f, x))
+        self.finish = if exact { take x } else {
+            round_solution(
+                self.free,
+                self.start,
+                self.decimals,
+                self.units,
+                solved: f64(self.solved),
+                solved_x: x,
+                steps: steps,
+                f: || 0.0,
+                numbers: f,
+                fit: true,
+            )
+        }
+        self.after = f32(squares_at(self.free, f, self.finish))
+    }
+
+    /// What was made small (`f`'s value, or a fit's sum of squares) at the literals' values
+    /// before.
     pub fn before(self) -> f32 {
         self.before
     }
 
-    /// `f` where BFGS stopped, before rounding.
+    /// It where the solve stopped, before rounding.
     pub fn solved(self) -> f32 {
         self.solved
     }
 
-    /// `f` where it ended, rounded.
+    /// It where the solve ended, rounded.
     pub fn after(self) -> f32 {
         self.after
     }
 
-    /// The steps BFGS took before rounding.
+    /// The steps the solve took before rounding.
     pub fn steps(self) -> u32 {
         self.steps
     }
@@ -363,65 +424,114 @@ impl Minimize {
     pub fn finish(self, i: u32) -> f32 {
         self.finish[i]
     }
+}
 
-    /// The solution `x` rounded, a literal at a time.
-    fn rounded(self, f: fn() -> f32, solved_x: [f32], steps: u32) -> Vec<f32> {
-        let n = solved_x.len()
-        borrow start = self.start
-        var x = Vec::from(solved_x)
-        // A literal the solve didn't move keeps its value.
-        var held = Vec::from_fn(n, |i| {
-            abs(f64(x[i]) - f64(start[i])) <= 1.0e-7 * max(abs(f64(start[i])), 1.0)
-        })
-        var left = 0
+/// What a solve makes small, with the literals `free` set to `x`: `f`'s value, or for a `fit`
+/// the sum of the squares of `numbers`'. (Both are passed, since a closure can't hold either:
+/// the one that isn't the solve's is never called.)
+fn value_at<const M: u32>(
+    free: [Literal],
+    x: [f32],
+    f: fn() -> f32,
+    numbers: fn() -> [f32; M],
+    fit: bool,
+) -> f64 {
+    if fit { squares_at(free, numbers, x) } else { loss_at(free, f, x) }
+}
+
+/// The solve again from `x`, over the literals `moves` lets change: where it stops.
+fn solved_again<const M: u32>(
+    free: [Literal],
+    x: [f32],
+    moves: [bool],
+    steps: u32,
+    f: fn() -> f32,
+    numbers: fn() -> [f32; M],
+    fit: bool,
+) -> Vec<f32> {
+    if fit {
+        let (again, _) = least_squares(free, numbers, x, moves, steps)
+        take again
+    } else {
+        let (again, _) = bfgs(free, f, x, moves, steps)
+        take again
+    }
+}
+
+/// The solution `solved_x` (whose value is `solved`) rounded to the literals' `decimals` of
+/// their `units`. All at once, where that leaves the value within `rounding_limit` of `solved`:
+/// one evaluation. Else a literal at a time, as `Minimize` says, the rest solved again each
+/// time (`value_at`'s `f`, `numbers` and `fit` say what is solved).
+fn round_solution<const M: u32>(
+    free: [Literal],
+    start: [f32],
+    decimals: [u32],
+    units: [f64],
+    solved: f64,
+    solved_x: [f32],
+    steps: u32,
+    f: fn() -> f32,
+    numbers: fn() -> [f32; M],
+    fit: bool,
+) -> Vec<f32> {
+    let n = solved_x.len()
+    var x = Vec::from(solved_x)
+    // A literal the solve didn't move keeps its value.
+    var held = Vec::from_fn(n, |i| {
+        abs(f64(x[i]) - f64(start[i])) <= 1.0e-7 * max(abs(f64(start[i])), 1.0)
+    })
+    var left = 0
+    for i in 0..n {
+        if held[i] {
+            x[i] = start[i]
+        } else {
+            left += 1
+        }
+    }
+    let all: Vec<f32> = Vec::from_fn(n, |i| {
+        if held[i] { x[i] } else { round_to(x[i], decimals[i], units[i]) }
+    })
+    if value_at(free, all, f, numbers, fit) <= rounding_limit(solved) {
+        return all
+    }
+    while left > 0 {
+        left -= 1
+        // The one that changed most (the last of those that changed as much).
+        var k = n
         for i in 0..n {
-            if held[i] {
-                x[i] = start[i]
-            } else {
-                left += 1
+            let change = abs(f64(x[i]) - f64(start[i]))
+            if !held[i] && (k == n || change >= abs(f64(x[k]) - f64(start[k]))) {
+                k = i
             }
         }
-        let solved = f64(self.solved)
-        while left > 0 {
-            left -= 1
-            // The one that changed most (the last of those that changed as much).
-            var k = n
-            for i in 0..n {
-                let change = abs(f64(x[i]) - f64(start[i]))
-                if !held[i] && (k == n || change >= abs(f64(x[k]) - f64(start[k]))) {
-                    k = i
-                }
-            }
-            if k == n {
+        if k == n {
+            break
+        }
+        var d = decimals[k]
+        let unit = units[k]
+        var v = round_to(x[k], d, unit)
+        let (enough, most) = if left == 0 {
+            (rounding_limit(solved), 7)
+        } else {
+            (rounding_limit(value_at(free, x, f, numbers, fit)), min(d + 3, 7))
+        }
+        while d < most {
+            var trial = x.clone()
+            trial[k] = v
+            if value_at(free, trial, f, numbers, fit) <= enough {
                 break
             }
-            var d = self.decimals[k]
-            let unit = self.units[k]
-            var v = round_to(x[k], d, unit)
-            let (enough, most) = if left == 0 {
-                (rounding_limit(solved), 7)
-            } else {
-                (rounding_limit(loss_at(self.free, f, x)), min(d + 3, 7))
-            }
-            while d < most {
-                var trial = x.clone()
-                trial[k] = v
-                if loss_at(self.free, f, trial) <= enough {
-                    break
-                }
-                d += 1
-                v = round_to(x[k], d, unit)
-            }
-            x[k] = v
-            held[k] = true
-            if left > 0 {
-                let moves = Vec::from_fn(n, |i| !held[i])
-                let (again, _) = bfgs(self.free, f, x, moves, steps)
-                x = take again
-            }
+            d += 1
+            v = round_to(x[k], d, unit)
         }
-        x
+        x[k] = v
+        held[k] = true
+        if left > 0 {
+            let moves = Vec::from_fn(n, |i| !held[i])
+            x = solved_again(free, x, moves, steps, f, numbers, fit)
+        }
     }
+    x
 }
 
 /// The largest loss rounding may leave: five percent of the loss's magnitude above it. Using
@@ -557,6 +667,212 @@ fn identity(n: u32) -> Vec<f64> {
     Vec::from_fn(n * n, |k| if k % (n + 1) == 0 { 1.0 } else { 0.0 })
 }
 
+/// The sum of the squares of the numbers `f` gives with the literals `free` set to `x`.
+fn squares_at<const M: u32>(free: [Literal], f: fn() -> [f32; M], x: [f32]) -> f64 {
+    for i in 0..free.len() {
+        free[i].set(x[i])
+    }
+    let r = f()
+    var sum: f64 = 0.0
+    for i in 0..M {
+        sum += f64(r[i]) * f64(r[i])
+    }
+    sum
+}
+
+/// The numbers `f` gives with the literals `free` set to `x`, and each one's derivative by each
+/// literal (`jacobian`, 16 literals at a time), row by row: number `i`'s by literal `k` is at
+/// `i * free.len() + k`, 0 for a literal `moves` holds still.
+fn jacobian_at<const M: u32>(
+    free: [Literal],
+    f: fn() -> [f32; M],
+    x: [f32],
+    moves: [bool],
+) -> (Vec<f64>, Vec<f64>) {
+    for i in 0..free.len() {
+        free[i].set(x[i])
+    }
+    let n = free.len()
+    var r: Vec<f64> = Vec::filled(M, value: 0.0)
+    var j: Vec<f64> = Vec::filled(M * n, value: 0.0)
+    var k = 0
+    while k < n {
+        var which = [free[k]; 16]
+        for c in 1..min(16, n - k) {
+            which[c] = free[k + c]
+        }
+        let (v, d) = jacobian(f, which)
+        if k == 0 {
+            for i in 0..M {
+                r[i] = f64(v[i])
+            }
+        }
+        for c in 0..min(16, n - k) {
+            if moves[k + c] {
+                for i in 0..M {
+                    j[i * n + k + c] = f64(d[c][i])
+                }
+            }
+        }
+        k += 16
+    }
+    (r, j)
+}
+
+/// The step `d` of (A + λ D) d = −g over the literals `live` (0 for the others), `a` the `n` by
+/// `n` matrix A, row-major: by its LDLᵀ factors. D is diagonal: for each literal, the mean of
+/// its own entry of A's diagonal and all the live literals' mean (`least_squares` says why).
+/// Empty where the matrix isn't positive definite as computed, which more damping mends.
+fn damped_step(a: [f64], g: [f64], n: u32, live: [u32], lambda: f64) -> Vec<f64> {
+    let k = live.len()
+    var c: Vec<f64> = Vec::from_fn(k * k, |t| a[live[t / k] * n + live[t % k]])
+    var mean: f64 = 0.0
+    for p in 0..k {
+        mean += c[p * k + p] / f64(k)
+    }
+    for p in 0..k {
+        c[p * k + p] += lambda * 0.5 * (c[p * k + p] + mean)
+    }
+    // A unit lower triangle L below the diagonal, and D on it.
+    for p in 0..k {
+        var dp = c[p * k + p]
+        for t in 0..p {
+            dp -= c[p * k + t] * c[p * k + t] * c[t * k + t]
+        }
+        if !(dp > 0.0) {
+            return Vec::new()
+        }
+        c[p * k + p] = dp
+        for q in p + 1..k {
+            var v = c[q * k + p]
+            for t in 0..p {
+                v -= c[q * k + t] * c[p * k + t] * c[t * k + t]
+            }
+            c[q * k + p] = v / dp
+        }
+    }
+    // L y = −g, then D Lᵀ d = y.
+    var y: Vec<f64> = Vec::filled(k, value: 0.0)
+    for p in 0..k {
+        var v = -g[live[p]]
+        for t in 0..p {
+            v -= c[p * k + t] * y[t]
+        }
+        y[p] = v
+    }
+    var d: Vec<f64> = Vec::filled(n, value: 0.0)
+    var p = k
+    while p > 0 {
+        p -= 1
+        var v = y[p] / c[p * k + p]
+        for t in p + 1..k {
+            v -= c[t * k + p] * d[live[t]]
+        }
+        d[live[p]] = v
+    }
+    d
+}
+
+/// Levenberg–Marquardt from `x0` over the literals `moves` lets change, `steps` steps at most:
+/// where it stopped, and the steps it took. Each step solves the numbers' linear model at `x`
+/// (A = JᵀJ, g = Jᵀr), damped by λ D; a step that doesn't lower the sum is tried again with
+/// four times the damping, and one that does leaves a tenth of it. It stops when a step lowers
+/// the sum by less than a millionth of it, or no damping finds a way down.
+///
+/// D is half Marquardt's damping (each literal's own entry of A's diagonal, so a literal's
+/// units don't matter) and half Levenberg's (one value for all, here the diagonal's mean).
+/// With Marquardt's alone, a literal the numbers barely change with (the angle of a bump that
+/// has no height yet) moves as freely as one they depend on, and settles before the form it
+/// belongs to has: on two fits of a limb's form to a sampled reference, of 72 and of 138
+/// literals, that ended 3% farther from the reference (rms) than with this D, which ended
+/// within 1% of where BFGS did.
+///
+/// K. Levenberg, "A method for the solution of certain non-linear problems in least squares",
+/// Quarterly of Applied Mathematics 2 (1944); D. W. Marquardt, "An algorithm for least-squares
+/// estimation of nonlinear parameters", SIAM Journal 11 (1963).
+fn least_squares<const M: u32>(
+    free: [Literal],
+    f: fn() -> [f32; M],
+    x0: [f32],
+    moves: [bool],
+    steps: u32,
+) -> (Vec<f32>, u32) {
+    let n = x0.len()
+    var x: Vec<f64> = Vec::from_fn(n, |i| f64(x0[i]))
+    var fx = squares_at(free, f, narrowed(x))
+    var lambda: f64 = 1.0e-3
+    var taken = 0
+    for _ in 0..steps {
+        if !(fx - fx == 0.0) {
+            break
+        }
+        let (r, j) = jacobian_at(free, f, narrowed(x), moves)
+        // A's upper triangle and g, a number at a time (most of a row is 0: a number changes
+        // with few literals).
+        var a: Vec<f64> = Vec::filled(n * n, value: 0.0)
+        var g: Vec<f64> = Vec::filled(n, value: 0.0)
+        for i in 0..M {
+            let row = i * n
+            for p in 0..n {
+                let jp = j[row + p]
+                if jp == 0.0 {
+                    continue
+                }
+                g[p] += jp * r[i]
+                for q in p..n {
+                    a[p * n + q] += jp * j[row + q]
+                }
+            }
+        }
+        for p in 0..n {
+            for q in 0..p {
+                a[p * n + q] = a[q * n + p]
+            }
+        }
+        // The literals the numbers change with at all.
+        var most: f64 = 0.0
+        for p in 0..n {
+            most = max(most, a[p * n + p])
+        }
+        var live: Vec<u32> = Vec::new()
+        for p in 0..n {
+            if moves[p] && a[p * n + p] > 1.0e-18 * most {
+                live.push(p)
+            }
+        }
+        if live.len() == 0 {
+            break
+        }
+        var x1: Vec<f64> = Vec::new()
+        var f1: f64 = 0.0
+        for _ in 0..40 {
+            let d = damped_step(a, g, n, live, lambda)
+            if d.len() == n {
+                let trial: Vec<f64> = Vec::from_fn(n, |i| x[i] + d[i])
+                let ft = squares_at(free, f, narrowed(trial))
+                if ft - ft == 0.0 && ft < fx {
+                    x1 = take trial
+                    f1 = ft
+                    break
+                }
+            }
+            lambda *= 4.0
+        }
+        if x1.len() == 0 {
+            break
+        }
+        taken += 1
+        let improved = fx - f1
+        x = take x1
+        fx = f1
+        lambda = max(0.1 * lambda, 1.0e-12)
+        if improved <= 1.0e-6 * max(fx, 1.0e-30) {
+            break
+        }
+    }
+    (narrowed(x), taken)
+}
+
 /// `v` rounded to `decimals` decimals of `unit`, halves away from 0 (`15cm`'s 0 decimals are
 /// whole centimetres). An underflowed written unit keeps a finite `v`; an overflowed one
 /// rounds it to zero.
@@ -609,6 +925,27 @@ fn a_gradient_by_no_literals_gives_the_value_and_an_empty_gradient() {
     let (v, d) = gradient(|| x * x + 1.0, none)
     assert(v == 3.25)
     assert(d.len() == 0)
+}
+
+@test
+fn a_jacobian_by_no_literals_gives_the_value_and_no_derivatives() {
+    let none: [Literal; 0] = []
+    let x = 1.5
+    let (v, d) = jacobian(|| [x * x, x + 1.0], none)
+    assert(v[0] == 2.25 && v[1] == 2.5)
+    assert(d.len() == 0)
+}
+
+@test
+fn a_damped_step_solves_its_equations() {
+    // (A + λ diag A) d = −g with A = [[4, 1], [1, 3]], λ = 0 and g = [−1, −2]: d = [1/11, 7/11].
+    let d = damped_step([4.0, 1.0, 1.0, 3.0], [-1.0, -2.0], 2, [0, 1], 0.0)
+    assert(abs(d[0] - 1.0 / 11.0) < 1.0e-12 && abs(d[1] - 7.0 / 11.0) < 1.0e-12)
+    // Over the second literal alone, the first is left where it is.
+    let one = damped_step([4.0, 1.0, 1.0, 3.0], [-1.0, -2.0], 2, [1], 0.0)
+    assert(one[0] == 0.0 && abs(one[1] - 2.0 / 3.0) < 1.0e-12)
+    // A matrix that isn't positive definite has no step.
+    assert(damped_step([1.0, 2.0, 2.0, 1.0], [-1.0, -2.0], 2, [0, 1], 0.0).len() == 0)
 }
 
 @test

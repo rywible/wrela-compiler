@@ -37,7 +37,7 @@
 //!                                         script format, for `wrela-host --input`
 //! wrela primer [area]                     the language's rules, each with a program that
 //!                                         keeps it and one that breaks it
-//! wrela solve <package-dir> (--minimize <fn> | --spec) --free <file>:<lines>...
+//! wrela solve <package-dir> (--minimize <fn> | --fit <fn> | --spec) --free <file>:<lines>...
 //!                                         choose literals that minimize a function, or that
 //!                                         make the package's spec hold (§23)
 //! wrela precision <package-dir> <fn> --box <lo>..<hi>,...
@@ -134,7 +134,7 @@ pub(crate) fn usage() -> ExitCode {
         "wrela test <package-dir> [<filter>] [--exact] [--std] [--bless] [--json]",
         "wrela script <package-dir> <module>::<NAME> [-o <file>]",
         "wrela primer [area]",
-        "wrela solve <package-dir> (--minimize <module>::<function> | --spec) --free <file>[:<lines>]... [--steps n] [--exact] [--write] [--json]",
+        "wrela solve <package-dir> (--minimize <module>::<function> | --fit <module>::<function> | --spec) --free <file>[:<lines>]... [--steps n] [--exact] [--write] [--json]",
         "wrela precision <package-dir> <module>::<function> --box <lo>..<hi>[,<lo>..<hi>]... [--box ...] [--tol t] [--json]",
         "wrela query <package-dir> [<query>...] [--json]",
         "wrela context <item> [<package-dir>] [--budget n]",

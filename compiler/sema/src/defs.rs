@@ -666,6 +666,7 @@ lang_items! {
     LatticeCoord = "std::field::lattice_coord",
     Pcg = "std::hash::pcg",
     LiftGradient = "std::lift::gradient",
+    LiftJacobian = "std::lift::jacobian",
     LiftReads = "std::lift::reads",
     LiftCount = "std::lift::literal_count",
     LiftValue = "std::lift::literal_value",

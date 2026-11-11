@@ -1,14 +1,17 @@
-//! `wrela solve <package-dir> (--minimize <module>::<function> | --spec) --free <file>[:<lines>]...
-//! [--steps n] [--exact] [--write] [--json]`: changes the literals on the lines named (a whole
-//! file, with no lines) until the function (a `pub fn` of no arguments returning `f32`, in a
-//! module of the package, not its main) is as small as it gets, or with `--spec` until the
+//! `wrela solve <package-dir> (--minimize <module>::<function> | --fit <module>::<function> |
+//! --spec) --free <file>[:<lines>]... [--steps n] [--exact] [--write] [--json]`: changes the
+//! literals on the lines named (a whole file, with no lines) until the function (a `pub fn` of
+//! no arguments returning `f32`, in a module of the package, not its main) is as small as it
+//! gets; with `--fit`, until the sum of the squares of the numbers the function gives (it
+//! returns `[f32; M]`: how far each of `M` things misses) is; or with `--spec` until the
 //! package's spec holds (its checks' `std::lift::Loss`, from `pub fn spec<C: Checks>(c: mut C)`
 //! in `spec.wrela`), reporting each check before and after (language.md §23).
 //!
 //! It writes a program around the function (`<package>/build/solve/`), builds it with the
 //! package's literals lifted, and runs it on the CPU, where `std::lift::Minimize` solves: BFGS
 //! on the function's derivatives by the literals (`std::lift::gradient`, forward mode), each
-//! step along a line searched until the value falls enough (Armijo's rule). The literals end
+//! step along a line searched until the value falls enough (Armijo's rule); a fit, by
+//! Levenberg–Marquardt on every number's derivatives (`std::lift::jacobian`). The literals end
 //! rounded to their own decimals, as a drag's are: the one that changed most first, the
 //! rest solved again with it held, and the last given more decimals while rounding would cost
 //! more than 5% of the value (`--exact` keeps them as solved). This finds the literals on the
@@ -23,12 +26,19 @@ use wrela_host::{CpuHost, Value};
 
 pub fn run(args: &[String]) -> ExitCode {
     let (mut dir, mut target, mut free, mut steps) = (None, None, Vec::new(), 200usize);
-    let (mut exact, mut write, mut json, mut spec) = (false, false, false, false);
+    let (mut exact, mut write, mut json, mut spec, mut fit) = (false, false, false, false, false);
     let mut it = args.iter();
     while let Some(a) = it.next() {
         match a.as_str() {
             "--minimize" => match it.next() {
                 Some(t) => target = Some(t.clone()),
+                None => return crate::usage(),
+            },
+            "--fit" => match it.next() {
+                Some(t) => {
+                    target = Some(t.clone());
+                    fit = true;
+                }
                 None => return crate::usage(),
             },
             "--free" => match it.next().and_then(|f| parse_free(f)) {
@@ -52,19 +62,21 @@ pub fn run(args: &[String]) -> ExitCode {
         (Some(t), false) => t,
         (None, true) => "spec::spec".to_string(),
         _ => {
-            eprintln!("error: give `--minimize <module>::<function>` or `--spec`, one of them");
+            eprintln!(
+                "error: give `--minimize <module>::<function>`, `--fit <module>::<function>` or `--spec`, one of them"
+            );
             return ExitCode::from(2);
         }
     };
     let Some((module, function)) = target.rsplit_once("::") else {
-        eprintln!("error: `--minimize` takes `<module>::<function>`, not `{target}`");
+        eprintln!("error: `--minimize` and `--fit` take `<module>::<function>`, not `{target}`");
         return ExitCode::from(2);
     };
     if free.is_empty() {
         eprintln!("error: name the literals to change with `--free <file>:<lines>`");
         return ExitCode::from(2);
     }
-    match solve(&dir, module, function, spec, &free, steps, exact, write) {
+    match solve(&dir, module, function, spec, fit, &free, steps, exact, write) {
         Ok(report) => {
             if json {
                 println!("{}", serde_json::to_string_pretty(&report).unwrap_or_default());
@@ -112,10 +124,21 @@ fn parse_free(arg: &str) -> Option<Free> {
 }
 
 /// The program around the function, as `wrela solve` writes it: around the spec's loss, and
-/// with an export that prints its report, for `--spec`.
-fn glue(package: &str, module: &str, function: &str, spec: bool) -> String {
+/// with an export that prints its report, for `--spec`; around the sum of the squares of the
+/// numbers the function gives, for `--fit`.
+fn glue(package: &str, module: &str, function: &str, spec: bool, fit: bool) -> String {
     // The program up to its `loss` (and for `--spec`, its `report`), and the call it minimizes.
-    let (head, call) = if spec {
+    let how = if fit { "fit" } else { "run" };
+    let (head, call) = if fit {
+        let head = format!(
+            "// Written by `wrela solve --fit`: {function} of {package}::{module}, with its literals lifted.\n\n\
+             use std::lift::{{Literal, Minimize}}\n\
+             use {package}::{module}::{function}\n\n\
+             pub fn frame(m: mut Minimize, time: f32, width: u32, height: u32) {{}}\n\n\
+             pub fn loss() -> f32 {{\n    var sum = 0.0\n    for v in {function}() {{\n        sum += v * v\n    }}\n    sum\n}}\n\n"
+        );
+        (head, format!("{function}()"))
+    } else if spec {
         let head = format!(
             "// Written by `wrela solve --spec`: the spec of {package}, with its literals lifted.\n\n\
              use std::io::print\n\
@@ -140,7 +163,7 @@ fn glue(package: &str, module: &str, function: &str, spec: bool) -> String {
         "{head}pub fn init() -> Minimize {{\n    Minimize::new()\n}}\n\n\
          pub fn free(m: mut Minimize, literal: u32, decimals: u32, unit: f64) {{\n    \
          m.free(Literal {{ index: literal }}, decimals, unit)\n}}\n\n\
-         pub fn solve(m: mut Minimize, steps: u32, exact: bool) {{\n    m.run(|| {call}, steps, exact)\n}}\n\n\
+         pub fn solve(m: mut Minimize, steps: u32, exact: bool) {{\n    m.{how}(|| {call}, steps, exact)\n}}\n\n\
          pub fn losses(m: Minimize) -> vec3 {{\n    vec3(m.before(), m.solved(), m.after())\n}}\n\n\
          pub fn steps(m: Minimize) -> u32 {{\n    m.steps()\n}}\n\n\
          pub fn moved(m: Minimize, i: u32) -> vec2 {{\n    vec2(m.start(i), m.finish(i))\n}}\n"
@@ -165,13 +188,14 @@ fn solve(
     module: &str,
     function: &str,
     spec: bool,
+    fit: bool,
     free: &[Free],
     steps: usize,
     exact: bool,
     write: bool,
 ) -> Result<serde_json::Value, String> {
     let (glue_dir, package) =
-        crate::glue_package(dir, "solve", |package| glue(package, module, function, spec))?;
+        crate::glue_package(dir, "solve", |package| glue(package, module, function, spec, fit))?;
     let out = wrela_driver::build_lifted(
         &glue_dir,
         std::slice::from_ref(&package),
@@ -262,6 +286,7 @@ fn solve(
     let mut answer = serde_json::json!({
         "solved": true,
         "minimize": format!("{module}::{function}"),
+        "fit": fit,
         "loss_before": num(before),
         "loss_solved": num(solved_loss),
         "loss_after": num(after),
