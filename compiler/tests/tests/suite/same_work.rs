@@ -190,7 +190,7 @@ fn k(g: Given, w: [f32], out: mut Slots<f32>, id: GlobalId) {{
 }}
 
 pub fn frame(time: f32, width: u32, height: u32) {{
-    let w: GpuBuffer<f32> = buffer(1024)
+    let w: GpuBuffer<f32> = buffer(4096)
     var out: GpuBuffer<f32> = buffer(64)
     dispatch(k.bind(Given {{ u: time }}, w, out: mut out), over: 64)
 }}
@@ -217,6 +217,10 @@ fn a_loop_under_a_uniform_s_branch_counts_as_it_would_outside() {
         chain("s")
     );
     assert_eq!(e0712(&kernel("same_let_through", 64, &let_through)).len(), 1);
+    // A variable of the branch alone that a second uniform steers inside it: the stride of the
+    // walk after is the command's to say.
+    let steered = "    var acc = 0.0\n    if g.u > 0.5 {\n        var n = 1\n        if g.u > 0.7 {\n            n = 7\n            out[id] = 2.0\n        }\n        for c in 0..400 {\n            acc += w[c * n + 3] * x\n        }\n    }\n    out[id] = acc";
+    assert_eq!(e0712(&table_kernel("same_walk_steered", steered)).len(), 1);
 }
 
 /// A kernel whose invocations call `sky` (40 rounds of math) with a direction read from a

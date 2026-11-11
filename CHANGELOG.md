@@ -6,10 +6,13 @@ detail; `docs/release.md` says how a release is cut.
 ## 0.31.2
 
 - E0712 (language.md §18.13) no longer counts a loop's counter math when the whole loop is under
-  a branch the command chooses (`if r.learned != 0 { .. }` round a net walking its weights,
-  `w[first + r * inputs + c]`): a counter that is a variable of that branch alone is the loop's
-  structure there as it is outside. A variable from outside the branch that the branch sets is
-  still the command's to say, and counted.
+  a branch the command chooses (`if g.learned != 0 { .. }` round a net walking its weights,
+  `w[FIRST + r * INPUTS + c]`): a counter that is a variable of that block alone, set there
+  before anything reads it, is the loop's structure there as it is outside, whatever led to the
+  block. A variable from outside the block that the branch sets is still the command's to say,
+  and counted. Still counted, wrongly: such a loop under a branch that is itself inside a loop
+  (the outer loop's counter is held to depend on the branch). `wrela pipelines` lists what it
+  did.
 
 ## 0.31.1
 

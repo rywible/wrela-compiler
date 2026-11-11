@@ -341,9 +341,9 @@ impl Sites<'_> {
         // a computation together than apart.
         // The same values computed only from constants and loops' counters: through pure
         // operations, and locals whose every store is of such a value, at such indices, under
-        // such conditions only, in loops left on such conditions only (conditions since the
-        // block the local lives in alone was entered: what led there doesn't change what it
-        // holds). They're the loop's own structure (`(f32(i) + 1.0) / f32(steps)`): computed
+        // such conditions only, in loops left on such conditions only (the conditions since
+        // the block the local lives in alone was entered, `LocalStore::led`: what led there
+        // doesn't change what it holds). They're the loop's own structure (`(f32(i) + 1.0) / f32(steps)`): computed
         // from nothing the command gives, so nothing to compute once and pass in (§18.13).
         // Not counted.
         let fixed = fixed_values(f, &def);
@@ -761,8 +761,9 @@ fn placed_values(
 ) -> HashSet<ValueId> {
     let (stores, reached) = local_stores(f);
     // Optimistic about locals: one each of whose stores is of a placed or same value, at placed or
-    // same indices, under placed or same conditions, is placed; each round finds more that
-    // aren't, until a round finds none.
+    // same indices, under placed or same conditions (every one: a call under a branch on what an
+    // invocation reads is listed, whichever block its arguments live in), is placed; each round
+    // finds more that aren't, until a round finds none.
     let mut locals: HashSet<LocalId> =
         stores.iter().map(|st| st.local).filter(|l| !reached.contains(l)).collect();
     loop {
@@ -992,7 +993,10 @@ fn local_stores(f: &Function) -> (Vec<LocalStore>, HashSet<LocalId>) {
     // The locals that live in `b` alone: every mention of one (`mentions`, the function's) is
     // in `b` or nested in it, and the first statement of `b` to mention it sets the whole of
     // it. Whenever `b` is entered such a local starts afresh, so what it holds there doesn't
-    // depend on what led to `b`.
+    // depend on what led to `b`: the branches `b` is under, and the exits of the loops it's in
+    // (its own loop's too, where `b` is a loop's body: a pass sets the local before it reads
+    // it). At most one block is such a local's: in a block round it, the first statement to
+    // mention the local is the `if` or the loop that holds it.
     fn own(b: &[Stmt], mentions: &[u32]) -> Vec<LocalId> {
         // By local: whether its first mention sets the whole of it, and its mentions.
         let mut here: std::collections::HashMap<LocalId, (bool, u32)> = Default::default();
@@ -1016,8 +1020,8 @@ fn local_stores(f: &Function) -> (Vec<LocalStore>, HashSet<LocalId>) {
     }
     struct Walk<'a> {
         mentions: &'a [u32],
-        // By local: how many of the conditions leading to the innermost block it lives in
-        // alone (`own`) there are. A store to it doesn't depend on those.
+        // By local: how many conditions lead to the block it lives in alone (`own`), 0 for a
+        // local with none.
         led: Vec<usize>,
         out: Vec<LocalStore>,
     }
@@ -1043,13 +1047,14 @@ fn local_stores(f: &Function) -> (Vec<LocalStore>, HashSet<LocalId>) {
                 }
                 Stmt::Store(p, v) => {
                     if let PlaceRoot::Local(l) = p.root {
-                        let mut deps = on[w.led[l.index()]..].to_vec();
+                        let mut deps = on.clone();
                         for q in &p.path {
                             if let crate::Proj::Index(i) = q {
                                 deps.push(*i);
                             }
                         }
-                        w.out.push(LocalStore { local: l, value: *v, on: deps });
+                        let led = w.led[l.index()];
+                        w.out.push(LocalStore { local: l, value: *v, on: deps, led });
                     }
                 }
                 _ => {}
@@ -1084,14 +1089,15 @@ fn local_stores(f: &Function) -> (Vec<LocalStore>, HashSet<LocalId>) {
     (stores, reached)
 }
 
-/// A store to a local, with the values it depends on beyond the one stored: its indices, the
-/// conditions of the branches it's in, and those of the exits of the loops it's in. Not the
-/// conditions that lead to a block the local lives in alone (`local_stores`' `own`): a loop
-/// under `if r.learned != 0 { .. }` counts as it would outside.
+/// A store to a local, with the values it depends on beyond the one stored: the conditions of
+/// the branches it's in and of the exits of the loops it's in, outermost first, then its
+/// indices. The first `led` of them led to the block the local lives in alone (`local_stores`'
+/// `own`; none, for a local with no such block): what the local holds doesn't depend on those.
 struct LocalStore {
     local: LocalId,
     value: ValueId,
     on: Vec<ValueId>,
+    led: usize,
 }
 
 /// The values of `def` (a function's same values) computed only from constants and locals
@@ -1105,10 +1111,12 @@ fn fixed_values(
     loop {
         let local_fixed = |l: LocalId, fixed: &HashSet<ValueId>| {
             !reached.contains(&l)
-                && stores
-                    .iter()
-                    .filter(|st| st.local == l)
-                    .all(|st| fixed.contains(&st.value) && st.on.iter().all(|c| fixed.contains(c)))
+                && stores.iter().filter(|st| st.local == l).all(|st| {
+                    // What led to the block the local lives in alone doesn't change what
+                    // it holds there: a loop under `if g.learned != 0 { .. }` counts as it
+                    // would outside.
+                    fixed.contains(&st.value) && st.on[st.led..].iter().all(|c| fixed.contains(c))
+                })
         };
         let keep: HashSet<ValueId> = fixed
             .iter()
