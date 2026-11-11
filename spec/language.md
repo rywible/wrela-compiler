@@ -2863,7 +2863,7 @@ The compiler knows the language, a closed list of std items and its targets; the
   - `std::cmp`: `Eq`, `Ord`, `Ordering`
   - `std::fmt`: `Format`, `Spec`, `assert_failed1`, `assert_failed2`
   - `std::arena`: `Arena`, `Handle`
-  - `std::lift`: `gradient`, `reads`, `literal_count`, `literal_value`, `literal_built_value`, `set_literal`, `literal_generation`, `literal_source`, `lifted_files`, `lifted_file`
+  - `std::lift`: `gradient`, `jacobian`, `reads`, `literal_count`, `literal_value`, `literal_built_value`, `set_literal`, `literal_generation`, `literal_source`, `lifted_files`, `lifted_file`
   - `std::job`: `Job`, `Step`
 - **Each std module passes an admission test:** it makes sense in a program that is not a game. The compiler knows nothing about the engine; a feature that only makes sense in a game belongs in the engine. Acoustics, creatures, terrain and timelines are engine code, in the `engine` package, not in std.
 - **std is written in Wrela** with a small unsafe core (§6.12). The core is these files, and only they contain `unsafe`: `std::mem` (raw memory), `std::alloc` (the allocator), `std::collections` (`Vec` and `Box`), `std::string`, `std::par` (the helpers and jobs), `std::audio` (the voice and its ring), `std::tick` (the ticker), `std::handoff` (the triple buffer), `std::time` (the clock) and `std::tool` (a tool's calls and tasks).

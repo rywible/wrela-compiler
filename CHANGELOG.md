@@ -3,7 +3,7 @@
 Each release's changes a program or a tool can see. The pull request of each release holds the
 detail; `docs/release.md` says how a release is cut.
 
-## Unreleased
+## 0.32.0
 
 - **Least-squares fits** (language.md §23): `wrela solve <package> --fit <module>::<function>`
   makes the sum of the squares of the numbers a function gives (`fn() -> [f32; M]`: how far each
