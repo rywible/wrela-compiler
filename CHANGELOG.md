@@ -3,6 +3,17 @@
 Each release's changes a program or a tool can see. The pull request of each release holds the
 detail; `docs/release.md` says how a release is cut.
 
+## 0.31.2
+
+- E0712 (language.md §18.13) no longer counts a loop's counter math when the whole loop is under
+  a branch the command chooses (`if g.learned != 0 { .. }` round a net walking its weights,
+  `w[FIRST + r * INPUTS + c]`): a counter that is a variable of that block alone, set there
+  before anything reads it, is the loop's structure there as it is outside, whatever led to the
+  block. A variable from outside the block that the branch sets is still the command's to say,
+  and counted. Still counted, wrongly: such a loop under a branch that is itself inside a loop
+  (the outer loop's counter is held to depend on the branch). `wrela pipelines` lists what it
+  did.
+
 ## 0.31.1
 
 - A borrow struct that is a temporary (a call's result, or written out where it's used) reads
