@@ -1,0 +1,81 @@
+// The sky read along a direction 16 times a pixel (plan step H.5): a soft blur of the sky
+// about the vertical. `wrela pipelines` lists `sky` under the calls a table could answer; its
+// twin, compiler/tests/sky-table, reads a table of it (std::table) instead.
+use std::gpu::{ClipPosition, VertexIndex, begin_screen_pass, draw}
+
+pub struct State {
+    frames: u32,
+}
+
+pub fn init() -> State {
+    State { frames: 0 }
+}
+
+/// Twelve suns: each a direction and a weight.
+const SUNS: [vec4; 12] = [
+    vec4(0.0, 1.0, 0.0, 0.30),
+    vec4(0.6, 0.8, 0.0, 0.20),
+    vec4(-0.6, 0.8, 0.0, 0.20),
+    vec4(0.0, 0.8, 0.6, 0.20),
+    vec4(0.0, 0.8, -0.6, 0.20),
+    vec4(0.8, 0.0, 0.6, 0.15),
+    vec4(-0.8, 0.0, 0.6, 0.15),
+    vec4(0.8, 0.0, -0.6, 0.15),
+    vec4(-0.8, 0.0, -0.6, 0.15),
+    vec4(0.6, -0.8, 0.0, 0.10),
+    vec4(-0.6, -0.8, 0.0, 0.10),
+    vec4(0.0, -1.0, 0.0, 0.10),
+]
+
+/// The sky's brightness along a direction: a glow round each sun and a haze toward the
+/// horizon. Smooth, and costly: twelve exponentials and more.
+fn sky(d: vec3) -> f32 {
+    var s = 0.0
+    for k in 0..12 {
+        let c = dot(d, SUNS[k].xyz)
+        s += SUNS[k].w * exp(3.0 * (c - 1.0)) * (1.0 + c * c)
+    }
+    0.25 * s + 0.2 * exp(-2.0 * d.y * d.y)
+}
+
+struct Quad: Copy {
+    pos: ClipPosition,
+    uv: vec2,
+}
+
+/// The whole screen: one triangle past its corners.
+@vertex
+fn whole(v: VertexIndex) -> Quad {
+    let corners = [vec2(-1.0, -1.0), vec2(3.0, -1.0), vec2(-1.0, 3.0)]
+    let c = corners[v.index]
+    Quad { pos: ClipPosition { position: vec4(c, 0.5, 1.0) }, uv: c }
+}
+
+/// A pixel's direction: on the upper half of a sphere round the eye.
+fn direction(uv: vec2) -> vec3 {
+    normalize(vec3(uv.x, 1.0, uv.y))
+}
+
+/// The sky round `d` turned by `k` steps about the vertical.
+fn turned(d: vec3, k: u32) -> vec3 {
+    let a = 0.03 * f32(k)
+    vec3(d.x * cos(a) - d.z * sin(a), d.y, d.x * sin(a) + d.z * cos(a))
+}
+
+@fragment
+fn blurred(q: Quad) -> vec4 {
+    let d = direction(q.uv)
+    var s = 0.0
+    for k in 0..16 {
+        s += sky(turned(d, k))
+    }
+    let v = s / 16.0
+    vec4(v, v, v, 1.0)
+}
+
+pub fn frame(s: mut State, time: f32, width: u32, height: u32) {
+    s.frames += 1
+    let screen = begin_screen_pass(clear: vec4(0.0))
+    draw(screen, whole.bind(), blurred.bind(), vertices: 3)
+    screen.present()
+}

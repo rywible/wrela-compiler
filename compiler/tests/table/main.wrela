@@ -1,11 +1,11 @@
-// Tables on the GPU (std::table, language.md §14.6): three tables made on the CPU (a sine, a
+// Tables on the GPU (compiler/tests/tables): three tables made on the CPU (a sine, a
 // product of waves, a ball's distance), uploaded, and read by a kernel at 4,096 points the CPU
 // chose, for compiler/tests/tests/suite/table.rs to compare with the CPU's reads of the same
 // tables at the same points.
 use std::derive::{Box2, Box3, Interval}
 use std::field::hash_u32
 use std::gpu::{GlobalId, GpuBuffer, R32Float, Slots, Texture3d, buffer, buffer_of, dispatch}
-use std::table::{Table1, Table2, Table3, Tabled1, Tabled2, Tabled3, table1, table2, table3}
+use tables::table::{Table1, Table2, Table3, Tabled1, Tabled2, Tabled3, table1, table2, table3}
 
 /// How many points the kernel reads each table at.
 const N: u32 = 4096

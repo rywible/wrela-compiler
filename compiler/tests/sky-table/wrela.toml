@@ -1,0 +1,5 @@
+[package]
+name = "sky_table"
+
+[dependencies]
+tables = { path = "../tables" }

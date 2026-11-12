@@ -1,0 +1,96 @@
+// compiler/tests/sky's twin (plan step H.5): the same picture, each of its 16 reads of the sky a
+// pixel a read of a table of the sky over the box of directions (compiler/tests/tables), with the table's
+// proven error.
+use std::derive::Box3
+use std::gpu::{ClipPosition, R32Float, Texture3d, VertexIndex, begin_screen_pass, draw}
+use tables::table::{Tabled3, table3}
+
+pub struct State {
+    frames: u32,
+    texture: Texture3d<R32Float>,
+    sky: Tabled3,
+}
+
+/// The table's promise and its largest size: 64 cells a side.
+const WITHIN: f32 = 0.002
+const MOST: u32 = 274625
+
+pub fn init() -> State {
+    let t = table3(|d: vec3| sky(d), Box3 { lo: vec3(-1.0), hi: vec3(1.0) }, WITHIN, MOST)
+    let (texture, sky) = t.upload()
+    State { frames: 0, texture, sky }
+}
+
+/// The table's proven error.
+pub fn error(s: State) -> f32 {
+    s.sky.error()
+}
+
+/// Twelve suns: each a direction and a weight.
+const SUNS: [vec4; 12] = [
+    vec4(0.0, 1.0, 0.0, 0.30),
+    vec4(0.6, 0.8, 0.0, 0.20),
+    vec4(-0.6, 0.8, 0.0, 0.20),
+    vec4(0.0, 0.8, 0.6, 0.20),
+    vec4(0.0, 0.8, -0.6, 0.20),
+    vec4(0.8, 0.0, 0.6, 0.15),
+    vec4(-0.8, 0.0, 0.6, 0.15),
+    vec4(0.8, 0.0, -0.6, 0.15),
+    vec4(-0.8, 0.0, -0.6, 0.15),
+    vec4(0.6, -0.8, 0.0, 0.10),
+    vec4(-0.6, -0.8, 0.0, 0.10),
+    vec4(0.0, -1.0, 0.0, 0.10),
+]
+
+/// The sky's brightness along a direction: a glow round each sun and a haze toward the
+/// horizon. Smooth, and costly: twelve exponentials and more.
+fn sky(d: vec3) -> f32 {
+    var s = 0.0
+    for k in 0..12 {
+        let c = dot(d, SUNS[k].xyz)
+        s += SUNS[k].w * exp(3.0 * (c - 1.0)) * (1.0 + c * c)
+    }
+    0.25 * s + 0.2 * exp(-2.0 * d.y * d.y)
+}
+
+struct Quad: Copy {
+    pos: ClipPosition,
+    uv: vec2,
+}
+
+/// The whole screen: one triangle past its corners.
+@vertex
+fn whole(v: VertexIndex) -> Quad {
+    let corners = [vec2(-1.0, -1.0), vec2(3.0, -1.0), vec2(-1.0, 3.0)]
+    let c = corners[v.index]
+    Quad { pos: ClipPosition { position: vec4(c, 0.5, 1.0) }, uv: c }
+}
+
+/// A pixel's direction: on the upper half of a sphere round the eye.
+fn direction(uv: vec2) -> vec3 {
+    normalize(vec3(uv.x, 1.0, uv.y))
+}
+
+/// The sky round `d` turned by `k` steps about the vertical.
+fn turned(d: vec3, k: u32) -> vec3 {
+    let a = 0.03 * f32(k)
+    vec3(d.x * cos(a) - d.z * sin(a), d.y, d.x * sin(a) + d.z * cos(a))
+}
+
+@fragment
+fn blurred(q: Quad, table: Tabled3) -> vec4 {
+    let d = direction(q.uv)
+    var s = 0.0
+    for k in 0..16 {
+        s += table.read(turned(d, k))
+    }
+    let v = s / 16.0
+    vec4(v, v, v, 1.0)
+}
+
+pub fn frame(s: mut State, time: f32, width: u32, height: u32) {
+    s.frames += 1
+    let screen = begin_screen_pass(clear: vec4(0.0))
+    draw(screen, whole.bind(), blurred.bind(table: s.sky), vertices: 3)
+    screen.present()
+}

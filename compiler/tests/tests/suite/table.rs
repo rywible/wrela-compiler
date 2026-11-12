@@ -1,9 +1,9 @@
-//! std::table on the GPU (language.md §14.6, plan step H.3): compiler/tests/table makes three
+//! Tables on the GPU (compiler/tests/tables, plan step H.3): compiler/tests/table makes three
 //! tables on the CPU (a sine, a product of waves, a ball's distance), uploads them, and reads each
 //! at 4,096 points in a kernel. Each GPU read is the CPU's read of the same table at the same
 //! point, within the two's rounding of its seven mixes (16 ulps of the larger of 1 and the value):
-//! so within the table's proven error of the function, as the CPU's read is (std::table's
-//! G-sound tests).
+//! so within the table's proven error of the function, as the CPU's read is (the tables
+//! package's G-sound tests).
 
 use crate::built;
 use wrela_host::{Host, Value};
