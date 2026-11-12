@@ -1449,6 +1449,13 @@ impl CpuHost {
         self.program.last_failure()
     }
 
+    /// A fuzzer's build's coverage map (`wrela_abi::COVERAGE_GLOBAL`): the byte of each site
+    /// that has run since the program started is 1.
+    /// `None` for a build without one.
+    pub fn coverage(&mut self) -> Option<Vec<u8>> {
+        self.program.coverage()
+    }
+
     /// Runs the program's `init`, for a host [`CpuBuild::instantiate_in`] made.
     pub fn init(&mut self) -> Result<()> {
         self.program.run_init()

@@ -96,6 +96,11 @@ pub const EXPORT_AUDIO: &str = "__audio";
 /// with the records at [`memory::TICK_RECORDS`], on the ticker's thread
 /// ([`memory::THREAD_TICK`]), on its own instance of the module, with the same memory.
 pub const EXPORT_TICK: &str = "__tick";
+/// In a fuzzer's build (`wrela fuzz`), the exported global that holds the address of its
+/// coverage map: [`COVERAGE_BYTES`] bytes, a site's byte set to 1 once the site has run.
+pub const COVERAGE_GLOBAL: &str = "__wrela_cov";
+/// The coverage map's size in bytes.
+pub const COVERAGE_BYTES: u32 = 65536;
 /// `__lift_set(literal, value)`: in a lifted build (language.md §23), changes a literal's value,
 /// as `std::lift::set` does: code reads the new one from its next call, on the CPU and the GPU.
 /// A host calls it on the program's thread, between calls (a tool's edit, hot reload).

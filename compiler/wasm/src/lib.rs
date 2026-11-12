@@ -206,11 +206,9 @@ pub struct Options {
     pub coverage: bool,
 }
 
-/// The coverage map's size in bytes (`Options::coverage`).
-pub const COVERAGE_BYTES: u32 = 65536;
-
-/// The exported global that holds the coverage map's address.
-pub const COVERAGE_GLOBAL: &str = "__wrela_cov";
+/// The coverage map's size in bytes (`Options::coverage`), and the exported global that holds
+/// its address: the ABI's, which a host reads.
+pub use wrela_abi::{COVERAGE_BYTES, COVERAGE_GLOBAL};
 
 impl Default for Options {
     fn default() -> Options {
