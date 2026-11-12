@@ -3244,11 +3244,18 @@ pub fn spec<C: Checks>(c: mut C) {
   - `width`: across x, at a height and a depth;
   - `front` and `back`: along z;
   - `farthest`: how far the surface reaches in a direction, within a box;
-  - `part_named`.
+  - `part_named`;
+  - `coverage`, `outline_miss` and `image_miss`: how far the silhouette from the side, the front or the top (`View`) is from an outline, such as a blueprint's (§23.7), or from an image's opaque part.
 
-  Each measure searches with values, then takes one Newton step along its ray, so its derivative by a lifted literal is exact.
+  Each measure along a ray searches with values, then takes one Newton step along its ray, so its derivative by a lifted literal is exact.
+- **An outline is a measure too.** `coverage(f, view, at, width, near, far)` is how much of a footprint `width` across the silhouette covers, the least of the field's distances at 48 depths from `near` to `far` along the view's axis, box-filtered (`filtered`, §14.1): its derivative by a literal is the edge's where the edge crosses the footprint, and 0 away from it. `outline_miss(f, view, outline, cell, near, far)` is the root of the mean square difference between the silhouette's coverage and the outline's (even-odd, of a 4 × 4 grid of points a cell) over a grid of cells `cell` across round the outline, at most 64 a side: 0 a match, 1 no overlap. `image_miss(f, view, image, lo, hi, near, far)` is the same against an image's opaque part (alpha at least a half), laid over the rectangle from `lo` to `hi`. The outline is read by a function given nothing the derivation follows, so a blueprint's `Vec` is lent to the measure as it is (§14.2). On a test sphere, the coverage's derivative by its radius is within 2.4% of a hard edge's central difference.
+
+  ```text
+  c.at_most("side outline", outline_miss(f, View::Side, blueprint::side(), cell: 0.02, near: -1.0, far: 1.0), 0.0, within: 0.05)
+  ```
 - **Run with a `Report`,** the checks say how they stand: each check's value, target and miss, and how many hold. **Run with a `Loss`,** they are one number: the sum of each miss over its `within`, squared. The loss touches no memory, so `std::lift::gradient` derives it.
 - **`wrela solve <package> --spec --free <file>[:<lines or names>]`** changes the literals named until the spec holds. It runs BFGS on the loss's gradient, then rounds each literal to its decimals, with more decimals where rounding would undo the solve. It reports each check before and after.
+  - **Only the files freed are lifted.** A literal of another file (a blueprint's outline, a spec's targets) is a reference: the solve neither moves it nor derives through it.
   - **Which literals:** those on lines (`body.wrela:12`, `body.wrela:12-20`), those of the value the file binds a name to (`body.wrela:reach`: the literals of `let reach = 0.62`, of a `var`'s value or of a `const`'s), several of either (`body.wrela:reach,drive,40-44`), or the whole file's with neither. A name stays where it is when the file's lines move. A name the file doesn't bind, binds more than once, or binds to a value with no lifted literal is an error.
   - **`--write`** writes the literals back through `wrela edit`, only if every check holds where the solve ended. Otherwise it writes nothing, says which checks miss, and fails (exit status 1): a solve that stopped short isn't one to keep.
   - **A literal the loss never changed with** is warned of, by its file and line: its derivative was 0 at every step, so the solve left it. Nothing on the loss's path reads it, or the loss is flat in it wherever the solve went. (A literal the path reads through heap memory is E0700, §14.2.)
@@ -3262,7 +3269,7 @@ A blueprint is outlines of the subject from the side, the front and the top, wri
 - from the front: (x, y);
 - from the top: (x, z).
 
-An outline is a reference: a tool can draw it over its view, measure where the subject's silhouette misses it, and fit literals to it.
+An outline is a reference. A spec holds the subject to it with `std::field::outline_miss` (§23.6), which measures where the subject's silhouette misses it, and `wrela solve --spec` fits the subject's literals to it; a tool can also draw it over its view.
 
 ### 23.8 What the medium gives an author
 
