@@ -339,7 +339,8 @@ fn solve(
     // The literals named: on a line named, or in the value a name named is bound to.
     let files = report["files"].as_array().map_or(&[][..], Vec::as_slice);
     let canonical = |p: &Path| p.canonicalize().unwrap_or_else(|_| p.to_path_buf());
-    let wanted: Vec<(PathBuf, &Free, &[(String, Bound)])> = free
+    // Each `--free`: its file, and where its names are bound.
+    let wanted: Vec<_> = free
         .iter()
         .zip(&names)
         .map(|(f, names)| (canonical(&dir.join(&f.file)), f, names.as_slice()))
@@ -353,15 +354,20 @@ fn solve(
         let by_name = |names: &[(String, Bound)]| {
             names.iter().find(|(_, b)| b.start <= at && at < b.end).map(|(n, _)| n.clone())
         };
-        let Some((fr, name)) =
-            wanted.iter().filter(|(p, ..)| *p == path).find_map(|(_, f, names)| {
-                let name = by_name(names);
-                let on_line = f.lines.iter().any(|&(a, b)| a <= line && line <= b);
-                (on_line || name.is_some()).then_some((f, name))
-            })
-        else {
-            continue;
-        };
+        // The first `--free` that names it; by a name, if any of them names it by one.
+        let mut freed: Option<(&Free, Option<String>)> = None;
+        for (_, f, names) in wanted.iter().filter(|(p, ..)| *p == path) {
+            let name = by_name(names);
+            if name.is_none() && !f.lines.iter().any(|&(a, b)| a <= line && line <= b) {
+                continue;
+            }
+            match &mut freed {
+                None => freed = Some((f, name)),
+                Some((_, by)) if by.is_none() => *by = name,
+                Some(_) => {}
+            }
+        }
+        let Some((fr, name)) = freed else { continue };
         let text = l["text"].as_str().unwrap_or("").to_string();
         lits.push(Lit {
             index: l["index"].as_u64().unwrap_or(0) as u32,

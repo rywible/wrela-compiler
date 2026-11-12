@@ -395,6 +395,17 @@ fn literals_are_freed_by_the_name_they_are_bound_to() {
     // With lines too, in one `--free`.
     let r = solve(&dir, "fit.wrela:reach,7");
     assert_eq!(named(&r), [lit("reach", 5, "1.0"), lit("", 7, "7.0")], "{r}");
+    // By its line in one `--free` and by its name in another: once, with its name.
+    let r = common::answer(common::wrela().arg("solve").arg(&dir).args([
+        "--minimize",
+        "fit::miss",
+        "--free",
+        "fit.wrela:5",
+        "--free",
+        "fit.wrela:reach",
+        "--json",
+    ]));
+    assert_eq!(named(&r), [lit("reach", 5, "1.0")], "{r}");
     // The file's lines move; the names don't.
     let dir = files(&format!("// A line above.\n// And another.\n{NAMED}"));
     let r = solve(&dir, "fit.wrela:reach");

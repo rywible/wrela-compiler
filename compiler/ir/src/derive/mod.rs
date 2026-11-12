@@ -1199,7 +1199,7 @@ fn threads(op: &MemOp) -> bool {
 /// operation), works with other threads, or reads or writes heap memory other than harmlessly
 /// (the first of them in the body; where, by the last `At` before it).
 pub(super) fn no_gpu_or_heap_work(body: &Block) -> Result<()> {
-    fn find<'a>(b: &'a Block, mut at: Option<Span>) -> Option<(&'a Expr, Option<Span>)> {
+    fn find(b: &Block, mut at: Option<Span>) -> Option<(&Expr, Option<Span>)> {
         for s in b {
             match s {
                 Stmt::At(span) => at = Some(*span),
