@@ -14,6 +14,7 @@ path = "src/main.rs"
 wrela-diag.workspace = true
 wrela-syntax.workspace = true
 wrela-driver = { workspace = true, features = ["gpu"] }
+wrela-ir.workspace = true
 wrela-host.workspace = true
 wrela-abi.workspace = true
 # `wrela run`'s rooms, for a program with a server role.

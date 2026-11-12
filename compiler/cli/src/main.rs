@@ -23,6 +23,9 @@
 //!                                         has it and the program fixed
 //! wrela doc <item> [<package-dir>]        an item's signature, doc comment and examples
 //! wrela pipelines <package-dir> [--json]  each GPU entry point's instantiations (§18.9)
+//! wrela pixel <package-dir> --frame n (--at x,y | --kernel <label> --id i)
+//!                                         why a pixel has its colour: each draw that changed
+//!                                         it, and the shader interpreted for it, line by line
 //! wrela profile <package-dir> [--frames n] [--size WxH] [--input <script.json>] [--serial]
 //!     [--json] [--baseline <report.json>] [--compare <build-dir>] where a frame's time goes on this machine: the GPU's
 //!                                         by label, the CPU's and its phases (medians and
@@ -103,6 +106,7 @@ mod fmt;
 mod migrate;
 mod pin;
 mod pipelines;
+mod pixel;
 mod precision;
 mod primer;
 mod profile;
@@ -130,6 +134,7 @@ pub(crate) fn usage() -> ExitCode {
         "wrela doc <item> [<package-dir>]",
         "wrela doc --export <dir> [--commit <sha>] [<package-dir>...]",
         "wrela pipelines <package-dir> [--set NAME=VALUE]... [--json]",
+        "wrela pixel <package-dir> --frame <n> (--at <x>,<y> [--draw <k>] [--fragment <j>] | --kernel <label> --id <i>) [--input <script.json>] [--size <w>x<h>] [--line <file>:<line>] [--full] [--json]",
         "wrela profile <package-dir> [--frames n] [--warmup n] [--workers n] [--size WxH] [--input <script.json>] [--scenario name] [--serial] [--worst n] [--chrome [--features none|<list>] [--checked]] [--optimize size|speed] [--relaxed-simd] [--json] [--baseline <report.json> | --compare <build-dir> [--pairs n]]",
         "wrela test <package-dir> [<filter>] [--exact] [--std] [--bless] [--json]",
         "wrela script <package-dir> <module>::<NAME> [-o <file>]",
@@ -184,6 +189,7 @@ fn main() -> ExitCode {
         "doc" if rest.iter().any(|a| a == "--export") => export::run(rest),
         "doc" => doc::run(rest),
         "pipelines" => pipelines::run(rest),
+        "pixel" => pixel::run(rest),
         "profile" => profile::run(rest),
         "test" => {
             // Each tool test runs in a process of this executable's (§13.2).

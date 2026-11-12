@@ -3625,6 +3625,7 @@ dependencies = [
  "wrela-diag",
  "wrela-driver",
  "wrela-host",
+ "wrela-ir",
  "wrela-serve",
  "wrela-syntax",
 ]
@@ -3783,6 +3784,7 @@ dependencies = [
  "wrela-driver",
  "wrela-grammar",
  "wrela-host",
+ "wrela-ir",
  "wrela-sema",
  "wrela-serve",
  "wrela-syntax",

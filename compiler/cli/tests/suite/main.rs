@@ -7,6 +7,7 @@ mod fix;
 mod migrate;
 mod pin;
 mod pipelines;
+mod pixel;
 mod profile;
 mod query;
 mod refactor;
