@@ -1,0 +1,63 @@
+// A sphere whose radius is a lifted literal (compiler/tests/tests/suite/measures.rs): the
+// derivative of its coverage through an antialiased edge, against a hard edge's central
+// differences.
+use std::field::{View, coverage, sphere}
+use std::lift::{Literal, count, gradient, literal}
+
+/// The grid: 32 × 32 cells 5 cm across over the square from -0.8 to 0.8.
+const CELLS: u32 = 32
+const CELL: f32 = 0.05
+
+fn centre(i: u32) -> vec2 {
+    vec2(f32(i % CELLS), f32(i / CELLS)) * CELL - vec2(0.8) + vec2(0.5 * CELL)
+}
+
+/// The radius: the literal the gradient is by.
+fn ball() -> f32 {
+    let s = sphere(0.437)
+    var sum = 0.0
+    for i in 0..CELLS * CELLS {
+        sum += coverage(s, View::Front, centre(i), CELL, near: -1.0, far: 1.0)
+    }
+    sum
+}
+
+/// The sum of the cells' coverages.
+pub fn soft_sum() -> f32 {
+    ball()
+}
+
+/// Its derivative by the radius's literal: the first whose value is 0.437 (this function's own
+/// 0.437, a literal too, comes after it).
+pub fn soft_slope() -> f32 {
+    var k = count()
+    for i in 0..count() {
+        if let Some(l) = literal(i) {
+            if l.value() == 0.437 && k == count() {
+                k = i
+            }
+        }
+    }
+    let (_, d) = gradient(ball, [Literal { index: k }])
+    d[0]
+}
+
+/// The same sum for a disc of radius `r` with a hard edge: each cell's share of 16 × 16 points
+/// inside it.
+pub fn hard_sum(r: f32) -> f32 {
+    var sum = 0.0
+    for i in 0..CELLS * CELLS {
+        let c = centre(i)
+        var inside = 0
+        for k in 0..256 {
+            let q = c + (vec2(f32(k % 16), f32(k / 16)) + vec2(0.5)) / 16.0 * CELL - vec2(0.5 * CELL)
+            if length(q) < r {
+                inside += 1
+            }
+        }
+        sum += f32(inside) / 256.0
+    }
+    sum
+}
+
+pub fn frame(time: f32, width: u32, height: u32) {}

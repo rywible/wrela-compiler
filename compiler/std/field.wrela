@@ -15,7 +15,8 @@
 // name, so a tool can say what a point belongs to without knowing what made the surface.
 
 use std::collections::Vec
-use std::derive::{Box3, Interval, gradient, interval, tape, value_and_gradient}
+use std::derive::{Box3, Interval, filtered, gradient, interval, tape, value_and_gradient}
+use std::png::Image
 use std::stage::Tape
 use std::quat::Quat
 use std::hash::{StateHash, pcg}
@@ -358,6 +359,204 @@ pub fn front<S: Surface>(field: S, x: f32, y: f32) -> f32 {
 pub fn back<S: Surface>(field: S, x: f32, y: f32) -> f32 {
     let t = hit(field, vec3(x, y, -10.0), vec3(0.0, 0.0, 1.0), far: 20.0)
     if t < 0.0 { 10.0 } else { t - 10.0 }
+}
+
+// ---- outlines (§23.6, §23.7) ------------------------------------------------------------
+//
+// A silhouette held to an outline or an image, as a number a spec can hold it to, with a
+// derivative a solve can follow through the silhouette's edge: each cell's coverage is the
+// share of its footprint inside the silhouette, box-filtered (`filtered`), so moving the edge
+// across the cell changes it smoothly.
+
+/// The axis a subject is seen along, with a blueprint's coordinates for what is seen (§23.7):
+/// from the side (z, y), the front (x, y) or the top (x, z).
+pub enum View: Copy {
+    Side,
+    Front,
+    Top,
+}
+
+impl View {
+    /// The point of space at `at` in this view's coordinates, `depth` along its axis.
+    pub fn point(self, at: vec2, depth: f32) -> vec3 {
+        match self {
+            View::Side => vec3(depth, at.y, at.x),
+            View::Front => vec3(at.x, at.y, depth),
+            View::Top => vec3(at.x, depth, at.y),
+        }
+    }
+}
+
+/// How many depths `coverage` looks at along a view's axis.
+const DEPTHS: u32 = 48
+
+/// The least of `field`'s distances at 48 depths from `near` to `far` along `view`'s axis at
+/// `u`: at most 0 where the silhouette covers `u`. The depths are fixed, so they don't depend on
+/// anything the field reads.
+fn least<S: Surface>(field: S, view: View, u: vec2, near: f32, far: f32) -> f32 {
+    var m = 1.0e30
+    for k in 0..DEPTHS {
+        let t = near + (far - near) * (f32(k) + 0.5) / f32(DEPTHS)
+        m = min(m, field.distance(view.point(u, t)))
+    }
+    m
+}
+
+/// How much of a footprint `width` across, at `at` in `view`'s coordinates, `field`'s
+/// silhouette covers, from 0 to 1. The silhouette is looked for between `near` and `far` along
+/// the view's axis (48 depths, so a part thinner than their spacing can be missed). Its
+/// derivative by anything the field reads is the edge's where the edge crosses the footprint,
+/// and 0 away from it.
+pub fn coverage<S: Surface>(
+    field: S,
+    view: View,
+    at: vec2,
+    width: f32,
+    near: f32,
+    far: f32,
+) -> f32 {
+    filtered(|u: vec2| step(least(field, view, u, near, far), 0.0), at, vec2(width))
+}
+
+/// The most cells a side of an outline's grid has.
+pub const MOST_CELLS: u32 = 64
+
+/// The grid round a polygon: its lower corner, and its cells across and up (the polygon's box
+/// and two cells round it, `cell` across). Panics past 64 cells a side, saying how many.
+fn grid_of(outline: [vec2], cell: f32) -> (vec2, [u32; 2]) {
+    var lo = vec2(1.0e30)
+    var hi = vec2(-1.0e30)
+    for p in outline {
+        lo = min(lo, p)
+        hi = max(hi, p)
+    }
+    let lo = lo - vec2(2.0 * cell)
+    let n = ceil((hi - lo) / cell + vec2(2.0))
+    if n.x > f32(MOST_CELLS) || n.y > f32(MOST_CELLS) {
+        panic(
+            f"an outline's grid would be {u32(n.x)} by {u32(n.y)} cells: make `cell` larger (at most 64 a side)",
+        )
+    }
+    (lo, [u32(n.x), u32(n.y)])
+}
+
+/// Whether `p` is inside the closed polygon `outline` (the even-odd rule).
+fn inside(outline: [vec2], p: vec2) -> bool {
+    var odd = false
+    let n = outline.len()
+    var j = n - 1
+    for i in 0..n {
+        let (a, b) = (outline[i], outline[j])
+        if (a.y > p.y) != (b.y > p.y) && p.x < a.x + (p.y - a.y) / (b.y - a.y) * (b.x - a.x) {
+            odd = !odd
+        }
+        j = i
+    }
+    odd
+}
+
+/// Every cell's share of the polygon (of a 4 × 4 grid of points in it, those inside), row by
+/// row, 64 to a row. Given nothing a derivation follows, so it may walk the polygon's memory.
+fn wanted(outline: [vec2], lo: vec2, cell: f32, cells: [u32; 2]) -> [f32; 4096] {
+    var out = [0.0; 4096]
+    for j in 0..cells[1] {
+        for i in 0..cells[0] {
+            var count = 0.0
+            for k in 0..16 {
+                let q = vec2(f32(i) + (f32(k % 4) + 0.5) / 4.0, f32(j) + (f32(k / 4) + 0.5) / 4.0)
+                if inside(outline, lo + q * cell) {
+                    count += 1.0
+                }
+            }
+            out[j * MOST_CELLS + i] = count / 16.0
+        }
+    }
+    out
+}
+
+/// The root of the mean square difference between `field`'s coverage of each cell and how much
+/// of it `want` holds, over `cells` cells `cell` across from `lo`.
+fn coverage_miss<S: Surface>(
+    field: S,
+    view: View,
+    want: [f32; 4096],
+    lo: vec2,
+    cell: vec2,
+    cells: [u32; 2],
+    near: f32,
+    far: f32,
+) -> f32 {
+    var sum = 0.0
+    for j in 0..cells[1] {
+        for i in 0..cells[0] {
+            let c = lo + (vec2(f32(i), f32(j)) + vec2(0.5)) * cell
+            let d = coverage(field, view, c, max(cell.x, cell.y), near, far) -
+                want[j * MOST_CELLS + i]
+            sum += d * d
+        }
+    }
+    sqrt(sum / f32(cells[0] * cells[1]))
+}
+
+/// How far `field`'s silhouette in `view` is from `outline` (a closed polygon in the view's
+/// coordinates, a blueprint's, §23.7): the root of the mean square difference of their
+/// coverages over a grid of cells `cell` across that holds the outline and two cells round it.
+/// 0 is a match; 1 is no overlap at all. A grid past 64 cells a side panics. A derivation
+/// derives it through the field alone: the polygon is read by a function given nothing it
+/// follows (§14.2).
+pub fn outline_miss<S: Surface>(
+    field: S,
+    view: View,
+    outline: [vec2],
+    cell: f32,
+    near: f32,
+    far: f32,
+) -> f32 {
+    let (lo, cells) = grid_of(outline, cell)
+    let want = wanted(outline, lo, cell, cells)
+    coverage_miss(field, view, want, lo, vec2(cell), cells, near, far)
+}
+
+/// Every cell's share of `image`'s opaque part (alpha at least a half), of a 4 × 4 grid of
+/// points in it, the image over the rectangle from `lo` to `hi`, its top row at `hi.y`.
+fn wanted_of(image: Image, lo: vec2, hi: vec2, cells: [u32; 2]) -> [f32; 4096] {
+    var out = [0.0; 4096]
+    let size = vec2(f32(image.width), f32(image.height))
+    for j in 0..cells[1] {
+        for i in 0..cells[0] {
+            var count = 0.0
+            for k in 0..16 {
+                let q = vec2(f32(i) + (f32(k % 4) + 0.5) / 4.0, f32(j) + (f32(k / 4) + 0.5) / 4.0)
+                let t = q / vec2(f32(cells[0]), f32(cells[1]))
+                // Row 0 is the image's top, at `hi.y`.
+                let x = min(u32(t.x * size.x), image.width - 1)
+                let y = min(u32((1.0 - t.y) * size.y), image.height - 1)
+                if image.texel(x, y).w >= 0.5 {
+                    count += 1.0
+                }
+            }
+            out[j * MOST_CELLS + i] = count / 16.0
+        }
+    }
+    out
+}
+
+/// `outline_miss` against an image's opaque part (its alpha at least a half), the image laid
+/// over the rectangle from `lo` to `hi` in the view's coordinates, its top row at `hi.y`: a grid
+/// of the image's pixels, at most 64 a side.
+pub fn image_miss<S: Surface>(
+    field: S,
+    view: View,
+    image: Image,
+    lo: vec2,
+    hi: vec2,
+    near: f32,
+    far: f32,
+) -> f32 {
+    let cells = [min(image.width, MOST_CELLS), min(image.height, MOST_CELLS)]
+    let want = wanted_of(image, lo, hi, cells)
+    let cell = (hi - lo) / vec2(f32(cells[0]), f32(cells[1]))
+    coverage_miss(field, view, want, lo, cell, cells, near, far)
 }
 
 /// How far the surface reaches in direction `dir` (a unit vector) within `region`: the
@@ -2987,4 +3186,56 @@ fn certified_checks_prove_what_holds_and_find_what_fails() {
         ),
         _ => assert(false, "overlapping parts are found"),
     }
+}
+
+@test
+fn a_spheres_coverage_is_whole_inside_none_outside_and_half_on_its_edge() {
+    let s = sphere(0.5)
+    for view in [View::Side, View::Front, View::Top] {
+        assert(coverage(s, view, vec2(0.0), 0.05, near: -1.0, far: 1.0) == 1.0)
+        assert(coverage(s, view, vec2(1.0, 0.0), 0.05, near: -1.0, far: 1.0) == 0.0)
+        let edge = coverage(s, view, vec2(0.5, 0.0), 0.05, near: -1.0, far: 1.0)
+        assert(edge > 0.4 && edge < 0.6)
+    }
+}
+
+/// A closed polygon of `n` corners round a circle of radius `r`.
+fn polygon(n: u32, r: f32) -> Vec<vec2> {
+    Vec::from_fn(n, |i| {
+        let a = 6.2831853 * f32(i) / f32(n)
+        vec2(r * cos(a), r * sin(a))
+    })
+}
+
+@test
+fn a_sphere_misses_an_outline_of_its_own_size_by_little() {
+    let s = sphere(0.5)
+    let own = polygon(64, 0.5)
+    let twice = polygon(64, 1.0)
+    // Cells of 2 cm, as a spec's are (§23.6); the outline twice the size needs 4 cm to be held
+    // in 64 cells a side.
+    for view in [View::Side, View::Front, View::Top] {
+        assert(outline_miss(s, view, own, 0.02, near: -1.0, far: 1.0) < 0.03)
+        assert(outline_miss(s, view, twice, 0.04, near: -1.0, far: 1.0) > 0.3)
+    }
+}
+
+@test
+fn a_sphere_misses_an_image_of_its_disc_by_little() {
+    // A 32 × 32 image of a disc of radius 0.5 over the square from -0.6 to 0.6.
+    var pixels: Vec<u8> = Vec::filled(32 * 32 * 4, value: 0)
+    for y in 0..32 {
+        for x in 0..32 {
+            let p = vec2(-0.6 + 1.2 * (f32(x) + 0.5) / 32.0, 0.6 - 1.2 * (f32(y) + 0.5) / 32.0)
+            if length(p) < 0.5 {
+                pixels[(y * 32 + x) * 4 + 3] = 255
+            }
+        }
+    }
+    let disc = Image { width: 32, height: 32, pixels }
+    let s = sphere(0.5)
+    let near_fit = image_miss(s, View::Front, disc, vec2(-0.6), vec2(0.6), near: -1.0, far: 1.0)
+    assert(near_fit < 0.1)
+    let big = sphere(1.0)
+    assert(image_miss(big, View::Front, disc, vec2(-0.6), vec2(0.6), near: -1.5, far: 1.5) > 0.3)
 }
