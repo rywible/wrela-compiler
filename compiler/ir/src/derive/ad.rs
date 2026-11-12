@@ -1068,11 +1068,13 @@ impl Ad<'_> {
                 let xdy = d[0].map(|dy| self.scale(out, dy, x, ty));
                 let ydx = d[1].map(|dx| self.scale(out, dx, y, ty));
                 let num = self.sub(out, xdy, ydx, ty);
+                // At (0, 0), where nothing moves the point (`atan2(clamp(x, 0, 0), 0)`), the
+                // numerator is 0 too: 0, not 0/0 (the typed programs' O3 found it).
                 num.map(|n| {
                     let x2 = self.bin(out, BinOp::Mul, x, x, ty);
                     let y2 = self.bin(out, BinOp::Mul, y, y, ty);
                     let den = self.bin(out, BinOp::Add, x2, y2, ty);
-                    self.div(out, n, den, ty)
+                    self.div_from_zero(out, n, den, ty)
                 })
             }
             B::Exp => d[0].map(|da| self.scale(out, da, v, ty)),

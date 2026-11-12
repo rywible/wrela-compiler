@@ -1646,6 +1646,34 @@ impl<'a, 'm> Fb<'a, 'm> {
                 hs[h] = self.through_variable(hs[h], ty, out);
             }
         }
+        // `tanh` of an `f32` is 1 (or -1) past 10 in size, to the last bit, but a GPU may
+        // compute it as a ratio of exponentials that overflow, and give NaN: Metal's does past
+        // 44 (the typed programs' oracle O6 found it). Clamped, its argument can't overflow.
+        if b == B::Tanh {
+            let n = match self.cx.m.types.get(self.f.value_ty(args[0])) {
+                ir::TypeDef::Scalar(ir::Scalar::F32) => Some(None),
+                ir::TypeDef::Vector(ir::Scalar::F32, n) => Some(Some(*n)),
+                _ => None,
+            };
+            if let Some(n) = n {
+                let mut bound = |x: f32, out: &mut Block| {
+                    let l = self.lit(Literal::F32(x), out);
+                    match n {
+                        Some(n) => self.expr(Expression::Splat { size: vsize(n), value: l }, out),
+                        None => l,
+                    }
+                };
+                let (lo, hi) = (bound(-10.0, out), bound(10.0, out));
+                let clamp = Expression::Math {
+                    fun: MathFunction::Clamp,
+                    arg: hs[0],
+                    arg1: Some(lo),
+                    arg2: Some(hi),
+                    arg3: None,
+                };
+                hs[0] = self.expr(clamp, out);
+            }
+        }
         let deriv = |axis| Expression::Derivative {
             axis,
             ctrl: naga::DerivativeControl::None,

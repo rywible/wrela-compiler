@@ -62,7 +62,8 @@ impl Choices {
 }
 
 /// Which programs: **tame** ones, whose every operation is total and finite on the domain by
-/// the guards the generator writes, or **wild** ones, with no guards (only built and run: their
+/// the guards the generator writes (a loop's step is `tanh` of its term, so a sum that reads
+/// itself can't grow past its start and 6), or **wild** ones, with no guards (only built and run: their
 /// values may be NaN). **Loops** programs are wild ones' shape over a `[f32; 64]` and integer
 /// sums, for the optimizer's oracle alone (stage L).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -481,6 +482,9 @@ impl Gen<'_> {
                     let g = self.tree(Ty::F32);
                     let (name, used) = self.counter.take().expect("the loop's counter");
                     let name = if used { name } else { "_".into() };
+                    // Tame, each step is at most 1 in size: a term that reads the sum would
+                    // otherwise feed on itself through products until it overflowed.
+                    let g = if self.mode == Mode::Tame { format!("tanh({g})") } else { g };
                     out += &format!(
                         "    for {name} in 0..{count} {{\n{leave}        {acc} = {acc} + {g}\n    }}\n"
                     );
