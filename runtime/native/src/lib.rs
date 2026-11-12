@@ -100,6 +100,16 @@ pub enum Timing {
     Serial,
 }
 
+/// `wrela pixel`'s probe: in frame `frame` (0 the first), the GPU work stops before the
+/// frame's draw number `draws + 1` (counting every draw, from 1): what that draw would see is
+/// what the GPU holds after the frame, and what the screen shows is the picture as it was
+/// before it. Every pass still ends and presents. Without a probe, every command runs.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Probe {
+    pub frame: u32,
+    pub draws: u32,
+}
+
 /// How to run a program.
 #[derive(Clone, Debug, Default)]
 pub struct Options {
@@ -1058,6 +1068,11 @@ impl Host {
     /// A GPU buffer's size in bytes: what [`Host::read_buffer`] gives, without reading it.
     pub fn buffer_size(&mut self, handle: u32) -> Result<u64> {
         self.p().executor().buffer_size(handle)
+    }
+
+    /// Sets `wrela pixel`'s probe ([`Probe`]), or clears it.
+    pub fn set_probe(&mut self, probe: Option<Probe>) {
+        self.p().executor().probe = probe;
     }
 
     /// The handles of the textures that exist, oldest first.

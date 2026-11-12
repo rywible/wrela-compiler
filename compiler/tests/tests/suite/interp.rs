@@ -1,9 +1,11 @@
 //! The interpreter of GPU code (`wrela_ir::interp`) against the GPU: texel loads and kernels that
-//! read a texture interpret as the GPU ran them, on what the GPU held (`wrela_driver::captured`).
+//! read a texture interpret as the GPU ran them, on what the GPU held (`wrela_driver::captured`);
+//! and the native host's probe (`wrela_host::Probe`), which stops a frame's GPU work before a
+//! draw, draws the same picture when it lets every draw run.
 
 use crate::built;
 use wrela_abi::stream::Command;
-use wrela_host::{Host, Options};
+use wrela_host::{Host, Options, Probe};
 use wrela_ir::interp::Interp;
 use wrela_ir::interp::concrete::{floats_of, uvec3};
 
@@ -121,4 +123,18 @@ fn kernels_that_read_a_texture_interpret_as_the_gpu_ran_them() {
     assert!(checked >= 3 * 64, "only {checked} invocations checked");
     println!("{checked} invocations of `sampled`'s texture kernels: worst difference {worst:e}");
     assert!(worst <= 1.0 / 255.0, "worst difference {worst:e}");
+}
+
+/// A probe that lets every draw run draws the same picture as no probe.
+#[test]
+#[ignore = "needs a GPU"]
+fn a_probe_draws_the_same_picture() {
+    let picture = |probe: Option<Probe>| {
+        let mut host = Host::load(built("pixel")).expect("load");
+        host.set_probe(probe);
+        host.frame(0.0, 64, 64).expect("a frame");
+        host.read_screen().expect("the screen")
+    };
+    assert_eq!(picture(None), picture(Some(Probe { frame: 0, draws: 4 })));
+    assert_ne!(picture(None), picture(Some(Probe { frame: 0, draws: 1 })));
 }

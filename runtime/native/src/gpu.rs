@@ -608,6 +608,12 @@ impl Counters {
 }
 
 pub(crate) struct Gpu {
+    /// `wrela pixel`'s probe: the frame whose GPU work stops before a draw, and how many draws
+    /// it has run ([`Probe`]).
+    pub(crate) probe: Option<crate::Probe>,
+    frames_begun: u32,
+    probe_draws: u32,
+    probe_stopped: bool,
     counters: Counters,
     device: wgpu::Device,
     queue: wgpu::Queue,
@@ -814,6 +820,10 @@ impl Gpu {
         let upload = Ring::new(&device, "upload ring", usage, u64::from(stream::UPLOAD_START));
         let timer = timestamps.then(|| Timer::new(&device, timing == Timing::Serial, true));
         let mut gpu = Gpu {
+            probe: None,
+            frames_begun: 0,
+            probe_draws: 0,
+            probe_stopped: false,
             counters: Counters::default(),
             device,
             queue,
@@ -2468,12 +2478,56 @@ fn staging(device: &wgpu::Device, slot: &mut Option<wgpu::Buffer>, size: u64) ->
     }
 }
 
+impl Gpu {
+    /// Whether the probe skips `cmd`: in the probed frame, once its draws have run, no more
+    /// GPU work runs (a draw, a dispatch, a write or a copy); passes still begin, end and
+    /// present, so what was drawn is there to read.
+    fn probed(&mut self, cmd: &Command<'_>) -> bool {
+        let Some(p) = self.probe else { return false };
+        if self.frames_begun != p.frame + 1 {
+            return false;
+        }
+        let draw = matches!(
+            cmd,
+            Command::Draw { .. }
+                | Command::DrawIndirect { .. }
+                | Command::DrawIndexed { .. }
+                | Command::DrawIndexedIndirect { .. }
+        );
+        let work = draw
+            || matches!(
+                cmd,
+                Command::Dispatch { .. }
+                    | Command::DispatchIndirect { .. }
+                    | Command::WriteBuffer { .. }
+                    | Command::WriteTexture { .. }
+                    | Command::CopyBuffer { .. }
+                    | Command::CopyTexture { .. }
+                    | Command::CopyTextureToBuffer { .. }
+                    | Command::CopyBufferToTexture { .. }
+            );
+        if draw && !self.probe_stopped {
+            self.probe_draws += 1;
+            if self.probe_draws > p.draws {
+                self.probe_stopped = true;
+            }
+        }
+        work && self.probe_stopped
+    }
+}
+
 impl Executor for Gpu {
     fn begin_frame(&mut self) {
         self.label = None;
+        self.frames_begun += 1;
+        self.probe_draws = 0;
+        self.probe_stopped = false;
     }
 
     fn execute(&mut self, cmd: &Command<'_>) -> Result<()> {
+        if self.probed(cmd) {
+            return Ok(());
+        }
         // A pass that ended waits only for one that may continue it: a `Label` records it too,
         // since a pass joins only one of its own label.
         if let Some(ended) = &self.ended {

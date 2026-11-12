@@ -1,0 +1,79 @@
+// `wrela pixel`'s fixture (compiler/tests/tests/suite/interp.rs, compiler/cli/tests/suite/
+// pixel.rs): four draws into the screen. A large triangle whose colour is its corners'
+// colours, interpolated (one corner's clip position has w = 2, so a screen-linear
+// interpolation would be wrong); a small one over its middle, flat orange; a band at the top
+// whose colour is the `fwidth` of a varying; and a band at the bottom that divides by the
+// distance from x = 32.5, which is zero down column 32.
+use std::gpu::{ClipPosition, FragCoord, VertexIndex, begin_screen_pass, draw}
+
+struct Shaded: Copy {
+    pos: ClipPosition,
+    colour: vec3,
+}
+
+@vertex
+fn big(v: VertexIndex) -> Shaded {
+    let corners = [vec4(-0.9, -0.9, 0.5, 1.0), vec4(0.9, -0.9, 0.5, 1.0), vec4(-1.8, 1.8, 1.0, 2.0)]
+    let colours = [vec3(1.0, 0.0, 0.0), vec3(0.0, 1.0, 0.0), vec3(0.0, 0.0, 1.0)]
+    Shaded { pos: ClipPosition { position: corners[v.index] }, colour: colours[v.index] }
+}
+
+@fragment
+fn colour(o: Shaded) -> vec4 {
+    vec4(o.colour, 1.0)
+}
+
+@vertex
+fn small(v: VertexIndex) -> ClipPosition {
+    let corners = [vec2(-0.3, -0.3), vec2(0.2, -0.3), vec2(-0.3, 0.2)]
+    ClipPosition { position: vec4(corners[v.index], 0.25, 1.0) }
+}
+
+@fragment
+fn orange(pixel: FragCoord) -> vec4 {
+    vec4(0.9, 0.5, 0.1, 1.0)
+}
+
+/// A band from y = `top` to `bottom` (clip space) across the screen, its colour's red channel
+/// going from 0 at the left to `width` at the right.
+fn band(i: u32, top: f32, bottom: f32, width: f32) -> Shaded {
+    let x = if i == 1 || i == 2 || i == 4 { 1.0 } else { -1.0 }
+    let y = if i == 2 || i == 4 || i == 5 { top } else { bottom }
+    Shaded {
+        pos: ClipPosition { position: vec4(x, y, 0.5, 1.0) },
+        colour: vec3((x + 1.0) * 0.5 * width, 0.25, 0.0),
+    }
+}
+
+@vertex
+fn upper(v: VertexIndex) -> Shaded {
+    band(v.index, top: 1.0, bottom: 0.95, width: 4.0)
+}
+
+/// Ten times how fast the red channel changes from pixel to pixel.
+@fragment
+fn wide(o: Shaded) -> vec4 {
+    vec4(fwidth(o.colour) * 10.0, 1.0)
+}
+
+@vertex
+fn lower(v: VertexIndex) -> Shaded {
+    band(v.index, top: -0.95, bottom: -1.0, width: 1.0)
+}
+
+/// One over the distance from x = 32.5, which is zero down column 32.
+@fragment
+fn ratio(pixel: FragCoord) -> vec4 {
+    let d = pixel.position.x - 32.5
+    let k = 0.01 / d
+    vec4(saturate(abs(k)), 0.0, 0.0, 1.0)
+}
+
+pub fn frame(time: f32, width: u32, height: u32) {
+    let screen = begin_screen_pass(clear: vec4(0.0, 0.0, 0.0, 1.0))
+    draw(screen, big, colour, vertices: 3)
+    draw(screen, small, orange, vertices: 3)
+    draw(screen, upper, wide, vertices: 6)
+    draw(screen, lower, ratio, vertices: 6)
+    screen.present()
+}
