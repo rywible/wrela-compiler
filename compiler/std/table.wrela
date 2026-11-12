@@ -1,0 +1,468 @@
+// Tables of functions of one, two or three numbers, each with what reading it is proven to be off
+// by (language.md §14.6): a function worked out once over a box at the nodes of a grid, read
+// between them by linear interpolation, the grid made as fine as a promised error needs.
+//
+// The proof. Over a cell with sides h_i, the multilinear interpolant If of a function's corner
+// values is off by
+//
+//   |f - If| <= Σ_i (h_i² / 8) · max |∂²f/∂x_i²|            where f has two continuous derivatives
+//   |f - If| <= L · d / 2                                     where f is only Lipschitz there
+//
+// with L its Lipschitz constant on the cell (the largest length of its gradient) and d the
+// cell's diagonal. The first: along one axis, linear interpolation between two points h apart is
+// off by at most h²/8 times the second derivative's largest size (the error at x is
+// f''(ξ)(x - a)(x - b)/2, and (x - a)(b - x) <= h²/4); interpolating axis by axis adds each axis's
+// term, since an interpolation is a weighted mean, which can't make an error larger (Carl de
+// Boor, "A Practical Guide to Splines", 1978, ch. 2 and ch. 17). The second: the interpolant is
+// a weighted mean of the corners, each off from f(x) by at most L times its distance from x, and
+// the weights' mean distance to x is at most d/2 (it is a convex function of x, so largest at a
+// corner, where it is the mean of the corner's distances to the cell's other corners, weighted
+// by a corner's own weight 1, that is 0, so at most d/2 by the triangle inequality on the
+// opposite corner). A cell's bound is the smaller of the two, with max|∂²f/∂x_i²| from the
+// `interval` of the second derivatives over the cell and L from the `interval` of the gradient
+// (§14.2), plus what the stored numbers are off by: the width of f's interval at each corner as
+// a point (a corner's value is computed, not exact), the interpolation's own rounding (8 · 2⁻²³
+// of the largest corner), and a point's place in its cell as `read` computes it (8 · 2⁻²³ of the
+// box's extent, times L). The table's `error` is the largest cell's.
+//
+// A table promises its error against f's exact value at points inside its box: `read(p)` is
+// within `error()` of the true f(p), so within `error()` of the interval of f at p as a point.
+
+use std::collections::Vec
+use std::derive::{Box2, Box3, Interval, gradient, interval}
+
+/// A table of a function of one number over a range, with what reading it is proven to be off
+/// by.
+pub struct Table1 {
+    n: u32,
+    over: Interval,
+    values: Vec<f32>,
+    error: f32,
+    worst: Interval,
+}
+
+/// A table of a function of two numbers over a rectangle, with what reading it is proven to be
+/// off by.
+pub struct Table2 {
+    n: u32,
+    over: Box2,
+    values: Vec<f32>,
+    error: f32,
+    worst: Box2,
+}
+
+/// A table of a function of three numbers over a box, with what reading it is proven to be off
+/// by. `Table1` and `Table2` are the same for one and two numbers.
+pub struct Table3 {
+    n: u32,
+    over: Box3,
+    values: Vec<f32>,
+    error: f32,
+    worst: Box3,
+}
+
+/// 2⁻²³: an f32's relative rounding.
+const ULP: f64 = 0.00000011920928955078125
+
+/// The first grid's cells a side; each finer grid has twice as many.
+const FIRST: u32 = 8
+
+/// Node `i` of `n` cells from `lo` to `hi`: `hi` exactly at the end.
+fn node(lo: f32, hi: f32, i: u32, n: u32) -> f32 {
+    if i == n { hi } else { lo + (hi - lo) * (f32(i) / f32(n)) }
+}
+
+/// Where `x` falls among `n` cells from `lo` to `hi`, clamped to them: the cell and how far
+/// across it.
+fn place(x: f32, lo: f32, hi: f32, n: u32) -> (u32, f32) {
+    let t = clamp((x - lo) / (hi - lo), 0.0, 1.0) * f32(n)
+    let i = min(u32(floor(t)), n - 1)
+    (i, t - f32(i))
+}
+
+/// The larger magnitude of an interval's ends; infinite if either isn't a number.
+fn size(lo: f32, hi: f32) -> f64 {
+    let m = max(abs(f64(lo)), abs(f64(hi)))
+    if m - m == 0.0 { m } else { 1.0e300 }
+}
+
+/// A cell's bound: the smaller of the two interpolation bounds (one that isn't a number counts
+/// as none), plus the stored numbers' error, as an f32 no smaller than it.
+fn bound(smooth: f64, lip: f64, place: f64, widest: f64, largest: f64) -> f32 {
+    let s = if smooth - smooth == 0.0 { smooth } else { 1.0e300 }
+    let l = if lip - lip == 0.0 { lip } else { 1.0e300 }
+    let b = min(s, l) + place + widest + 8.0 * ULP * largest
+    // Rounded up: an f32 a hair above the f64.
+    let r = f32(b)
+    if f64(r) < b { r * (1.0 + 2.0 * f32(ULP)) } else { r }
+}
+
+/// The number of grid points of `n` cells a side in `dims` dimensions.
+fn points(n: u32, dims: u32) -> u64 {
+    var p: u64 = 1
+    for _ in 0..dims {
+        p *= u64(n) + 1
+    }
+    p
+}
+
+/// The cells a side of the first grid to try for at most `most` numbers in `dims` dimensions.
+fn first_n(most: u32, dims: u32) -> u32 {
+    var n = FIRST
+    while n > 1 && points(n, dims) > u64(most) {
+        n /= 2
+    }
+    n
+}
+
+/// `f` over `over` as a table of at most `most` numbers, as fine as `within` needs: the
+/// coarsest grid (each side doubling from 8 cells) every cell of which is proven within
+/// `within`, or the finest `most` allows.
+pub fn table1<F: fn(f32) -> f32>(f: F, over: Interval, within: f32, most: u32) -> Table1 {
+    var n = first_n(most, 1)
+    var t = build1(f, over, n)
+    while !(t.error <= within) && points(n * 2, 1) <= u64(most) {
+        n *= 2
+        t = build1(f, over, n)
+    }
+    t
+}
+
+fn build1<F: fn(f32) -> f32>(f: F, over: Interval, n: u32) -> Table1 {
+    let xs: Vec<f32> = Vec::from_fn(n + 1, |i| node(over.lo, over.hi, i, n))
+    let values: Vec<f32> = Vec::from_fn(n + 1, |i| f(xs[i]))
+    let corners: Vec<Interval> = Vec::from_fn(n + 1, |i| interval(|r| f(r), Interval { lo: xs[i], hi: xs[i] }))
+    let extent = max(abs(f64(over.lo)), abs(f64(over.hi))) + (f64(over.hi) - f64(over.lo))
+    var error: f32 = 0.0
+    var worst = Interval { lo: xs[0], hi: xs[1] }
+    for i in 0..n {
+        let cell = Interval { lo: xs[i], hi: xs[i + 1] }
+        let g = interval(|x: f32| gradient(|r| f(r), x), cell)
+        let d2 = interval(|x: f32| gradient(|y: f32| gradient(|r| f(r), y), x), cell)
+        let lip = size(g.lo, g.hi)
+        let h = f64(cell.hi) - f64(cell.lo)
+        let (a, b) = (corners[i], corners[i + 1])
+        let widest = max(f64(a.hi) - f64(a.lo), f64(b.hi) - f64(b.lo))
+        let largest = max(size(a.lo, a.hi), size(b.lo, b.hi))
+        let e = bound(h * h / 8.0 * size(d2.lo, d2.hi), lip * h / 2.0, lip * 8.0 * ULP * extent, widest, largest)
+        if !(e <= error) {
+            error = e
+            worst = cell
+        }
+    }
+    Table1 { n, over, values, error, worst }
+}
+
+impl Table1 {
+    /// Proven: no read of a point in the table's range is off from the function's exact value
+    /// by more (§14.6).
+    pub fn error(self) -> f32 {
+        self.error
+    }
+
+    /// Whether every read is proven within `within`.
+    pub fn holds(self, within: f32) -> bool {
+        self.error <= within
+    }
+
+    /// The cell with the largest bound.
+    pub fn worst(self) -> Interval {
+        self.worst
+    }
+
+    /// The table's cells.
+    pub fn cells(self) -> u32 {
+        self.n
+    }
+
+    /// The function at `x`, interpolated linearly between the two nodes round it. Outside the
+    /// table's range, the edge's value: the error is promised only inside it. Reading a table
+    /// reads its `Vec`, so a function that reads one can't itself be derived (E0700): derive the
+    /// function the table was made from.
+    pub fn read(self, x: f32) -> f32 {
+        let (i, u) = place(x, self.over.lo, self.over.hi, self.n)
+        mix(self.values[i], self.values[i + 1], u)
+    }
+}
+
+/// `table1` for a function of two numbers over a rectangle.
+pub fn table2<F: fn(vec2) -> f32>(f: F, over: Box2, within: f32, most: u32) -> Table2 {
+    var n = first_n(most, 2)
+    var t = build2(f, over, n)
+    while !(t.error <= within) && points(n * 2, 2) <= u64(most) {
+        n *= 2
+        t = build2(f, over, n)
+    }
+    t
+}
+
+fn build2<F: fn(vec2) -> f32>(f: F, over: Box2, n: u32) -> Table2 {
+    let m = n + 1
+    let xs: Vec<f32> = Vec::from_fn(m, |i| node(over.lo.x, over.hi.x, i, n))
+    let ys: Vec<f32> = Vec::from_fn(m, |i| node(over.lo.y, over.hi.y, i, n))
+    let values: Vec<f32> = Vec::from_fn(m * m, |k| f(vec2(xs[k % m], ys[k / m])))
+    let corners: Vec<Interval> = Vec::from_fn(m * m, |k| {
+        let p = vec2(xs[k % m], ys[k / m])
+        interval(|r| f(r), Box2 { lo: p, hi: p })
+    })
+    let extent = |lo: f32, hi: f32| max(abs(f64(lo)), abs(f64(hi))) + (f64(hi) - f64(lo))
+    let reach = extent(over.lo.x, over.hi.x) + extent(over.lo.y, over.hi.y)
+    var error: f32 = 0.0
+    var worst = Box2 { lo: vec2(xs[0], ys[0]), hi: vec2(xs[1], ys[1]) }
+    for j in 0..n {
+        for i in 0..n {
+            let cell = Box2 { lo: vec2(xs[i], ys[j]), hi: vec2(xs[i + 1], ys[j + 1]) }
+            let g = interval(|p: vec2| gradient(|r| f(r), p), cell)
+            let d2 = interval(
+                |p: vec2| vec2(
+                    gradient(|q: vec2| gradient(|r| f(r), q).x, p).x,
+                    gradient(|q: vec2| gradient(|r| f(r), q).y, p).y,
+                ),
+                cell,
+            )
+            let (gx, gy) = (size(g.lo.x, g.hi.x), size(g.lo.y, g.hi.y))
+            let lip = sqrt(gx * gx + gy * gy)
+            let (hx, hy) = (f64(cell.hi.x) - f64(cell.lo.x), f64(cell.hi.y) - f64(cell.lo.y))
+            let smooth =
+                hx * hx / 8.0 * size(d2.lo.x, d2.hi.x) + hy * hy / 8.0 * size(d2.lo.y, d2.hi.y)
+            var widest = 0.0
+            var largest = 0.0
+            for c in 0..4 {
+                let v = corners[(j + c / 2) * m + i + c % 2]
+                widest = max(widest, f64(v.hi) - f64(v.lo))
+                largest = max(largest, size(v.lo, v.hi))
+            }
+            let d = sqrt(hx * hx + hy * hy)
+            let e = bound(smooth, lip * d / 2.0, lip * 8.0 * ULP * reach, widest, largest)
+            if !(e <= error) {
+                error = e
+                worst = cell
+            }
+        }
+    }
+    Table2 { n, over, values, error, worst }
+}
+
+impl Table2 {
+    /// Proven: no read of a point in the table's rectangle is off from the function's exact
+    /// value by more (§14.6).
+    pub fn error(self) -> f32 {
+        self.error
+    }
+
+    /// Whether every read is proven within `within`.
+    pub fn holds(self, within: f32) -> bool {
+        self.error <= within
+    }
+
+    /// The cell with the largest bound.
+    pub fn worst(self) -> Box2 {
+        self.worst
+    }
+
+    /// The table's cells a side.
+    pub fn cells(self) -> u32 {
+        self.n
+    }
+
+    /// The function at `p`, interpolated bilinearly between the four nodes round it. Outside
+    /// the table's rectangle, the edge's value: the error is promised only inside it. Reading a
+    /// table reads its `Vec`, so a function that reads one can't itself be derived (E0700):
+    /// derive the function the table was made from.
+    pub fn read(self, p: vec2) -> f32 {
+        let m = self.n + 1
+        let (i, u) = place(p.x, self.over.lo.x, self.over.hi.x, self.n)
+        let (j, v) = place(p.y, self.over.lo.y, self.over.hi.y, self.n)
+        let at = j * m + i
+        let a = mix(self.values[at], self.values[at + 1], u)
+        let b = mix(self.values[at + m], self.values[at + m + 1], u)
+        mix(a, b, v)
+    }
+}
+
+/// `table1` for a function of three numbers over a box.
+pub fn table3<F: fn(vec3) -> f32>(f: F, over: Box3, within: f32, most: u32) -> Table3 {
+    var n = first_n(most, 3)
+    var t = build3(f, over, n)
+    while !(t.error <= within) && points(n * 2, 3) <= u64(most) {
+        n *= 2
+        t = build3(f, over, n)
+    }
+    t
+}
+
+/// Node `k` of a grid whose nodes along each axis are `xs`, `ys` and `zs`, x fastest.
+fn grid3(xs: [f32], ys: [f32], zs: [f32], k: u32) -> vec3 {
+    let m = xs.len()
+    vec3(xs[k % m], ys[k / m % m], zs[k / (m * m)])
+}
+
+fn build3<F: fn(vec3) -> f32>(f: F, over: Box3, n: u32) -> Table3 {
+    let m = n + 1
+    let xs: Vec<f32> = Vec::from_fn(m, |i| node(over.lo.x, over.hi.x, i, n))
+    let ys: Vec<f32> = Vec::from_fn(m, |i| node(over.lo.y, over.hi.y, i, n))
+    let zs: Vec<f32> = Vec::from_fn(m, |i| node(over.lo.z, over.hi.z, i, n))
+    let values: Vec<f32> = Vec::from_fn(m * m * m, |k| f(grid3(xs, ys, zs, k)))
+    let corners: Vec<Interval> = Vec::from_fn(m * m * m, |k| {
+        let p = grid3(xs, ys, zs, k)
+        interval(|r| f(r), Box3 { lo: p, hi: p })
+    })
+    let extent = |lo: f32, hi: f32| max(abs(f64(lo)), abs(f64(hi))) + (f64(hi) - f64(lo))
+    let reach =
+        extent(over.lo.x, over.hi.x) + extent(over.lo.y, over.hi.y) + extent(over.lo.z, over.hi.z)
+    var error: f32 = 0.0
+    var worst = Box3 { lo: grid3(xs, ys, zs, 0), hi: grid3(xs, ys, zs, m * m + m + 1) }
+    for k in 0..n {
+        for j in 0..n {
+            for i in 0..n {
+                let base = (k * m + j) * m + i
+                let cell = Box3 { lo: grid3(xs, ys, zs, base), hi: grid3(xs, ys, zs, base + m * m + m + 1) }
+                let g = interval(|p: vec3| gradient(|r| f(r), p), cell)
+                let d2 = interval(
+                    |p: vec3| vec3(
+                        gradient(|q: vec3| gradient(|r| f(r), q).x, p).x,
+                        gradient(|q: vec3| gradient(|r| f(r), q).y, p).y,
+                        gradient(|q: vec3| gradient(|r| f(r), q).z, p).z,
+                    ),
+                    cell,
+                )
+                let (gx, gy, gz) = (size(g.lo.x, g.hi.x), size(g.lo.y, g.hi.y), size(g.lo.z, g.hi.z))
+                let lip = sqrt(gx * gx + gy * gy + gz * gz)
+                let hx = f64(cell.hi.x) - f64(cell.lo.x)
+                let hy = f64(cell.hi.y) - f64(cell.lo.y)
+                let hz = f64(cell.hi.z) - f64(cell.lo.z)
+                let smooth = hx * hx / 8.0 * size(d2.lo.x, d2.hi.x) +
+                    hy * hy / 8.0 * size(d2.lo.y, d2.hi.y) +
+                    hz * hz / 8.0 * size(d2.lo.z, d2.hi.z)
+                var widest = 0.0
+                var largest = 0.0
+                for c in 0..8 {
+                    let v = corners[base + (c % 2) + (c / 2 % 2) * m + (c / 4) * m * m]
+                    widest = max(widest, f64(v.hi) - f64(v.lo))
+                    largest = max(largest, size(v.lo, v.hi))
+                }
+                let d = sqrt(hx * hx + hy * hy + hz * hz)
+                let e = bound(smooth, lip * d / 2.0, lip * 8.0 * ULP * reach, widest, largest)
+                if !(e <= error) {
+                    error = e
+                    worst = cell
+                }
+            }
+        }
+    }
+    Table3 { n, over, values, error, worst }
+}
+
+impl Table3 {
+    /// Proven: no read of a point in the table's box is off from the function's exact value by
+    /// more (§14.6).
+    pub fn error(self) -> f32 {
+        self.error
+    }
+
+    /// Whether every read is proven within `within`.
+    pub fn holds(self, within: f32) -> bool {
+        self.error <= within
+    }
+
+    /// The cell with the largest bound.
+    pub fn worst(self) -> Box3 {
+        self.worst
+    }
+
+    /// The table's cells a side.
+    pub fn cells(self) -> u32 {
+        self.n
+    }
+
+    /// The function at `p`, interpolated trilinearly between the eight nodes round it: seven
+    /// mixes. Outside the table's box, the edge's value: the error is promised only inside it.
+    /// Reading a table reads its `Vec`, so a function that reads one can't itself be derived
+    /// (E0700): derive the function the table was made from.
+    pub fn read(self, p: vec3) -> f32 {
+        let m = self.n + 1
+        let (i, u) = place(p.x, self.over.lo.x, self.over.hi.x, self.n)
+        let (j, v) = place(p.y, self.over.lo.y, self.over.hi.y, self.n)
+        let (k, w) = place(p.z, self.over.lo.z, self.over.hi.z, self.n)
+        let at = (k * m + j) * m + i
+        borrow s = self.values
+        let a = mix(mix(s[at], s[at + 1], u), mix(s[at + m], s[at + m + 1], u), v)
+        let up = at + m * m
+        let b = mix(mix(s[up], s[up + 1], u), mix(s[up + m], s[up + m + 1], u), v)
+        mix(a, b, w)
+    }
+}
+
+// ---- tests: G-sound, each read within the proven error -------------------------------------------
+
+/// Whether `read` is within `error` of `f`'s exact value at `x`: of `f`'s interval at the point.
+fn sound(read: f32, near: Interval, error: f32) -> bool {
+    near.lo - error <= read && read <= near.hi + error
+}
+
+@test
+fn a_sine_is_read_within_its_proven_error() {
+    let f = |x: f32| sin(x)
+    let over = Interval { lo: 0.0, hi: 6.0 }
+    let t = table1(f, over, 0.0001, 4096)
+    assert(t.holds(0.0001))
+    // Proven, not loose: a sine's second derivative is at most 1, so 6/n squared over 8.
+    assert(t.error() < 0.0001)
+    for i in 0..100000 {
+        let x = over.sample(3, i)
+        assert(sound(t.read(x), interval(|r| f(r), Interval { lo: x, hi: x }), t.error()))
+    }
+}
+
+@test
+fn a_product_is_read_within_its_proven_error() {
+    let f = |p: vec2| p.x * p.y
+    let over = Box2 { lo: vec2(0.0), hi: vec2(1.0) }
+    let t = table2(f, over, 0.001, 65536)
+    // x·y has no second derivative along either axis: bilinear interpolation is exact, up to
+    // the stored numbers' rounding and where `read` places a point (8 · 2⁻²³ of the rectangle's
+    // reach times the gradient's length, about 5e-6 here).
+    assert(t.error() < 0.00001)
+    for i in 0..100000 {
+        let p = over.sample(5, i)
+        assert(sound(t.read(p), interval(|r| f(r), Box2 { lo: p, hi: p }), t.error()))
+    }
+}
+
+@test
+fn a_balls_distance_is_read_within_its_proven_error() {
+    let f = |p: vec3| length(p) - 0.5
+    let over = Box3 { lo: vec3(0.2, 0.2, 0.2), hi: vec3(1.0, 1.0, 1.0) }
+    let t = table3(f, over, 0.001, 40000)
+    assert(t.holds(0.001))
+    for i in 0..100000 {
+        let p = over.sample(7, i)
+        assert(sound(t.read(p), interval(|r| f(r), Box3 { lo: p, hi: p }), t.error()))
+    }
+}
+
+@test
+fn fbm_is_read_within_its_proven_error() {
+    let noise = std::field::fbm(freq: 2.0, octaves: 4)
+    let f = |p: vec3| std::field::Noise::value(noise, p)
+    let over = Box3 { lo: vec3(-0.5), hi: vec3(0.5) }
+    // 8 cells a side: 729 numbers.
+    let t = table3(f, over, 0.05, 729)
+    for i in 0..100000 {
+        let p = over.sample(11, i)
+        assert(sound(t.read(p), interval(|r| f(r), Box3 { lo: p, hi: p }), t.error()))
+    }
+}
+
+@test
+fn a_table_is_as_coarse_as_its_promise_allows() {
+    let f = |x: f32| x * x
+    let over = Interval { lo: 0.0, hi: 1.0 }
+    // x² over [0, 1] in n cells: 2/8 / n² off. 8 cells: 1/256; 16: 1/1024.
+    assert(table1(f, over, 0.005, 1000).cells() == 8)
+    assert(table1(f, over, 0.002, 1000).cells() == 16)
+    // A promise `most` can't keep: the finest it allows, and `holds` says no.
+    let t = table1(f, over, 0.0000001, 40)
+    assert(t.cells() == 32)
+    assert(!t.holds(0.0000001))
+}
