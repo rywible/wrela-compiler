@@ -319,23 +319,40 @@ fn o2(host: &mut CpuHost, rng: &mut Rng) -> Result<Counts, Failure> {
 
 /// O3: at 16 points, central differences `D(h)` and `D(h/2)`, `h` = 1e-3. A point counts where
 /// they agree within 1e-3 relative in each component (the function is smooth there); at a point
-/// that counts, the gradient is within 2e-3 relative of `D(h/2)`.
+/// that counts, the gradient is within 2e-3 relative of `D(h/2)`. A point also counts only
+/// where the differences stand well above the values' own rounding (a large value's ulp over
+/// the step) and the point's value is continuous with its neighbours'.
 fn o3(host: &mut CpuHost, rng: &mut Rng) -> Result<Counts, Failure> {
     let mut counted = 0;
     for _ in 0..16 {
         let p = point(rng);
         let g = floats(host, "grad", &args(p))?;
+        let here = f64::from(value(host, p)?);
         let mut d = [[0.0f64; 3]; 2];
+        // Each difference's own rounding: an ulp of the largest value it subtracts, over its
+        // step, and whether the point's value lies between its neighbours' (f is continuous
+        // there: a branch that flips at the point itself, as a table read at a rounded index
+        // can, makes its neighbours' difference another branch's slope).
+        let (mut noise, mut continuous) = ([0.0f64; 3], true);
         for (s, h) in [1e-3f32, 5e-4].into_iter().enumerate() {
             for axis in 0..3 {
                 let (mut a, mut b) = (p, p);
                 a[axis] += h;
                 b[axis] -= h;
                 let step = f64::from(a[axis]) - f64::from(b[axis]);
-                d[s][axis] = (f64::from(value(host, a)?) - f64::from(value(host, b)?)) / step;
+                let (fa, fb) = (f64::from(value(host, a)?), f64::from(value(host, b)?));
+                d[s][axis] = (fa - fb) / step;
+                let ulp = f64::from(f32::EPSILON) * fa.abs().max(fb.abs());
+                noise[axis] = noise[axis].max(4.0 * ulp / step);
+                let spread = (fa - fb).abs() + 4.0 * ulp;
+                continuous &= (here - 0.5 * (fa + fb)).abs() <= spread + 1e-3 * (1.0 + here.abs());
             }
         }
-        let smooth = (0..3).all(|i| (d[0][i] - d[1][i]).abs() <= 1e-3 * (1.0 + d[0][i].abs()));
+        let smooth = continuous
+            && (0..3).all(|i| {
+                (d[0][i] - d[1][i]).abs() <= 1e-3 * (1.0 + d[0][i].abs())
+                    && noise[i] <= 1e-3 * (1.0 + d[1][i].abs())
+            });
         if !smooth {
             continue;
         }
