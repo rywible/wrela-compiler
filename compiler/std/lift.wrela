@@ -629,8 +629,13 @@ fn loss_at(free: [Literal], f: fn() -> f32, x: [f32]) -> f64 {
     f64(f())
 }
 
-/// `f`'s derivative by each of the literals `free` at `x`, 16 at a time; 0 for those `moves`
-/// holds still. `changes` notes each literal the derivative isn't 0 by, held still or not.
+/// From how many free literals a gradient is taken by reverse mode (`reverse`): one recorded
+/// evaluation and a sweep for each 256, in place of forward mode's 16 at a time.
+pub const REVERSE_FROM: u32 = 4294967295
+
+/// `f`'s derivative by each of the literals `free` at `x`, 16 at a time by forward mode, or
+/// past `REVERSE_FROM` of them 256 at a time by reverse mode; 0 for those `moves` holds still.
+/// `changes` notes each literal the derivative isn't 0 by, held still or not.
 fn gradient_at(
     free: [Literal],
     f: fn() -> f32,
@@ -644,21 +649,41 @@ fn gradient_at(
     let n = free.len()
     var g: Vec<f64> = Vec::new()
     var k = 0
+    let reversed = n >= REVERSE_FROM
+    let chunk = if reversed { 256 } else { 16 }
     while k < n {
-        var which = [free[k]; 16]
-        for j in 1..min(16, n - k) {
-            which[j] = free[k + j]
-        }
-        let (_, d) = gradient(f, which)
-        for j in 0..min(16, n - k) {
-            if d[j] != 0.0 {
-                changes[k + j] = true
+        let m = min(chunk, n - k)
+        if reversed {
+            // The chunk's first literal fills the rest: a literal named twice is derived once.
+            var which = [free[k]; 256]
+            for j in 1..m {
+                which[j] = free[k + j]
             }
-            g.push(if moves[k + j] { f64(d[j]) } else { 0.0 })
+            let (_, d) = reverse(f, which)
+            for j in 0..m {
+                note(mut g, mut changes, moves[k + j], d[j], k + j)
+            }
+        } else {
+            var which = [free[k]; 16]
+            for j in 1..m {
+                which[j] = free[k + j]
+            }
+            let (_, d) = gradient(f, which)
+            for j in 0..m {
+                note(mut g, mut changes, moves[k + j], d[j], k + j)
+            }
         }
-        k += 16
+        k += chunk
     }
     g
+}
+
+/// A literal's derivative into the gradient (0 if it doesn't move), and whether it changes.
+fn note(g: mut Vec<f64>, changes: mut Vec<bool>, moves: bool, d: f32, at: u32) {
+    if d != 0.0 {
+        changes[at] = true
+    }
+    g.push(if moves { f64(d) } else { 0.0 })
 }
 
 /// BFGS from `x0` over the literals `moves` lets change, `steps` steps at most: where it
