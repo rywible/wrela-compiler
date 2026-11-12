@@ -48,6 +48,7 @@ LIGHT_STEPS = ("rustfmt", "wrela-fmt", "tools", "browser-types", "browser-dist",
                "browser", "cloudflare-types", "cloudflare-dist", "cloudflare", "wgsl")
 STEPS = CARGO_STEPS + LIGHT_STEPS
 CONTROLS = ("WRELA_RUN_ONLY", "WRELA_BLESS", "WRELA_FUZZ_WORKER", "WRELA_CONST_CACHE",
+            "WRELA_TYPED_SEEDS",
             "WRELA_VALIDATOR")
 PRINT = threading.Lock()
 
