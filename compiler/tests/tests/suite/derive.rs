@@ -523,3 +523,26 @@ fn the_slope_is_the_weight() {
     let dir = crate::package("derive-heap-constants", src);
     assert_eq!(crate::tests_pass(&dir), 1);
 }
+
+/// A trace past its most nodes panics, saying what to do (`Trace::holding` sets a small most).
+#[test]
+fn a_trace_past_its_most_panics() {
+    let src = "use std::derive::Trace
+
+@test
+fn past() {
+    var t = Trace::holding(4)
+    for _ in 0..4 {
+        let _ = t.leaf()
+    }
+}
+";
+    let dir = crate::package("derive-trace-most", src);
+    let out = wrela_driver::test(&dir, None);
+    let failure = out.results.iter().find_map(|r| r.failure.clone()).expect("the test fails");
+    let rendered = wrela_diag::render::render_all(&out.sources, &[failure]);
+    assert!(
+        rendered.contains("a reverse gradient's trace passed 2^26 numbers"),
+        "{rendered}"
+    );
+}
