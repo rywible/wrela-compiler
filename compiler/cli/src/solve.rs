@@ -13,7 +13,9 @@
 //! package's literals lifted, and runs it on the CPU, where `std::lift::Minimize` solves: BFGS
 //! on the function's derivatives by the literals (`std::lift::gradient`, forward mode), each
 //! step along a line searched until the value falls enough (Armijo's rule); a fit, by
-//! Levenberg–Marquardt on every number's derivatives (`std::lift::jacobian`). The literals end
+//! Levenberg–Marquardt on every number's derivatives (`std::lift::jacobian`). No step moves a
+//! literal farther than its own size, and a solve the program fails under says which literals
+//! it was trying where. The literals end
 //! rounded to their own decimals, as a drag's are: the one that changed most first, the
 //! rest solved again with it held, and the last given more decimals while rounding would cost
 //! more than 5% of the value, and only the decimals that buy something where none keeps the
@@ -289,6 +291,7 @@ fn glue(package: &str, module: &str, function: &str, spec: bool, fit: bool) -> S
         "{head}pub fn init() -> Minimize {{\n    Minimize::new()\n}}\n\n\
          pub fn free(m: mut Minimize, literal: u32, decimals: u32, unit: f64) {{\n    \
          m.free(Literal {{ index: literal }}, decimals, unit)\n}}\n\n\
+         pub fn literal_now(literal: u32) -> f32 {{\n    Literal {{ index: literal }}.value()\n}}\n\n\
          pub fn solve(m: mut Minimize, steps: u32, exact: bool) {{\n    m.{how}(|| {call}, steps, exact)\n}}\n\n\
          pub fn losses(m: Minimize) -> vec3 {{\n    vec3(m.before(), m.solved(), m.after())\n}}\n\n\
          pub fn steps(m: Minimize) -> u32 {{\n    m.steps()\n}}\n\n\
@@ -360,7 +363,14 @@ fn solve(
     // the warnings.)
     let held_before = spec && checks_before["missed"].as_u64() == Some(0);
     let (steps, exact) = if held_before { (0, true) } else { (steps, exact) };
-    call(&mut host, "solve", &[Value::I32(steps as i32), Value::I32(i32::from(exact))])?;
+    let began = values(&mut host, &lits);
+    if let Err(why) =
+        call(&mut host, "solve", &[Value::I32(steps as i32), Value::I32(i32::from(exact))])
+    {
+        // The program failed where the solve set its literals: which, and where.
+        let now = values(&mut host, &lits);
+        return Err(why + &trying(&lits, began.as_deref(), now.as_deref()));
+    }
     let (before, solved_loss, after) = match call(&mut host, "losses", &[])?.as_slice() {
         [Value::F32(a), Value::F32(b), Value::F32(c)] => (*a, *b, *c),
         other => return Err(format!("`losses` returned {other:?}")),
@@ -527,6 +537,37 @@ pub(crate) fn freed(
         }
     }
     Ok(lits)
+}
+
+/// Each literal's value in the program now (the glue's `literal_now`), if it can say.
+fn values(host: &mut CpuHost, lits: &[Lit]) -> Option<Vec<f32>> {
+    lits.iter()
+        .map(|l| {
+            let value = host.call_export("literal_now", &[Value::I32(l.index as i32)]).ok()?;
+            match value.as_slice() {
+                [Value::F32(v)] => Some(*v),
+                _ => None,
+            }
+        })
+        .collect()
+}
+
+/// What a solve was trying when the program failed under it: the literals that weren't where
+/// they began (`began`), and where they were (`now`). The program doesn't run there, which its
+/// author can't see from the trap alone. Nothing, where the program couldn't say.
+fn trying(lits: &[Lit], began: Option<&[f32]>, now: Option<&[f32]>) -> String {
+    let (Some(began), Some(now)) = (began, now) else { return String::new() };
+    let moved: Vec<String> = lits
+        .iter()
+        .zip(began.iter().zip(now))
+        .filter(|(_, (b, n))| b.to_bits() != n.to_bits())
+        .map(|(l, (_, n))| format!("{}:{} `{}` at {n}", l.file, l.line, l.edit.text))
+        .collect();
+    if moved.is_empty() {
+        String::new()
+    } else {
+        format!(" (the solve was trying {})", moved.join(", "))
+    }
 }
 
 /// The spec's report at the literals' values now (the glue's `report` prints it).

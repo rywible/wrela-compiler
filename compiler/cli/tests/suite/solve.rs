@@ -210,6 +210,62 @@ fn a_literal_gets_no_decimals_that_buy_nothing() {
     assert!(within["loss_after"].as_f64().unwrap() < 1.05, "{within}");
 }
 
+/// A steep function (its gradient where `X` is written is -100,000) of a program that fails far
+/// from there: it reads a table by `X`, and traps off its end. The first step tried is no
+/// farther from `X` than its size, not as long as the gradient, so the solve never leaves the
+/// table.
+#[test]
+fn a_step_moves_no_literal_farther_than_its_size() {
+    let fit = "pub const X: f32 = 0.2\n\npub fn miss() -> f32 {\n    let table = [1.0, 1.0, 1.0, 1.0]\n    let d = X - 0.25\n    1.0e6 * d * d * table[u32(X * 2.0 + 1.0)]\n}\n";
+    let dir = common::package(
+        "solve-step-size",
+        &[
+            ("wrela.toml", &common::manifest("step_size")),
+            ("fit.wrela", fit),
+            ("main.wrela", common::FRAME),
+        ],
+    );
+    let answer = common::answer(common::wrela().arg("solve").arg(&dir).args([
+        "--minimize",
+        "fit::miss",
+        "--free",
+        "fit.wrela:1",
+        "--json",
+    ]));
+    assert_eq!(answer["solved"], true, "{answer}");
+    assert!(answer["loss_before"].as_f64().unwrap() > 2499.0, "{answer}");
+    assert!(answer["loss_after"].as_f64().unwrap() < 1e-3, "{answer}");
+    let x = answer["literals"][0]["after"].as_f64().unwrap();
+    assert!((x - 0.25).abs() < 1e-6, "{answer}");
+}
+
+/// The same with a table that ends nearer than `X`'s size: the first step tried is off it. The
+/// solve fails with the trap, and says which literal it was trying where.
+#[test]
+fn a_solve_the_program_fails_under_says_what_it_was_trying() {
+    let fit = "pub const X: f32 = 0.2\n\npub fn miss() -> f32 {\n    let table = [1.0, 1.0, 1.0, 1.0]\n    let d = X - 0.25\n    1.0e6 * d * d * table[u32(X * 10.0)]\n}\n";
+    let dir = common::package(
+        "solve-trying",
+        &[
+            ("wrela.toml", &common::manifest("trying")),
+            ("fit.wrela", fit),
+            ("main.wrela", common::FRAME),
+        ],
+    );
+    let out = common::wrela()
+        .arg("solve")
+        .arg(&dir)
+        .args(["--minimize", "fit::miss", "--free", "fit.wrela:1", "--json"])
+        .output()
+        .expect("run wrela");
+    assert_eq!(out.status.code(), Some(1));
+    let answer: serde_json::Value = serde_json::from_slice(&out.stdout).expect("JSON");
+    assert_eq!(answer["solved"], false);
+    let why = answer["why"].as_str().unwrap();
+    assert!(why.contains("trapped"), "{answer}");
+    assert!(why.contains("(the solve was trying fit.wrela:1 `0.2` at 0.4"), "{answer}");
+}
+
 /// A solve that gains under 1%, where `X` rounded to its one decimal lands on the steep side:
 /// within the 5% a rounding may cost, and above where the solve began. `X` stays where it was.
 #[test]

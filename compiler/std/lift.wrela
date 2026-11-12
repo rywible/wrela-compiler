@@ -337,6 +337,9 @@ impl Checks for Report {
 ///   derivatives of every number from `jacobian`, 16 literals at a time. Each step has what BFGS
 ///   learns over many, so it takes far fewer.
 ///
+/// Neither tries a step that moves a literal farther than its own size (`reach`): its size
+/// now, or where the solve began if that was larger, or 1 if it began at 0.
+///
 /// Then the literals are rounded to their sources' decimals: all at once where that costs no
 /// more than 5% of the solved value; else one at a time, the one that changed most first and
 /// the rest solved again with it held, a literal getting more decimals while rounding would
@@ -803,8 +806,8 @@ fn bfgs(
             slope = -gg
             h = identity(n)
         }
-        // Armijo's rule, halving the step from 1.
-        var t: f64 = 1.0
+        // Armijo's rule, halving the step from all of it that `reach` lets a first try go.
+        var t: f64 = reach(x, x0, p)
         var x1: Vec<f64> = Vec::new()
         var f1: f64 = 0.0
         for _ in 0..40 {
@@ -846,6 +849,31 @@ fn bfgs(
         }
     }
     (narrowed(x), taken)
+}
+
+/// How much of a step `p` from `x` a solve that began at `x0` tries: all of it (1), or as much
+/// as moves no literal farther than its own size. That is its size now, or where the solve
+/// began if that was larger (so it can cross 0), or 1 if it began at 0. The function's
+/// derivatives say nothing of it that far off, and a step can be far longer than any literal:
+/// BFGS's first is as long as the gradient (its estimate starts as the identity), which for a
+/// loss of 1,149 that rises 164 for a thousandth of a second of a key's time was a time of
+/// -164,460 s, where one evaluation ran for hours. A literal can still double each step, so
+/// one that has far to go gets there in a few.
+///
+/// A line search's maximum step: J. E. Dennis and R. B. Schnabel, "Numerical Methods for
+/// Unconstrained Optimization and Nonlinear Equations" (1983), §6.3 and algorithm A6.3.1
+/// (`maxstep`), there one length for the whole step and here each literal's own.
+fn reach(x: [f64], x0: [f32], p: [f64]) -> f64 {
+    var t: f64 = 1.0
+    for i in 0..x.len() {
+        let began = abs(f64(x0[i]))
+        let most = max(abs(x[i]), if began == 0.0 { 1.0 } else { began })
+        let step = abs(p[i])
+        if t * step > most {
+            t = most / step
+        }
+    }
+    t
 }
 
 fn narrowed(x: [f64]) -> Vec<f32> {
@@ -1064,7 +1092,8 @@ fn least_squares<const M: u32>(
         for _ in 0..40 {
             let d = damped_step(a, g, n, live, lambda)
             if d.len() == n {
-                let trial: Vec<f64> = Vec::from_fn(n, |i| x[i] + d[i])
+                let t = reach(x, x0, d)
+                let trial: Vec<f64> = Vec::from_fn(n, |i| x[i] + t * d[i])
                 let ft = squares_at(free, f, narrowed(trial))
                 if ft - ft == 0.0 && ft < fx {
                     x1 = take trial
@@ -1162,6 +1191,25 @@ fn a_damped_step_solves_its_equations() {
     assert(one[0] == 0.0 && abs(one[1] - 2.0 / 3.0) < 1.0e-12)
     // A matrix that isn't positive definite has no step.
     assert(damped_step([1.0, 2.0, 2.0, 1.0], [-1.0, -2.0], 2, [0, 1], 0.0).len() == 0)
+}
+
+@test
+fn a_step_moves_no_literal_farther_than_its_size() {
+    // A step within every literal's size is taken whole.
+    assert(reach([0.5, -32.0], [0.5, -32.0], [0.25, 20.0]) == 1.0)
+    // A key's time of 0.5 s and a step as long as its gradient: 0.5 s of it.
+    assert(abs(reach([0.5], [0.5], [-164460.0]) * 164460.0 - 0.5) < 1.0e-12)
+    // The literal that would go farthest for its size sets how much of the step is tried.
+    assert(abs(reach([2.0, 100.0], [2.0, 100.0], [-8.0, 150.0]) - 0.25) < 1.0e-12)
+    // One that has come near 0 can still move as far as it began from it, and so cross it.
+    assert(abs(reach([0.125], [0.5], [-2.0]) - 0.25) < 1.0e-12)
+    // One that began at 0 has no size to go by: 1.
+    assert(abs(reach([0.0], [0.0], [5.0]) - 0.2) < 1.0e-12)
+    // A step that isn't a number bounds nothing, and an endless one is not taken at all.
+    let quiet: u64 = 0x7ff8000000000000
+    let infinity: u64 = 0x7ff0000000000000
+    assert(reach([1.0], [1.0], [bitcast_f64(quiet)]) == 1.0)
+    assert(reach([1.0], [1.0], [bitcast_f64(infinity)]) == 0.0)
 }
 
 @test
