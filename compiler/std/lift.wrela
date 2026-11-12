@@ -716,8 +716,9 @@ fn loss_at(free: [Literal], f: fn() -> f32, x: [f32]) -> f64 {
 }
 
 /// From how many free literals a gradient is taken by reverse mode (`reverse`): one recorded
-/// evaluation and a sweep for each 256, in place of forward mode's 16 at a time.
-pub const REVERSE_FROM: u32 = 4294967295
+/// evaluation and a sweep for each 256, in place of forward mode's 16 at a time. Measured on a
+/// wolf's spec solve on the M4: 1.0 times as fast at 18 literals, 1.32 at 65, 2.66 at 259.
+pub const REVERSE_FROM: u32 = 65
 
 /// `f`'s derivative by each of the literals `free` at `x`, 16 at a time by forward mode, or
 /// past `REVERSE_FROM` of them 256 at a time by reverse mode; 0 for those `moves` holds still.
