@@ -21,6 +21,7 @@
 //! branch and each loop's passes. The no-op observer, `()`, costs nothing.
 
 pub mod concrete;
+pub mod error;
 pub mod raster;
 
 pub use crate::const_fold::K as V;
