@@ -312,6 +312,14 @@ pub fn build_for_tests_with(root: &Path, debug: bool, no_opt: bool) -> Output {
     on_compiler_thread(|| compile(root, mode, wrela_lower::Roots::of, &[]))
 }
 
+/// A build for `wrela fuzz` alone: a debug build (so a float operation that makes a NaN traps)
+/// whose WASM marks the code it runs in a coverage map (`wrela_wasm::Options::coverage`), with
+/// no GPU output. Nothing else builds this way (language.md §16.2).
+pub fn build_fuzz(root: &Path) -> Output {
+    let mode = Mode { debug: true, coverage: true, ..Mode::RELEASE };
+    on_compiler_thread(|| compile(root, mode, wrela_lower::Roots::of, &[]))
+}
+
 /// [`build`], lowering every function of the package that can be lowered on its own, exported
 /// or not ([`wrela_lower::Roots::every_fn`]): for tests of code that nothing calls.
 pub fn build_every_fn(root: &Path) -> Output {
@@ -916,6 +924,8 @@ struct Mode {
     no_opt: bool,
     /// Each GPU pipeline's module kept in the output ([`gpu_modules`]).
     keep_gpu: bool,
+    /// The CPU module with coverage and no GPU output ([`build_fuzz`]).
+    coverage: bool,
 }
 
 impl Mode {
@@ -928,6 +938,7 @@ impl Mode {
         relaxed_simd: false,
         no_opt: false,
         keep_gpu: false,
+        coverage: false,
     };
     const RELEASE: Mode = Mode { emit: true, ..Mode::CHECK };
 }
@@ -1071,6 +1082,12 @@ fn compile_loaded_in(
                 data_report = wrela_wasm::data_report(&lowered.cpu).ok();
             }
             if !ok || !mode.emit {
+                continue;
+            }
+            if mode.coverage && role == wrela_sema::defs::Role::Client {
+                let out = build::emit_for_fuzz(&lowered, &sources);
+                diagnostics.extend(out.diagnostics);
+                files.extend(out.files);
                 continue;
             }
             if role != wrela_sema::defs::Role::Client {

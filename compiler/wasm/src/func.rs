@@ -259,6 +259,9 @@ pub(crate) struct At<'m> {
     pub simd: bool,
     /// Relaxable functions use relaxed SIMD (`crate::Options::relaxed`).
     pub relaxed: bool,
+    /// The coverage map's address (`crate::Options::coverage`), and the next site's number.
+    pub coverage: Option<u32>,
+    pub sites: std::cell::Cell<u32>,
 }
 
 /// A function's code, and where each source location starts in it (byte offsets from the
@@ -349,6 +352,7 @@ pub(crate) fn emit_function(
     if fe.relaxed {
         (fe.fused, fe.fused_away) = fusions(m, f, &mut fe.release);
     }
+    fe.cover();
     fe.block(&f.body)?;
     // Falling off the end: only a function with no result can.
     fe.epilogue();
@@ -1132,6 +1136,19 @@ impl<'m> Fe<'m> {
 
     // ---- statements ------------------------------------------------------------------------
 
+    /// A coverage site (`crate::Options::coverage`): `map[site] = 1`, the next site's number.
+    fn cover(&mut self) {
+        let Some(at) = self.at.coverage else { return };
+        let site = self.at.sites.get();
+        self.at.sites.set(site.wrapping_add(1));
+        let addr = at + site % crate::COVERAGE_BYTES;
+        self.ins.extend([
+            I::I32Const(addr as i32),
+            I::I32Const(1),
+            I::I32Store8(wasm_encoder::MemArg { offset: 0, align: 0, memory_index: 0 }),
+        ]);
+    }
+
     fn block(&mut self, b: &ir::Block) -> R<()> {
         let mut learned = Vec::new();
         for s in b {
@@ -1247,11 +1264,13 @@ impl<'m> Fe<'m> {
                 self.ins.extend([I::LocalGet(self.v(*cond)), I::If(BlockType::Empty)]);
                 self.labels.push(Label::Plain);
                 let learned = self.learn(*cond, true);
+                self.cover();
                 self.block(then)?;
                 self.forget(learned.into_iter().collect());
-                if !else_.is_empty() {
+                if !else_.is_empty() || self.at.coverage.is_some() {
                     self.ins.push(I::Else);
                     let learned = self.learn(*cond, false);
+                    self.cover();
                     self.block(else_)?;
                     self.forget(learned.into_iter().collect());
                 }
@@ -1274,6 +1293,7 @@ impl<'m> Fe<'m> {
                 self.labels.push(Label::LoopTop);
                 self.ins.push(I::Block(BlockType::Empty));
                 self.labels.push(Label::LoopContinue);
+                self.cover();
                 self.block(body)?;
                 self.labels.pop();
                 self.ins.push(I::End);
