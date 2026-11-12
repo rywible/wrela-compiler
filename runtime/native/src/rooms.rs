@@ -298,6 +298,8 @@ pub struct RoomHost {
     outbox: Vec<Out>,
     /// How many calls in a row failed at the host's limits.
     failures: u32,
+    /// The messages the program trapped on alone and then refused poisoned, with the trap.
+    poisoned: Vec<(u32, Vec<u8>, String)>,
     _held: Held,
 }
 
@@ -331,6 +333,7 @@ impl RoomHost {
             incoming: VecDeque::new(),
             outbox: Vec::new(),
             failures: 0,
+            poisoned: Vec::new(),
             _held: held,
         };
         room.restore(records)?;
@@ -475,6 +478,18 @@ impl RoomHost {
         if self.conns.iter().any(|&(c, _)| c == conn) {
             self.incoming.push_back(Incoming::Message(conn, bytes));
         }
+    }
+
+    /// The messages the program trapped on alone, since the last call, each given back poisoned
+    /// and refused: its connection, its bytes and the trap. The room went on, but its reducer
+    /// has a bug those bytes show (`wrela fuzz --room`).
+    pub fn take_poisoned(&mut self) -> Vec<(u32, Vec<u8>, String)> {
+        std::mem::take(&mut self.poisoned)
+    }
+
+    /// The running instance's coverage map, in a fuzzer's build (`wrela_abi::COVERAGE_GLOBAL`).
+    pub fn coverage(&self) -> Option<Vec<u8>> {
+        self.room.as_ref().and_then(Room::coverage)
     }
 
     /// What it has released to send or close, in order.
@@ -666,6 +681,10 @@ impl RoomHost {
                     Err(Fail::Room(f)) if f.is_program() => {
                         self.quarantine(format!("a poisoned message traps it: {f}"));
                         Err(Fail::Room(f))
+                    }
+                    Ok(()) => {
+                        self.poisoned.push((*c, bytes.clone(), f.to_string()));
+                        Ok(())
                     }
                     other => other,
                 }

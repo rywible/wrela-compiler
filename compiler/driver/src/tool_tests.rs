@@ -111,7 +111,7 @@ pub(crate) fn run(
     if has_errors(&diags) {
         return (Vec::new(), diags);
     }
-    let out = crate::build::emit_headless(&lowered, sources, !data.no_simd, Role::Tool);
+    let out = crate::build::emit_headless(&lowered, sources, !data.no_simd, Role::Tool, false);
     diags.extend(out.diagnostics);
     let Some((_, wasm)) = out.files.into_iter().find(|(p, _)| p == crate::build::TOOL_WASM) else {
         return (Vec::new(), diags);

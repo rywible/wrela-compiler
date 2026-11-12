@@ -1091,7 +1091,9 @@ fn compile_loaded_in(
                 continue;
             }
             if role != wrela_sema::defs::Role::Client {
-                let out = build::emit_headless(&lowered, &sources, !data.no_simd, role);
+                // A fuzzer's server module marks its code too (`wrela fuzz --room`).
+                let coverage = mode.coverage && role == wrela_sema::defs::Role::Server;
+                let out = build::emit_headless(&lowered, &sources, !data.no_simd, role, coverage);
                 diagnostics.extend(out.diagnostics);
                 files.extend(out.files);
                 continue;

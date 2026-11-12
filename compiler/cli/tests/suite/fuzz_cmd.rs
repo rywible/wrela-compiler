@@ -2,7 +2,8 @@
 //! 255, and the fuzzer finds that line; a step that divides by `pointer x - 300` traps only at
 //! one x, which mutating the inputs that reach the division finds; a step with no bug gives no
 //! finding and exit status 0. A finding is minimized, saved as a tick log and a script, and
-//! replayed until its bug is fixed.
+//! replayed until its bug is fixed. A room's server that indexes by a message's first byte is
+//! poisoned by one out of range.
 
 use crate::common;
 
@@ -146,4 +147,63 @@ fn a_finding_is_minimized_and_replays_until_its_bug_is_fixed() {
     let (code, r) = fuzz(&dir, &["--replay", saved.to_str().unwrap()]);
     assert_eq!(code, Some(0), "{r}");
     assert_eq!(r["replayed"].as_array().unwrap().len(), 2, "{r}");
+}
+
+const ROOM: &str = "use std::input::{Event, events, payload}
+use std::net::POISONED
+
+pub struct Counts {
+    seen: [u32; 16],
+}
+
+pub fn serve_init() -> Counts {
+    Counts { seen: [0; 16] }
+}
+
+pub fn serve(c: mut Counts, time: f32) {
+    for e in events() {
+        if let Event::Message { conn, .. } = e {
+            let Some(bytes) = payload(e) else { continue }
+            if conn >= POISONED || bytes.len() == 0 {
+                continue
+            }
+            let i = u32(bytes[0])
+            c.seen[INDEX] += 1
+        }
+    }
+}
+
+pub fn init() -> u32 {
+    0
+}
+
+pub fn frame(state: mut u32, time: f32, width: u32, height: u32) {}
+";
+
+/// A server whose handler counts messages by their first byte in an array of 16: `--room`
+/// reports `poison`, a message whose first byte is out of range, which the room refused
+/// poisoned and went on; the saved finding replays until the handler stays in range.
+#[test]
+fn a_room_that_indexes_by_a_messages_first_byte_is_poisoned() {
+    let main = ROOM.replace("INDEX", "i");
+    let dir = common::package(
+        "fuzz-room",
+        &[("wrela.toml", &common::manifest("fuzz_room")), ("main.wrela", &main)],
+    );
+    let (code, r) = fuzz(&dir, &["--room", "--runs", "2000", "--seed", "1"]);
+    assert_eq!(code, Some(1), "{r}");
+    let f = &r["findings"].as_array().unwrap()[0];
+    assert_eq!(f["kind"], "poison", "{r}");
+    let bytes = f["bytes"].as_array().unwrap();
+    assert!(bytes[0].as_u64().unwrap() >= 16, "{r}");
+    let files = f["files"].as_array().unwrap();
+    let bin = std::fs::read(files[1].as_str().unwrap()).unwrap();
+    assert!(bin[0] >= 16, "{bin:?}");
+
+    let saved = dir.join("build/fuzz");
+    let (code, r) = fuzz(&dir, &["--room", "--replay", saved.to_str().unwrap()]);
+    assert_eq!(code, Some(1), "{r}");
+    std::fs::write(dir.join("main.wrela"), ROOM.replace("INDEX", "i % 16")).unwrap();
+    let (code, r) = fuzz(&dir, &["--room", "--replay", saved.to_str().unwrap()]);
+    assert_eq!(code, Some(0), "{r}");
 }

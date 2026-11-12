@@ -269,6 +269,8 @@ pub struct Room {
     limits: Limits,
     /// Whether its last call's requests were answered: its next call can read them.
     answered: bool,
+    /// Where a fuzzer's build keeps its coverage map (`wrela_abi::COVERAGE_GLOBAL`).
+    coverage_at: Option<u32>,
 }
 
 impl Room {
@@ -317,7 +319,11 @@ impl Room {
         let memory = instance
             .get_memory(&mut store, EXPORT_MEMORY)
             .ok_or_else(|| Failure::Host("the program has no memory export".into()))?;
-        let mut room = Room { store, serve, memory, limits, answered: false };
+        let coverage_at = instance
+            .get_global(&mut store, wrela_abi::COVERAGE_GLOBAL)
+            .and_then(|g| g.get(&mut store).i32())
+            .map(|a| a as u32);
+        let mut room = Room { store, serve, memory, limits, answered: false, coverage_at };
         if instance.get_export(&mut room.store, EXPORT_SERVE_INIT).is_some() {
             let init = instance
                 .get_typed_func::<(), ()>(&mut room.store, EXPORT_SERVE_INIT)
@@ -325,6 +331,14 @@ impl Room {
             room.call(|store| init.call(store, ()))?;
         }
         Ok(room)
+    }
+
+    /// A fuzzer's build's coverage map (`wrela_abi::COVERAGE_GLOBAL`): the byte of each site
+    /// this instance has run is 1. `None` for a build without one.
+    pub fn coverage(&self) -> Option<Vec<u8>> {
+        let at = self.coverage_at? as usize;
+        let bytes = self.memory.data(&self.store);
+        bytes.get(at..at + wrela_abi::COVERAGE_BYTES as usize).map(<[u8]>::to_vec)
     }
 
     /// Wakes the room: `serve(time)`, within its deadline.

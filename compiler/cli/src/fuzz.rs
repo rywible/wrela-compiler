@@ -27,8 +27,12 @@
 //! reports which still fail: a regression check. A log made by another build of the program
 //! is run as a script (its records alone), since its hashes are the other build's.
 //!
+//! `--room` fuzzes the package's server instead, a room of it at a time ([`room`]).
+//!
 //! Exit status: 0 no finding (or none still fails), 1 a finding (or the build failed), 2 a
 //! usage error.
+
+mod room;
 
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
@@ -39,7 +43,7 @@ use wrela_abi::input::{
 };
 use wrela_host::{CpuBuild, CpuHost, TickLog};
 
-const USAGE: &str = "usage: wrela fuzz <package-dir> [--ticks <n>] [--time <seconds> | --runs <n>] [--seed <n>] [--fuel <n>] [--seeds <dir>] [--out <dir>] [--replay <file-or-dir>] [--json]";
+const USAGE: &str = "usage: wrela fuzz <package-dir> [--ticks <n>] [--time <seconds> | --runs <n>] [--seed <n>] [--fuel <n>] [--seeds <dir>] [--out <dir>] [--replay <file-or-dir>] [--room] [--json]";
 
 /// How long a fuzzer runs unless told.
 const DEFAULT_TIME: u64 = 60;
@@ -53,6 +57,7 @@ struct Args {
     seeds: Option<PathBuf>,
     out: Option<PathBuf>,
     replay: Option<PathBuf>,
+    room: bool,
     json: bool,
 }
 
@@ -67,6 +72,22 @@ pub fn run(args: &[String]) -> ExitCode {
         eprintln!("{USAGE}");
         return ExitCode::from(2);
     };
+    if a.room {
+        return match fuzz_room(&a) {
+            Ok((json, text, failed)) => {
+                if a.json {
+                    println!("{}", serde_json::to_string_pretty(&json).expect("JSON"));
+                } else {
+                    print!("{text}");
+                }
+                if failed { ExitCode::FAILURE } else { ExitCode::SUCCESS }
+            }
+            Err(e) => {
+                eprintln!("error: {e}");
+                ExitCode::FAILURE
+            }
+        };
+    }
     if let Some(saved) = &a.replay {
         return match replay(&a, saved) {
             Ok(r) => {
@@ -106,7 +127,7 @@ pub fn run(args: &[String]) -> ExitCode {
 fn parse(args: &[String]) -> Option<Args> {
     let (mut dir, mut ticks, mut runs, mut time) = (None, 64, None, None);
     let (mut seed, mut fuel, mut seeds, mut json) = (0, 1 << 28, None, false);
-    let (mut out, mut replay) = (None, None);
+    let (mut out, mut replay, mut room) = (None, None, false);
     let mut it = args.iter();
     while let Some(x) = it.next() {
         match x.as_str() {
@@ -118,6 +139,7 @@ fn parse(args: &[String]) -> Option<Args> {
             "--seeds" => seeds = Some(PathBuf::from(it.next()?)),
             "--out" => out = Some(PathBuf::from(it.next()?)),
             "--replay" => replay = Some(PathBuf::from(it.next()?)),
+            "--room" => room = true,
             "--json" => json = true,
             _ if dir.is_none() && !x.starts_with('-') => dir = Some(PathBuf::from(x)),
             _ => return None,
@@ -129,7 +151,7 @@ fn parse(args: &[String]) -> Option<Args> {
         (None, Some(t)) => Limit::Time(Duration::from_secs_f64(t)),
         (None, None) => Limit::Time(Duration::from_secs(DEFAULT_TIME)),
     };
-    Some(Args { dir: dir?, ticks, limit, seed, fuel, seeds, out, replay, json })
+    Some(Args { dir: dir?, ticks, limit, seed, fuel, seeds, out, replay, room, json })
 }
 
 /// What a finding is.
@@ -138,6 +160,10 @@ pub(crate) enum Kind {
     Trap,
     Hang,
     NotDeterministic,
+    /// A room's message the program traps on alone (`--room`).
+    Poison,
+    /// A room that can't go on (`--room`).
+    Quarantine,
 }
 
 impl Kind {
@@ -146,6 +172,8 @@ impl Kind {
             Kind::Trap => "trap",
             Kind::Hang => "hang",
             Kind::NotDeterministic => "not-deterministic",
+            Kind::Poison => "poison",
+            Kind::Quarantine => "quarantine",
         }
     }
 }
@@ -160,8 +188,12 @@ pub(crate) struct Found {
 }
 
 impl Found {
-    /// What tells findings apart: the kind and the source line (not the column).
+    /// What tells findings apart: the kind and the source line (not the column); a room's
+    /// finding, which has no line, by its message.
     fn key(&self) -> (Kind, Option<String>) {
+        if matches!(self.kind, Kind::Poison | Kind::Quarantine) {
+            return (self.kind, Some(self.message.clone()));
+        }
         let line = self.at.as_ref().map(|a| match a.rsplit_once(':') {
             Some((l, c)) if c.parse::<u32>().is_ok() => l.to_string(),
             _ => a.clone(),
@@ -577,12 +609,82 @@ fn place(at: Option<&str>) -> (Option<String>, Option<u32>) {
     }
 }
 
-/// Builds the package for fuzzing, into `build/fuzz-build`, and loads it.
-fn subject(dir: &Path, ticks: u32, fuel: u64) -> Result<Subject, String> {
+/// Builds the package for fuzzing, into `build/fuzz-build`: the directory.
+fn fuzz_build(dir: &Path) -> Result<PathBuf, String> {
     let out = wrela_driver::build_fuzz(dir);
     let built = dir.join("build").join("fuzz-build");
     crate::generated_path(dir, &built)?;
     crate::write_build(&out, &built)?;
+    Ok(built)
+}
+
+/// `--room`: the report as JSON and as text, and whether anything was found (or still fails).
+fn fuzz_room(a: &Args) -> Result<(serde_json::Value, String, bool), String> {
+    use serde_json::json;
+    let built = fuzz_build(&a.dir)?;
+    let scratch = a.dir.join("build").join("fuzz-room");
+    crate::generated_path(&a.dir, &scratch)?;
+    let server = room::Server::load(&built, scratch)?;
+    if let Some(saved) = &a.replay {
+        let r = Replayed(room::replay(&server, saved)?);
+        let failed = r.0.iter().any(|(_, f)| f.is_some());
+        return Ok((r.json(), r.text(), failed));
+    }
+    let out = a.out.clone().unwrap_or_else(|| a.dir.join("build").join("fuzz"));
+    crate::generated_path(&a.dir, &out)?;
+    let start = Instant::now();
+    let limit = a.limit;
+    let done = move |n: u64| match limit {
+        Limit::Runs(k) => n >= k,
+        Limit::Time(t) => start.elapsed() >= t,
+    };
+    let r = room::fuzz(&server, a.seed, a.seeds.as_deref(), done, &out)?;
+    let per_second = r.executions as f64 / r.seconds.max(1e-9);
+    let findings: Vec<serde_json::Value> = r
+        .findings
+        .iter()
+        .map(|f| {
+            json!({"kind": f.found.kind.name(), "message": f.found.message, "event": f.found.tick,
+                   "bytes": f.bytes, "events": room::to_json(&f.input), "after": f.after,
+                   "files": f.files})
+        })
+        .collect();
+    let mut text = format!(
+        "{} executions in {:.1} s ({per_second:.0} a second), {} sites covered, corpus of {}\n",
+        r.executions, r.seconds, r.sites, r.corpus
+    );
+    if r.findings.is_empty() {
+        text += "no findings\n";
+    }
+    for f in &r.findings {
+        text += &format!(
+            "{} at event {} (found after {} executions): {}\n",
+            f.found.kind.name(),
+            f.found.tick,
+            f.after,
+            f.found.message
+        );
+        if let Some(b) = &f.bytes {
+            text += &format!("  the message: {b:?}\n");
+        }
+        for p in &f.files {
+            text += &format!("  {}\n", p.display());
+        }
+    }
+    let json = json!({
+        "executions": r.executions,
+        "seconds": (r.seconds * 1000.0).round() / 1000.0,
+        "per_second": per_second.round(),
+        "sites": r.sites,
+        "corpus": r.corpus,
+        "findings": findings,
+    });
+    Ok((json, text, !r.findings.is_empty()))
+}
+
+/// Builds the package for fuzzing, into `build/fuzz-build`, and loads it.
+fn subject(dir: &Path, ticks: u32, fuel: u64) -> Result<Subject, String> {
+    let built = fuzz_build(dir)?;
     let build = CpuBuild::load_metered_cpu(&built, fuel).map_err(|e| e.to_string())?.quiet();
     Ok(Subject { build, ticks, fuel })
 }
