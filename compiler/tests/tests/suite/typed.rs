@@ -107,3 +107,22 @@ fn o6_the_targets_agree() {
     over(Oracle::O6, count(16));
 }
 
+/// Regression files the oracles still fail on, by file name: each a compiler bug the typed
+/// fuzzer found and this release didn't fix (the pull request lists them).
+const KNOWN: &[&str] = &[];
+
+/// Each file in `compiler/tests/typed/regress/` (but `KNOWN`) through the oracle its first line
+/// names, at the seed its header gives.
+#[test]
+fn every_regression_still_holds() {
+    let dir = wrela_tests::repo_root().join("compiler/tests/typed/regress");
+    let files: Vec<_> = wrela_tests::cases(&dir)
+        .into_iter()
+        .filter(|f| !KNOWN.iter().any(|k| f.file_name().is_some_and(|n| n == *k)))
+        .collect();
+    assert!(!files.is_empty(), "no regression files in {}", dir.display());
+    let scratch = crate::scratch("typed-regress");
+    let failures: Vec<String> =
+        files.iter().filter_map(|f| oracles::run_file(f, &scratch).err()).collect();
+    assert!(failures.is_empty(), "{}", failures.join("\n"));
+}
