@@ -228,9 +228,10 @@ pub(super) fn derive(
         return Ok(d);
     }
     let func = m.functions[f.index()].clone();
-    no_gpu_work(&func.body)?;
+    no_gpu_or_heap_work(&func.body)?;
     let returns = returns_active(m, cache, f, mask.clone(), Mode::Ad) != 0;
     let act = body_activity(m, cache, f, &mask, Mode::Ad);
+    no_heap_store(&act)?;
     no_write_through_mut(&func, &act, &mask, "a derivative")?;
     let mut nf = func.clone_signature();
     nf.name = format!("{}_{}{}", func.name, if filter { "f" } else { "d" }, n);
@@ -588,7 +589,9 @@ impl Ad<'_> {
             out.push(let_or_eval(v, Expr::Call(g, args.to_vec())));
             return Ok(());
         }
-        let dg = derive(self.m, self.cache, g, mask.clone(), self.n, self.target, self.filter)?;
+        let at = self.track.at;
+        let dg = derive(self.m, self.cache, g, mask.clone(), self.n, self.target, self.filter)
+            .map_err(|e| e.through(at))?;
         let mut new_args = args.to_vec();
         for (i, a) in args.iter().enumerate() {
             if mask[i] == 0 {

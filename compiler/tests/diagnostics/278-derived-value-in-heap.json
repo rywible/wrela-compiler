@@ -1,0 +1,53 @@
+{
+  "diagnostics": [
+    {
+      "code": "E0700",
+      "file": "main.wrela",
+      "fixes": [],
+      "help": [
+        "keep what depends on the input in arrays and values, or make the heap value in a function that takes nothing that depends on the input and returns a value"
+      ],
+      "internal": false,
+      "label": null,
+      "labels": [
+        {
+          "file": "main.wrela",
+          "message": "derived here",
+          "span": {
+            "column": 5,
+            "end": 282,
+            "end_column": 19,
+            "end_line": 9,
+            "line": 9,
+            "start": 268
+          }
+        },
+        {
+          "file": "<std::collections>",
+          "message": "in std's code here",
+          "span": {
+            "column": 13,
+            "end": 5390,
+            "end_column": 56,
+            "end_line": 175,
+            "line": 175,
+            "start": 5347
+          }
+        }
+      ],
+      "message": "this puts a value that depends on the input in heap memory (a `Vec`, a `String`, a `Box`), where a derivation can't follow it",
+      "notes": [],
+      "severity": "error",
+      "span": {
+        "column": 5,
+        "end": 392,
+        "end_column": 16,
+        "end_line": 15,
+        "line": 15,
+        "start": 381
+      },
+      "title": "a function that can't be derived"
+    }
+  ],
+  "version": 2
+}

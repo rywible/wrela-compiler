@@ -534,7 +534,7 @@ fn build(
                 return;
             };
             let code = match &e {
-                ir::Error::NotDerivable(..) => codes::E0700,
+                ir::Error::NotDerivable(..) | ir::Error::HeapMemory(..) => codes::E0700,
                 ir::Error::ActiveLoopExit(..) => codes::E0701,
                 ir::Error::NotTapeable(..) => codes::E0709,
                 ir::Error::Internal(m) => {
@@ -542,9 +542,12 @@ fn build(
                     return;
                 }
             };
-            // A tape's error in std's code is shown at the program's call that reached it.
+            // A tape's error in std's code is shown at the program's call that reached it, and
+            // so is heap memory's (a `Vec`'s `push` is std's code; the line that pushes is the
+            // program's).
             let (span, inner) = match &e {
-                ir::Error::NotTapeable(_, Some(at), calls) => {
+                ir::Error::NotTapeable(_, Some(at), calls)
+                | ir::Error::HeapMemory(_, Some(at), calls) => {
                     let std = std_files(cx);
                     let mine = std::iter::once(at).chain(calls).find(|s| !std.contains(&s.file));
                     match mine {
@@ -565,6 +568,8 @@ fn build(
             }
             cx.err(d.with_help(if code == codes::E0701 {
                 "make the loop run a fixed count: `for _ in 0..n { ... }`, leaving it early with `break`"
+            } else if matches!(e, ir::Error::HeapMemory(..)) {
+                "keep what depends on the input in arrays and values, or make the heap value in a function that takes nothing that depends on the input and returns a value"
             } else if code == codes::E0709 {
                 "compute what the tape can't hold from the field's data, outside the point's path, or tape the parts that can be taped and keep the rest compiled"
             } else {

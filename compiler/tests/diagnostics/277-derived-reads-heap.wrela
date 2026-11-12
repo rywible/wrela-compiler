@@ -1,0 +1,20 @@
+// mistake: a derived function that reads a `Vec`
+// expect: E0700
+// fix: no
+use std::collections::Vec
+use std::derive::gradient
+
+/// How fast `f` changes at `x`.
+fn slope(f: fn(f32) -> f32, x: f32) -> f32 {
+    gradient(f, x)
+}
+
+/// `x` by a weight kept in a `Vec`.
+fn weighed(x: f32) -> f32 {
+    let weights: Vec<f32> = Vec::filled(4, value: 0.5)
+    x * weights[2]
+}
+
+pub fn frame(time: f32, width: u32, height: u32) {
+    let s = slope(weighed, time)
+}

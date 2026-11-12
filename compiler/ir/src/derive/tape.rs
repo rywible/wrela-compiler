@@ -523,7 +523,7 @@ pub(super) fn derive(
         return Ok(d);
     }
     let orig = m.functions[f.index()].clone();
-    no_gpu_work(&orig.body)?;
+    no_gpu_or_heap_work(&orig.body)?;
     let returns = returns_active(m, cache, f, mask.clone(), Mode::Interval) != 0;
     // As an interval does: one exit, so a `return` under a branch on the point is a store both
     // sides can make, and a loop that leaves early on the point runs its count with flags.
@@ -534,6 +534,7 @@ pub(super) fn derive(
         )
         .at(at));
     }
+    no_heap_store(&act)?;
     no_write_through_mut(&func, &act, &mask, "registers")?;
     let mut nf = func.clone_signature();
     nf.name = format!("{}_taped", func.name);

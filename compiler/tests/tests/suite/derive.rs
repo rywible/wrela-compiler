@@ -361,3 +361,165 @@ pub fn called(lo: f32, hi: f32) -> vec2 {
         assert!(near(stays, (4.0 * k, 4.0 * k)), "{name} over [-1, -0.5]: {stays:?}");
     }
 }
+
+/// What every heap case below starts with: a gradient taken through a parameter, so the
+/// function it derives is known only when it's built.
+const SLOPE: &str = "use std::collections::{Box, Vec}
+use std::derive::gradient
+
+fn slope(f: fn(f32) -> f32, x: f32) -> f32 {
+    gradient(f, x)
+}
+
+struct Rows {
+    cells: Vec<f32>,
+}
+
+impl Rows {
+    fn cell(mut self, i: u32) -> mut f32 {
+        mut self.cells[i]
+    }
+}
+
+fn fill(xs: mut [f32], x: f32) {
+    for i in 0..xs.len() {
+        xs[i] = x
+    }
+}
+
+fn set(slot: mut f32, x: f32) {
+    slot = x
+}
+";
+
+/// A value that depends on a gradient's input put in heap memory is E0700 at the line that
+/// puts it there (§14.2), however it gets there: a `Vec`'s `push`, an element assigned, changed
+/// in place, named or looped over, a `Box`'s value, a projection of the program's own, an
+/// element or the elements lent to a function that writes them. The function that stores isn't
+/// derived (a `Vec` it returns carries no derivative, as far as its code shows), nor the one
+/// that reads the value back, so each was run as it was and the gradient was 0, with no error.
+#[test]
+fn a_value_that_depends_on_the_input_put_in_heap_memory_is_an_error() {
+    // Each: what keeps `x` (its line marked `// here`), and what reads it back.
+    let cases = [
+        ("push", "    var v: Vec<f32> = Vec::new()\n    v.push(x) // here\n    v", "v[0]"),
+        (
+            "element",
+            "    var v: Vec<f32> = Vec::filled(2, value: 0.0)\n    v[1] = x // here\n    v",
+            "v[1]",
+        ),
+        (
+            "in-place",
+            "    var v: Vec<f32> = Vec::filled(2, value: 1.0)\n    v[1] *= x // here\n    v",
+            "v[1]",
+        ),
+        (
+            "named",
+            "    var v: Vec<f32> = Vec::filled(2, value: 0.0)\n    mut slot = v[0]\n    slot = x // here\n    v",
+            "v[0]",
+        ),
+        (
+            "looped",
+            "    var v: Vec<f32> = Vec::filled(2, value: 0.0)\n    for mut r in v {\n        r = x // here\n    }\n    v",
+            "v[0]",
+        ),
+        (
+            "lent-element",
+            "    var v: Vec<f32> = Vec::filled(2, value: 0.0)\n    set(mut v[1], x) // here\n    v",
+            "v[1]",
+        ),
+        (
+            "lent-elements",
+            "    var v: Vec<f32> = Vec::filled(2, value: 0.0)\n    fill(mut v, x) // here\n    v",
+            "v[1]",
+        ),
+    ];
+    let mut programs: Vec<(String, String)> = cases
+        .iter()
+        .map(|(name, keep, read)| {
+            let text = format!(
+                "{SLOPE}\nfn kept(x: f32) -> Vec<f32> {{\n{keep}\n}}\n\nfn read(x: f32) -> f32 {{\n    let v = kept(x)\n    {read}\n}}\n\nfn curve(x: f32) -> f32 {{\n    read(x) - 3.0\n}}\n\npub fn frame(time: f32, width: u32, height: u32) {{\n    let s = slope(curve, time)\n}}\n"
+            );
+            (name.to_string(), text)
+        })
+        .collect();
+    // A `Box`'s value, and a projection of the program's own.
+    programs.push((
+        "boxed".into(),
+        format!(
+            "{SLOPE}\nfn kept(x: f32) -> Box<f32> {{\n    var b = Box::new(0.0)\n    b.get_mut() = x // here\n    b\n}}\n\nfn read(x: f32) -> f32 {{\n    let b = kept(x)\n    b.get()\n}}\n\nfn curve(x: f32) -> f32 {{\n    read(x) - 3.0\n}}\n\npub fn frame(time: f32, width: u32, height: u32) {{\n    let s = slope(curve, time)\n}}\n"
+        ),
+    ));
+    programs.push((
+        "projected".into(),
+        format!(
+            "{SLOPE}\nfn kept(x: f32) -> Rows {{\n    var r = Rows {{ cells: Vec::filled(2, value: 0.0) }}\n    r.cell(1) = x // here\n    r\n}}\n\nfn read(x: f32) -> f32 {{\n    let r = kept(x)\n    r.cells[1]\n}}\n\nfn curve(x: f32) -> f32 {{\n    read(x) - 3.0\n}}\n\npub fn frame(time: f32, width: u32, height: u32) {{\n    let s = slope(curve, time)\n}}\n"
+        ),
+    ));
+    for (name, text) in &programs {
+        let dir = crate::package(&format!("derive-heap-{name}"), text);
+        let (codes, rendered) = crate::checked(&dir);
+        let errors: Vec<&String> = codes.iter().filter(|c| c.starts_with('E')).collect();
+        assert_eq!(errors, ["E0700"], "{name}:\n{rendered}");
+        assert!(
+            rendered.contains("puts a value that depends on the input in heap memory"),
+            "{name}:\n{rendered}"
+        );
+        let line = 1 + text.lines().position(|l| l.ends_with("// here")).expect("the marked line");
+        assert!(
+            rendered.contains(&format!("main.wrela:{line}:")),
+            "{name}, line {line}:\n{rendered}"
+        );
+        assert!(
+            rendered.contains("keep what depends on the input in arrays and values"),
+            "{name}:\n{rendered}"
+        );
+    }
+}
+
+/// Heap memory that holds nothing of the input stays as it was (§14.2): a function given
+/// nothing that depends on the input runs as it is, a `Vec` and all, and so does one given the
+/// input whose result carries no derivative; what they give is a constant to the gradient.
+#[test]
+fn heap_memory_that_holds_nothing_of_the_input_is_left_alone() {
+    let src = "use std::collections::Vec
+use std::derive::gradient
+
+fn slope(f: fn(f32) -> f32, x: f32) -> f32 {
+    gradient(f, x)
+}
+
+/// Weights made in a `Vec`, given back as values.
+fn weights() -> [f32; 2] {
+    var v: Vec<f32> = Vec::new()
+    v.push(0.5)
+    v.push(4.0)
+    [v[0], v[1]]
+}
+
+/// How many of a table's entries are below `x`: a count, which carries no derivative.
+fn below(x: f32) -> u32 {
+    let table: Vec<f32> = Vec::from([1.0, 2.0, 3.0])
+    var n = 0
+    for t in table {
+        if t < x {
+            n += 1
+        }
+    }
+    n
+}
+
+fn curve(x: f32) -> f32 {
+    let w = weights()
+    x * w[0] + w[1] + f32(below(x))
+}
+
+@test
+fn the_slope_is_the_weight() {
+    assert(abs(slope(curve, 2.5) - 0.5) < 1.0e-6)
+    assert(curve(2.5) == 1.25 + 4.0 + 2.0)
+}
+";
+    let dir = crate::package("derive-heap-constants", src);
+    assert_eq!(crate::tests_pass(&dir), 1);
+}

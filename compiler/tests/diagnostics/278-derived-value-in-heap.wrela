@@ -1,0 +1,32 @@
+// mistake: a value a derivative is taken by, kept in a `Vec` by a function the derivation runs as it is
+// expect: E0700
+// fix: no
+use std::collections::Vec
+use std::derive::gradient
+
+/// How fast `f` changes at `x`.
+fn slope(f: fn(f32) -> f32, x: f32) -> f32 {
+    gradient(f, x)
+}
+
+/// `x` and its square.
+fn powers(x: f32) -> Vec<f32> {
+    var out: Vec<f32> = Vec::new()
+    out.push(x)
+    out.push(x * x)
+    out
+}
+
+/// `x`'s square, read back.
+fn square(x: f32) -> f32 {
+    let p = powers(x)
+    p[1]
+}
+
+fn curve(x: f32) -> f32 {
+    square(x) - 3.0
+}
+
+pub fn frame(time: f32, width: u32, height: u32) {
+    let s = slope(curve, time)
+}
