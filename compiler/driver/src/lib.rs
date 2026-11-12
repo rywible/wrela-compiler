@@ -275,6 +275,14 @@ pub fn build_for_tests(root: &Path, debug: bool) -> Output {
     on_compiler_thread(|| compile(root, mode, wrela_lower::Roots::of, &[]))
 }
 
+/// [`build_for_tests`], and with `no_opt` the CPU module left as lowering made it, unoptimized
+/// (no inlining or folding): for the test that the optimizer keeps every bit. Nothing else
+/// builds this way.
+pub fn build_for_tests_with(root: &Path, debug: bool, no_opt: bool) -> Output {
+    let mode = Mode { debug, testing: true, no_opt, ..Mode::RELEASE };
+    on_compiler_thread(|| compile(root, mode, wrela_lower::Roots::of, &[]))
+}
+
 /// [`build`], lowering every function of the package that can be lowered on its own, exported
 /// or not ([`wrela_lower::Roots::every_fn`]): for tests of code that nothing calls.
 pub fn build_every_fn(root: &Path) -> Output {
@@ -875,6 +883,8 @@ struct Mode {
     conditions: bool,
     /// A second module, with relaxed SIMD outside deterministic code ([`build_relaxed`]).
     relaxed_simd: bool,
+    /// The CPU module left unoptimized ([`build_for_tests_with`]).
+    no_opt: bool,
 }
 
 impl Mode {
@@ -885,6 +895,7 @@ impl Mode {
         testing: false,
         conditions: false,
         relaxed_simd: false,
+        no_opt: false,
     };
     const RELEASE: Mode = Mode { emit: true, ..Mode::CHECK };
 }
@@ -987,6 +998,7 @@ fn compile_loaded_in(
         no_simd: mode.no_simd,
         testing: mode.testing,
         relaxed_simd: mode.relaxed_simd,
+        no_opt: mode.no_opt,
         few: mode.conditions && !mode.emit,
         ..Default::default()
     };

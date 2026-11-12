@@ -511,6 +511,7 @@ fn lower_in(
     // Inlining finds no mistakes in the program, only makes its code faster, so a check (no
     // code emitted) skips it.
     if emit
+        && !data.no_opt
         && !wrela_diag::has_errors(&cx.diags)
         && let Err(e) = ir::opt::inline_cpu(&mut cpu.m)
     {
