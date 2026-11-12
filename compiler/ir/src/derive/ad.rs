@@ -55,7 +55,7 @@ pub(super) fn value_and_gradient(
     };
     let mut mask = vec![0; func.params.len()];
     mask[xi] = all_bits(&m.types, x_ty);
-    let d = derive(m, cache, f, mask.clone(), n, target, false)?;
+    let d = derive(m, cache, f, mask.clone(), n, target, false, None)?;
     let returns = returns_active(m, cache, f, mask, Mode::Ad) != 0;
     let tuple = value_gradient_ty(&mut m.types, x_ty, payload);
     let mut g = Function::new(
@@ -186,7 +186,7 @@ pub(super) fn filtered_value(
     }
     let mut mask = vec![0; func.params.len()];
     mask[xi] = all_bits(&m.types, x_ty);
-    let d = derive(m, cache, f, mask.clone(), n, target, true)?;
+    let d = derive(m, cache, f, mask.clone(), n, target, true, None)?;
     let returns = returns_active(m, cache, f, mask, Mode::Ad) != 0;
     let mut params = func.params.clone();
     let width_param = params.len() as u32;
@@ -211,8 +211,23 @@ pub(super) fn filtered_value(
     Ok(m.add_function(g))
 }
 
+/// What a recording derivation calls: std's `Trace::one` and `Trace::two`, which push a node of
+/// one or two terms onto the trace and give its slot, and the `Trace` they push onto.
+#[derive(Clone, Copy, Debug)]
+pub struct RecordFns {
+    pub one: FuncId,
+    pub two: FuncId,
+    pub trace: TypeId,
+    /// `trace_leaf`, which pushes an input's node: what a literals' record seeds with.
+    pub leaf: Option<FuncId>,
+}
+
+/// The bit of a derivation's directions in the cache's key that says it records.
+const RECORDED: u8 = 0x40;
+
 /// The derivative of `f` with active parameters `mask` and `n` directions; with `filter`, a
-/// filtering one (see [`Ad::filter`]).
+/// filtering one (see [`Ad::filter`]); with `record`, a recording one (see [`Ad::record`]).
+#[allow(clippy::too_many_arguments)]
 pub(super) fn derive(
     m: &mut Module,
     cache: &mut DeriveCache,
@@ -221,9 +236,17 @@ pub(super) fn derive(
     n: u8,
     target: Target,
     filter: bool,
+    record: Option<RecordFns>,
 ) -> Result<FuncId> {
-    // The cache's key: the directions, and the filtering mode in the top bit.
-    let key_n = n | if filter { FILTERED } else { 0 };
+    if record.is_some() && (filter || target == Target::Gpu || n != 1) {
+        return Err(Error::not_derivable(if target == Target::Gpu {
+            "a reverse gradient runs on the CPU"
+        } else {
+            "a reverse gradient can't be filtered"
+        }));
+    }
+    // The cache's key: the directions, and the filtering and recording modes in the top bits.
+    let key_n = n | if filter { FILTERED } else { 0 } | if record.is_some() { RECORDED } else { 0 };
     if let Some(&d) = cache.ad.get(&(f, mask.clone(), key_n)) {
         return Ok(d);
     }
@@ -249,6 +272,11 @@ pub(super) fn derive(
                 });
             }
         }
+    }
+    // A recording one takes the trace last, by reference.
+    let trace_param = nf.params.len() as u32;
+    if let Some(r) = record {
+        nf.params.push(Param { name: "trace".into(), ty: r.trace, by_ref: true, mutable: true });
     }
     let mut tlocal: Vec<Vec<LocalId>> = vec![Vec::new(); func.locals.len()];
     for (l, decl) in func.locals.iter().enumerate() {
@@ -288,6 +316,8 @@ pub(super) fn derive(
         n,
         target,
         filter,
+        record,
+        trace_param,
         tparam,
         tlocal,
         tv: HashMap::new(),
@@ -322,6 +352,14 @@ struct Ad<'a> {
     /// footprint's width along it, and the discontinuous builtins are box-filtered over the
     /// footprint they give (see `filtered_let`).
     filter: bool,
+    /// Recording (`std::derive::recorded`, reverse mode): one direction, whose "tangent" is
+    /// each value's place on a trace, as the bits of a value of its type (a slot below 2²⁶, so
+    /// never a NaN's bits, which no move changes). A move moves it as forward mode moves a
+    /// tangent; arithmetic pushes a node of its local partials, found by calling the forward
+    /// rules with unit seeds (`record_let`).
+    record: Option<RecordFns>,
+    /// The derived function's trace parameter, when it records.
+    trace_param: u32,
     tparam: Vec<Vec<u32>>,
     tlocal: Vec<Vec<LocalId>>,
     /// Each active value's tangents (`None`: structurally zero).
@@ -536,6 +574,11 @@ impl Ad<'_> {
                     _ => out.push(s.clone()),
                 }
                 if self.act.value(*v) {
+                    if self.record.is_some() {
+                        let t = self.record_let(*v, e, out)?;
+                        self.tv.insert(*v, vec![t]);
+                        return Ok(());
+                    }
                     let mut ts = Vec::new();
                     for k in 0..self.n as usize {
                         ts.push(self.tangent(*v, e, k, out)?);
@@ -590,8 +633,17 @@ impl Ad<'_> {
             return Ok(());
         }
         let at = self.track.at;
-        let dg = derive(self.m, self.cache, g, mask.clone(), self.n, self.target, self.filter)
-            .map_err(|e| e.through(at))?;
+        let dg = derive(
+            self.m,
+            self.cache,
+            g,
+            mask.clone(),
+            self.n,
+            self.target,
+            self.filter,
+            self.record,
+        )
+        .map_err(|e| e.through(at))?;
         let mut new_args = args.to_vec();
         for (i, a) in args.iter().enumerate() {
             if mask[i] == 0 {
@@ -606,6 +658,9 @@ impl Ad<'_> {
                     Arg::Place(p) => Arg::Place(self.place(p, k)?),
                 });
             }
+        }
+        if self.record.is_some() {
+            new_args.push(Arg::Place(Place::root(PlaceRoot::Param(self.trace_param))));
         }
         match (v, returns) {
             (Some(v), true) => {
@@ -833,6 +888,170 @@ impl Ad<'_> {
             _ => own,
         };
         out.push(Stmt::Let(v, Expr::Builtin(B::Mix, vec![own, filtered, used])));
+    }
+
+    /// A recording derivation's slot for `v = e` (see [`Ad::record`]): a move's is the move of
+    /// its operand's slot; arithmetic's is a new node of the trace for each component, whose
+    /// terms are each active operand's slot and the partial derivative by it, from the forward
+    /// rule run with a unit seed: one seed of ones where the operation is componentwise in an
+    /// operand of its own type, one of `1.0` for a scalar operand, else one for each of the
+    /// operand's components.
+    fn record_let(&mut self, v: ValueId, e: &Expr, out: &mut Block) -> Result<Option<ValueId>> {
+        let vty = self.ty(v);
+        if !self.m.types.has_float(vty) {
+            return Ok(None);
+        }
+        let comps = |m: &Module, t: TypeId| -> Result<u8> {
+            match m.types.get(t) {
+                TypeDef::Scalar(Scalar::F32) => Ok(1),
+                TypeDef::Vector(Scalar::F32, n) => Ok(*n),
+                _ => Err(Error::not_derivable(format!(
+                    "a reverse gradient follows `f32`s and their vectors, not `{}`",
+                    m.types.display(t)
+                ))),
+            }
+        };
+        let arithmetic =
+            matches!(e, Expr::Unary(UnOp::Neg, _) | Expr::Binary(..) | Expr::Builtin(..));
+        if let Expr::Convert(x, s) = e
+            && s.is_float()
+            && self.ty(*x) != vty
+        {
+            return Err(Error::not_derivable(
+                "a reverse gradient follows `f32`s and their vectors, not a conversion to another float",
+            ));
+        }
+        if !arithmetic {
+            // A move: the operand's slot moves as forward mode moves a tangent.
+            return self.tangent(v, e, 0, out);
+        }
+        let nv = comps(self.m, vty)?;
+        let operands: Vec<ValueId> = match e {
+            Expr::Unary(_, x) => vec![*x],
+            Expr::Binary(_, a, b) => vec![*a, *b],
+            Expr::Builtin(_, args) => args.clone(),
+            _ => unreachable!("arithmetic"),
+        };
+        let mut distinct: Vec<ValueId> = Vec::new();
+        for x in operands {
+            if !distinct.contains(&x) && self.t(x, 0).is_some() {
+                distinct.push(x);
+            }
+        }
+        let f32t = self.m.types.f32();
+        let u32t = self.m.types.u32();
+        let mut terms: Vec<Vec<(ValueId, ValueId)>> = vec![Vec::new(); nv as usize];
+        for &x in &distinct {
+            let xty = self.ty(x);
+            let nx = comps(self.m, xty)?;
+            let shadow = self.t(x, 0).expect("an active operand's slot");
+            let elementwise = match e {
+                Expr::Unary(..) | Expr::Binary(..) => true,
+                Expr::Builtin(b, _) => b.is_elementwise(),
+                _ => false,
+            };
+            // Each probe: its seed, and which component of the operand each of `v`'s comes from.
+            let mut probes: Vec<(ValueId, Vec<u8>)> = Vec::new();
+            let one = self.fc(out, f32t, 1.0);
+            if elementwise && xty == vty {
+                let seed = if nx == 1 { one } else { self.emit(out, xty, Expr::Splat(one, nx)) };
+                probes.push((seed, (0..nv).collect()));
+            } else if nx == 1 {
+                probes.push((one, vec![0; nv as usize]));
+            } else {
+                let zero = self.fc(out, f32t, 0.0);
+                for j in 0..nx {
+                    let parts = (0..nx).map(|c| if c == j { one } else { zero }).collect();
+                    let seed = self.emit(out, xty, Expr::Construct(xty, parts));
+                    probes.push((seed, vec![j; nv as usize]));
+                }
+            }
+            for (seed, from) in probes {
+                // The forward rule with `x`'s tangent the seed and every other operand's zero.
+                let saved: Vec<(ValueId, Option<Vec<Option<ValueId>>>)> = distinct
+                    .iter()
+                    .map(|&o| (o, self.tv.insert(o, vec![if o == x { Some(seed) } else { None }])))
+                    .collect();
+                let d = self.tangent(v, e, 0, out);
+                for (o, was) in saved {
+                    match was {
+                        Some(t) => self.tv.insert(o, t),
+                        None => self.tv.remove(&o),
+                    };
+                }
+                let Some(d) = d? else { continue };
+                for c in 0..nv {
+                    let partial = if nv == 1 {
+                        d
+                    } else {
+                        self.emit(out, f32t, Expr::Extract(d, u32::from(c)))
+                    };
+                    let j = from[c as usize];
+                    let bits = if nx == 1 {
+                        shadow
+                    } else {
+                        self.emit(out, f32t, Expr::Extract(shadow, u32::from(j)))
+                    };
+                    let slot = self.emit(out, u32t, Expr::Bitcast(bits, Scalar::U32));
+                    terms[c as usize].push((slot, partial));
+                }
+            }
+        }
+        let fns = self.record.expect("a recording derivation");
+        let tp = self.trace_param;
+        let trace = move || Arg::Place(Place::root(PlaceRoot::Param(tp)));
+        let mut slots = Vec::new();
+        for ts in terms {
+            let slot = match ts.as_slice() {
+                [] => self.emit(out, u32t, Expr::Const(Const::U32(0))),
+                [(s, d)] => {
+                    let v = self.nf.new_value(u32t);
+                    out.push(Stmt::Let(
+                        v,
+                        Expr::Call(fns.one, vec![trace(), Arg::Value(*s), Arg::Value(*d)]),
+                    ));
+                    v
+                }
+                [(s1, d1), rest @ ..] => {
+                    let (s2, d2) = rest[0];
+                    let mut r = self.nf.new_value(u32t);
+                    out.push(Stmt::Let(
+                        r,
+                        Expr::Call(
+                            fns.two,
+                            vec![
+                                trace(),
+                                Arg::Value(*s1),
+                                Arg::Value(*d1),
+                                Arg::Value(s2),
+                                Arg::Value(d2),
+                            ],
+                        ),
+                    ));
+                    for &(s, d) in &rest[1..] {
+                        let one = self.fc(out, f32t, 1.0);
+                        let next = self.nf.new_value(u32t);
+                        out.push(Stmt::Let(
+                            next,
+                            Expr::Call(
+                                fns.two,
+                                vec![
+                                    trace(),
+                                    Arg::Value(r),
+                                    Arg::Value(one),
+                                    Arg::Value(s),
+                                    Arg::Value(d),
+                                ],
+                            ),
+                        ));
+                        r = next;
+                    }
+                    r
+                }
+            };
+            slots.push(self.emit(out, f32t, Expr::Bitcast(slot, Scalar::F32)));
+        }
+        Ok(Some(if nv == 1 { slots[0] } else { self.emit(out, vty, Expr::Construct(vty, slots)) }))
     }
 
     /// The `k`th tangent of `v = e`.
@@ -1353,7 +1572,7 @@ mod tests {
         f.body = body;
         let id = m.add_function(f);
         verify(&m).expect("the source is valid IR");
-        derive(&mut m, &mut DeriveCache::default(), id, vec![1], 1, Target::Cpu, false)
+        derive(&mut m, &mut DeriveCache::default(), id, vec![1], 1, Target::Cpu, false, None)
             .expect("normalization is differentiable");
         verify(&m).expect("the derivative keeps the vector's component type");
     }

@@ -1392,7 +1392,8 @@ pub(crate) fn intrinsic(
             | Lang::Filtered
             | Lang::TapeOf
             | Lang::TapeWith
-            | Lang::TapeSized),
+            | Lang::TapeSized
+            | Lang::Recorded),
         ) => {
             return crate::derive::call(fl, l, substs, c, ty);
         }

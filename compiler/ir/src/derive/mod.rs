@@ -13,6 +13,10 @@ pub mod interval;
 pub mod literal;
 pub mod tape;
 
+#[cfg(test)]
+mod record_tests;
+
+pub use ad::RecordFns;
 pub use interval::Report;
 pub use literal::literal_gradient;
 pub use tape::{TapeFns, TapeOf};
@@ -53,6 +57,64 @@ pub fn value_and_gradient(
     with: bool,
 ) -> Result<FuncId> {
     ad::value_and_gradient(m, cache, f, ncap, target, with)
+}
+
+/// A function of `f`'s captures, `x`, `slots` (of `x`'s type: each of `x`'s numbers' place on
+/// the trace, as its bits) and the trace (by reference, last), returning `(value, slot)`:
+/// `f(x)`, and its result's place on the trace, every operation on the way recorded there with
+/// its local partials (`std::derive::recorded`, reverse mode). `ret` is the `(f32, f32)` the
+/// call takes. CPU only. `f` itself is held to the heap rule as a forward derivation is; the
+/// trace is the derivation's own, written into the derived code, which nothing derives again.
+pub fn recorded(
+    m: &mut Module,
+    cache: &mut DeriveCache,
+    f: FuncId,
+    ncap: u32,
+    fns: ad::RecordFns,
+    ret: TypeId,
+) -> Result<FuncId> {
+    let func = m.functions[f.index()].clone_signature();
+    let xi = ncap as usize;
+    let x = func.params.get(xi).ok_or_else(|| Error::internal("no input parameter"))?.clone();
+    let f32 = m.types.f32();
+    if func.ret != Some(f32) || func.ret_ref {
+        return Err(Error::not_derivable(
+            "a reverse gradient needs a function that returns an `f32`",
+        ));
+    }
+    let mut mask = vec![0; func.params.len()];
+    mask[xi] = all_bits(&m.types, x.ty);
+    let d = ad::derive(m, cache, f, mask.clone(), 1, Target::Cpu, false, Some(fns))?;
+    let returns = returns_active(m, cache, f, mask, Mode::Ad) != 0;
+    let mut params = func.params.clone();
+    params.push(Param { name: "slots".into(), ..x.clone() });
+    params.push(Param { name: "trace".into(), ty: fns.trace, by_ref: true, mutable: true });
+    let mut g = Function::new(format!("{}_recorded", func.name), params, Some(ret));
+    let mut body = Vec::new();
+    let mut args: Vec<Arg> =
+        (0..func.params.len() as u32).map(|i| g.param_arg(i, &mut body)).collect();
+    let slots = g.param_arg(func.params.len() as u32, &mut body);
+    if returns {
+        args.push(slots);
+    }
+    args.push(Arg::Place(Place::root(PlaceRoot::Param(func.params.len() as u32 + 1))));
+    // A derived function that returns nothing active returns the value alone, and takes no
+    // tangent for an input it doesn't use: then the slot is 0, and so is every derivative.
+    let (value, slot) = if returns {
+        let dual = m.functions[d.index()].ret.ok_or_else(|| Error::internal("no dual"))?;
+        let r = g.let_(&mut body, dual, Expr::Call(d, args));
+        let v = g.let_(&mut body, f32, Expr::Extract(r, 0));
+        let s = g.let_(&mut body, f32, Expr::Extract(r, 1));
+        (v, s)
+    } else {
+        let v = g.let_(&mut body, f32, Expr::Call(f, args[..func.params.len()].to_vec()));
+        let s = g.let_(&mut body, f32, Expr::Const(Const::F32(0.0)));
+        (v, s)
+    };
+    let out = g.let_(&mut body, ret, Expr::Construct(ret, vec![value, slot]));
+    body.push(Stmt::Return(Some(out)));
+    g.body = body;
+    Ok(m.add_function(g))
 }
 
 /// A function of `f`'s captures, `x` and a width (of `x`'s type) returning `f(x)` box-filtered

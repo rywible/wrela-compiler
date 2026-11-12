@@ -1495,6 +1495,7 @@ The compiler derives a function's gradient and its interval over a box from the 
 | Interpretation | What it gives |
 |---|---|
 | `gradient` | The forward-mode derivative |
+| `reverse` | The derivative by each number of an array, from one recorded evaluation swept back (reverse mode); CPU only |
 | `interval` | A conservative range over a box |
 | `filtered` | The value box-filtered over a footprint (antialiasing) |
 | Lipschitz bound | Not a compiler feature: a std method, `lipschitz(near)` (§14.5, §20.3). Debug builds and tests check it against the derived local bound, the `interval` of the `gradient`. |
@@ -1515,6 +1516,7 @@ The derivations are `std::derive::{gradient, value_and_gradient, value_gradient_
 - `value_gradient_with` takes a function that returns `(f32, T)` and gives `(f32, X, T)`: the value, its gradient, and the rest as the function computes it, from one derived evaluation. So a shader gets a field's normal and channels without computing its distance twice.
 - `interval` takes the input's box type (`Interval`, `Box2`, `Box3`, `Box4`) and returns an `Interval`. For a vector result, it returns the vector's box: each component's range, from one derived function, the same as the per-component intervals.
 - `filtered(f, at, width)` gives `f(at)` averaged over a footprint `width` wide along each of `at`'s components: a pixel's spread in `f`'s input, from `fwidth`, for example. It is forward-mode differentiation with each direction's seed its width, so each value's tangents span its range over the footprint, to first order. Each `fract`, `floor`, `ceil`, `round`, `trunc`, `step`, `sign`, `abs`, `min`, `max`, `clamp` and `saturate` on the input's path takes the average of its operand's range in place of its point value: the point value plus what the jumps or kinks inside the footprint add. So a footprint that crosses none keeps the point's value exactly, at any magnitude, and a footprint under 10⁻⁶ keeps it too. Each value is averaged alone: a product of patterns along different components averages exactly, but `abs` of a difference of two averaged patterns does not, and what a branch on the input chooses is not filtered.
+- `reverse(f, at)` takes a function of an array, `fn([f32; N]) -> f32`, and gives `(f32, [f32; N])`: the value, and its derivative by each of `at`'s numbers, from one evaluation that records each operation's local partials on a `Trace` and one sweep back through it. It costs about a few evaluations however large `N` is: a two-layer net of 4,096 weights costs 7.2 plain evaluations, in fuel. It runs on the CPU. The input is an array, so what the derivation follows stays out of heap memory; arrays live on the stack, so `N` can be 196,608 (a larger one traps, as a value too large for the stack does, §2.4).
 - `std::field::Surface` provides `gradient`, `sample` (distance and gradient) and `interval` for every surface.
 
 ### 14.2 How they're derived
@@ -1522,6 +1524,7 @@ The derivations are `std::derive::{gradient, value_and_gradient, value_gradient_
 The compiler derives them from the function's body, and from every function it calls.
 
 - **Gradients** are forward mode, one tangent per input component. They agree with central differences within 3.4e-4 relative, across the test corpus. Where a vector's `length` is zero and nothing moves it (inside a box's `length(max(q, 0))`), its tangent is zero. Where `min`'s or `max`'s arguments are equal, the tangent is the average of theirs, so std's `smin` has its true gradient on a blend's seam.
+- **Reverse mode is forward mode with one direction whose tangent is a place on a trace.** A value's place travels as the bits of a value of its type, moved by the same instructions that move the value; each arithmetic operation pushes a node of its local partials onto the trace, found by running the forward rules with unit seeds, and `reverse` sweeps the trace back from the result. No rule is written twice. It refuses `f64` and matrices on the input's path (E0700). The function it derives is held to the heap rule as a forward one is; the trace is the derivation's own, so a recorded function can't be derived again: a `reverse` inside a `gradient` or an `interval` is E0700 (it allocates its trace, §8.3). A trace holds at most 2²⁶ numbers; past it, `reverse` panics.
 - **Derivations nest.** A derived function is ordinary code, so it can be derived again. The `gradient` of a `gradient` component is a Hessian row (and once more, a third derivative). The `interval` of a `gradient` component bounds the gradient over a box, which is a local Lipschitz bound. A closure can pass part of its input to an inner derivation as data: `interval(|q: vec4| gradient(|s: vec3| f(s, q.w), q.xyz).x, b)` bounds the spatial gradient over space and time.
 - **Intervals** bound every value a point in the box can give, as the target computes it.
   - On the CPU, each rounded result is widened by its rounding: an ulp, or four for std's transcendentals.
@@ -2850,7 +2853,7 @@ The compiler knows the language, a closed list of std items and its targets; the
   - `std::input`: `Script`
   - `std::tool::browser`: `Script`
   - `std::mem`: `take_answer`, `take_input`, `take_payload`, `keep_bytes`, `kept_bytes`, `read_clock`, `Drop`, `size_of`, `align_of`, `needs_drop`, `is_copy`, `read`, `zeroed`, `write`, `drop_at`, `at`, `at_mut`, `at_mut_pair`, `heap_base`, `memory_pages`, `memory_grow`, `load_u32`, `store_u32`, `load_u8`, `store_u8`, `copy`, `fill`, `compare_swap`, `atomic_add`, `atomic_load`, `atomic_store`, `wait`, `notify`, `run_task`, `task`, `thread_block`, `wait_for`, `abort`, `debug_build`, `test_build`, `tool_request`, `tool_wait`, `tool_any`, `tool_take`, `tool_idle`, `tool_active`, `tool_join`, `tool_done`
-  - `std::derive`: `Interval`, `Domain`, `gradient`, `value_and_gradient`, `value_gradient_with`, `interval`, `precision`, `precision_note`, `filtered`, `tape`, `tape_with`, `tape_sized`
+  - `std::derive`: `Interval`, `Domain`, `gradient`, `value_and_gradient`, `value_gradient_with`, `interval`, `precision`, `precision_note`, `filtered`, `tape`, `tape_with`, `tape_sized`, `recorded`, `Trace`, `trace_one`, `trace_two`
   - `std::field`: `smin`, `value_noise`, `value_noise_box`, `lattice_coord`
   - `std::hash`: `pcg`
   - `std::stage`: `Building`, `push_one`, `push_two`, `push_new`, `finish`

@@ -400,6 +400,11 @@ fn set(slot: mut f32, x: f32) {
 /// that reads the value back, so each was run as it was and the gradient was 0, with no error.
 #[test]
 fn a_value_that_depends_on_the_input_put_in_heap_memory_is_an_error() {
+    heap_errors(&heap_programs(), "derive-heap");
+}
+
+/// The programs of the heap test: each case's name and text, a gradient taken through `slope`.
+fn heap_programs() -> Vec<(String, String)> {
     // Each: what keeps `x` (its line marked `// here`), and what reads it back.
     let cases = [
         ("push", "    var v: Vec<f32> = Vec::new()\n    v.push(x) // here\n    v", "v[0]"),
@@ -456,8 +461,13 @@ fn a_value_that_depends_on_the_input_put_in_heap_memory_is_an_error() {
             "{SLOPE}\nfn kept(x: f32) -> Rows {{\n    var r = Rows {{ cells: Vec::filled(2, value: 0.0) }}\n    r.cell(1) = x // here\n    r\n}}\n\nfn read(x: f32) -> f32 {{\n    let r = kept(x)\n    r.cells[1]\n}}\n\nfn curve(x: f32) -> f32 {{\n    read(x) - 3.0\n}}\n\npub fn frame(time: f32, width: u32, height: u32) {{\n    let s = slope(curve, time)\n}}\n"
         ),
     ));
-    for (name, text) in &programs {
-        let dir = crate::package(&format!("derive-heap-{name}"), text);
+    programs
+}
+
+/// Checks each heap program is E0700 at its marked line, with the heap rule's words.
+fn heap_errors(programs: &[(String, String)], stem: &str) {
+    for (name, text) in programs {
+        let dir = crate::package(&format!("{stem}-{name}"), text);
         let (codes, rendered) = crate::checked(&dir);
         let errors: Vec<&String> = codes.iter().filter(|c| c.starts_with('E')).collect();
         assert_eq!(errors, ["E0700"], "{name}:\n{rendered}");
@@ -475,6 +485,83 @@ fn a_value_that_depends_on_the_input_put_in_heap_memory_is_an_error() {
             "{name}:\n{rendered}"
         );
     }
+}
+
+/// The same cases with `reverse` in place of `gradient` (§14.2): a recorded function is held to
+/// the heap rule as a forward one is, with the same words at the same lines.
+#[test]
+fn a_value_put_in_heap_memory_is_an_error_under_reverse_too() {
+    let programs: Vec<(String, String)> =
+        heap_programs().into_iter().map(|(name, text)| (name, as_reverse(&text))).collect();
+    heap_errors(&programs, "derive-heap-reverse");
+}
+
+/// A heap program with its gradient taken by `reverse`, on the same lines.
+fn as_reverse(text: &str) -> String {
+    let out = text
+        .replace("use std::derive::gradient", "use std::derive::reverse")
+        .replace(
+            "fn slope(f: fn(f32) -> f32, x: f32) -> f32 {\n    gradient(f, x)\n}",
+            "fn slope(f: fn([f32; 1]) -> f32, x: f32) -> f32 {\n    reverse(f, [x]).1[0]\n}",
+        )
+        .replace(
+            "fn curve(x: f32) -> f32 {\n    read(x) - 3.0\n}",
+            "fn curve(xs: [f32; 1]) -> f32 {\n    read(xs[0]) - 3.0\n}",
+        );
+    assert_eq!(out.lines().count(), text.lines().count(), "the lines stay where they were");
+    assert!(out.contains("reverse(f, [x])") && out.contains("read(xs[0])"), "{out}");
+    out
+}
+
+/// Weights made in a `Vec` by a function given nothing of the input, handed back as an array,
+/// leave a reverse gradient right; and `reverse` named inside a forward derivation is refused,
+/// since it allocates its trace (§8.3).
+#[test]
+fn heap_memory_that_holds_nothing_of_the_input_is_left_alone_under_reverse() {
+    let src = "use std::collections::Vec
+use std::derive::{gradient, reverse}
+
+fn slope(f: fn([f32; 2]) -> f32, x: [f32; 2]) -> [f32; 2] {
+    reverse(f, x).1
+}
+
+/// Weights made in a `Vec`, given back as values.
+fn weights() -> [f32; 2] {
+    var v: Vec<f32> = Vec::new()
+    v.push(0.5)
+    v.push(4.0)
+    [v[0], v[1]]
+}
+
+fn curve(x: [f32; 2]) -> f32 {
+    let w = weights()
+    x[0] * w[0] + x[1] * x[1] * w[1]
+}
+
+@test
+fn the_slope_is_the_weights() {
+    let g = slope(curve, [2.5, 3.0])
+    assert(abs(g[0] - 0.5) < 1.0e-6)
+    assert(abs(g[1] - 24.0) < 1.0e-5)
+}
+";
+    let dir = crate::package("derive-heap-reverse-constants", src);
+    assert_eq!(crate::tests_pass(&dir), 1);
+    let nested = "use std::derive::{gradient, reverse}
+
+fn inner(x: f32) -> f32 {
+    reverse(|y: [f32; 1]| y[0] * y[0] * x, [x]).1[0]
+}
+
+pub fn frame(time: f32, width: u32, height: u32) {
+    let _s = gradient(inner, time)
+}
+";
+    let dir = crate::package("derive-reverse-in-gradient", nested);
+    let (codes, rendered) = crate::checked(&dir);
+    let errors: Vec<&String> = codes.iter().filter(|c| c.starts_with('E')).collect();
+    assert_eq!(errors, ["E0700"], "{rendered}");
+    assert!(rendered.contains("`reverse` allocates"), "{rendered}");
 }
 
 /// Heap memory that holds nothing of the input stays as it was (§14.2): a function given

@@ -417,6 +417,32 @@ fn trace_two(t: mut Trace, a: u32, da: f32, b: u32, db: f32) -> u32 {
     }
 }
 
+/// `f(at)`, every operation on the input's path recorded onto `trace` with its local partials,
+/// `slots` the input's numbers' nodes (as their bits): the value, and its node (as its bits).
+/// The derivation is forward mode's with one direction whose tangent is a node. (`reverse`
+/// allocates, its trace's room, so a derivation can't be given one by name, §8.3.)
+@intrinsic
+fn recorded<X>(f: fn(X) -> f32, at: X, slots: X, trace: mut Trace) -> (f32, f32) {}
+
+/// `f`'s value at `at`, and its derivative by each of `at`'s numbers, from one recorded
+/// evaluation and one sweep back through it (reverse mode): about the cost of a few
+/// evaluations, however many numbers. CPU only. The input is an array, so what the derivation
+/// follows stays out of heap memory (§14.2).
+pub fn reverse<const N: u32>(f: fn([f32; N]) -> f32, at: [f32; N]) -> (f32, [f32; N]) {
+    var trace = Trace::new()
+    var slots = [0.0; N]
+    for i in 0..N {
+        slots[i] = bitcast_f32(trace.leaf())
+    }
+    let (value, slot) = recorded(f, at, slots, mut trace)
+    let adjoint = trace.sweep(bitcast_u32(slot))
+    var g = [0.0; N]
+    for i in 0..N {
+        g[i] = adjoint[bitcast_u32(slots[i])]
+    }
+    (value, g)
+}
+
 // ---- tests (the suite runs std's: `std_tests_pass`) --------------------------------------------
 
 @test
@@ -661,4 +687,34 @@ fn a_trace_sweeps_back_to_its_leaves() {
     assert(t.nodes() == 6)
     t.clear()
     assert(t.nodes() == 1)
+}
+
+@test
+fn a_reverse_gradient_is_the_gradient() {
+    let (v, g) = reverse(|x: [f32; 2]| x[0] * x[1] + sin(x[0]), [2.0, 3.0])
+    assert(v == 2.0 * 3.0 + sin(2.0))
+    assert(abs(g[0] - (3.0 + cos(2.0))) < 1.0e-6)
+    assert(abs(g[1] - 2.0) < 1.0e-6)
+}
+
+@test
+fn a_reverse_gradient_follows_vectors() {
+    let f = |x: [f32; 6]| {
+        let u = vec3(x[0], x[1], x[2])
+        let w = vec3(x[3], x[4], x[5])
+        length(cross(u, w)) + dot(normalize(u), w * 2.0) + sin(u * w).y
+    }
+    let at = [0.3, -1.2, 0.8, 1.1, 0.4, -0.7]
+    let (v, g) = reverse(f, at)
+    assert(v == f(at))
+    // Each component's derivative, by forward mode along its axis.
+    for i in 0..6 {
+        let along = |t: f32| {
+            var y = at
+            y[i] = y[i] + t
+            f(y)
+        }
+        let d = gradient(along, 0.0)
+        assert(abs(g[i] - d) <= 1.0e-5 * (1.0 + abs(d)))
+    }
 }
