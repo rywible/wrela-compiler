@@ -337,8 +337,9 @@ impl Checks for Report {
 ///   derivatives of every number from `jacobian`, 16 literals at a time. Each step has what BFGS
 ///   learns over many, so it takes far fewer.
 ///
-/// Neither tries a step that moves a literal farther than its own size (`reach`): its size
-/// now, or where the solve began if that was larger, or 1 if it began at 0.
+/// Neither tries a step that moves a literal farther than its own size (`within_reach`): its
+/// size now, or where the solve began if that was larger, or 1 if it began at 0. Each literal
+/// is held by itself, so one with too long a step doesn't shorten the others'.
 ///
 /// Then the literals are rounded to their sources' decimals: all at once where that costs no
 /// more than 5% of the solved value; else one at a time, the one that changed most first and
@@ -397,6 +398,7 @@ impl Minimize {
             self.free,
             f,
             self.start,
+            began: self.start,
             moves: Vec::filled(n, value: true),
             steps: steps,
             changes: mut self.changes,
@@ -445,6 +447,7 @@ impl Minimize {
             self.free,
             f,
             self.start,
+            began: self.start,
             moves: Vec::filled(n, value: true),
             steps: steps,
             changes: mut self.changes,
@@ -529,6 +532,7 @@ fn value_at<const M: u32>(
 fn solved_again<const M: u32>(
     free: [Literal],
     x: [f32],
+    began: [f32],
     moves: [bool],
     steps: u32,
     f: fn() -> f32,
@@ -537,10 +541,10 @@ fn solved_again<const M: u32>(
     changes: mut Vec<bool>,
 ) -> Vec<f32> {
     if fit {
-        let (again, _) = least_squares(free, numbers, x, moves, steps, mut changes)
+        let (again, _) = least_squares(free, numbers, x, began, moves, steps, mut changes)
         take again
     } else {
-        let (again, _) = bfgs(free, f, x, moves, steps, mut changes)
+        let (again, _) = bfgs(free, f, x, began, moves, steps, mut changes)
         take again
     }
 }
@@ -673,7 +677,7 @@ fn rounded<const M: u32>(
         held[k] = true
         if left > 0 {
             let moves = Vec::from_fn(n, |i| !held[i])
-            x = solved_again(free, x, moves, steps, f, numbers, fit, mut changes)
+            x = solved_again(free, x, start, moves, steps, f, numbers, fit, mut changes)
         }
     }
     x
@@ -778,10 +782,12 @@ fn note(g: mut Vec<f64>, changes: mut Vec<bool>, moves: bool, d: f32, at: u32) {
 
 /// BFGS from `x0` over the literals `moves` lets change, `steps` steps at most: where it
 /// stopped, and the steps it took. `changes` notes the literals a gradient it takes isn't 0 by.
+/// `began` is where the whole solve began, for each literal's size (`within_reach`).
 fn bfgs(
     free: [Literal],
     f: fn() -> f32,
     x0: [f32],
+    began: [f32],
     moves: [bool],
     steps: u32,
     changes: mut Vec<bool>,
@@ -806,18 +812,31 @@ fn bfgs(
             slope = -gg
             h = identity(n)
         }
-        // Armijo's rule, halving the step from all of it that `reach` lets a first try go.
-        var t: f64 = reach(x, x0, p)
+        // Armijo's rule along the step, halved from 1, each literal's part of it held to its
+        // own size (`within_reach`). A try the same as the last (every literal still held) is
+        // passed over, and isn't one of the 40.
+        var t: f64 = 1.0
         var x1: Vec<f64> = Vec::new()
         var f1: f64 = 0.0
-        for _ in 0..40 {
-            let trial: Vec<f64> = Vec::from_fn(n, |i| x[i] + t * p[i])
+        var last: Vec<f64> = Vec::new()
+        var tries = 0
+        while tries < 40 && t > 0.0 {
+            let step = within_reach(x, began, p, t)
+            if same(step, last) {
+                t *= 0.5
+                continue
+            }
+            tries += 1
+            let trial: Vec<f64> = Vec::from_fn(n, |i| x[i] + step[i])
             let ft = loss_at(free, f, narrowed(trial))
-            if ft - ft == 0.0 && ft <= fx + 1.0e-4 * t * slope {
+            // The slope along what was tried: the step's own, where no literal was held.
+            let down = if whole(step, p, t) { t * slope } else { dot(step, g) }
+            if ft - ft == 0.0 && down < 0.0 && ft <= fx + 1.0e-4 * down {
                 x1 = take trial
                 f1 = ft
                 break
             }
+            last = take step
             t *= 0.5
         }
         if x1.len() == 0 {
@@ -851,29 +870,59 @@ fn bfgs(
     (narrowed(x), taken)
 }
 
-/// How much of a step `p` from `x` a solve that began at `x0` tries: all of it (1), or as much
-/// as moves no literal farther than its own size. That is its size now, or where the solve
-/// began if that was larger (so it can cross 0), or 1 if it began at 0. The function's
-/// derivatives say nothing of it that far off, and a step can be far longer than any literal:
-/// BFGS's first is as long as the gradient (its estimate starts as the identity), which for a
-/// loss of 1,149 that rises 164 for a thousandth of a second of a key's time was a time of
-/// -164,460 s, where one evaluation ran for hours. A literal can still double each step, so
-/// one that has far to go gets there in a few.
+/// How far a literal at `x` goes in one step of a solve it began at `began`: its size now, or
+/// where the solve began if that was larger (so it can cross 0), or 1 if it began at 0.
+fn size(x: f64, began: f32) -> f64 {
+    let from = abs(f64(began))
+    max(abs(x), if from == 0.0 { 1.0 } else { from })
+}
+
+/// `t` of the step `p` from `x`, each literal's part of it held to the literal's own `size`.
+/// The function's derivatives say nothing of it farther off than that, and a step can be far
+/// longer than any literal: BFGS's first is as long as the gradient (its estimate starts as
+/// the identity), which for a loss of 1,149 that rises 164 for a thousandth of a second of a
+/// key's time was a time of -164,460 s, where one evaluation ran for hours. A literal can
+/// still double each step, so one that has far to go gets there in a few.
 ///
-/// A line search's maximum step: J. E. Dennis and R. B. Schnabel, "Numerical Methods for
-/// Unconstrained Optimization and Nonlinear Equations" (1983), §6.3 and algorithm A6.3.1
-/// (`maxstep`), there one length for the whole step and here each literal's own.
-fn reach(x: [f64], x0: [f32], p: [f64]) -> f64 {
-    var t: f64 = 1.0
-    for i in 0..x.len() {
-        let began = abs(f64(x0[i]))
-        let most = max(abs(x[i]), if began == 0.0 { 1.0 } else { began })
-        let step = abs(p[i])
-        if t * step > most {
-            t = most / step
+/// Each literal is held by itself, so one whose part of the step is far too long (the loss
+/// barely changes with it, and the estimate gives it a long way to go) doesn't hold the rest
+/// to a fraction of theirs: scaling the whole step to fit it stopped a solve of ten literals
+/// against two outlines at a loss of 52.
+///
+/// A step held to a box and searched by Armijo's rule along what is left of it: D. P.
+/// Bertsekas, "On the Goldstein-Levitin-Polyak gradient projection method", IEEE Transactions
+/// on Automatic Control 21 (1976). The box as the most a step may go: J. E. Dennis and R. B.
+/// Schnabel, "Numerical Methods for Unconstrained Optimization and Nonlinear Equations"
+/// (1983), §6.3 and algorithm A6.3.1 (`maxstep`), there one length for the whole step.
+fn within_reach(x: [f64], began: [f32], p: [f64], t: f64) -> Vec<f64> {
+    Vec::from_fn(x.len(), |i| {
+        let most = size(x[i], began[i])
+        let step = t * p[i]
+        if step > most { most } else if step < -most { -most } else { step }
+    })
+}
+
+/// Whether `step` is all of `t` of `p`: no literal's part was held.
+fn whole(step: [f64], p: [f64], t: f64) -> bool {
+    for i in 0..step.len() {
+        if step[i] != t * p[i] {
+            return false
         }
     }
-    t
+    true
+}
+
+/// Whether two steps are the same, number for number.
+fn same(a: [f64], b: [f64]) -> bool {
+    if a.len() != b.len() {
+        return false
+    }
+    for i in 0..a.len() {
+        if a[i] != b[i] {
+            return false
+        }
+    }
+    true
 }
 
 fn narrowed(x: [f64]) -> Vec<f32> {
@@ -1037,6 +1086,7 @@ fn least_squares<const M: u32>(
     free: [Literal],
     f: fn() -> [f32; M],
     x0: [f32],
+    began: [f32],
     moves: [bool],
     steps: u32,
     changes: mut Vec<bool>,
@@ -1092,8 +1142,8 @@ fn least_squares<const M: u32>(
         for _ in 0..40 {
             let d = damped_step(a, g, n, live, lambda)
             if d.len() == n {
-                let t = reach(x, x0, d)
-                let trial: Vec<f64> = Vec::from_fn(n, |i| x[i] + t * d[i])
+                let step = within_reach(x, began, d, 1.0)
+                let trial: Vec<f64> = Vec::from_fn(n, |i| x[i] + step[i])
                 let ft = squares_at(free, f, narrowed(trial))
                 if ft - ft == 0.0 && ft < fx {
                     x1 = take trial
@@ -1196,20 +1246,26 @@ fn a_damped_step_solves_its_equations() {
 @test
 fn a_step_moves_no_literal_farther_than_its_size() {
     // A step within every literal's size is taken whole.
-    assert(reach([0.5, -32.0], [0.5, -32.0], [0.25, 20.0]) == 1.0)
-    // A key's time of 0.5 s and a step as long as its gradient: 0.5 s of it.
-    assert(abs(reach([0.5], [0.5], [-164460.0]) * 164460.0 - 0.5) < 1.0e-12)
-    // The literal that would go farthest for its size sets how much of the step is tried.
-    assert(abs(reach([2.0, 100.0], [2.0, 100.0], [-8.0, 150.0]) - 0.25) < 1.0e-12)
+    let small = within_reach([0.5, -32.0], [0.5, -32.0], [0.25, 20.0], 1.0)
+    assert(small[0] == 0.25 && small[1] == 20.0 && whole(small, [0.25, 20.0], 1.0))
+    // A key's time of 0.5 s and a step as long as its gradient: 0.5 s of it, at any `t` that
+    // still leaves it longer.
+    let long = within_reach([0.5], [0.5], [-164460.0], 1.0)
+    assert(long[0] == -0.5 && !whole(long, [-164460.0], 1.0))
+    assert(same(long, within_reach([0.5], [0.5], [-164460.0], 0.5)))
+    assert(abs(within_reach([0.5], [0.5], [-164460.0], 0.000001)[0] + 0.16446) < 1.0e-12)
+    // One literal held doesn't hold the other.
+    let one = within_reach([2.0, 100.0], [2.0, 100.0], [-8.0, 50.0], 1.0)
+    assert(one[0] == -2.0 && one[1] == 50.0)
     // One that has come near 0 can still move as far as it began from it, and so cross it.
-    assert(abs(reach([0.125], [0.5], [-2.0]) - 0.25) < 1.0e-12)
+    assert(within_reach([0.125], [0.5], [-2.0], 1.0)[0] == -0.5)
     // One that began at 0 has no size to go by: 1.
-    assert(abs(reach([0.0], [0.0], [5.0]) - 0.2) < 1.0e-12)
-    // A step that isn't a number bounds nothing, and an endless one is not taken at all.
+    assert(within_reach([0.0], [0.0], [5.0], 1.0)[0] == 1.0)
+    // A step that isn't a number is neither whole nor the same as itself: a search tries it,
+    // finds no value there and halves.
     let quiet: u64 = 0x7ff8000000000000
-    let infinity: u64 = 0x7ff0000000000000
-    assert(reach([1.0], [1.0], [bitcast_f64(quiet)]) == 1.0)
-    assert(reach([1.0], [1.0], [bitcast_f64(infinity)]) == 0.0)
+    let nan = within_reach([1.0], [1.0], [bitcast_f64(quiet)], 1.0)
+    assert(!whole(nan, [bitcast_f64(quiet)], 1.0) && !same(nan, nan))
 }
 
 @test
