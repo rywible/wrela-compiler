@@ -11,6 +11,8 @@
 pub mod build;
 #[cfg(feature = "gpu")]
 pub mod captured;
+#[cfg(feature = "gpu")]
+pub mod pixel;
 pub use wrela_wasm::DataReport;
 pub mod const_cache;
 pub mod consts;
