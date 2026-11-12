@@ -149,6 +149,94 @@ fn a_negative_loss_uses_its_magnitude_for_rounding_tolerance() {
     assert!((x - 1.3).abs() < 1e-6, "the source-precision value is kept: {answer}");
 }
 
+/// A solve that gains 7%, all of it given up when `a` and `c` are rounded to their own decimals
+/// (each within the 5% a rounding may cost). No number of decimals of `b`, rounded last, brings
+/// it back: `b` keeps its own two, not seven.
+const OUT_OF_REACH: &str = "pub fn miss() -> f32 {
+    let a = 1.0
+    let c = 3.0
+    let b = 2.00
+    let da = a - 1.04
+    let dc = c - 3.03
+    let db = b - 2.0043217
+    1.0 + 25.0 * da * da + 44.444443 * dc * dc + 50.0 * db * db
+}
+";
+
+/// The same with one more decimal of `b` keeping the solve within 5%: it gets that one.
+const IN_REACH: &str = "pub fn miss() -> f32 {
+    let a = 1.0
+    let b = 2.00
+    let da = a - 1.04
+    let db = b - 2.004
+    1.0 + 25.0 * da * da + 1250.0 * db * db
+}
+";
+
+#[test]
+fn a_literal_gets_no_decimals_that_buy_nothing() {
+    let solve = |name: &str, fit: &str, lines: &str| {
+        let dir = common::package(
+            name,
+            &[
+                ("wrela.toml", &common::manifest("decimals")),
+                ("fit.wrela", fit),
+                ("main.wrela", common::FRAME),
+            ],
+        );
+        common::answer(common::wrela().arg("solve").arg(&dir).args([
+            "--minimize",
+            "fit::miss",
+            "--free",
+            lines,
+            "--json",
+        ]))
+    };
+    let after = |answer: &serde_json::Value, text: &str| {
+        let literals = answer["literals"].as_array().unwrap();
+        let literal = literals.iter().find(|l| l["text"] == text).expect("the literal freed");
+        literal["after"].as_f64().unwrap()
+    };
+    let out = solve("solve-decimals-out-of-reach", OUT_OF_REACH, "fit.wrela:2-4");
+    let (before, solved) =
+        (out["loss_before"].as_f64().unwrap(), out["loss_solved"].as_f64().unwrap());
+    assert!(before > 1.08 && solved < 1.001, "the solve gains 7%: {out}");
+    assert!((after(&out, "1.0") - 1.0).abs() < 1e-6, "{out}");
+    assert!((after(&out, "3.0") - 3.0).abs() < 1e-6, "{out}");
+    assert!((after(&out, "2.00") - 2.0).abs() < 1e-6, "decimals that buy nothing: {out}");
+    let within = solve("solve-decimals-in-reach", IN_REACH, "fit.wrela:2-3");
+    assert!((after(&within, "1.0") - 1.0).abs() < 1e-6, "{within}");
+    assert!((after(&within, "2.00") - 2.004).abs() < 1e-6, "the decimal that buys it: {within}");
+    assert!(within["loss_after"].as_f64().unwrap() < 1.05, "{within}");
+}
+
+/// A solve that gains under 1%, where `X` rounded to its one decimal lands on the steep side:
+/// within the 5% a rounding may cost, and above where the solve began. `X` stays where it was.
+#[test]
+fn rounding_never_leaves_a_function_larger_than_the_solve_found_it() {
+    let fit = "pub const X: f32 = 1.0\n\npub fn miss() -> f32 {\n    let d = X - 1.06\n    let steep = if d > 0.0 { 8.0 } else { 1.0 }\n    1.0 + 2.0 * steep * d * d\n}\n";
+    let dir = common::package(
+        "solve-never-larger",
+        &[
+            ("wrela.toml", &common::manifest("never_larger")),
+            ("fit.wrela", fit),
+            ("main.wrela", common::FRAME),
+        ],
+    );
+    let answer = common::answer(common::wrela().arg("solve").arg(&dir).args([
+        "--minimize",
+        "fit::miss",
+        "--free",
+        "fit.wrela:1",
+        "--json",
+    ]));
+    let loss = |key: &str| answer[key].as_f64().unwrap();
+    assert!(loss("loss_before") > 1.007 && loss("loss_solved") < 1.0001, "{answer}");
+    assert!(loss("loss_after") <= loss("loss_before"), "{answer}");
+    let x = answer["literals"][0]["after"].as_f64().unwrap();
+    assert!((x - 1.0).abs() < 1e-6, "1.1 is within 5% of the solve, and above its start: {answer}");
+}
+
 #[test]
 fn repeated_free_options_include_each_range_of_the_same_file_once() {
     let dir = common::package(
@@ -216,6 +304,7 @@ fn a_spec_is_solved_over_a_files_literals() {
         "--json",
     ]));
     assert_eq!(r["spec_before"]["held"], 0, "{r}");
+    assert_eq!(r["held_before"], false, "{r}");
     assert_eq!(r["spec_after"]["held"], 2, "{r}");
     assert_eq!(r["spec_after"]["missed"], 0, "{r}");
     let names: Vec<&str> = r["spec_after"]["checks"]
@@ -330,6 +419,55 @@ fn a_spec_that_misses_is_not_written() {
         .output()
         .expect("run wrela");
     assert_eq!(out.status.code(), Some(0));
+}
+
+/// The ball's spec holding as the ball is written, 10cm off a target it may miss by 20.
+const SPEC_HELD: &str = "use ball::ball
+use std::field::top
+use std::lift::Checks
+
+pub fn spec<C: Checks>(c: mut C) {
+    let f = ball()
+    c.near(\"height\", top(f, x: 0.0, z: 0.0), 0.90, within: 0.20)
+}
+";
+
+/// `--spec` of a spec whose every check already holds takes no step: no literal moves, though
+/// a solve could lower its loss, and `--write` writes nothing.
+#[test]
+fn a_spec_that_already_holds_is_left_as_it_is() {
+    let dir = spec_package("solve-spec-held", SPEC_HELD);
+    let r = common::answer(common::wrela().arg("solve").arg(&dir).args([
+        "--spec",
+        "--free",
+        "ball.wrela",
+        "--write",
+        "--json",
+    ]));
+    assert_eq!(r["held_before"], true, "{r}");
+    assert_eq!(r["spec_before"]["missed"], 0, "{r}");
+    assert!(r["loss_before"].as_f64().unwrap() > 0.1, "a loss a solve could lower: {r}");
+    assert_eq!(r["steps"], 0, "{r}");
+    assert_eq!(r["rounded"], false, "{r}");
+    assert_eq!(r["written"], false, "nothing to write: {r}");
+    assert!(r["refused"].is_null(), "{r}");
+    assert_eq!(r["loss_after"], r["loss_before"], "{r}");
+    for l in r["literals"].as_array().unwrap() {
+        assert_eq!(l["after"], l["before"], "{r}");
+    }
+    assert_eq!(std::fs::read_to_string(dir.join("ball.wrela")).unwrap(), BALL, "nothing changed");
+    // As text, it says so, and that isn't a failure.
+    let (code, stdout, all) = common::outputs(&[
+        "solve",
+        dir.to_str().unwrap(),
+        "--spec",
+        "--free",
+        "ball.wrela",
+        "--write",
+    ]);
+    assert_eq!(code, Some(0), "{all}");
+    assert!(stdout.contains("every check already held: nothing solved"), "{all}");
+    assert!(!stdout.lines().any(|l| l == "written"), "{all}");
 }
 
 const NAMED: &str = "/// How far the reach misses.

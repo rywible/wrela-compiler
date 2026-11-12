@@ -16,7 +16,10 @@
 //! Levenberg–Marquardt on every number's derivatives (`std::lift::jacobian`). The literals end
 //! rounded to their own decimals, as a drag's are: the one that changed most first, the
 //! rest solved again with it held, and the last given more decimals while rounding would cost
-//! more than 5% of the value (`--exact` keeps them as solved). This finds the literals named
+//! more than 5% of the value, and only the decimals that buy something where none keeps the
+//! cost within that (`--exact` keeps them as solved); they stay where they began where rounding
+//! left the value above the one before the solve. A spec whose every check already holds isn't
+//! solved or written: its literals stay. This finds the literals named
 //! and their decimals, passes them in, and reports what came out, with a warning for each
 //! literal the function never changed with (its derivative by it was 0 wherever the solve took
 //! one). With `--write`, `wrela edit` writes them to the source, unless a spec's solve stopped
@@ -413,6 +416,11 @@ fn solve(
         call(&mut host, "free", &args)?;
     }
     let checks_before = if spec { spec_report(&mut host)? } else { serde_json::Value::Null };
+    // A spec whose every check already holds has nothing to solve: no step is taken and
+    // nothing is rounded, so its literals stay. (The derivatives are still taken once, for
+    // the warnings.)
+    let held_before = spec && checks_before["missed"].as_u64() == Some(0);
+    let (steps, exact) = if held_before { (0, true) } else { (steps, exact) };
     call(&mut host, "solve", &[Value::I32(steps as i32), Value::I32(i32::from(exact))])?;
     let (before, solved_loss, after) = match call(&mut host, "losses", &[])?.as_slice() {
         [Value::F32(a), Value::F32(b), Value::F32(c)] => (*a, *b, *c),
@@ -479,6 +487,7 @@ fn solve(
         "loss_after": num(after),
         "steps": taken,
         "rounded": !exact,
+        "held_before": held_before,
         "spec_before": checks_before,
         "spec_after": checks_after,
         "literals": lits.iter().zip(start.iter().zip(&finish)).zip(&changes).map(|((l, (b, a)), changed)| serde_json::json!({
@@ -490,7 +499,7 @@ fn solve(
     });
     if let Some(why) = refused {
         answer["refused"] = why.into();
-    } else if write {
+    } else if write && !held_before {
         let edits: Vec<LiteralEdit> = lits
             .iter()
             .zip(&finish)
@@ -564,6 +573,9 @@ fn print_report(r: &serde_json::Value) {
                 if c["holds"] == true { String::new() } else { format!(", off by {}", c["miss"]) }
             );
         }
+    }
+    if r["held_before"] == true {
+        println!("every check already held: nothing solved, nothing to write");
     }
     if r["written"] == true {
         println!("written");

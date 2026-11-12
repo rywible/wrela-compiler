@@ -341,7 +341,10 @@ impl Checks for Report {
 /// more than 5% of the solved value; else one at a time, the one that changed most first and
 /// the rest solved again with it held, a literal getting more decimals while rounding would
 /// cost more than 5% of the value (the last one, against the solved value; each before it, up
-/// to three more, against the value before rounding it).
+/// to three more, against the value before rounding it). Where no number of decimals keeps the
+/// cost within that, the literal gets the fewest whose value is within 5% of the least any of
+/// them gives: more decimals are kept only for what they buy. Where the rounded literals leave
+/// the value above the one before the solve, they stay where they began.
 pub struct Minimize {
     free: Vec<Literal>,
     decimals: Vec<u32>,
@@ -403,6 +406,7 @@ impl Minimize {
                 self.start,
                 self.decimals,
                 self.units,
+                before: f64(self.before),
                 solved: f64(self.solved),
                 solved_x: x,
                 steps: steps,
@@ -450,6 +454,7 @@ impl Minimize {
                 self.start,
                 self.decimals,
                 self.units,
+                before: f64(self.before),
                 solved: f64(self.solved),
                 solved_x: x,
                 steps: steps,
@@ -537,11 +542,47 @@ fn solved_again<const M: u32>(
     }
 }
 
+/// The solution `solved_x` rounded (`rounded`), or the literals where they began (`start`,
+/// whose value is `before`) where rounding left the value above `before`: a solve never leaves
+/// what it makes small larger than it found it.
+fn round_solution<const M: u32>(
+    free: [Literal],
+    start: [f32],
+    decimals: [u32],
+    units: [f64],
+    before: f64,
+    solved: f64,
+    solved_x: [f32],
+    steps: u32,
+    f: fn() -> f32,
+    numbers: fn() -> [f32; M],
+    fit: bool,
+    changes: mut Vec<bool>,
+) -> Vec<f32> {
+    let x = rounded(
+        free,
+        start,
+        decimals,
+        units,
+        solved,
+        solved_x,
+        steps,
+        f,
+        numbers,
+        fit,
+        mut changes,
+    )
+    if !(value_at(free, x, f, numbers, fit) <= before) {
+        return Vec::from(start)
+    }
+    x
+}
+
 /// The solution `solved_x` (whose value is `solved`) rounded to the literals' `decimals` of
 /// their `units`. All at once, where that leaves the value within `rounding_limit` of `solved`:
 /// one evaluation. Else a literal at a time, as `Minimize` says, the rest solved again each
 /// time (`value_at`'s `f`, `numbers` and `fit` say what is solved).
-fn round_solution<const M: u32>(
+fn rounded<const M: u32>(
     free: [Literal],
     start: [f32],
     decimals: [u32],
@@ -595,14 +636,35 @@ fn round_solution<const M: u32>(
         } else {
             (rounding_limit(value_at(free, x, f, numbers, fit)), min(d + 3, 7))
         }
+        // The value at each number of decimals that isn't within `enough`, from its own.
+        var over: Vec<f64> = Vec::new()
+        var met = false
         while d < most {
             var trial = x.clone()
             trial[k] = v
-            if value_at(free, trial, f, numbers, fit) <= enough {
+            let value = value_at(free, trial, f, numbers, fit)
+            if value <= enough {
+                met = true
                 break
             }
+            over.push(value)
             d += 1
             v = round_to(x[k], d, unit)
+        }
+        if !met && over.len() > 0 {
+            var trial = x.clone()
+            trial[k] = v
+            let value = value_at(free, trial, f, numbers, fit)
+            if !(value <= enough) {
+                // No number of decimals is within `enough`: the fewest whose value is within
+                // the limit of the least any gives, so none is spent on a value out of reach.
+                over.push(value)
+                let fewest = fewest_decimals(over)
+                if fewest < over.len() {
+                    d = decimals[k] + fewest
+                    v = round_to(x[k], d, unit)
+                }
+            }
         }
         x[k] = v
         held[k] = true
@@ -612,6 +674,30 @@ fn round_solution<const M: u32>(
         }
     }
     x
+}
+
+/// Of `values` (a literal's value at each number of decimals, from its own), the first within
+/// `rounding_limit` of the least: how many more decimals than its own buy something. Their
+/// count where none is a number.
+fn fewest_decimals(values: [f64]) -> u32 {
+    let n = values.len()
+    var least = n
+    for j in 0..n {
+        let value = values[j]
+        if value - value == 0.0 && (least == n || value < values[least]) {
+            least = j
+        }
+    }
+    if least == n {
+        return n
+    }
+    let limit = rounding_limit(values[least])
+    for j in 0..least {
+        if values[j] <= limit {
+            return j
+        }
+    }
+    least
 }
 
 /// The largest loss rounding may leave: five percent of the loss's magnitude above it. Using
@@ -1075,6 +1161,23 @@ fn a_damped_step_solves_its_equations() {
     assert(one[0] == 0.0 && abs(one[1] - 2.0 / 3.0) < 1.0e-12)
     // A matrix that isn't positive definite has no step.
     assert(damped_step([1.0, 2.0, 2.0, 1.0], [-1.0, -2.0], 2, [0, 1], 0.0).len() == 0)
+}
+
+@test
+fn decimals_are_kept_only_for_what_they_buy() {
+    // More decimals lower the value by a hair: its own are within 5% of the least.
+    assert(fewest_decimals([0.3719011, 0.371805, 0.371805, 0.37180242]) == 0)
+    // One more decimal buys most of it, and the rest a hair.
+    assert(fewest_decimals([5.0, 1.1, 1.06, 1.06]) == 1)
+    // The least itself, where nothing before it is near.
+    assert(fewest_decimals([5.0, 3.0, 2.0, 1.0]) == 3)
+    // A negative value's limit is above it.
+    assert(fewest_decimals([-90.0, -99.0, -100.0]) == 1)
+    // A value that isn't a number is no value: passed over, and all of them is no answer.
+    let quiet: u64 = 0x7ff8000000000000
+    let nan = bitcast_f64(quiet)
+    assert(fewest_decimals([nan, 2.0, 1.99]) == 1)
+    assert(fewest_decimals([nan, nan]) == 2)
 }
 
 @test
