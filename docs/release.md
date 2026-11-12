@@ -35,7 +35,9 @@ the author's choice.
    the version is written; every crate inherits it, and `wrela --version` reads it.
 3. Run any Cargo build (for example `cargo check --workspace`) so that `Cargo.lock` takes the
    new version of each workspace crate. Commit `Cargo.toml` and `Cargo.lock` together.
-4. Run `tools/check.sh`.
+4. Run `tools/check.sh`. If the frozen programs have saved fuzz findings (`build/fuzz` of a
+   package, or a directory a program keeps them in), run `wrela fuzz <package> --replay <dir>`
+   on each: a finding that still fails holds the release.
 5. Run the agent syntax test with the release's compiler, and put its headline numbers (first
    try correct, mean attempts to correct, mean tokens) in the pull request:
 

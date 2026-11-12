@@ -30,9 +30,10 @@
 //! wrela sliders <package-dir> <module>::<fn> --free <file>:<lines or names>... [--move i=a] [--write]
 //!                                         the independent ways a surface's literals move it,
 //!                                         each named, and moving along one
-//! wrela fuzz <package-dir> [--ticks n] [--time s | --runs n] [--seed n]
-//!                                         the inputs that trap the program's ticks, found
-//!                                         by mutating inputs that run new code
+//! wrela fuzz <package-dir> [--ticks n] [--time s | --runs n] [--seed n] [--room]
+//!                                         the inputs that trap the program's ticks (or its
+//!                                         rooms), found by mutating inputs that run new
+//!                                         code, minimized and saved; --replay runs them
 //! wrela pixel <package-dir> --frame n (--at x,y | --kernel <label> --id i)
 //!                                         why a pixel has its colour: each draw that changed
 //!                                         it, and the shader interpreted for it, line by line
@@ -150,7 +151,7 @@ pub(crate) fn usage() -> ExitCode {
         "wrela inspect <package-dir> <module>::<fn> [--depth <n>] [--region <lo>..<hi>,<lo>..<hi>,<lo>..<hi>] [--thin <metres>] [--lift] [--views <dir>] [--json]",
         "wrela sliders <package-dir> <module>::<fn> --free <file>[:<lines or names>]... [--top <k>] [--depth <n>] [--region <lo>..<hi>,<lo>..<hi>,<lo>..<hi>] [--move <i>=<amount>]... [--write] [--sheet <file.png>] [--json]",
         "wrela pixel <package-dir> --frame <n> (--at <x>,<y> [--draw <k>] [--fragment <j>] | --kernel <label> --id <i>) [--input <script.json>] [--size <w>x<h>] [--line <file>:<line>] [--full] [--json]",
-        "wrela fuzz <package-dir> [--ticks <n>] [--time <seconds> | --runs <n>] [--seed <n>] [--fuel <n>] [--seeds <dir>] [--json]",
+        "wrela fuzz <package-dir> [--ticks <n>] [--time <seconds> | --runs <n>] [--seed <n>] [--fuel <n>] [--seeds <dir>] [--out <dir>] [--replay <file-or-dir>] [--room] [--json]",
         "wrela profile <package-dir> [--frames n] [--warmup n] [--workers n] [--size WxH] [--input <script.json>] [--scenario name] [--serial] [--worst n] [--chrome [--features none|<list>] [--checked]] [--optimize size|speed] [--relaxed-simd] [--json] [--baseline <report.json> | --compare <build-dir> [--pairs n]]",
         "wrela test <package-dir> [<filter>] [--exact] [--std] [--bless] [--json]",
         "wrela script <package-dir> <module>::<NAME> [-o <file>]",
