@@ -65,6 +65,31 @@ pub struct Output {
     /// What the client build's constant data holds (`wrela build --report data`), when it was
     /// built.
     pub data: Option<wrela_wasm::DataReport>,
+    /// Each GPU pipeline's module as the WGSL is written from it, when [`gpu_modules`] asked.
+    pub gpu: Vec<GpuModule>,
+}
+
+/// A GPU pipeline as the build writes it: its name, its entry points' names, the flattened
+/// module its WGSL is written from (`wrela_wgsl::emit`'s input), and its manifest entry. What
+/// interpreting a pipeline needs (`wrela_ir::interp`).
+#[derive(Clone, Debug)]
+pub struct GpuModule {
+    pub name: String,
+    pub entries: Vec<String>,
+    pub module: wrela_ir::Module,
+    pub manifest: Option<wrela_abi::manifest::Pipeline>,
+}
+
+/// The package at `root` built as `wrela build` builds it (a debug build, or a test build, as
+/// `kind` says), with each GPU pipeline's [`GpuModule`] in its `gpu` (and its files and sources
+/// as any build's): or the build's output, if it doesn't build.
+pub fn gpu_modules(root: &Path, kind: BuildKind) -> Result<Output, Box<Output>> {
+    let mode = Mode { debug: kind.debug, testing: kind.testing, keep_gpu: true, ..Mode::RELEASE };
+    let out = on_compiler_thread(|| compile(root, mode, wrela_lower::Roots::of, &[]));
+    if out.has_errors() {
+        return Err(Box::new(out));
+    }
+    Ok(out)
 }
 
 /// One pipeline: an instantiation of its entry points, and why it exists.
@@ -885,6 +910,8 @@ struct Mode {
     relaxed_simd: bool,
     /// The CPU module left unoptimized ([`build_for_tests_with`]).
     no_opt: bool,
+    /// Each GPU pipeline's module kept in the output ([`gpu_modules`]).
+    keep_gpu: bool,
 }
 
 impl Mode {
@@ -896,6 +923,7 @@ impl Mode {
         conditions: false,
         relaxed_simd: false,
         no_opt: false,
+        keep_gpu: false,
     };
     const RELEASE: Mode = Mode { emit: true, ..Mode::CHECK };
 }
@@ -968,6 +996,7 @@ fn compile_loaded_in(
             program_files: Vec::new(),
             consts: consts::ConstStats::default(),
             data: None,
+            gpu: Vec::new(),
         });
     };
     // The program package's own files: package 1's (std is 0).
@@ -993,6 +1022,7 @@ fn compile_loaded_in(
     let mut files = Vec::new();
     let mut pipelines = Vec::new();
     let mut data_report = None;
+    let mut gpu: Vec<GpuModule> = Vec::new();
     let mut data = wrela_lower::BuildData {
         debug: mode.debug,
         no_simd: mode.no_simd,
@@ -1062,6 +1092,18 @@ fn compile_loaded_in(
             diagnostics.extend(out.diagnostics);
             files.extend(out.files);
             files.append(&mut shipped_files);
+            if mode.keep_gpu {
+                gpu = lowered
+                    .pipelines
+                    .iter()
+                    .map(|p| GpuModule {
+                        name: p.name.clone(),
+                        entries: p.module.entry_points.iter().map(|e| e.name.clone()).collect(),
+                        module: p.module.clone(),
+                        manifest: None,
+                    })
+                    .collect();
+            }
             if let Some(t) = &data.lift {
                 files.push(("lift.json".into(), lift::report(&checked, &sources, t).into_bytes()));
             }
@@ -1092,6 +1134,15 @@ fn compile_loaded_in(
     if has_errors(&diagnostics) {
         files.clear();
     }
+    // Each pipeline's manifest entry, in the manifest's order (the pipelines' own).
+    if let Some((_, bytes)) = files.iter().find(|(p, _)| p == "manifest.json")
+        && let Some(manifest) =
+            std::str::from_utf8(bytes).ok().and_then(|t| wrela_abi::Manifest::parse(t).ok())
+    {
+        for (g, p) in gpu.iter_mut().zip(manifest.pipelines) {
+            g.manifest = Some(p);
+        }
+    }
     let std_warnings = finish_diagnostics(&sources, &mut diagnostics);
     Ok(Output {
         sources,
@@ -1102,6 +1153,7 @@ fn compile_loaded_in(
         program_files,
         consts: stats,
         data: data_report,
+        gpu,
     })
 }
 
