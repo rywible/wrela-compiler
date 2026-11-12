@@ -30,6 +30,9 @@
 
 use std::collections::Vec
 use std::derive::{Box2, Box3, Interval, gradient, interval}
+use std::gpu::{
+    GlobalId, R32Float, Texels3d, Texture3d, Texture3dHandle, buffer_of, dispatch, texture3d,
+}
 
 /// A table of a function of one number over a range, with what reading it is proven to be off
 /// by.
@@ -131,7 +134,10 @@ pub fn table1<F: fn(f32) -> f32>(f: F, over: Interval, within: f32, most: u32) -
 fn build1<F: fn(f32) -> f32>(f: F, over: Interval, n: u32) -> Table1 {
     let xs: Vec<f32> = Vec::from_fn(n + 1, |i| node(over.lo, over.hi, i, n))
     let values: Vec<f32> = Vec::from_fn(n + 1, |i| f(xs[i]))
-    let corners: Vec<Interval> = Vec::from_fn(n + 1, |i| interval(|r| f(r), Interval { lo: xs[i], hi: xs[i] }))
+    let corners: Vec<Interval> = Vec::from_fn(
+        n + 1,
+        |i| interval(|r| f(r), Interval { lo: xs[i], hi: xs[i] }),
+    )
     let extent = max(abs(f64(over.lo)), abs(f64(over.hi))) + (f64(over.hi) - f64(over.lo))
     var error: f32 = 0.0
     var worst = Interval { lo: xs[0], hi: xs[1] }
@@ -144,7 +150,13 @@ fn build1<F: fn(f32) -> f32>(f: F, over: Interval, n: u32) -> Table1 {
         let (a, b) = (corners[i], corners[i + 1])
         let widest = max(f64(a.hi) - f64(a.lo), f64(b.hi) - f64(b.lo))
         let largest = max(size(a.lo, a.hi), size(b.lo, b.hi))
-        let e = bound(h * h / 8.0 * size(d2.lo, d2.hi), lip * h / 2.0, lip * 8.0 * ULP * extent, widest, largest)
+        let e = bound(
+            h * h / 8.0 * size(d2.lo, d2.hi),
+            lip * h / 2.0,
+            lip * 8.0 * ULP * extent,
+            widest,
+            largest,
+        )
         if !(e <= error) {
             error = e
             worst = cell
@@ -223,8 +235,8 @@ fn build2<F: fn(vec2) -> f32>(f: F, over: Box2, n: u32) -> Table2 {
             let (gx, gy) = (size(g.lo.x, g.hi.x), size(g.lo.y, g.hi.y))
             let lip = sqrt(gx * gx + gy * gy)
             let (hx, hy) = (f64(cell.hi.x) - f64(cell.lo.x), f64(cell.hi.y) - f64(cell.lo.y))
-            let smooth =
-                hx * hx / 8.0 * size(d2.lo.x, d2.hi.x) + hy * hy / 8.0 * size(d2.lo.y, d2.hi.y)
+            let smooth = hx * hx / 8.0 * size(d2.lo.x, d2.hi.x) +
+                hy * hy / 8.0 * size(d2.lo.y, d2.hi.y)
             var widest = 0.0
             var largest = 0.0
             for c in 0..4 {
@@ -308,15 +320,19 @@ fn build3<F: fn(vec3) -> f32>(f: F, over: Box3, n: u32) -> Table3 {
         interval(|r| f(r), Box3 { lo: p, hi: p })
     })
     let extent = |lo: f32, hi: f32| max(abs(f64(lo)), abs(f64(hi))) + (f64(hi) - f64(lo))
-    let reach =
-        extent(over.lo.x, over.hi.x) + extent(over.lo.y, over.hi.y) + extent(over.lo.z, over.hi.z)
+    let reach = extent(over.lo.x, over.hi.x) +
+        extent(over.lo.y, over.hi.y) +
+        extent(over.lo.z, over.hi.z)
     var error: f32 = 0.0
     var worst = Box3 { lo: grid3(xs, ys, zs, 0), hi: grid3(xs, ys, zs, m * m + m + 1) }
     for k in 0..n {
         for j in 0..n {
             for i in 0..n {
                 let base = (k * m + j) * m + i
-                let cell = Box3 { lo: grid3(xs, ys, zs, base), hi: grid3(xs, ys, zs, base + m * m + m + 1) }
+                let cell = Box3 {
+                    lo: grid3(xs, ys, zs, base),
+                    hi: grid3(xs, ys, zs, base + m * m + m + 1),
+                }
                 let g = interval(|p: vec3| gradient(|r| f(r), p), cell)
                 let d2 = interval(
                     |p: vec3| vec3(
@@ -326,7 +342,11 @@ fn build3<F: fn(vec3) -> f32>(f: F, over: Box3, n: u32) -> Table3 {
                     ),
                     cell,
                 )
-                let (gx, gy, gz) = (size(g.lo.x, g.hi.x), size(g.lo.y, g.hi.y), size(g.lo.z, g.hi.z))
+                let (gx, gy, gz) = (
+                    size(g.lo.x, g.hi.x),
+                    size(g.lo.y, g.hi.y),
+                    size(g.lo.z, g.hi.z),
+                )
                 let lip = sqrt(gx * gx + gy * gy + gz * gz)
                 let hx = f64(cell.hi.x) - f64(cell.lo.x)
                 let hy = f64(cell.hi.y) - f64(cell.lo.y)
@@ -389,6 +409,164 @@ impl Table3 {
         let a = mix(mix(s[at], s[at + 1], u), mix(s[at + m], s[at + m + 1], u), v)
         let up = at + m * m
         let b = mix(mix(s[up], s[up + 1], u), mix(s[up + m], s[up + m + 1], u), v)
+        mix(a, b, w)
+    }
+}
+
+// ---- on the GPU -----------------------------------------------------------------------------------
+
+/// A table on the GPU (`Table1::upload`): its texture's handle, where it lies, and its proven
+/// error. `Copy + GpuData`: a kernel or a shader takes it as an argument, and the texture is
+/// bound beside it (§20.3). Its texture is a 3D one of `n + 1` texels by 1 by 1.
+pub struct Tabled1: Copy + GpuData {
+    texels: Texture3dHandle<R32Float>,
+    lo: f32,
+    hi: f32,
+    n: u32,
+    error: f32,
+}
+
+/// A two-number table on the GPU (`Table2::upload`), its texture `n + 1` by `n + 1` by 1.
+pub struct Tabled2: Copy + GpuData {
+    texels: Texture3dHandle<R32Float>,
+    lo: vec2,
+    hi: vec2,
+    n: u32,
+    error: f32,
+}
+
+/// A three-number table on the GPU (`Table3::upload`): a texture's handle and where it lies.
+pub struct Tabled3: Copy + GpuData {
+    texels: Texture3dHandle<R32Float>,
+    lo: vec3,
+    hi: vec3,
+    n: u32,
+    error: f32,
+}
+
+/// Each texel of a table's texture, from its values: x fastest, then y, then z.
+@compute(4, 4, 4)
+fn fill(values: [f32], size: vec3u, out: mut Texels3d<R32Float>, id: GlobalId) {
+    if id.x < size.x && id.y < size.y && id.z < size.z {
+        out.store(id, values[(id.z * size.y + id.y) * size.x + id.x])
+    }
+}
+
+/// `values` in a new 3D texture of `size`: CPU code can't write a 3D texture's texels, so a
+/// kernel copies them from a buffer.
+@client
+fn upload_values(values: [f32], size: vec3u) -> Texture3d<R32Float> {
+    var t: Texture3d<R32Float> = texture3d(width: size.x, height: size.y, depth: size.z)
+    let b = buffer_of(values)
+    let groups = (size.x + 3) / 4
+    dispatch(fill.bind(b, size, mut t), groups: (groups, (size.y + 3) / 4, (size.z + 3) / 4))
+    t
+}
+
+impl Table1 {
+    /// The table on the GPU: its texture, which the caller keeps for as long as the `Tabled1`
+    /// is read (dropping it releases it), and the `Tabled1` that reads it. A side of a 3D
+    /// texture is at most 2,048 texels, so a table of at most 2,047 cells.
+    @client
+    pub fn upload(self) -> (Texture3d<R32Float>, Tabled1) {
+        let t = upload_values(self.values, vec3u(self.n + 1, 1, 1))
+        let tabled = Tabled1 {
+            texels: t.to_handle(),
+            lo: self.over.lo,
+            hi: self.over.hi,
+            n: self.n,
+            error: self.error,
+        }
+        (t, tabled)
+    }
+}
+
+impl Table2 {
+    /// The table on the GPU, as `Table1::upload`: its texture and the `Tabled2` that reads it.
+    @client
+    pub fn upload(self) -> (Texture3d<R32Float>, Tabled2) {
+        let t = upload_values(self.values, vec3u(self.n + 1, self.n + 1, 1))
+        let tabled = Tabled2 {
+            texels: t.to_handle(),
+            lo: self.over.lo,
+            hi: self.over.hi,
+            n: self.n,
+            error: self.error,
+        }
+        (t, tabled)
+    }
+}
+
+impl Table3 {
+    /// The table on the GPU, as `Table1::upload`: its texture and the `Tabled3` that reads it.
+    @client
+    pub fn upload(self) -> (Texture3d<R32Float>, Tabled3) {
+        let m = self.n + 1
+        let t = upload_values(self.values, vec3u(m, m, m))
+        let tabled = Tabled3 {
+            texels: t.to_handle(),
+            lo: self.over.lo,
+            hi: self.over.hi,
+            n: self.n,
+            error: self.error,
+        }
+        (t, tabled)
+    }
+}
+
+impl Tabled1 {
+    /// The table's proven error (`Table1::error`).
+    pub fn error(self) -> f32 {
+        self.error
+    }
+
+    /// The function at `x`, as `Table1::read` interpolates it: two texel loads and a mix.
+    pub fn read(self, x: f32) -> f32 {
+        let (i, u) = place(x, self.lo, self.hi, self.n)
+        mix(self.texels.load(x: i, y: 0, z: 0), self.texels.load(x: i + 1, y: 0, z: 0), u)
+    }
+}
+
+impl Tabled2 {
+    /// The table's proven error (`Table2::error`).
+    pub fn error(self) -> f32 {
+        self.error
+    }
+
+    /// The function at `p`, as `Table2::read` interpolates it: four texel loads and three mixes.
+    pub fn read(self, p: vec2) -> f32 {
+        let (i, u) = place(p.x, self.lo.x, self.hi.x, self.n)
+        let (j, v) = place(p.y, self.lo.y, self.hi.y, self.n)
+        let t = self.texels
+        let a = mix(t.load(x: i, y: j, z: 0), t.load(x: i + 1, y: j, z: 0), u)
+        let b = mix(t.load(x: i, y: j + 1, z: 0), t.load(x: i + 1, y: j + 1, z: 0), u)
+        mix(a, b, v)
+    }
+}
+
+impl Tabled3 {
+    /// The table's proven error (`Table3::error`).
+    pub fn error(self) -> f32 {
+        self.error
+    }
+
+    /// The function at `p`, as `Table3::read` interpolates it: eight texel loads and seven
+    /// mixes. GPU code derives through it as it does any texel load (§14).
+    pub fn read(self, p: vec3) -> f32 {
+        let (i, u) = place(p.x, self.lo.x, self.hi.x, self.n)
+        let (j, v) = place(p.y, self.lo.y, self.hi.y, self.n)
+        let (k, w) = place(p.z, self.lo.z, self.hi.z, self.n)
+        let t = self.texels
+        let a = mix(
+            mix(t.load(x: i, y: j, z: k), t.load(x: i + 1, y: j, z: k), u),
+            mix(t.load(x: i, y: j + 1, z: k), t.load(x: i + 1, y: j + 1, z: k), u),
+            v,
+        )
+        let b = mix(
+            mix(t.load(x: i, y: j, z: k + 1), t.load(x: i + 1, y: j, z: k + 1), u),
+            mix(t.load(x: i, y: j + 1, z: k + 1), t.load(x: i + 1, y: j + 1, z: k + 1), u),
+            v,
+        )
         mix(a, b, w)
     }
 }

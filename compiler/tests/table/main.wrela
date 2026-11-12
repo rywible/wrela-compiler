@@ -1,0 +1,116 @@
+// Tables on the GPU (std::table, language.md §14.6): three tables made on the CPU (a sine, a
+// product of waves, a ball's distance), uploaded, and read by a kernel at 4,096 points the CPU
+// chose, for compiler/tests/tests/suite/table.rs to compare with the CPU's reads of the same
+// tables at the same points.
+use std::derive::{Box2, Box3, Interval}
+use std::field::hash_u32
+use std::gpu::{GlobalId, GpuBuffer, R32Float, Slots, Texture3d, buffer, buffer_of, dispatch}
+use std::table::{Table1, Table2, Table3, Tabled1, Tabled2, Tabled3, table1, table2, table3}
+
+/// How many points the kernel reads each table at.
+const N: u32 = 4096
+
+pub struct State {
+    t1: Table1,
+    t2: Table2,
+    t3: Table3,
+    textures: Vec<Texture3d<R32Float>>,
+    points: GpuBuffer<vec4>,
+    balls: GpuBuffer<vec4>,
+    out: GpuBuffer<vec4>,
+}
+
+fn sine(x: f32) -> f32 {
+    sin(x)
+}
+
+fn waves(p: vec2) -> f32 {
+    sin(3.0 * p.x) * cos(2.0 * p.y)
+}
+
+fn ball(p: vec3) -> f32 {
+    length(p) - 0.5
+}
+
+const RANGE: Interval = Interval { lo: 0.0, hi: 6.0 }
+const SQUARE: Box2 = Box2 { lo: vec2(0.0, 0.0), hi: vec2(1.0, 1.0) }
+const CUBE: Box3 = Box3 { lo: vec3(0.2, 0.2, 0.2), hi: vec3(1.0, 1.0, 1.0) }
+
+pub fn init() -> State {
+    State {
+        t1: table1(|x: f32| sine(x), RANGE, 0.0001, 4096),
+        t2: table2(|p: vec2| waves(p), SQUARE, 0.001, 65536),
+        t3: table3(|p: vec3| ball(p), CUBE, 0.001, 40000),
+        textures: Vec::new(),
+        points: buffer(0),
+        balls: buffer(0),
+        out: buffer(0),
+    }
+}
+
+fn unit(h: u32) -> f32 {
+    f32(h >> 8) * (1.0 / 16777216.0)
+}
+
+/// Point `i`: a number of the sine's range and a point of the square (x, then y, z), and a point
+/// of the ball's cube.
+fn point(i: u32) -> (vec4, vec4) {
+    let h0 = hash_u32(i ^ 0x5eed)
+    let h1 = hash_u32(h0)
+    let h2 = hash_u32(h1)
+    let h3 = hash_u32(h2)
+    let h4 = hash_u32(h3)
+    let h5 = hash_u32(h4)
+    let x = RANGE.lo + unit(h0) * (RANGE.hi - RANGE.lo)
+    let q = SQUARE.lo + vec2(unit(h1), unit(h2)) * (SQUARE.hi - SQUARE.lo)
+    let b = CUBE.lo + vec3(unit(h3), unit(h4), unit(h5)) * (CUBE.hi - CUBE.lo)
+    (vec4(x, q.x, q.y, 0.0), vec4(b, 0.0))
+}
+
+@compute(64)
+fn reads(
+    t1: Tabled1,
+    t2: Tabled2,
+    t3: Tabled3,
+    points: [vec4],
+    balls: [vec4],
+    out: mut Slots<vec4>,
+    id: GlobalId,
+) {
+    let p = points[id.x]
+    out[id] = vec4(t1.read(p.x), t2.read(p.yz), t3.read(balls[id.x].xyz), 0.0)
+}
+
+/// Uploads the tables and reads each at the N points on the GPU.
+pub fn on_gpu(s: mut State) {
+    var ps = Vec::new()
+    var bs = Vec::new()
+    for i in 0..N {
+        let (p, b) = point(i)
+        ps.push(p)
+        bs.push(b)
+    }
+    s.points = buffer_of(ps)
+    s.balls = buffer_of(bs)
+    s.out = buffer(N)
+    let (a, g1) = s.t1.upload()
+    let (b, g2) = s.t2.upload()
+    let (c, g3) = s.t3.upload()
+    s.textures.push(take a)
+    s.textures.push(take b)
+    s.textures.push(take c)
+    dispatch(reads.bind(g1, g2, g3, s.points, s.balls, mut s.out), groups: N / 64)
+}
+
+/// The CPU's reads of the three tables at point `i`.
+pub fn cpu(s: State, i: u32) -> vec3 {
+    let (p, b) = point(i)
+    vec3(s.t1.read(p.x), s.t2.read(p.yz), s.t3.read(b.xyz))
+}
+
+/// The tables' proven errors.
+pub fn errors(s: State) -> vec3 {
+    vec3(s.t1.error(), s.t2.error(), s.t3.error())
+}
+
+pub fn frame(s: mut State, time: f32, width: u32, height: u32) {}

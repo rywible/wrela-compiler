@@ -62,6 +62,7 @@ mod stage;
 mod standin;
 mod std_docs;
 mod subjects;
+mod table;
 mod test_items;
 mod threads;
 mod tool;
