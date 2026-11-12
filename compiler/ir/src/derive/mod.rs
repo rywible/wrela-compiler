@@ -18,7 +18,7 @@ mod record_tests;
 
 pub use ad::RecordFns;
 pub use interval::Report;
-pub use literal::literal_gradient;
+pub use literal::{literal_gradient, literal_recorded};
 pub use tape::{TapeFns, TapeOf};
 
 use crate::*;

@@ -404,6 +404,11 @@ fn trace_one(t: mut Trace, a: u32, da: f32) -> u32 {
     if a == 0 { 0 } else { t.node(a, da, 0, 0.0) }
 }
 
+/// A new input's node: what a record of lifted literals seeds each with.
+fn trace_leaf(t: mut Trace) -> u32 {
+    t.leaf()
+}
+
 /// A recorded number of two terms (0 if both are node 0).
 fn trace_two(t: mut Trace, a: u32, da: f32, b: u32, db: f32) -> u32 {
     if a == 0 && b == 0 {

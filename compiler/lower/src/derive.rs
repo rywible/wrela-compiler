@@ -27,6 +27,7 @@ pub(crate) fn call(
         Lang::LiftReads => DeriveKind::Reads,
         Lang::TapeOf | Lang::TapeWith | Lang::TapeSized => DeriveKind::Tape,
         Lang::Recorded => DeriveKind::Recorded,
+        Lang::LiftRecorded => DeriveKind::LiteralsRecorded,
         _ => DeriveKind::ValueAndGradient,
     };
     let Some(Repr::Callable(callable, srcs)) = fl.callable_arg(&c.args[0]) else {
@@ -53,6 +54,10 @@ pub(crate) fn call(
             (substs[0], if lang == Lang::ValueGradientWith { substs.get(1).copied() } else { None })
         }
         DeriveKind::Recorded => (substs[0], ty.map(|t| fl.concrete(t))),
+        DeriveKind::LiteralsRecorded => {
+            let which = fl.place_src_ty(c.args[1].place()?);
+            (which, ty.map(|t| fl.concrete(t)))
+        }
     };
     let key = InstanceKey::Derived { of: callable, kind, input, output };
     let callee = fl.cx.instance(fl.mb, key, Some((fl.id, c.span)));
@@ -64,6 +69,10 @@ pub(crate) fn call(
     if kind == DeriveKind::Filtered {
         let width = fl.arg_value(&c.args[2])?;
         args.push(ir::Arg::Value(width));
+    }
+    if kind == DeriveKind::LiteralsRecorded {
+        let trace = fl.place(c.args[2].place()?)?;
+        args.push(ir::Arg::Place(trace));
     }
     if kind == DeriveKind::Recorded {
         if fl.is_gpu() {
@@ -139,7 +148,7 @@ fn record_fns(
         one: f(Lang::TraceOne)?,
         two: f(Lang::TraceTwo)?,
         trace: trace?,
-        leaf: None,
+        leaf: f(Lang::TraceLeaf),
     })
 }
 
@@ -210,7 +219,7 @@ pub(crate) fn signature(cx: &mut Cx, mb: &mut ModuleBuilder, key: &InstanceKey) 
         }
         // `input` is the tape's type.
         DeriveKind::Tape => ir::Function::new("tape", params, x),
-        DeriveKind::Recorded => {
+        DeriveKind::Recorded | DeriveKind::LiteralsRecorded => {
             let r = output.and_then(|o| cx.lower_ty(mb, o, span));
             let trace = cx
                 .checked
@@ -445,6 +454,27 @@ fn build(
     let target = mb.target();
     let result = match kind {
         DeriveKind::Reads => return build_reads(mb, id, inner),
+        DeriveKind::LiteralsRecorded => {
+            let sig = &mb.m.functions[id.index()];
+            let n = sig.params.len();
+            let (which, trace, ret) = (
+                sig.params.get(n.wrapping_sub(2)).map(|p| p.ty),
+                sig.params.last().map(|p| p.ty),
+                sig.ret,
+            );
+            match (record_fns(cx, mb, id, trace), which, ret) {
+                (Some(fns), Some(which), Some(ret)) => ir::derive::literal_recorded(
+                    &mut mb.m,
+                    &mut mb.derived,
+                    inner,
+                    mb.lift.map(|t| t.table),
+                    which,
+                    fns,
+                    ret,
+                ),
+                _ => Err(ir::Error::internal("a literals' record's signature is incomplete")),
+            }
+        }
         DeriveKind::Recorded => {
             let sig = &mb.m.functions[id.index()];
             let (ncap, ret) = ((sig.params.len() as u32).saturating_sub(3), sig.ret);

@@ -9,6 +9,7 @@
 // each file's hash when it was built, so a tool can show a literal's line and write a change
 // back (`wrela edit`). In a build that isn't lifted there are no literals: `count()` is 0.
 
+use std::derive::Trace
 use std::fmt::{json_number, json_string}
 use std::string::String
 
@@ -111,6 +112,55 @@ pub fn gradient<const N: u32>(f: fn() -> f32, which: [Literal; N]) -> (f32, [f32
 /// them, where a `gradient` of each part would run `f` again for each.
 @intrinsic
 pub fn jacobian<const N: u32, R>(f: fn() -> R, which: [Literal; N]) -> (R, [R; N]) {}
+
+/// `f()`, every operation on a literal's path recorded onto `trace`, the literals of `which` its
+/// next nodes in order (none where `f` reads none): the value, and its node (as its bits).
+@intrinsic
+fn recorded<const N: u32>(f: fn() -> f32, which: [Literal; N], trace: mut Trace) -> (f32, f32) {}
+
+/// `gradient` by reverse mode: `f`'s value and its derivative by each literal of `which`, from
+/// one recorded evaluation and one sweep back through it (Griewank and Walther), at the cost of
+/// a few evaluations however many literals, with no limit of 255 (§23.1). It takes `f` through a
+/// parameter, as `Minimize` does, so the code `f` reaches is held to the heap rule alone.
+pub fn reverse<const N: u32>(f: fn() -> f32, which: [Literal; N]) -> (f32, [f32; N]) {
+    var trace = Trace::new()
+    let (value, slot) = recorded(f, which, mut trace)
+    (value, adjoints(trace, slot, N))
+}
+
+/// `reverse` of a sum of `n` terms, `term(i)` for each `i` below `n`: one record and sweep a
+/// term, so the trace holds one term at a time.
+pub fn reverse_sum<const N: u32>(
+    n: u32,
+    term: fn(u32) -> f32,
+    which: [Literal; N],
+) -> (f32, [f32; N]) {
+    var trace = Trace::new()
+    var sum = 0.0
+    var g: [f32; N] = [0.0; N]
+    for i in 0..n {
+        trace.clear()
+        let (value, slot) = recorded(|| term(i), which, mut trace)
+        let d: [f32; N] = adjoints(trace, slot, N)
+        sum += value
+        for k in 0..N {
+            g[k] += d[k]
+        }
+    }
+    (sum, g)
+}
+
+/// The adjoints of a record's `N` literals, nodes 1 to `N`, by the value at node `slot`.
+fn adjoints<const N: u32>(trace: Trace, slot: f32, n: u32) -> [f32; N] {
+    let adj = trace.sweep(bitcast_u32(slot))
+    var g: [f32; N] = [0.0; N]
+    for k in 0..n {
+        if k + 1 < adj.len() {
+            g[k] = adj[k + 1]
+        }
+    }
+    g
+}
 
 /// The literals `f`'s code can read, through everything it calls on the CPU, in index order:
 /// those that can change what it gives. (GPU work it records reads its own literals when it

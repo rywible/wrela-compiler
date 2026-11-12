@@ -2853,7 +2853,7 @@ The compiler knows the language, a closed list of std items and its targets; the
   - `std::input`: `Script`
   - `std::tool::browser`: `Script`
   - `std::mem`: `take_answer`, `take_input`, `take_payload`, `keep_bytes`, `kept_bytes`, `read_clock`, `Drop`, `size_of`, `align_of`, `needs_drop`, `is_copy`, `read`, `zeroed`, `write`, `drop_at`, `at`, `at_mut`, `at_mut_pair`, `heap_base`, `memory_pages`, `memory_grow`, `load_u32`, `store_u32`, `load_u8`, `store_u8`, `copy`, `fill`, `compare_swap`, `atomic_add`, `atomic_load`, `atomic_store`, `wait`, `notify`, `run_task`, `task`, `thread_block`, `wait_for`, `abort`, `debug_build`, `test_build`, `tool_request`, `tool_wait`, `tool_any`, `tool_take`, `tool_idle`, `tool_active`, `tool_join`, `tool_done`
-  - `std::derive`: `Interval`, `Domain`, `gradient`, `value_and_gradient`, `value_gradient_with`, `interval`, `precision`, `precision_note`, `filtered`, `tape`, `tape_with`, `tape_sized`, `recorded`, `Trace`, `trace_one`, `trace_two`
+  - `std::derive`: `Interval`, `Domain`, `gradient`, `value_and_gradient`, `value_gradient_with`, `interval`, `precision`, `precision_note`, `filtered`, `tape`, `tape_with`, `tape_sized`, `recorded`, `Trace`, `trace_one`, `trace_two`, `trace_leaf`
   - `std::field`: `smin`, `value_noise`, `value_noise_box`, `lattice_coord`
   - `std::hash`: `pcg`
   - `std::stage`: `Building`, `push_one`, `push_two`, `push_new`, `finish`
@@ -2868,7 +2868,7 @@ The compiler knows the language, a closed list of std items and its targets; the
   - `std::cmp`: `Eq`, `Ord`, `Ordering`
   - `std::fmt`: `Format`, `Spec`, `assert_failed1`, `assert_failed2`
   - `std::arena`: `Arena`, `Handle`
-  - `std::lift`: `gradient`, `jacobian`, `reads`, `literal_count`, `literal_value`, `literal_built_value`, `set_literal`, `literal_generation`, `literal_source`, `lifted_files`, `lifted_file`
+  - `std::lift`: `gradient`, `jacobian`, `recorded`, `reads`, `literal_count`, `literal_value`, `literal_built_value`, `set_literal`, `literal_generation`, `literal_source`, `lifted_files`, `lifted_file`
   - `std::job`: `Job`, `Step`
 - **Each std module passes an admission test:** it makes sense in a program that is not a game. The compiler knows nothing about the engine; a feature that only makes sense in a game belongs in the engine. Acoustics, creatures, terrain and timelines are engine code, in the `engine` package, not in std.
 - **std is written in Wrela** with a small unsafe core (§6.12). The core is these files, and only they contain `unsafe`: `std::mem` (raw memory), `std::alloc` (the allocator), `std::collections` (`Vec` and `Box`), `std::string`, `std::par` (the helpers and jobs), `std::audio` (the voice and its ring), `std::tick` (the ticker), `std::handoff` (the triple buffer), `std::time` (the clock) and `std::tool` (a tool's calls and tasks).
@@ -3154,6 +3154,7 @@ A lifted build reads a package's `f32` literals from a table instead of building
 - **`std::lift`** is the program's view of its table: `count()` and `literal(i)`; a `Literal`'s `value()`, `built_value()`, `set(v)` and `source()` (file, bytes, line, column, and the written mantissa's unit including its exponent and suffix); `files()`, `file_name(i)`, `file_path(i)`, `file_text(i)` and `file_hash(i)`. A build that is not lifted has no literals: `count()` is 0.
 - **`std::lift::gradient(f, which)`** gives `f`'s value and its derivative by each literal of `which`. This is a parameter gradient, derived in forward mode as `gradient` is (§14.2), through everything that `f` calls, including the code that builds values from literals. It runs on the CPU. `reads(f)` gives the literals that `f`'s code can read on the CPU, through everything that it calls, for any `fn() -> T`.
 - **`std::lift::jacobian(f, which)`** is `gradient` of a function that gives more than one number (an array of `f32`, a vector, a struct of them): `f`'s value, and for each literal of `which` how every part of the value changes with it, as a value of the same type. One derived evaluation gives all of them; a `gradient` of each part would run `f` again for each.
+- **`std::lift::reverse(f, which)`** is `gradient` by reverse mode (§14.1): from one recorded evaluation and one sweep back through it, at the cost of a few evaluations however many literals, with no limit of 255. `reverse_sum(n, term, which)` does the same for a sum of `n` terms, one record and sweep a term, so the trace holds one term at a time. A literal named twice is derived once, at its first place. Both take `f` through a parameter, as `Minimize` does, so the code `f` reaches is held to the heap rule alone.
 - **A host changes a literal** through the export that a lifted build has, `__lift_set(literal, value)`, as `set` does. `std::lift::generation()` counts the table's changes. A `Watch` (`Watch::new(reads(f))`) says when a literal that it watches has a new value (`changed()`, once per change). A program cooks again, at that time, what it cooked from literals at load.
 
 ### 23.2 Hot reload

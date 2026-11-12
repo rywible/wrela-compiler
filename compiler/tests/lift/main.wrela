@@ -6,7 +6,7 @@ use shapes::blob::{AROUND, blob}
 use std::derive::Box3
 use std::field::Surface
 use std::gpu::{ClipPosition, FragCoord, VertexIndex, begin_screen_pass, draw}
-use std::lift::{Literal, count, gradient, jacobian, literal}
+use std::lift::{Literal, count, gradient, jacobian, literal, reverse}
 
 pub fn frame(time: f32, width: u32, height: u32) {
     let screen = begin_screen_pass(clear: vec4(0.1, 0.1, 0.12, 1.0))
@@ -89,6 +89,20 @@ pub fn derivatives4(x: f32, y: f32, z: f32, i: u32) -> vec4 {
         Literal { index: i + 3 },
     ]
     let (_, d) = gradient(|| blob().distance(p), which)
+    vec4(d[0], d[1], d[2], d[3])
+}
+
+/// The distance's derivatives by literals `i` to `i + 3` by reverse mode (`reverse`): to check
+/// each against `derivative`'s.
+pub fn reverse4(x: f32, y: f32, z: f32, i: u32) -> vec4 {
+    let p = vec3(x, y, z)
+    let which = [
+        Literal { index: i },
+        Literal { index: i + 1 },
+        Literal { index: i + 2 },
+        Literal { index: i + 3 },
+    ]
+    let (_, d) = reverse(|| blob().distance(p), which)
     vec4(d[0], d[1], d[2], d[3])
 }
 
