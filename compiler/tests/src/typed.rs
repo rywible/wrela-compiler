@@ -659,6 +659,17 @@ pub fn taped(x: f32, y: f32, z: f32) -> f32 {
 }
 ";
 
+/// What a program built for the reverse-mode oracle (O8) has besides [`HARNESS`]: `f`'s
+/// gradient by `std::derive::reverse`, through a closure of the point's three numbers.
+pub const REVERSE_HARNESS: &str = "
+use std::derive::reverse
+
+pub fn rgrad(x: f32, y: f32, z: f32) -> vec3 {
+    let (_, g) = reverse(|q: [f32; 3]| f(vec3(q[0], q[1], q[2])), [x, y, z])
+    vec3(g[0], g[1], g[2])
+}
+";
+
 /// A whole program: [`program`] and the [`HARNESS`].
 pub fn source(choices: &mut Choices, mode: Mode, feat: Features) -> String {
     program(choices, mode, feat) + HARNESS

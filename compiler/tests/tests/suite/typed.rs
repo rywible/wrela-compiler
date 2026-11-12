@@ -133,3 +133,9 @@ fn every_regression_still_holds() {
 fn o7_the_interpreter_agrees_with_the_gpu() {
     over(Oracle::O7, count(16));
 }
+
+/// O8: reverse mode's gradient agrees with forward mode's.
+#[test]
+fn o8_reverse_gradients_agree_with_forward_ones() {
+    over(Oracle::O8, count(32));
+}

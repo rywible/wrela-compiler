@@ -10,9 +10,10 @@
 //! | O4 | the tape agrees | `interpret(tape(f), p)` within 3e-6 of `f(p)` (§14.4) |
 //! | O5 | the optimizer keeps the bits | a `no_opt` build's values, bit for bit |
 //! | O7 | the interpreter agrees | the GPU code interpreted (`wrela_ir::interp`) gives the GPU's value, within O6's bound |
+//! | O8 | reverse mode agrees | `std::derive::reverse`'s gradient within `1e-5 (1 + |g|)` of `gradient`'s |
 //! | O6 | the targets agree | the GPU's value inside its interval (within 8 ulps: Metal's fast math reassociates), and near the CPU's |
 
-use super::{Features, HARNESS, Mode, TAPE_HARNESS, program};
+use super::{Features, HARNESS, Mode, REVERSE_HARNESS, TAPE_HARNESS, program};
 use crate::{Rng, u32s};
 use std::path::{Path, PathBuf};
 use wrela_host::{CpuBuild, CpuHost, Host, Value};
@@ -27,10 +28,11 @@ pub enum Oracle {
     O5,
     O6,
     O7,
+    O8,
 }
 
 impl Oracle {
-    pub const ALL: [Oracle; 7] = [
+    pub const ALL: [Oracle; 8] = [
         Oracle::O1,
         Oracle::O2,
         Oracle::O3,
@@ -38,6 +40,7 @@ impl Oracle {
         Oracle::O5,
         Oracle::O6,
         Oracle::O7,
+        Oracle::O8,
     ];
 
     pub fn parse(s: &str) -> Option<Oracle> {
@@ -53,6 +56,7 @@ impl Oracle {
             Oracle::O5 => "O5",
             Oracle::O6 => "O6",
             Oracle::O7 => "O7",
+            Oracle::O8 => "O8",
         }
     }
 
@@ -73,6 +77,11 @@ impl Oracle {
             _ => &[Mode::Tame],
         }
     }
+}
+
+std::thread_local! {
+    /// O8's worst difference on this thread's programs, relative to the gradient's size.
+    pub static WORST_O8: std::cell::Cell<f64> = const { std::cell::Cell::new(0.0) };
 }
 
 /// What tape limits O4 lets pass: E0709's messages for what §14.4 says a tape can't hold, each
@@ -252,6 +261,32 @@ pub fn run(oracle: Oracle, src: &str, seed: u64, dir: &Path) -> Result<Counts, F
         }
         Oracle::O6 => o6(&build(dir, src, false)?, seed),
         Oracle::O7 => o7(dir, &build(dir, src, false)?, seed),
+        Oracle::O8 => {
+            let mut host = start(&build(dir, &(src.to_string() + REVERSE_HARNESS), false)?)?;
+            let mut worst = 0.0f64;
+            for _ in 0..16 {
+                let p = point(&mut rng);
+                let f = floats(&mut host, "grad", &args(p))?
+                    .into_iter()
+                    .map(f64::from)
+                    .collect::<Vec<_>>();
+                let r = floats(&mut host, "rgrad", &args(p))?
+                    .into_iter()
+                    .map(f64::from)
+                    .collect::<Vec<_>>();
+                let norm = |v: &[f64]| v.iter().map(|x| x * x).sum::<f64>().sqrt();
+                let diff: Vec<f64> = f.iter().zip(&r).map(|(a, b)| a - b).collect();
+                let d = norm(&diff) / (1.0 + norm(&f));
+                if !within(d, 1e-5) {
+                    return fail(format!(
+                        "at {p:?}: forward mode gives {f:?}, reverse mode {r:?} ({d:e} apart)"
+                    ));
+                }
+                worst = worst.max(d);
+            }
+            WORST_O8.with(|w| w.set(w.get().max(worst)));
+            Ok(Counts { points: 16, counted: 16 })
+        }
     }
 }
 

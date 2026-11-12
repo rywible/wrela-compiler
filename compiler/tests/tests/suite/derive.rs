@@ -135,6 +135,61 @@ fn gradients_agree_with_central_differences() {
     println!("AC3 gradients against central differences:\n{}", report.join("\n"));
 }
 
+/// Reverse mode against forward mode (stage C's gate): each corpus function's gradient by
+/// `std::derive::reverse`, through a closure of the point's three numbers, is within
+/// `1e-5 (1 + |g|)` of `gradient`'s at 1,000 points in [-2, 2]³, `|g|` the gradient's size (as
+/// the corpus's gradient test scales its error). Taken a component at a time instead, `march`
+/// misses by 3.5e-5 where its gradient is 17,000 across and its z component 2.87, the sum of
+/// terms of 10⁴ that cancel: there, against f64, reverse mode's z is off by 2e-5 and forward
+/// mode's by 1.2e-4, so it's the order of the sum, not either derivation.
+#[test]
+fn reverse_gradients_agree_with_forward_ones() {
+    let corpus = CpuBuild::load(built("fields")).expect("load the corpus");
+    let functions: Vec<usize> = (0..NAMES.len()).collect();
+    let worst_of = par_map_with(
+        &functions,
+        || corpus.start().expect("start the corpus"),
+        |host, &fi| {
+            let mut rng = Rng::new(0xbac + fi as u64);
+            let mut worst = 0.0f64;
+            let mut at_worst = ([0.0f32; 3], [0.0f64; 3], [0.0f64; 3]);
+            for _ in 0..1000 {
+                let p = [0, 1, 2].map(|_| (rng.unit() * 4.0 - 2.0) as f32);
+                let args = point_args(fi as u32, p);
+                let vec = |host: &mut CpuHost, name: &str| -> [f64; 3] {
+                    match host.call_export(name, &args).expect(name).as_slice() {
+                        [Value::F32(x), Value::F32(y), Value::F32(z)] => {
+                            [*x, *y, *z].map(f64::from)
+                        }
+                        other => panic!("{name} returned {other:?}"),
+                    }
+                };
+                let (f, r) = (vec(host, "gradient"), vec(host, "reverse_gradient"));
+                let norm = |v: [f64; 3]| (v[0] * v[0] + v[1] * v[1] + v[2] * v[2]).sqrt();
+                let d = norm([f[0] - r[0], f[1] - r[1], f[2] - r[2]]) / (1.0 + norm(f));
+                if d.is_nan() || d > worst {
+                    worst = d;
+                    at_worst = (p, f, r);
+                }
+            }
+            if worst.is_nan() || worst > 1e-5 {
+                println!(
+                    "{}: at {:?}, forward {:?}, reverse {:?}",
+                    NAMES[fi], at_worst.0, at_worst.1, at_worst.2
+                );
+            }
+            worst
+        },
+    );
+    let mut report: Vec<String> =
+        NAMES.iter().zip(&worst_of).map(|(n, w)| format!("  {n:>13}: worst {w:.1e}")).collect();
+    report.sort();
+    println!("reverse against forward gradients, 1,000 points each:\n{}", report.join("\n"));
+    let over: Vec<_> =
+        NAMES.iter().zip(&worst_of).filter(|(_, w)| w.is_nan() || **w > 1e-5).collect();
+    assert!(over.is_empty(), "over 1e-5: {over:?}");
+}
+
 /// Boxes per call of `misses_cpu`: the calls of all the functions are shared out between
 /// threads, each with its own host.
 const CHUNK: u32 = 50_000;

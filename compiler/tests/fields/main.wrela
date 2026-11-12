@@ -8,7 +8,7 @@ use corpus::{
     oval_, sphere_, sphere_tape, table_, tube_, waves_tape,
 }
 use grazer::{Grazer, P3, PARAM_FLOATS, bounds, grazer, grazer_from, p3, params}
-use std::derive::{Box3, interval}
+use std::derive::{Box3, interval, reverse}
 use std::field::{Surface, check_lipschitz, hash_u32}
 use std::gpu::{
     ClipPosition, FragCoord, GlobalId, GpuBuffer, Slots, VertexIndex, begin_screen_pass, buffer,
@@ -537,6 +537,22 @@ impl Visit for Gradient {
     }
 }
 
+/// A function's gradient at a point by reverse mode (`std::derive::reverse`), through a closure
+/// of the point's three numbers.
+struct ReverseGradient: Copy {
+    p: vec3,
+}
+
+impl Visit for ReverseGradient {
+    type Out = vec3
+
+    fn visit<F: Surface>(self, f: F) -> vec3 {
+        let at = [self.p.x, self.p.y, self.p.z]
+        let (_, g) = reverse(|x: [f32; 3]| f.distance(vec3(x[0], x[1], x[2])), at)
+        vec3(g[0], g[1], g[2])
+    }
+}
+
 /// Function `fi` at a point, on the CPU.
 pub fn value(fi: u32, x: f32, y: f32, z: f32) -> f32 {
     with_function(fi, Distance { p: vec3(x, y, z) })
@@ -545,6 +561,11 @@ pub fn value(fi: u32, x: f32, y: f32, z: f32) -> f32 {
 /// Function `fi`'s derived gradient at a point, on the CPU.
 pub fn gradient(fi: u32, x: f32, y: f32, z: f32) -> vec3 {
     with_function(fi, Gradient { p: vec3(x, y, z) })
+}
+
+/// Function `fi`'s gradient by reverse mode, on the CPU.
+pub fn reverse_gradient(fi: u32, x: f32, y: f32, z: f32) -> vec3 {
+    with_function(fi, ReverseGradient { p: vec3(x, y, z) })
 }
 
 // ---- fields built at runtime against their compiled twins (std::stage) ------------------------
