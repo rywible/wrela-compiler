@@ -510,3 +510,95 @@ fn a_literal_kept_in_heap_memory_is_an_error_not_a_solve_of_no_steps() {
     assert!(all.contains("fit.wrela:8:5"), "at the `push`: {all}");
     assert!(all.contains("keep what depends on the input in arrays and values"), "{all}");
 }
+
+/// A sphere above a box, each size 20% from the blueprint's.
+const BODY: &str = "use std::field::{Surface, cuboid, sphere}
+
+pub fn body() -> Surface {
+    let head = sphere(0.30).translate(vec3(0.0, 0.70, 0.0))
+    let block = cuboid(vec3(0.48, 0.18, 0.24)).translate(vec3(0.0, 0.15, 0.0))
+    head.union(block)
+}
+";
+
+/// The blueprint, drawn from the sizes the body should have: a head of radius 0.25 and a box
+/// half 0.40 across, 0.15 high and 0.20 deep. Each view's outline is its two shapes, one loop
+/// after the other (the step between them and back cancels in the even-odd rule).
+const BLUEPRINT: &str = "use std::collections::Vec
+
+fn loops(r: f32, hw: f32) -> Vec<vec2> {
+    var v: Vec<vec2> = Vec::new()
+    for i in 0..49 {
+        let a = 6.2831853 * f32(i % 48) / 48.0
+        v.push(vec2(r * cos(a), 0.70 + r * sin(a)))
+    }
+    let corners = [vec2(-hw, 0.0), vec2(hw, 0.0), vec2(hw, 0.30), vec2(-hw, 0.30), vec2(-hw, 0.0)]
+    for c in corners {
+        v.push(c)
+    }
+    v.push(vec2(r, 0.70))
+    v
+}
+
+/// From the side, (z, y).
+pub fn side() -> Vec<vec2> {
+    loops(0.25, 0.20)
+}
+
+/// From the front, (x, y).
+pub fn front() -> Vec<vec2> {
+    loops(0.25, 0.40)
+}
+";
+
+const OUTLINE_SPEC: &str = "use body::body
+use std::field::{View, outline_miss}
+use std::lift::Checks
+
+pub fn spec<C: Checks>(c: mut C) {
+    let f = body()
+    c.at_most(\"side outline\", outline_miss(f, View::Side, blueprint::side(), 0.02, near: -1.0, far: 1.0), 0.0, within: 0.05)
+    c.at_most(\"front outline\", outline_miss(f, View::Front, blueprint::front(), 0.02, near: -1.0, far: 1.0), 0.0, within: 0.05)
+}
+";
+
+/// A spec that holds a body to its blueprint's outlines (§23.6, §23.7), solved from sizes 20%
+/// off, recovers each size within 2 mm, writes them, and feels every size it freed: the
+/// outline's derivative reaches each through the silhouette's edge.
+#[test]
+fn a_spec_of_outlines_recovers_the_sizes() {
+    let dir = common::package(
+        "solve-outlines",
+        &[
+            ("wrela.toml", &common::manifest("outlined")),
+            ("body.wrela", BODY),
+            ("blueprint.wrela", BLUEPRINT),
+            ("spec.wrela", OUTLINE_SPEC),
+            ("main.wrela", common::FRAME),
+        ],
+    );
+    let out = common::wrela()
+        .arg("solve")
+        .arg(&dir)
+        .args(["--spec", "--free", "body.wrela:4-5", "--write", "--json"])
+        .output()
+        .expect("run wrela");
+    let all =
+        format!("{}{}", String::from_utf8_lossy(&out.stdout), String::from_utf8_lossy(&out.stderr));
+    let r: serde_json::Value =
+        serde_json::from_slice(&out.stdout).unwrap_or_else(|e| panic!("{e}: {all}"));
+    println!("{}", serde_json::to_string_pretty(&r["literals"]).unwrap());
+    println!("{}", serde_json::to_string_pretty(&r["spec_after"]).unwrap());
+    assert_eq!(r["written"], true, "{all}");
+    assert_eq!(r["spec_after"]["missed"], 0, "{all}");
+    assert!(!all.contains("never changed"), "a freed size wasn't felt: {all}");
+    let want: std::collections::BTreeMap<&str, f64> =
+        [("0.30", 0.25), ("0.48", 0.40), ("0.18", 0.15), ("0.24", 0.20)].into();
+    for lit in r["literals"].as_array().expect("literals") {
+        let text = lit["text"].as_str().unwrap();
+        if let Some(w) = want.get(text) {
+            let after = lit["after"].as_f64().unwrap();
+            assert!((after - w).abs() <= 0.002, "{text}: solved to {after}, the blueprint's {w}");
+        }
+    }
+}

@@ -324,12 +324,15 @@ fn solve(
     let names = free.iter().map(|f| named(dir, f)).collect::<Result<Vec<_>, _>>()?;
     let (glue_dir, package) =
         crate::glue_package(dir, "solve", |package| glue(package, module, function, spec, fit))?;
-    let out = wrela_driver::build_lifted(
-        &glue_dir,
-        std::slice::from_ref(&package),
-        Default::default(),
-        &[],
-    )?;
+    // Only the files freed are lifted: a literal of another file (a blueprint's outline, a
+    // spec's targets) is a reference, which the solve neither moves nor derives through.
+    let mut lifted: Vec<String> = free
+        .iter()
+        .map(|f| format!("{package}/{}", f.file.to_string_lossy().replace('\\', "/")))
+        .collect();
+    lifted.sort();
+    lifted.dedup();
+    let out = wrela_driver::build_lifted(&glue_dir, &lifted, Default::default(), &[])?;
     let built = glue_dir.join("out");
     crate::write_build(&out, &built)?;
     let report: serde_json::Value = serde_json::from_str(
