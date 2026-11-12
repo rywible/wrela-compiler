@@ -243,6 +243,12 @@ impl Subject {
         self.run_for(input, self.ticks)
     }
 
+    // Each input starts a fresh instance and runs `init`, rather than putting back a snapshot
+    // of memory and globals taken after `init`: on the M4 that start is 22% of a run (0.31 s
+    // of 1.40 s over 20,000 runs of a 64-tick input), so a snapshot that cost nothing to put
+    // back would run at most 1.28 times as many inputs a second, short of the 2 times that
+    // would pay for it (plan step G.5).
+
     /// [`Subject::run`] over `ticks` ticks.
     fn run_for(&self, input: &[Scripted], ticks: u32) -> Result<Ran, String> {
         let mut host = self.start()?;
