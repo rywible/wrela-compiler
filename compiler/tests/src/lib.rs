@@ -6,6 +6,7 @@
 //! size; historical milestone benchmarks and full-scene tours are not part of verification.
 
 pub mod spike01;
+pub mod typed;
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
