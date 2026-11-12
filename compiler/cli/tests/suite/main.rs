@@ -13,6 +13,7 @@ mod profile;
 mod query;
 mod refactor;
 mod same;
+mod sliders;
 mod script;
 mod solve;
 mod suite;

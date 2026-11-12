@@ -112,13 +112,13 @@ pub fn run(args: &[String]) -> ExitCode {
 /// `body.wrela:12-20`), those of the value a name is bound to (`body.wrela:reach`: the file's
 /// `let reach = 0.62`), or both (`body.wrela:3,reach,7-9`). A name stays put when the file's
 /// lines move.
-struct Free {
-    file: PathBuf,
+pub(crate) struct Free {
+    pub(crate) file: PathBuf,
     lines: Vec<(u32, u32)>,
     names: Vec<String>,
 }
 
-fn parse_free(arg: &str) -> Option<Free> {
+pub(crate) fn parse_free(arg: &str) -> Option<Free> {
     // A file alone: every line of it.
     if !arg.contains(':') {
         return Some(Free { file: PathBuf::from(arg), lines: vec![(1, u32::MAX)], names: vec![] });
@@ -151,7 +151,7 @@ fn is_name(s: &str) -> bool {
 }
 
 /// A value a name is bound to in a file: where its expression is (bytes), and its line.
-struct Bound {
+pub(crate) struct Bound {
     start: u32,
     end: u32,
     line: u32,
@@ -219,7 +219,7 @@ fn bound(text: &str, name: &str) -> Vec<Bound> {
 
 /// Where the names of `free` are bound in its file, each to one value: an error for a name the
 /// file doesn't bind, or binds more than once (its lines tell them apart).
-fn named(dir: &Path, free: &Free) -> Result<Vec<(String, Bound)>, String> {
+pub(crate) fn named(dir: &Path, free: &Free) -> Result<Vec<(String, Bound)>, String> {
     if free.names.is_empty() {
         return Ok(Vec::new());
     }
@@ -299,16 +299,16 @@ fn glue(package: &str, module: &str, function: &str, spec: bool, fit: bool) -> S
 
 /// A literal that may change: its index, where it is, and its edit for `wrela edit` (its value
 /// set when it's written).
-struct Lit {
-    index: u32,
-    file: String,
-    line: u32,
+pub(crate) struct Lit {
+    pub(crate) index: u32,
+    pub(crate) file: String,
+    pub(crate) line: u32,
     /// The name it was freed by (`--free <file>:<name>`), if by one.
-    name: Option<String>,
+    pub(crate) name: Option<String>,
     /// Its text's decimals, and the unit they count in (`15cm`: 0.01; 1 with no unit suffix).
-    decimals: u32,
-    unit: f64,
-    edit: LiteralEdit,
+    pub(crate) decimals: u32,
+    pub(crate) unit: f64,
+    pub(crate) edit: LiteralEdit,
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -342,68 +342,7 @@ fn solve(
         &std::fs::read_to_string(built.join("lift.json")).map_err(|e| e.to_string())?,
     )
     .map_err(|e| e.to_string())?;
-    // The literals named: on a line named, or in the value a name named is bound to.
-    let files = report["files"].as_array().map_or(&[][..], Vec::as_slice);
-    let canonical = |p: &Path| p.canonicalize().unwrap_or_else(|_| p.to_path_buf());
-    // Each `--free`: its file, and where its names are bound.
-    let wanted: Vec<_> = free
-        .iter()
-        .zip(&names)
-        .map(|(f, names)| (canonical(&dir.join(&f.file)), f, names.as_slice()))
-        .collect();
-    let mut lits = Vec::new();
-    for l in report["literals"].as_array().into_iter().flatten() {
-        let f = &files[l["file"].as_u64().unwrap_or(0) as usize];
-        let path = canonical(&glue_dir.join(f["path"].as_str().unwrap_or("")));
-        let line = l["line"].as_u64().unwrap_or(0) as u32;
-        let at = l["start"].as_u64().unwrap_or(0) as u32;
-        let by_name = |names: &[(String, Bound)]| {
-            names.iter().find(|(_, b)| b.start <= at && at < b.end).map(|(n, _)| n.clone())
-        };
-        // The first `--free` that names it; by a name, if any of them names it by one.
-        let mut freed: Option<(&Free, Option<String>)> = None;
-        for (_, f, names) in wanted.iter().filter(|(p, ..)| *p == path) {
-            let name = by_name(names);
-            if name.is_none() && !f.lines.iter().any(|&(a, b)| a <= line && line <= b) {
-                continue;
-            }
-            match &mut freed {
-                None => freed = Some((f, name)),
-                Some((_, by)) if by.is_none() => *by = name,
-                Some(_) => {}
-            }
-        }
-        let Some((fr, name)) = freed else { continue };
-        let text = l["text"].as_str().unwrap_or("").to_string();
-        lits.push(Lit {
-            index: l["index"].as_u64().unwrap_or(0) as u32,
-            file: fr.file.display().to_string(),
-            line,
-            name,
-            decimals: decimals(&text),
-            unit: wrela_driver::edit::unit_of(&text),
-            edit: LiteralEdit {
-                file: f["path"].as_str().unwrap_or("").into(),
-                start: l["start"].as_u64().unwrap_or(0) as u32,
-                end: l["end"].as_u64().unwrap_or(0) as u32,
-                text,
-                hash: f["hash"].as_str().unwrap_or("").into(),
-                value: 0.0,
-            },
-        });
-    }
-    // A name was given for its literals: one whose value has none is said, not passed over.
-    for (f, names) in free.iter().zip(&names) {
-        for (name, b) in names {
-            if !lits.iter().any(|l| l.name.as_deref() == Some(name.as_str())) {
-                return Err(format!(
-                    "`{name}` in `{}` (line {}) is bound to a value with no lifted literal in it",
-                    f.file.display(),
-                    b.line
-                ));
-            }
-        }
-    }
+    let lits = freed(dir, &glue_dir, free, &names, &report)?;
     if lits.is_empty() {
         return Err("no lifted literal is on the lines named".into());
     }
@@ -516,6 +455,80 @@ fn solve(
     Ok(answer)
 }
 
+/// The literals `free` names, from a lifted build's `lift.json` (`report`) of the program in
+/// `glue_dir` around the package in `dir`: on a line named, or in the value a name named is bound
+/// to, each by the first `--free` that names it. What `wrela solve` and `wrela sliders` move.
+pub(crate) fn freed(
+    dir: &Path,
+    glue_dir: &Path,
+    free: &[Free],
+    names: &[Vec<(String, Bound)>],
+    report: &serde_json::Value,
+) -> Result<Vec<Lit>, String> {
+    let files = report["files"].as_array().map_or(&[][..], Vec::as_slice);
+    let canonical = |p: &Path| p.canonicalize().unwrap_or_else(|_| p.to_path_buf());
+    // Each `--free`: its file, and where its names are bound.
+    let wanted: Vec<_> = free
+        .iter()
+        .zip(names)
+        .map(|(f, names)| (canonical(&dir.join(&f.file)), f, names.as_slice()))
+        .collect();
+    let mut lits = Vec::new();
+    for l in report["literals"].as_array().into_iter().flatten() {
+        let f = &files[l["file"].as_u64().unwrap_or(0) as usize];
+        let path = canonical(&glue_dir.join(f["path"].as_str().unwrap_or("")));
+        let line = l["line"].as_u64().unwrap_or(0) as u32;
+        let at = l["start"].as_u64().unwrap_or(0) as u32;
+        let by_name = |names: &[(String, Bound)]| {
+            names.iter().find(|(_, b)| b.start <= at && at < b.end).map(|(n, _)| n.clone())
+        };
+        // The first `--free` that names it; by a name, if any of them names it by one.
+        let mut freed: Option<(&Free, Option<String>)> = None;
+        for (_, f, names) in wanted.iter().filter(|(p, ..)| *p == path) {
+            let name = by_name(names);
+            if name.is_none() && !f.lines.iter().any(|&(a, b)| a <= line && line <= b) {
+                continue;
+            }
+            match &mut freed {
+                None => freed = Some((f, name)),
+                Some((_, by)) if by.is_none() => *by = name,
+                Some(_) => {}
+            }
+        }
+        let Some((fr, name)) = freed else { continue };
+        let text = l["text"].as_str().unwrap_or("").to_string();
+        lits.push(Lit {
+            index: l["index"].as_u64().unwrap_or(0) as u32,
+            file: fr.file.display().to_string(),
+            line,
+            name,
+            decimals: decimals(&text),
+            unit: wrela_driver::edit::unit_of(&text),
+            edit: LiteralEdit {
+                file: f["path"].as_str().unwrap_or("").into(),
+                start: l["start"].as_u64().unwrap_or(0) as u32,
+                end: l["end"].as_u64().unwrap_or(0) as u32,
+                text,
+                hash: f["hash"].as_str().unwrap_or("").into(),
+                value: 0.0,
+            },
+        });
+    }
+    // A name was given for its literals: one whose value has none is said, not passed over.
+    for (f, names) in free.iter().zip(names) {
+        for (name, b) in names {
+            if !lits.iter().any(|l| l.name.as_deref() == Some(name.as_str())) {
+                return Err(format!(
+                    "`{name}` in `{}` (line {}) is bound to a value with no lifted literal in it",
+                    f.file.display(),
+                    b.line
+                ));
+            }
+        }
+    }
+    Ok(lits)
+}
+
 /// The spec's report at the literals' values now (the glue's `report` prints it).
 fn spec_report(host: &mut CpuHost) -> Result<serde_json::Value, String> {
     let _ = host.take_logs();
@@ -526,7 +539,7 @@ fn spec_report(host: &mut CpuHost) -> Result<serde_json::Value, String> {
 }
 
 /// How many decimals a literal's text has (its mantissa's; 0 for an integer).
-fn decimals(text: &str) -> u32 {
+pub(crate) fn decimals(text: &str) -> u32 {
     let t = text.trim_start_matches('-');
     let mantissa = t.split(['e', 'E']).next().unwrap_or(t);
     let digits = mantissa.trim_end_matches(|c: char| c.is_ascii_alphabetic());
