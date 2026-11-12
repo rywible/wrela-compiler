@@ -3331,6 +3331,7 @@ These commands let an agent read what the compiler knows about a package, instea
 | `wrela bisect <package> --until "<export> <op> <number>"` | Finds the first frame at which a condition holds (`nan <export>` too) |
 | `wrela same <package> --against <build-dir>` | Whether the package built now behaves as a saved build of it does (below) |
 | `wrela profile <package> [--frames n]` | Shows where a frame's time goes on this machine (below) |
+| `wrela inspect <package> <module>::<fn>` | Says what a surface is made of, as findings with a point each: its pieces (certified), necks and specks, the parts that decide it nowhere, the parts thinner than a size, the literals that move it nowhere (`--lift`), and pictures of it from three sides (`--views`) (§23.10) |
 | `wrela pixel <package> --frame <n> --at <x>,<y>` | Says why a pixel of the screen has its colour: every draw of the frame that changed it, with the pixel before and after each; the draw that decided it, and that draw's fragment there; and the fragment shader run again for that one pixel in an interpreter of the GPU code the build wrote, with each source line's values (how often it ran, its first and last values, its extremes), the first value that wasn't finite, and each operation WGSL leaves undefined. `--kernel <label> --id <i>` does the same for one invocation of a kernel (below) |
 | `wrela primer [area]` | Teaches the language area by area: each rule of the conformance suite, with a program that keeps it and one that breaks it |
 
@@ -3368,6 +3369,22 @@ Each time is a median, with its 95th percentile beside it, because a budget is a
 - `trace` and `bisect` accept `--no-gpu`: the CPU host checks submitted commands but does not execute shaders. Use it to watch CPU state that needs no GPU readbacks.
 - Both accept `--workers N`; without it, worker counts follow the available CPUs.
 - CPU-only frame and tick tests keep language checks and command validation, and generate no unused shader or browser files. Tests marked `gpu: true` still build and execute shaders.
+
+### 23.10 Reading what was made
+
+`wrela inspect` reads what a surface is made of, as a compiler's lints read code: a report of findings, each with a stable `kind`, a `proof` and a point, and pictures that need no GPU.
+
+```text
+wrela inspect <package> <module>::<fn> [--depth <n>] [--region <lo>..<hi>,<lo>..<hi>,<lo>..<hi>] [--thin <metres>] [--lift] [--views <dir>] [--json]
+```
+
+- **`<fn>`** takes nothing and returns a `Surface`, as a spec's subject does. The region is the surface's `bound()` grown by a tenth; an unbounded surface needs `--region`. `--depth` is 7 unless said (cells a 128th of the region), at most 9.
+- **Pieces** come from `std::field::pieces(field, region, depth)`: an octree, each cell classed by the field's interval as inside, outside or edge. Inside cells joined by faces are one body, so each group of them is one piece, **certified** connected. A path through the body passes only through inside and edge cells, so two pieces apart in those are certified apart, by at least a cell. A piece apart from the largest is `floating`, with the parts that make it and the gap. Two bodies joined only through edge cells are a `neck` (joined, if at all, by something thinner than a cell); a group of edge cells with no inside cell is a `speck` (something smaller than a cell may be here). `Pieces::one()` is true when the surface is certified to be one body down to the cell size.
+- **`dead-part`** is a part that decides the surface at no edge cell's centre (`part_at` never names it, and `part_share` is under 1e-3): **sampled**. **`thin`** is a part whose own inside fits a box thinner than `--thin` (5 mm unless said): certified, from the part's own octree.
+- **`dead-literal`** and **`faint-literal`** (with `--lift`): a literal of the subject's package whose derivative of the distance is 0 at every sampled edge cell (up to 512), or under 1e-6 of the largest literal's: **sampled**, from `std::lift::jacobian`, by its file, line and text. Code that keeps what depends on a literal in heap memory is the finding `not-derivable`, with the compiler's message.
+- **`certified`** means an interval proved it; anything else says `sampled`.
+- **Pictures:** `std::field::preview(field, view, region, size, row)` is a row of a picture from a view, lit by the surface's normal and darker with depth. `--views <dir>` writes `side.png`, `front.png` and `top.png`, 128 pixels across, so an agent with no GPU can look at what it made.
+- Findings are advice: the command exits 0 with them, 1 if the package doesn't build. On the frozen wolf it takes 19 s on the M4.
 
 ## The rules by ID
 
