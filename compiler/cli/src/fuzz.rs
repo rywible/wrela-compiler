@@ -15,8 +15,20 @@
 //! for each input that joins the corpus, a second run of the input whose ticks' state hashes
 //! differ from the first's (`not-deterministic`: something the checker let through). The report
 //! gives the executions, how many a second, the sites covered, the corpus's size, and each
-//! distinct finding (by its kind and source line) with the tick it happened in. Exit status: 0
-//! no finding, 1 a finding (or the build failed), 2 a usage error.
+//! distinct finding (by its kind and source line) with the tick it happened in.
+//!
+//! Each finding is minimized (Zeller and Hildebrandt's delta debugging): the ticks after it
+//! dropped, then halves, quarters, ... of its events down to single ones, then each field
+//! toward 0, keeping a change that still gives the same finding. It's written to `--out`
+//! (`build/fuzz` unless said) as `<kind>-<hash>.ticks`, a tick log `wrela-host --replay` runs
+//! on the build in `build/fuzz-build`, and `<kind>-<hash>.json`, the same as a script.
+//!
+//! `wrela fuzz <package-dir> --replay <file-or-dir>` runs saved logs and scripts instead, and
+//! reports which still fail: a regression check. A log made by another build of the program
+//! is run as a script (its records alone), since its hashes are the other build's.
+//!
+//! Exit status: 0 no finding (or none still fails), 1 a finding (or the build failed), 2 a
+//! usage error.
 
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
@@ -27,7 +39,7 @@ use wrela_abi::input::{
 };
 use wrela_host::{CpuBuild, CpuHost, TickLog};
 
-const USAGE: &str = "usage: wrela fuzz <package-dir> [--ticks <n>] [--time <seconds> | --runs <n>] [--seed <n>] [--fuel <n>] [--seeds <dir>] [--json]";
+const USAGE: &str = "usage: wrela fuzz <package-dir> [--ticks <n>] [--time <seconds> | --runs <n>] [--seed <n>] [--fuel <n>] [--seeds <dir>] [--out <dir>] [--replay <file-or-dir>] [--json]";
 
 /// How long a fuzzer runs unless told.
 const DEFAULT_TIME: u64 = 60;
@@ -39,6 +51,8 @@ struct Args {
     seed: u64,
     fuel: u64,
     seeds: Option<PathBuf>,
+    out: Option<PathBuf>,
+    replay: Option<PathBuf>,
     json: bool,
 }
 
@@ -53,6 +67,26 @@ pub fn run(args: &[String]) -> ExitCode {
         eprintln!("{USAGE}");
         return ExitCode::from(2);
     };
+    if let Some(saved) = &a.replay {
+        return match replay(&a, saved) {
+            Ok(r) => {
+                if a.json {
+                    println!("{}", serde_json::to_string_pretty(&r.json()).expect("JSON"));
+                } else {
+                    print!("{}", r.text());
+                }
+                if r.0.iter().any(|(_, f)| f.is_some()) {
+                    ExitCode::FAILURE
+                } else {
+                    ExitCode::SUCCESS
+                }
+            }
+            Err(e) => {
+                eprintln!("error: {e}");
+                ExitCode::FAILURE
+            }
+        };
+    }
     match fuzz(&a) {
         Ok(report) => {
             if a.json {
@@ -72,6 +106,7 @@ pub fn run(args: &[String]) -> ExitCode {
 fn parse(args: &[String]) -> Option<Args> {
     let (mut dir, mut ticks, mut runs, mut time) = (None, 64, None, None);
     let (mut seed, mut fuel, mut seeds, mut json) = (0, 1 << 28, None, false);
+    let (mut out, mut replay) = (None, None);
     let mut it = args.iter();
     while let Some(x) = it.next() {
         match x.as_str() {
@@ -81,6 +116,8 @@ fn parse(args: &[String]) -> Option<Args> {
             "--seed" => seed = it.next()?.parse().ok()?,
             "--fuel" => fuel = it.next()?.parse().ok().filter(|&n| n > 0)?,
             "--seeds" => seeds = Some(PathBuf::from(it.next()?)),
+            "--out" => out = Some(PathBuf::from(it.next()?)),
+            "--replay" => replay = Some(PathBuf::from(it.next()?)),
             "--json" => json = true,
             _ if dir.is_none() && !x.starts_with('-') => dir = Some(PathBuf::from(x)),
             _ => return None,
@@ -92,7 +129,7 @@ fn parse(args: &[String]) -> Option<Args> {
         (None, Some(t)) => Limit::Time(Duration::from_secs_f64(t)),
         (None, None) => Limit::Time(Duration::from_secs(DEFAULT_TIME)),
     };
-    Some(Args { dir: dir?, ticks, limit, seed, fuel, seeds, json })
+    Some(Args { dir: dir?, ticks, limit, seed, fuel, seeds, out, replay, json })
 }
 
 /// What a finding is.
@@ -139,6 +176,8 @@ struct Finding {
     input: Vec<Scripted>,
     /// The executions run when it was found.
     after: u64,
+    /// Its tick log and its script, once written.
+    files: Vec<PathBuf>,
 }
 
 /// One run of an input: the sites it ran, each tick's state hash, and what went wrong.
@@ -169,9 +208,14 @@ impl Subject {
 
     /// Runs `input` from `init`, tick by tick, until a tick fails or the last has run.
     fn run(&self, input: &[Scripted]) -> Result<Ran, String> {
+        self.run_for(input, self.ticks)
+    }
+
+    /// [`Subject::run`] over `ticks` ticks.
+    fn run_for(&self, input: &[Scripted], ticks: u32) -> Result<Ran, String> {
         let mut host = self.start()?;
         let (mut hashes, mut found) = (Vec::new(), None);
-        for k in 0..self.ticks {
+        for k in 0..ticks {
             host.push_records(records_at(input, k));
             match host.tick() {
                 Ok(t) => hashes.push(t.hash.unwrap_or(0)),
@@ -182,6 +226,17 @@ impl Subject {
             }
         }
         Ok(Ran { coverage: host.coverage().unwrap_or_default(), hashes, found })
+    }
+
+    /// What `input` gives of the kind `kind`, if anything: for `not-deterministic`, after a
+    /// second run.
+    fn reproduce(&self, input: &[Scripted], kind: Kind) -> Result<Option<Found>, String> {
+        let ran = self.run(input)?;
+        if ran.found.is_some() || kind != Kind::NotDeterministic {
+            return Ok(ran.found);
+        }
+        let again = self.run(input)?;
+        Ok(differs(&ran.hashes, &again.hashes))
     }
 
     fn failed(&self, host: &CpuHost, message: &str, tick: u32) -> Found {
@@ -197,6 +252,21 @@ impl Subject {
         }
         Found { kind: Kind::Trap, message: message.to_string(), at, tick }
     }
+}
+
+/// A `not-deterministic` finding, if a second run's hashes aren't the first's.
+fn differs(first: &[u64], again: &[u64]) -> Option<Found> {
+    let k = (0..first.len().max(again.len())).find(|&k| again.get(k) != first.get(k))?;
+    Some(Found {
+        kind: Kind::NotDeterministic,
+        message: format!(
+            "run again, tick {k}'s state hash is {:016x}, not {:016x}",
+            again.get(k).copied().unwrap_or(0),
+            first.get(k).copied().unwrap_or(0)
+        ),
+        at: None,
+        tick: k as u32,
+    })
 }
 
 /// splitmix64: a run's random choices, the same for a seed.
@@ -454,7 +524,7 @@ impl Report {
                 let (file, line) = place(f.found.at.as_deref());
                 json!({"kind": f.found.kind.name(), "message": f.found.message, "file": file,
                        "line": line, "tick": f.found.tick, "events": f.input.len(),
-                       "after": f.after})
+                       "after": f.after, "files": f.files})
             })
             .collect();
         json!({
@@ -488,6 +558,9 @@ impl Report {
                 f.after,
                 f.found.message
             );
+            for p in &f.files {
+                s += &format!("  {}\n", p.display());
+            }
         }
         s
     }
@@ -551,20 +624,8 @@ fn fuzz(a: &Args) -> Result<Report, String> {
             // Once for each input that joins the corpus: the same hashes a second time.
             let again = subject.run(&input)?;
             executions += 1;
-            if let Some(k) =
-                (0..ran.hashes.len()).find(|&k| again.hashes.get(k) != ran.hashes.get(k))
-            {
-                found = Some(Found {
-                    kind: Kind::NotDeterministic,
-                    message: format!(
-                        "run again, tick {k}'s state hash is {:016x}, not {:016x}",
-                        again.hashes.get(k).copied().unwrap_or(0),
-                        ran.hashes[k]
-                    ),
-                    at: None,
-                    tick: k as u32,
-                });
-            } else {
+            found = differs(&ran.hashes, &again.hashes);
+            if found.is_none() {
                 for (s, &c) in seen.iter_mut().zip(&ran.coverage) {
                     *s |= c != 0;
                 }
@@ -574,14 +635,294 @@ fn fuzz(a: &Args) -> Result<Report, String> {
         if let Some(f) = found
             && keys.insert(f.key())
         {
-            findings.push(Finding { found: f, input, after: executions });
+            findings.push(Finding { found: f, input, after: executions, files: Vec::new() });
         }
+    }
+    let seconds = start.elapsed().as_secs_f64();
+    let out = a.out.clone().unwrap_or_else(|| a.dir.join("build").join("fuzz"));
+    if !findings.is_empty() {
+        crate::generated_path(&a.dir, &out)?;
+        std::fs::create_dir_all(&out).map_err(|e| format!("can't make {}: {e}", out.display()))?;
+    }
+    for f in &mut findings {
+        (f.input, f.found) = minimize(&subject, std::mem::take(&mut f.input), f.found.clone())?;
+        f.files = write_finding(&subject, &out, f)?;
     }
     Ok(Report {
         executions,
-        seconds: start.elapsed().as_secs_f64(),
+        seconds,
         sites: seen.iter().filter(|&&s| s).count(),
         corpus: corpus.len(),
         findings,
     })
+}
+
+/// Whether a field of an event is a float, and the least value it takes (a key's is 1: key 0 is
+/// `Unknown`, which a script can't name). `None`: not a field of the event's kind, or an event
+/// a seed gave, which is kept as it is.
+fn field(kind: EventKind, slot: usize) -> Option<(bool, u32)> {
+    use EventKind as K;
+    // Slot 0 is the modifiers, 1 to 4 the words.
+    match (kind, slot) {
+        (_, 0) if KINDS.contains(&kind) => Some((false, 0)),
+        (K::PointerMove | K::PointerDown | K::PointerUp, 1 | 2) => Some((true, 0)),
+        (K::PointerDown | K::PointerUp, 3) => Some((false, 0)),
+        (K::Wheel, 1..=4) => Some((true, 0)),
+        (K::KeyDown | K::KeyUp, 1) => Some((false, 1)),
+        (K::KeyDown, 2) => Some((false, 0)),
+        (K::PadButton, 1 | 2 | 4) | (K::PadAxis, 1 | 2) => Some((false, 0)),
+        (K::PadButton | K::PadAxis, 3) => Some((true, 0)),
+        _ => None,
+    }
+}
+
+fn slot(e: &mut Event, slot: usize) -> &mut u32 {
+    if slot == 0 { &mut e.modifiers } else { &mut e.words[slot - 1] }
+}
+
+/// `input` made as small as it can be while it still gives `found` (the same kind at the same
+/// line): the ticks after it dropped, then chunks of its events (halves, quarters, ... single
+/// events), then each field toward its least value.
+fn minimize(
+    subject: &Subject,
+    input: Vec<Scripted>,
+    found: Found,
+) -> Result<(Vec<Scripted>, Found), String> {
+    let key = found.key();
+    let same = |cand: &[Scripted]| -> Result<Option<Found>, String> {
+        Ok(subject.reproduce(cand, found.kind)?.filter(|f| f.key() == key))
+    };
+    let (mut best, mut now) = (input, found.clone());
+    let before: Vec<Scripted> = best.iter().filter(|s| tick_of(s) <= now.tick).cloned().collect();
+    if before.len() < best.len()
+        && let Some(f) = same(&before)?
+    {
+        (best, now) = (before, f);
+    }
+    let mut size = (best.len() / 2).max(1);
+    while !best.is_empty() {
+        let mut i = 0;
+        while i < best.len() {
+            let mut cand = best[..i].to_vec();
+            cand.extend_from_slice(&best[(i + size).min(best.len())..]);
+            match same(&cand)? {
+                Some(f) => (best, now) = (cand, f),
+                None => i += size,
+            }
+        }
+        if size == 1 {
+            break;
+        }
+        size = (size / 2).max(1);
+    }
+    for i in 0..best.len() {
+        for k in 0..5 {
+            let Some((float, least)) = field(best[i].event.kind, k) else { continue };
+            // The least value; else halves toward it, while they still give the finding.
+            let mut tries = vec![least];
+            let mut v = *slot(&mut best[i].event, k);
+            for _ in 0..24 {
+                v = if float {
+                    let x = f32::from_bits(v);
+                    if x.abs() < 1.0 {
+                        break;
+                    }
+                    (x / 2.0).trunc().to_bits()
+                } else {
+                    if v / 2 < least {
+                        break;
+                    }
+                    v / 2
+                };
+                tries.push(v);
+            }
+            for t in tries {
+                if *slot(&mut best[i].event, k) == t {
+                    break;
+                }
+                let mut cand = best.clone();
+                *slot(&mut cand[i].event, k) = t;
+                match same(&cand)? {
+                    Some(f) => {
+                        (best, now) = (cand, f);
+                        break;
+                    }
+                    None if t == least => {}
+                    None => break,
+                }
+            }
+        }
+    }
+    Ok((best, now))
+}
+
+/// FNV-1a 64 of `text`: a finding's name, the same for the same kind and line.
+fn fnv(text: &str) -> u64 {
+    text.bytes()
+        .fold(0xcbf2_9ce4_8422_2325, |h, b| (h ^ u64::from(b)).wrapping_mul(0x100_0000_01b3))
+}
+
+/// Writes a finding's tick log and script into `out`: their paths.
+fn write_finding(subject: &Subject, out: &Path, f: &Finding) -> Result<Vec<PathBuf>, String> {
+    let (kind, line) = f.found.key();
+    let name = format!("{}-{:016x}", kind.name(), fnv(&format!("{}:{line:?}", kind.name())));
+    let log = log_of(subject, &f.input, &f.found)?;
+    let ticks = out.join(format!("{name}.ticks"));
+    let script = out.join(format!("{name}.json"));
+    let write = |p: &Path, bytes: &[u8]| {
+        std::fs::write(p, bytes).map_err(|e| format!("can't write {}: {e}", p.display()))
+    };
+    write(&ticks, &log.encode())?;
+    let json = serde_json::to_string_pretty(&script_json(&f.input)).expect("JSON") + "\n";
+    write(&script, json.as_bytes())?;
+    Ok(vec![ticks, script])
+}
+
+/// The tick log of `input` up to the tick of `found`: each tick before it with its state hash,
+/// then that tick with its records (a hash of 0: it has none, it fails). A `not-deterministic`
+/// finding's log is every tick of one run.
+fn log_of(subject: &Subject, input: &[Scripted], found: &Found) -> Result<TickLog, String> {
+    let wrap = |e: wrela_host::Error| e.to_string();
+    if found.kind == Kind::NotDeterministic {
+        return subject.build.record_ticks(subject.ticks, input, 1).map_err(wrap);
+    }
+    let mut log = subject.build.record_ticks(found.tick, input, 1).map_err(wrap)?;
+    let records = records_at(input, found.tick).map(|e| e.bytes()).collect();
+    log.ticks.push(wrela_abi::ticks::Tick { records, hash: 0 });
+    Ok(log)
+}
+
+/// An input as a script ([`wrela_abi::input`]'s format), each event with its tick. A seed's
+/// event a script can't give alone (a post, a character of a composition) is left out.
+fn script_json(input: &[Scripted]) -> serde_json::Value {
+    use EventKind as K;
+    use serde_json::json;
+    let mut out = Vec::new();
+    for s in input {
+        let e = &s.event;
+        let f = |w: u32| f64::from(f32::from_bits(e.words[w as usize]));
+        let w = |i: usize| e.words[i];
+        let mut o = match e.kind {
+            K::PointerMove => json!({"type": "move", "x": f(0), "y": f(1)}),
+            K::PointerDown => json!({"type": "down", "x": f(0), "y": f(1), "button": w(2)}),
+            K::PointerUp => json!({"type": "up", "x": f(0), "y": f(1), "button": w(2)}),
+            K::Wheel => json!({"type": "wheel", "x": f(0), "y": f(1), "dx": f(2), "dy": f(3)}),
+            K::KeyDown => json!({"type": "keydown", "code": w(0), "repeat": w(1) != 0}),
+            K::KeyUp => json!({"type": "keyup", "code": w(0)}),
+            K::PadButton => json!({"type": "padbutton", "pad": w(0), "button": w(1),
+                                   "value": f(2), "pressed": w(3) != 0}),
+            K::PadAxis => json!({"type": "padaxis", "pad": w(0), "axis": w(1), "value": f(2)}),
+            K::Text => match char::from_u32(w(0)) {
+                Some(c) => json!({"type": "text", "text": c.to_string()}),
+                None => continue,
+            },
+            K::Paste => json!({"type": "paste", "serial": w(0)}),
+            K::Assist => json!({"type": "assist", "node": w(0), "action": w(1)}),
+            K::Field => json!({"type": "field", "node": w(0), "revision": w(1)}),
+            _ => continue,
+        };
+        o["tick"] = json!(tick_of(s));
+        for (name, bit) in [("shift", 1), ("ctrl", 2), ("alt", 4), ("meta", 8)] {
+            if KINDS.contains(&e.kind) && e.modifiers & bit != 0 {
+                o[name] = json!(true);
+            }
+        }
+        out.push(o);
+    }
+    json!(out)
+}
+
+/// `--replay`: each saved file, and what it gives now, if anything.
+struct Replayed(Vec<(PathBuf, Option<Found>)>);
+
+impl Replayed {
+    fn json(&self) -> serde_json::Value {
+        use serde_json::json;
+        let files: Vec<serde_json::Value> = self
+            .0
+            .iter()
+            .map(|(p, f)| match f {
+                None => json!({"path": p, "fails": false}),
+                Some(f) => {
+                    let (file, line) = place(f.at.as_deref());
+                    json!({"path": p, "fails": true, "kind": f.kind.name(),
+                           "message": f.message, "file": file, "line": line, "tick": f.tick})
+                }
+            })
+            .collect();
+        json!({ "replayed": files })
+    }
+
+    fn text(&self) -> String {
+        let mut s = String::new();
+        for (p, f) in &self.0 {
+            match f {
+                None => s += &format!("{}: passes\n", p.display()),
+                Some(f) => {
+                    let at = f.at.as_deref().map(|a| format!(" at {a}")).unwrap_or_default();
+                    s += &format!(
+                        "{}: {}{at}, tick {}: {}\n",
+                        p.display(),
+                        f.kind.name(),
+                        f.tick,
+                        f.message
+                    );
+                }
+            }
+        }
+        let failing = self.0.iter().filter(|(_, f)| f.is_some()).count();
+        s += &format!("{failing} of {} still fail\n", self.0.len());
+        s
+    }
+}
+
+/// Runs each saved log and script in `saved` (a file, or a directory of them).
+fn replay(a: &Args, saved: &Path) -> Result<Replayed, String> {
+    let subject = subject(&a.dir, a.ticks, a.fuel)?;
+    let paths = if saved.is_dir() {
+        let mut ps: Vec<PathBuf> = std::fs::read_dir(saved)
+            .map_err(|e| format!("can't read {}: {e}", saved.display()))?
+            .filter_map(|e| e.ok().map(|e| e.path()))
+            .filter(|p| p.extension().is_some_and(|e| e == "ticks" || e == "json"))
+            .collect();
+        ps.sort();
+        ps
+    } else {
+        vec![saved.to_path_buf()]
+    };
+    let mut out = Vec::new();
+    for p in paths {
+        let found = replay_one(&subject, &p)?;
+        out.push((p, found));
+    }
+    Ok(Replayed(out))
+}
+
+fn replay_one(subject: &Subject, p: &Path) -> Result<Option<Found>, String> {
+    let input = read_input(p)?;
+    let ticks = input.iter().map(|s| tick_of(s) + 1).max().unwrap_or(0).max(subject.ticks);
+    if p.extension().is_some_and(|e| e == "ticks") {
+        let bytes = std::fs::read(p).map_err(|e| format!("can't read {}: {e}", p.display()))?;
+        let log = TickLog::decode(&bytes).map_err(|e| format!("{}: {e}", p.display()))?;
+        if log.wasm_hash == subject.build.wasm_hash() {
+            // This build's log: its ticks, each hash checked.
+            use wrela_host::ReplayError as R;
+            let mut host = subject.start()?;
+            let n = log.ticks.len() as u32;
+            return Ok(match host.replay_ticks(&log, n) {
+                Ok(()) => None,
+                Err(R::Failed { tick: Some(k), error }) => {
+                    Some(subject.failed(&host, &error.to_string(), k))
+                }
+                Err(R::Tick { tick, log, replayed }) => Some(Found {
+                    kind: Kind::NotDeterministic,
+                    message: format!("tick {tick}'s state hash is {replayed:016x}, not {log:016x}"),
+                    at: None,
+                    tick,
+                }),
+                Err(e) => return Err(format!("{}: {e}", p.display())),
+            });
+        }
+    }
+    Ok(subject.run_for(&input, ticks)?.found)
 }

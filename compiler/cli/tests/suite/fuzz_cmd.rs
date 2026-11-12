@@ -1,7 +1,8 @@
 //! `wrela fuzz` (language.md §16.2): a step that adds key codes into a `u8` traps once they pass
 //! 255, and the fuzzer finds that line; a step that divides by `pointer x - 300` traps only at
 //! one x, which mutating the inputs that reach the division finds; a step with no bug gives no
-//! finding and exit status 0.
+//! finding and exit status 0. A finding is minimized, saved as a tick log and a script, and
+//! replayed until its bug is fixed.
 
 use crate::common;
 
@@ -99,4 +100,50 @@ fn a_step_with_no_bug_has_no_finding() {
     assert_eq!(code, Some(0), "{r}");
     assert_eq!(r["findings"].as_array().unwrap().len(), 0, "{r}");
     assert_eq!(r["executions"].as_u64().unwrap(), 5000, "{r}");
+}
+
+/// The overflow's finding, minimized, is the key presses that pass 255 and nothing else; its
+/// tick log fails on replay at the same line (as `wrela-host --replay` runs it); and `--replay`
+/// over the saved findings exits 1 before the bug is fixed and 0 after.
+#[test]
+fn a_finding_is_minimized_and_replays_until_its_bug_is_fixed() {
+    let dir = ticked("fuzz-replay", "u8", OVERFLOW);
+    let (code, r) = fuzz(&dir, &["--runs", "3000", "--seed", "1"]);
+    assert_eq!(code, Some(1), "{r}");
+    let f = &r["findings"].as_array().unwrap()[0];
+    let files: Vec<&str> =
+        f["files"].as_array().unwrap().iter().map(|p| p.as_str().unwrap()).collect();
+    let (log, script) = (files[0], files[1]);
+    assert!(log.ends_with(".ticks") && script.ends_with(".json"), "{files:?}");
+
+    // Only key presses, whose codes pass 255 together and don't without the last.
+    let events: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(script).unwrap()).unwrap();
+    let events = events.as_array().unwrap();
+    assert!(events.iter().all(|e| e["type"] == "keydown"), "{events:?}");
+    let codes: Vec<u64> = events.iter().map(|e| e["code"].as_u64().unwrap()).collect();
+    let sum: u64 = codes.iter().sum();
+    assert!(sum > 255 && sum - codes.iter().min().unwrap() <= 255, "{codes:?}");
+
+    let bytes = std::fs::read(log).unwrap();
+    let log = wrela_abi::ticks::TickLog::decode(&bytes).unwrap();
+    let build = wrela_host::CpuBuild::load_cpu(dir.join("build/fuzz-build")).unwrap();
+    match build.replay(&log, 1) {
+        Err(wrela_host::ReplayError::Failed { tick: Some(k), error }) => {
+            assert_eq!(u64::from(k), f["tick"].as_u64().unwrap());
+            let line = format!("main.wrela:{}:", BEFORE_STEP + 2);
+            assert!(error.to_string().contains(&line), "{error}");
+        }
+        other => panic!("the log replays as {other:?}"),
+    }
+
+    let saved = dir.join("build/fuzz");
+    let (code, r) = fuzz(&dir, &["--replay", saved.to_str().unwrap()]);
+    assert_eq!(code, Some(1), "{r}");
+    assert!(r["replayed"].as_array().unwrap().iter().all(|x| x["fails"] == true), "{r}");
+    let main = std::fs::read_to_string(dir.join("main.wrela")).unwrap();
+    std::fs::write(dir.join("main.wrela"), main.replace(OVERFLOW, CLEAN)).unwrap();
+    let (code, r) = fuzz(&dir, &["--replay", saved.to_str().unwrap()]);
+    assert_eq!(code, Some(0), "{r}");
+    assert_eq!(r["replayed"].as_array().unwrap().len(), 2, "{r}");
 }
