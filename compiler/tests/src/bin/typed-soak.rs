@@ -57,7 +57,7 @@ fn main() {
         (std::sync::atomic::AtomicU64::new(0), std::sync::atomic::AtomicU64::new(0));
     let started = std::time::Instant::now();
     // The GPU's oracle opens a device for each program: one at a time.
-    let threads = if oracle == Oracle::O6 { 1 } else { threads };
+    let threads = if matches!(oracle, Oracle::O6 | Oracle::O7) { 1 } else { threads };
     let total = count * modes.len() as u64;
     wrela_grammar::rng::par_seeded(
         total,

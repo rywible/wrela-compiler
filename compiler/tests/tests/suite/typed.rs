@@ -29,7 +29,7 @@ fn over(oracle: Oracle, n: u64) -> Counts {
         oracles::check_seed(oracle, mode, oracle.features(), seed, &scratch, &out)
     };
     // The GPU's oracle runs one program at a time: each opens its own device.
-    let results = if oracle == Oracle::O6 {
+    let results = if matches!(oracle, Oracle::O6 | Oracle::O7) {
         runs.iter().map(each).collect()
     } else {
         wrela_tests::par_map(&runs, each)
@@ -125,4 +125,11 @@ fn every_regression_still_holds() {
     let failures: Vec<String> =
         files.iter().filter_map(|f| oracles::run_file(f, &scratch).err()).collect();
     assert!(failures.is_empty(), "{}", failures.join("\n"));
+}
+
+/// O7: the GPU code, interpreted (`wrela_ir::interp`), gives what the GPU gave.
+#[test]
+#[ignore = "needs a GPU"]
+fn o7_the_interpreter_agrees_with_the_gpu() {
+    over(Oracle::O7, count(16));
 }

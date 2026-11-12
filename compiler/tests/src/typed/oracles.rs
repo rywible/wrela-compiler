@@ -9,6 +9,7 @@
 //! | O3 | the gradient agrees | with central differences where the function is smooth |
 //! | O4 | the tape agrees | `interpret(tape(f), p)` within 3e-6 of `f(p)` (§14.4) |
 //! | O5 | the optimizer keeps the bits | a `no_opt` build's values, bit for bit |
+//! | O7 | the interpreter agrees | the GPU code interpreted (`wrela_ir::interp`) gives the GPU's value, within O6's bound |
 //! | O6 | the targets agree | the GPU's value inside its interval (within 8 ulps: Metal's fast math reassociates), and near the CPU's |
 
 use super::{Features, HARNESS, Mode, TAPE_HARNESS, program};
@@ -25,11 +26,19 @@ pub enum Oracle {
     O4,
     O5,
     O6,
+    O7,
 }
 
 impl Oracle {
-    pub const ALL: [Oracle; 6] =
-        [Oracle::O1, Oracle::O2, Oracle::O3, Oracle::O4, Oracle::O5, Oracle::O6];
+    pub const ALL: [Oracle; 7] = [
+        Oracle::O1,
+        Oracle::O2,
+        Oracle::O3,
+        Oracle::O4,
+        Oracle::O5,
+        Oracle::O6,
+        Oracle::O7,
+    ];
 
     pub fn parse(s: &str) -> Option<Oracle> {
         Oracle::ALL.into_iter().find(|o| o.name().eq_ignore_ascii_case(s))
@@ -43,6 +52,7 @@ impl Oracle {
             Oracle::O4 => "O4",
             Oracle::O5 => "O5",
             Oracle::O6 => "O6",
+            Oracle::O7 => "O7",
         }
     }
 
@@ -241,6 +251,7 @@ pub fn run(oracle: Oracle, src: &str, seed: u64, dir: &Path) -> Result<Counts, F
             Ok(Counts { points: 16, counted: 16 })
         }
         Oracle::O6 => o6(&build(dir, src, false)?, seed),
+        Oracle::O7 => o7(dir, &build(dir, src, false)?, seed),
     }
 }
 
@@ -349,6 +360,71 @@ fn o6(build: &Path, seed: u64) -> Result<Counts, Failure> {
         }
     }
     Ok(Counts { points: N, counted: N - reassociated })
+}
+
+/// O7: the kernel that writes `f(p)` (`values_k`), taken from the build as its WGSL was written
+/// (`wrela_driver::gpu_modules`) and interpreted at each of the 64 points with the points
+/// buffer the GPU read, gives the GPU's value within O6's bound: the two point intervals'
+/// widths, and Metal's reassociation (8 ulps of the value, or of 1 under 1).
+fn o7(dir: &Path, build: &Path, seed: u64) -> Result<Counts, Failure> {
+    use wrela_ir::interp::{Interp, V, concrete};
+    const N: u32 = 64;
+    let modules = wrela_driver::gpu_modules(dir, wrela_driver::BuildKind::default())
+        .map_err(|out| Failure {
+            what: wrela_diag::render::render_all(&out.sources, &out.diagnostics),
+        })?
+        .gpu;
+    let Some(kernel) = modules.iter().find(|g| g.entries.iter().any(|e| e == "values_k")) else {
+        return fail("no pipeline runs `values_k`");
+    };
+    let m = &kernel.module;
+    let mut gpu = Host::load(build).or_else(|e| fail(format!("the GPU host: {e}")))?;
+    let at = [Value::I32(seed as u32 as i32)];
+    gpu.call_export("on_gpu", &at).or_else(|e| fail(format!("on_gpu: {e}")))?;
+    let made = gpu.buffers();
+    let [.., points, values, ranges] = made[..] else { return fail("on_gpu made no buffers") };
+    let read = |gpu: &mut Host, b| gpu.read_buffer(b).or_else(|e| fail(format!("read: {e}")));
+    let points = read(&mut gpu, points)?;
+    let values = u32s(&read(&mut gpu, values)?);
+    let ranges = u32s(&read(&mut gpu, ranges)?);
+    let Some(input) = m.resources.iter().find(|r| r.kind == wrela_ir::ResourceKind::StorageRead)
+    else {
+        return fail("`values_k` reads no buffer");
+    };
+    let mut cpu = start(build)?;
+    for i in 0..N as usize {
+        let mut given = concrete::Given::default();
+        given.bytes.insert(input.binding, points.clone());
+        given.builtins = vec![
+            (wrela_ir::BuiltinInput::GlobalInvocationId, concrete::uvec3(i as u32, 0, 0)),
+            (wrela_ir::BuiltinInput::NumWorkgroups, concrete::uvec3(1, 1, 1)),
+        ];
+        let out = Interp::new(m, &mut given, &mut ())
+            .run_entry(0)
+            .or_else(|e| fail(format!("the interpreter: {e}")))?;
+        let Some(w) = out.writes.iter().find(|w| w.index == i as u32) else {
+            return fail(format!("the interpreted kernel wrote nothing at {i}"));
+        };
+        let iv = match &w.value {
+            V::P(c) => concrete::floats_of(&c[3]).first().copied(),
+            _ => None,
+        }
+        .ok_or_else(|| Failure { what: format!("the kernel wrote {:?}", w.value) })?;
+        let p = [0, 1, 2].map(|k| f32::from_bits(values[4 * i + k]));
+        let gv = f32::from_bits(values[4 * i + 3]);
+        let (glo, ghi) = (f32::from_bits(ranges[2 * i]), f32::from_bits(ranges[2 * i + 1]));
+        let r = floats(&mut cpu, "range", &ranged(p, p))?;
+        let slack = 8.0 * f64::from(f32::EPSILON) * f64::from(gv.abs().max(1.0));
+        let room = f64::from(r[1] - r[0]) + f64::from(ghi - glo) + slack;
+        let same = iv.to_bits() == gv.to_bits() || (iv.is_nan() && gv.is_nan());
+        if !same && !within((f64::from(iv) - f64::from(gv)).abs(), room) {
+            return fail(format!(
+                "at {p:?}: the interpreter gives {iv:e} and the GPU {gv:e} (apart by more \
+                 than {room:e})"
+            ));
+        }
+    }
+    Ok(Counts { points: N, counted: N })
 }
 
 /// The seed of program `i` of a run from `base`: what the suite and the soak both use.

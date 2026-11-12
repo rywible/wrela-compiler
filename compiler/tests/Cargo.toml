@@ -15,6 +15,7 @@ doctest = false
 wrela-diag.workspace = true
 wrela-driver = { workspace = true, features = ["gpu"] }
 wrela-wasm.workspace = true
+wrela-ir.workspace = true
 wrela-sema.workspace = true
 wrela-syntax.workspace = true
 wrela-grammar.workspace = true
