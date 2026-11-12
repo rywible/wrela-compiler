@@ -16,6 +16,8 @@
 
 use crate::Rng;
 
+pub mod oracles;
+
 /// Every random choice a program is made from: drawn and recorded while generating, or replayed
 /// from a buffer (each entry taken modulo the number of choices, 0 past its end).
 #[derive(Clone, Debug)]
@@ -572,7 +574,7 @@ pub const HARNESS: &str = "
 // ---- the harness (compiler/tests/src/typed.rs) -------------------------------------------------
 use std::derive::{Box3, gradient, interval}
 use std::field::hash_u32
-use std::gpu::{GlobalId, GpuBuffer, Slots, buffer, dispatch}
+use std::gpu::{GlobalId, GpuBuffer, Slots, buffer, buffer_of, dispatch}
 
 pub fn value(x: f32, y: f32, z: f32) -> f32 {
     f(vec3(x, y, z))
@@ -588,17 +590,13 @@ pub fn range(lx: f32, ly: f32, lz: f32, hx: f32, hy: f32, hz: f32) -> vec2 {
 }
 
 pub struct Outs {
+    points: GpuBuffer<vec4>,
     values: GpuBuffer<vec4>,
     ranges: GpuBuffer<vec2>,
 }
 
 pub fn init() -> Outs {
-    Outs { values: buffer(0), ranges: buffer(0) }
-}
-
-struct Seed: Copy + GpuData {
-    seed: u32,
-    count: u32,
+    Outs { points: buffer(0), values: buffer(0), ranges: buffer(0) }
 }
 
 fn unit(h: u32) -> f32 {
@@ -613,30 +611,33 @@ fn point(seed: u32, i: u32) -> vec3 {
     vec3(unit(h0), unit(h1), unit(h2)) * 4.0 - vec3(2.0)
 }
 
+// The kernels read their points from a buffer the CPU wrote: computed in the kernel, a
+// shader compiler may fuse the point's arithmetic with `f`'s (Metal reassociates), and `f`
+// would be evaluated at another point than the one stored.
 @compute(64)
-fn values_k(s: Seed, out: mut Slots<vec4>, id: GlobalId) {
-    if id.x < s.count {
-        let p = point(s.seed, id.x)
-        out[id] = vec4(p, f(p))
-    }
+fn values_k(points: [vec4], out: mut Slots<vec4>, id: GlobalId) {
+    let p = points[id.x].xyz
+    out[id] = vec4(p, f(p))
 }
 
 @compute(64)
-fn ranges_k(s: Seed, out: mut Slots<vec2>, id: GlobalId) {
-    if id.x < s.count {
-        let p = point(s.seed, id.x)
-        let r = interval(f, Box3 { lo: p, hi: p })
-        out[id] = vec2(r.lo, r.hi)
-    }
+fn ranges_k(points: [vec4], out: mut Slots<vec2>, id: GlobalId) {
+    let p = points[id.x].xyz
+    let r = interval(f, Box3 { lo: p, hi: p })
+    out[id] = vec2(r.lo, r.hi)
 }
 
-/// `count` points of `seed` on the GPU: each point and `f` there, and `f`'s interval over it.
-pub fn on_gpu(state: mut Outs, seed: u32, count: u32) {
-    let s = Seed { seed, count }
-    state.values = buffer(count)
-    state.ranges = buffer(count)
-    dispatch(values_k.bind(s: s, out: mut state.values), groups: (count + 63) / 64)
-    dispatch(ranges_k.bind(s: s, out: mut state.ranges), groups: (count + 63) / 64)
+/// 64 points of `seed` on the GPU: each point and `f` there, and `f`'s interval over it.
+pub fn on_gpu(state: mut Outs, seed: u32) {
+    var ps = [vec4(0.0); 64]
+    for i in 0..64 {
+        ps[i] = vec4(point(seed, i), 0.0)
+    }
+    state.points = buffer_of(ps)
+    state.values = buffer(64)
+    state.ranges = buffer(64)
+    dispatch(values_k.bind(points: state.points, out: mut state.values), groups: 1)
+    dispatch(ranges_k.bind(points: state.points, out: mut state.ranges), groups: 1)
 }
 
 pub fn frame(state: mut Outs, time: f32, width: u32, height: u32) {}

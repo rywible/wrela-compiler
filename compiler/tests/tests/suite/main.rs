@@ -69,6 +69,7 @@ mod tool_image;
 mod tool_serve;
 mod tool_threads;
 mod transport;
+mod typed;
 mod unroll;
 mod warnings;
 mod work;

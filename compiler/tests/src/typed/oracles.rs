@@ -1,0 +1,388 @@
+//! The oracles over typed programs (the plan's stage A): each builds a program [`super`] made
+//! and checks the compiler against itself on it. The suite (`suite/typed.rs`) runs them over a
+//! fixed set of seeds; the soak binary (`typed-soak`) over as many as it's asked.
+//!
+//! | | Oracle | What it requires |
+//! |---|---|---|
+//! | O1 | builds | the program builds, with no error, and runs at 16 points without a trap |
+//! | O2 | the interval encloses | over 8 boxes, 16 points each: `lo <= value <= hi` |
+//! | O3 | the gradient agrees | with central differences where the function is smooth |
+//! | O4 | the tape agrees | `interpret(tape(f), p)` within 3e-6 of `f(p)` (§14.4) |
+//! | O5 | the optimizer keeps the bits | a `no_opt` build's values, bit for bit |
+//! | O6 | the targets agree | the GPU's value inside its interval (within 8 ulps: Metal's fast math reassociates), and near the CPU's |
+
+use super::{Features, HARNESS, Mode, TAPE_HARNESS, program};
+use crate::{Rng, u32s};
+use std::path::{Path, PathBuf};
+use wrela_host::{CpuBuild, CpuHost, Host, Value};
+
+/// An oracle.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum Oracle {
+    O1,
+    O2,
+    O3,
+    O4,
+    O5,
+    O6,
+}
+
+impl Oracle {
+    pub const ALL: [Oracle; 6] =
+        [Oracle::O1, Oracle::O2, Oracle::O3, Oracle::O4, Oracle::O5, Oracle::O6];
+
+    pub fn parse(s: &str) -> Option<Oracle> {
+        Oracle::ALL.into_iter().find(|o| o.name().eq_ignore_ascii_case(s))
+    }
+
+    pub fn name(self) -> &'static str {
+        match self {
+            Oracle::O1 => "O1",
+            Oracle::O2 => "O2",
+            Oracle::O3 => "O3",
+            Oracle::O4 => "O4",
+            Oracle::O5 => "O5",
+            Oracle::O6 => "O6",
+        }
+    }
+
+    /// The productions its programs use: all, but O4's have no `pow`, since a tape can't hold a
+    /// power whose exponent depends on the point (§14.4; with `pow`, most programs had one, and
+    /// O4 saw almost nothing).
+    pub fn features(self) -> Features {
+        match self {
+            Oracle::O4 => Features { pow: false, ..Features::default() },
+            _ => Features::default(),
+        }
+    }
+
+    /// The programs it's run on: O1 sees both modes; the rest need finite values.
+    pub fn modes(self) -> &'static [Mode] {
+        match self {
+            Oracle::O1 => &[Mode::Tame, Mode::Wild],
+            _ => &[Mode::Tame],
+        }
+    }
+}
+
+/// What tape limits O4 lets pass: E0709's messages for what §14.4 says a tape can't hold, each
+/// a limit of tapes, not a bug.
+pub const TAPE_ALLOWED: &[&str] =
+    &["a tape can't hold a power whose exponent depends on the point"];
+
+/// What a run of an oracle over one program found: how many points it checked, and how many of
+/// them counted (O3: where the function is smooth enough to compare).
+#[derive(Clone, Copy, Debug, Default)]
+pub struct Counts {
+    pub points: u32,
+    pub counted: u32,
+}
+
+/// Why an oracle failed on a program: what, and at the first failing point.
+#[derive(Clone, Debug)]
+pub struct Failure {
+    pub what: String,
+}
+
+impl std::fmt::Display for Failure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.what)
+    }
+}
+
+/// `a <= b`, false where either is NaN.
+fn within<T: PartialOrd>(a: T, b: T) -> bool {
+    a <= b
+}
+
+fn fail<T>(what: impl Into<String>) -> Result<T, Failure> {
+    Err(Failure { what: what.into() })
+}
+
+/// The program `data` makes, with the harness.
+pub fn text(data: &[u32], mode: Mode, feat: Features) -> String {
+    program(&mut super::Choices::replay(data), mode, feat) + HARNESS
+}
+
+/// Runs the regression file at `path`: its first lines say the oracle (`// oracle: O3`) and the
+/// seed of its points (`// seed: 7`), and the rest is the program with its harness.
+pub fn run_file(path: &Path, scratch: &Path) -> Result<Counts, String> {
+    let src = std::fs::read_to_string(path).map_err(|e| format!("{}: {e}", path.display()))?;
+    let oracle = crate::header(&src, "oracle")
+        .next()
+        .and_then(Oracle::parse)
+        .ok_or_else(|| format!("{}: no `// oracle:` line", path.display()))?;
+    let seed = crate::header(&src, "seed").next().and_then(|s| s.parse().ok()).unwrap_or(0);
+    let name = path.file_stem().map_or("regress".into(), |s| s.to_string_lossy().into_owned());
+    let dir = scratch.join(format!("regress-{name}"));
+    let ran = run(oracle, &src, seed, &dir).map_err(|f| format!("{}: {f}", path.display()));
+    let _ = std::fs::remove_dir_all(&dir);
+    ran
+}
+
+/// Builds `text` as a package in `dir` (made afresh), with `no_opt` if asked: the build's
+/// directory, or the errors rendered.
+pub fn build(dir: &Path, text: &str, no_opt: bool) -> Result<PathBuf, Failure> {
+    let _ = std::fs::remove_dir_all(dir);
+    std::fs::create_dir_all(dir).expect("make the program's directory");
+    std::fs::write(dir.join("wrela.toml"), "[package]\nname = \"typed\"\n").expect("write");
+    std::fs::write(dir.join("main.wrela"), text).expect("write main.wrela");
+    let out = wrela_driver::build_for_tests_with(dir, false, no_opt);
+    let bad: Vec<_> = out
+        .diagnostics
+        .iter()
+        .filter(|d| d.is_error() || d.code.as_str() == "I0001")
+        .cloned()
+        .collect();
+    if !bad.is_empty() {
+        return fail(wrela_diag::render::render_all(&out.sources, &bad));
+    }
+    let build = dir.join("build");
+    out.write_to(&build).expect("write the build");
+    Ok(build)
+}
+
+fn start(build: &Path) -> Result<CpuHost, Failure> {
+    CpuBuild::load(build)
+        .and_then(|b| b.start_with(1))
+        .or_else(|e| fail(format!("the build doesn't load: {e}")))
+}
+
+/// A point in [-2, 2]³.
+fn point(rng: &mut Rng) -> [f32; 3] {
+    [0, 1, 2].map(|_| (rng.unit() * 4.0 - 2.0) as f32)
+}
+
+fn args(p: [f32; 3]) -> [Value; 3] {
+    p.map(Value::F32)
+}
+
+fn value(host: &mut CpuHost, p: [f32; 3]) -> Result<f32, Failure> {
+    match host.call_export("value", &args(p)) {
+        Ok(v) => match v.as_slice() {
+            [Value::F32(x)] => Ok(*x),
+            other => fail(format!("value returned {other:?}")),
+        },
+        Err(e) => fail(format!("trapped at {p:?}: {e}")),
+    }
+}
+
+/// `range`'s arguments for the box from `lo` to `hi`.
+fn ranged(lo: [f32; 3], hi: [f32; 3]) -> Vec<Value> {
+    lo.into_iter().chain(hi).map(Value::F32).collect()
+}
+
+fn floats(host: &mut CpuHost, name: &str, args: &[Value]) -> Result<Vec<f32>, Failure> {
+    match host.call_export(name, args) {
+        Ok(v) => v
+            .iter()
+            .map(|x| match x {
+                Value::F32(x) => Ok(*x),
+                other => fail(format!("{name} returned {other:?}")),
+            })
+            .collect(),
+        Err(e) => fail(format!("{name} trapped at {args:?}: {e}")),
+    }
+}
+
+/// Runs `oracle` on the program `src` (with [`HARNESS`]), its files under `dir`, its points
+/// from `seed`.
+pub fn run(oracle: Oracle, src: &str, seed: u64, dir: &Path) -> Result<Counts, Failure> {
+    let mut rng = Rng::new(seed ^ 0x0a11_ce5e_ed00_0000);
+    match oracle {
+        Oracle::O1 => {
+            let mut host = start(&build(dir, src, false)?)?;
+            for _ in 0..16 {
+                value(&mut host, point(&mut rng))?;
+            }
+            Ok(Counts { points: 16, counted: 16 })
+        }
+        Oracle::O2 => o2(&mut start(&build(dir, src, false)?)?, &mut rng),
+        Oracle::O3 => o3(&mut start(&build(dir, src, false)?)?, &mut rng),
+        Oracle::O4 => {
+            let build = match build(dir, &(src.to_string() + TAPE_HARNESS), false) {
+                Err(f) if f.what.contains("E0709") => {
+                    if TAPE_ALLOWED.iter().any(|a| f.what.contains(a)) {
+                        return Ok(Counts::default());
+                    }
+                    return Err(f);
+                }
+                other => other?,
+            };
+            let mut host = start(&build)?;
+            for _ in 0..16 {
+                let p = point(&mut rng);
+                let v = value(&mut host, p)?;
+                let t = floats(&mut host, "taped", &args(p))?[0];
+                if !within((t - v).abs(), 3e-6 * v.abs().max(1.0)) {
+                    return fail(format!("at {p:?}: the tape gives {t:e}, f gives {v:e}"));
+                }
+            }
+            Ok(Counts { points: 16, counted: 16 })
+        }
+        Oracle::O5 => {
+            let mut opt = start(&build(dir, src, false)?)?;
+            let mut plain = start(&build(&dir.join("no_opt"), src, true)?)?;
+            for _ in 0..16 {
+                let p = point(&mut rng);
+                let (a, b) = (value(&mut opt, p), value(&mut plain, p));
+                match (a, b) {
+                    (Ok(a), Ok(b)) if a.to_bits() == b.to_bits() => {}
+                    (Err(_), Err(_)) => {}
+                    (a, b) => {
+                        return fail(format!(
+                            "at {p:?}: optimized {:?}, not optimized {:?}",
+                            a.map(f32::to_bits).map_err(|f| f.what),
+                            b.map(f32::to_bits).map_err(|f| f.what)
+                        ));
+                    }
+                }
+            }
+            Ok(Counts { points: 16, counted: 16 })
+        }
+        Oracle::O6 => o6(&build(dir, src, false)?, seed),
+    }
+}
+
+/// O2: for 8 boxes (a centre in [-2, 2]³, half sizes log-uniform from 1e-4 to 2) and 16 points
+/// in each (its corners and 8 inside), the interval holds the value.
+fn o2(host: &mut CpuHost, rng: &mut Rng) -> Result<Counts, Failure> {
+    for _ in 0..8 {
+        let c = point(rng);
+        let h = [0, 1, 2].map(|_| 10f64.powf(rng.unit() * 4.3 - 4.0) as f32);
+        let lo = [0, 1, 2].map(|i| c[i] - h[i]);
+        let hi = [0, 1, 2].map(|i| c[i] + h[i]);
+        let r = floats(host, "range", &ranged(lo, hi))?;
+        for k in 0..16 {
+            let p = if k < 8 {
+                [0, 1, 2].map(|i| if k & (1 << i) == 0 { lo[i] } else { hi[i] })
+            } else {
+                [0, 1, 2].map(|i| (lo[i] + (hi[i] - lo[i]) * rng.unit() as f32).clamp(lo[i], hi[i]))
+            };
+            let v = value(host, p)?;
+            if !(within(r[0], v) && within(v, r[1])) {
+                return fail(format!(
+                    "the interval over {lo:?}..{hi:?} is [{:e}, {:e}], but f({p:?}) = {v:e}",
+                    r[0], r[1]
+                ));
+            }
+        }
+    }
+    Ok(Counts { points: 128, counted: 128 })
+}
+
+/// O3: at 16 points, central differences `D(h)` and `D(h/2)`, `h` = 1e-3. A point counts where
+/// they agree within 1e-3 relative in each component (the function is smooth there); at a point
+/// that counts, the gradient is within 2e-3 relative of `D(h/2)`.
+fn o3(host: &mut CpuHost, rng: &mut Rng) -> Result<Counts, Failure> {
+    let mut counted = 0;
+    for _ in 0..16 {
+        let p = point(rng);
+        let g = floats(host, "grad", &args(p))?;
+        let mut d = [[0.0f64; 3]; 2];
+        for (s, h) in [1e-3f32, 5e-4].into_iter().enumerate() {
+            for axis in 0..3 {
+                let (mut a, mut b) = (p, p);
+                a[axis] += h;
+                b[axis] -= h;
+                let step = f64::from(a[axis]) - f64::from(b[axis]);
+                d[s][axis] = (f64::from(value(host, a)?) - f64::from(value(host, b)?)) / step;
+            }
+        }
+        let smooth = (0..3).all(|i| (d[0][i] - d[1][i]).abs() <= 1e-3 * (1.0 + d[0][i].abs()));
+        if !smooth {
+            continue;
+        }
+        counted += 1;
+        for i in 0..3 {
+            let (g, fd) = (f64::from(g[i]), d[1][i]);
+            if !within((g - fd).abs(), 2e-3 * (1.0 + fd.abs())) {
+                return fail(format!(
+                    "at {p:?}: the gradient's component {i} is {g:e}, central differences {fd:e}"
+                ));
+            }
+        }
+    }
+    Ok(Counts { points: 16, counted })
+}
+
+/// O6: at 64 points on the GPU, the GPU's value lies in the GPU's interval over the point, and
+/// the CPU's and the GPU's values differ by at most the widths of the two point intervals.
+fn o6(build: &Path, seed: u64) -> Result<Counts, Failure> {
+    const N: u32 = 64;
+    let mut gpu = Host::load(build).or_else(|e| fail(format!("the GPU host: {e}")))?;
+    let at = [Value::I32(seed as u32 as i32)];
+    gpu.call_export("on_gpu", &at).or_else(|e| fail(format!("on_gpu: {e}")))?;
+    let made = gpu.buffers();
+    let [.., values, ranges] = made[..] else { return fail("on_gpu made no buffers") };
+    let values = u32s(&gpu.read_buffer(values).or_else(|e| fail(format!("read: {e}")))?);
+    let ranges = u32s(&gpu.read_buffer(ranges).or_else(|e| fail(format!("read: {e}")))?);
+    let mut cpu = start(build)?;
+    let mut reassociated = 0;
+    for i in 0..N as usize {
+        let p = [0, 1, 2].map(|k| f32::from_bits(values[4 * i + k]));
+        let gv = f32::from_bits(values[4 * i + 3]);
+        let (glo, ghi) = (f32::from_bits(ranges[2 * i]), f32::from_bits(ranges[2 * i + 1]));
+        let cv = value(&mut cpu, p)?;
+        let r = floats(&mut cpu, "range", &ranged(p, p))?;
+        if !(within(glo, gv) && within(gv, ghi)) {
+            // The native host's GPU on Metal compiles with Metal's fast math (wgpu 30 leaves
+            // `MTLCompileOptions` at its default), which reassociates sums: a value a few ulps
+            // outside the interval derived op by op. That's reported (not counted), not failed;
+            // a miss larger than 8 ulps of the value, or of 1 under 1 (a reassociated sum
+            // cancels: its error is its operands'), fails: a NaN, a wrong branch.
+            let miss = if gv < glo { glo - gv } else { gv - ghi };
+            let ulp = f32::EPSILON * gv.abs().max(1.0);
+            if !within(miss, 8.0 * ulp) {
+                return fail(format!(
+                    "at {p:?}: the GPU's value {gv:e} is outside [{glo:e}, {ghi:e}]"
+                ));
+            }
+            reassociated += 1;
+        }
+        let room = f64::from(r[1] - r[0]) + f64::from(ghi - glo);
+        if !within((f64::from(gv) - f64::from(cv)).abs(), room) {
+            return fail(format!(
+                "at {p:?}: the GPU gives {gv:e} and the CPU {cv:e}, more apart than the point \
+                 intervals' widths ({room:e})"
+            ));
+        }
+    }
+    Ok(Counts { points: N, counted: N - reassociated })
+}
+
+/// The seed of program `i` of a run from `base`: what the suite and the soak both use.
+pub fn program_seed(base: u64, i: u64) -> u64 {
+    wrela_grammar::rng::mix(base, i)
+}
+
+/// Runs `oracle` on program `seed` (`mode`), and on a failure shrinks it and writes the shrunk
+/// program to `out/<oracle>-<seed>.wrela`: the counts, or a message that names the seed, the
+/// file and what failed.
+pub fn check_seed(
+    oracle: Oracle,
+    mode: Mode,
+    feat: Features,
+    seed: u64,
+    scratch: &Path,
+    out: &Path,
+) -> Result<Counts, String> {
+    let (_, data) = super::generate(seed, mode, feat);
+    let dir = scratch.join(format!("{}-{mode:?}-{seed:x}", oracle.name()));
+    let first = match run(oracle, &text(&data, mode, feat), seed, &dir) {
+        Ok(counts) => {
+            let _ = std::fs::remove_dir_all(&dir);
+            return Ok(counts);
+        }
+        Err(f) => f,
+    };
+    let fails = |d: &[u32]| run(oracle, &text(d, mode, feat), seed, &dir).is_err();
+    let small = super::shrink(&data, 2000, fails);
+    let why = run(oracle, &text(&small, mode, feat), seed, &dir).err().unwrap_or(first);
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(out).expect("make the failures' directory");
+    let path = out.join(format!("{}-{seed}.wrela", oracle.name()));
+    let header = format!("// oracle: {}\n// mode: {mode:?}\n// seed: {seed}\n", oracle.name());
+    std::fs::write(&path, header + &text(&small, mode, feat)).expect("write the failure");
+    Err(format!("{} fails on {mode:?} seed {seed} ({}): {why}", oracle.name(), path.display()))
+}
