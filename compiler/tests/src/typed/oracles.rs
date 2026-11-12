@@ -333,7 +333,10 @@ fn o3(host: &mut CpuHost, rng: &mut Rng) -> Result<Counts, Failure> {
         // step, and whether the point's value lies between its neighbours' (f is continuous
         // there: a branch that flips at the point itself, as a table read at a rounded index
         // can, makes its neighbours' difference another branch's slope).
-        let (mut noise, mut continuous) = ([0.0f64; 3], true);
+        // And whether the one-sided differences agree at the smaller step: a corner within a
+        // step of the point (a clamp's, a min's) makes both central differences the mean of
+        // its two slopes, which agree with each other and with neither side's gradient.
+        let (mut noise, mut continuous, mut cornered) = ([0.0f64; 3], true, [0.0f64; 3]);
         for (s, h) in [1e-3f32, 5e-4].into_iter().enumerate() {
             for axis in 0..3 {
                 let (mut a, mut b) = (p, p);
@@ -346,12 +349,18 @@ fn o3(host: &mut CpuHost, rng: &mut Rng) -> Result<Counts, Failure> {
                 noise[axis] = noise[axis].max(4.0 * ulp / step);
                 let spread = (fa - fb).abs() + 4.0 * ulp;
                 continuous &= (here - 0.5 * (fa + fb)).abs() <= spread + 1e-3 * (1.0 + here.abs());
+                let (up, down) = (
+                    f64::from(a[axis]) - f64::from(p[axis]),
+                    f64::from(p[axis]) - f64::from(b[axis]),
+                );
+                cornered[axis] = ((fa - here) / up - (here - fb) / down).abs();
             }
         }
         let smooth = continuous
             && (0..3).all(|i| {
                 (d[0][i] - d[1][i]).abs() <= 1e-3 * (1.0 + d[0][i].abs())
                     && noise[i] <= 1e-3 * (1.0 + d[1][i].abs())
+                    && cornered[i] <= 2e-3 * (1.0 + d[1][i].abs())
             });
         if !smooth {
             continue;
