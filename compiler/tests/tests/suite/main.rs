@@ -22,6 +22,7 @@ mod fuzz;
 mod gpu_limits;
 mod grazer;
 mod handover;
+mod interp;
 mod hello_field;
 mod herd;
 mod http;

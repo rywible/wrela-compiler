@@ -1060,6 +1060,22 @@ impl Host {
         self.p().executor().buffer_size(handle)
     }
 
+    /// The handles of the textures that exist, oldest first.
+    pub fn textures(&mut self) -> Vec<u32> {
+        self.p().executor().textures()
+    }
+
+    /// A texture's level, raw in its own format (rows top to bottom; a 3D texture's every
+    /// slice, else layer `layer`), with its size (width, height, slices) and format.
+    pub fn read_texture(
+        &mut self,
+        handle: u32,
+        level: u32,
+        layer: u32,
+    ) -> Result<([u32; 3], wrela_abi::stream::TextureFormat, Vec<u8>)> {
+        self.p().executor().read_texture(handle, level, layer)
+    }
+
     /// Reads a GPU buffer back after a run. For tests: it waits for the GPU.
     pub fn read_buffer(&mut self, handle: u32) -> Result<Vec<u8>> {
         self.p().executor().read_buffer(handle)

@@ -9,6 +9,8 @@
 //! the deepest tree the parser accepts (`wrela_syntax::MAX_NESTING`, `MAX_EXPR_DEPTH`).
 
 pub mod build;
+#[cfg(feature = "gpu")]
+pub mod captured;
 pub use wrela_wasm::DataReport;
 pub mod const_cache;
 pub mod consts;

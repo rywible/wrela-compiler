@@ -2204,6 +2204,86 @@ impl Gpu {
         out
     }
 
+    /// The handles of the textures that exist, oldest first: for tests and `wrela pixel`.
+    pub(crate) fn textures(&self) -> Vec<u32> {
+        let mut out: Vec<u32> = self
+            .resources
+            .iter()
+            .filter(|(_, r)| matches!(r, Resource::Texture(_)))
+            .map(|(&h, _)| h)
+            .collect();
+        out.sort_unstable();
+        out
+    }
+
+    /// A texture's level `level`, raw in its own format, rows top to bottom with no padding:
+    /// of a 3D texture every slice, else layer `layer` (a depth texture through its depth
+    /// aspect). With its size (width, height, slices) and format. Waits for the GPU.
+    pub(crate) fn read_texture(
+        &mut self,
+        handle: u32,
+        level: u32,
+        layer: u32,
+    ) -> Result<([u32; 3], TextureFormat, Vec<u8>)> {
+        self.flush()?;
+        let Some(Resource::Texture(Texture { texture, format, .. })) = self.resources.get(&handle)
+        else {
+            return Err(Error::Gpu(format!("there's no texture {handle}")));
+        };
+        let format = *format;
+        if format.is_compressed() {
+            return Err(Error::Gpu(format!("texture {handle} is compressed")));
+        }
+        if level >= texture.mip_level_count() {
+            return Err(Error::Gpu(format!("texture {handle} has no level {level}")));
+        }
+        let (width, height) = stream::level_size(texture.width(), texture.height(), level);
+        let three = texture.dimension() == wgpu::TextureDimension::D3;
+        let slices = if three { (texture.depth_or_array_layers() >> level).max(1) } else { 1 };
+        if !three && layer >= texture.depth_or_array_layers() {
+            return Err(Error::Gpu(format!("texture {handle} has no layer {layer}")));
+        }
+        let texel = u64::from(format.bytes_per_texel());
+        let row = u64::from(width) * texel;
+        let padded = align_to(row, u64::from(wgpu::COPY_BYTES_PER_ROW_ALIGNMENT));
+        let size = padded * u64::from(height) * u64::from(slices);
+        let staging = staging(&self.device, &mut self.image_readback, size);
+        let mut encoder =
+            self.device.create_command_encoder(&wgpu::CommandEncoderDescriptor::default());
+        let aspect = if format == TextureFormat::Depth32Float {
+            wgpu::TextureAspect::DepthOnly
+        } else {
+            wgpu::TextureAspect::All
+        };
+        encoder.copy_texture_to_buffer(
+            wgpu::TexelCopyTextureInfo {
+                texture,
+                mip_level: level,
+                origin: wgpu::Origin3d { x: 0, y: 0, z: if three { 0 } else { layer } },
+                aspect,
+            },
+            wgpu::TexelCopyBufferInfo {
+                buffer: &staging,
+                layout: wgpu::TexelCopyBufferLayout {
+                    offset: 0,
+                    bytes_per_row: Some(padded as u32),
+                    rows_per_image: Some(height),
+                },
+            },
+            wgpu::Extent3d { width, height, depth_or_array_layers: slices },
+        );
+        self.queue.submit([encoder.finish()]);
+        let bytes = map_read_with(&self.device, &staging, size, |bytes| {
+            let mut out = Vec::with_capacity((row * u64::from(height * slices)) as usize);
+            for padded_row in bytes.chunks_exact(padded as usize) {
+                out.extend_from_slice(&padded_row[..row as usize]);
+            }
+            out
+        })?;
+        self.check_errors()?;
+        Ok(([width, height, slices], format, bytes))
+    }
+
     /// A buffer's size in bytes.
     pub(crate) fn buffer_size(&self, handle: u32) -> Result<u64> {
         match self.resources.get(&handle) {
