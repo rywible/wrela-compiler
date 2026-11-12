@@ -19,7 +19,7 @@ use std::collections::HashMap;
 
 /// A value known as the shader is built: a scalar, or a vector's, array's or struct's parts.
 #[derive(Clone, Debug, PartialEq)]
-enum K {
+pub enum K {
     S(Const),
     P(Vec<K>),
 }
@@ -416,16 +416,16 @@ impl Folder<'_> {
                 {
                     return None;
                 }
-                each2(k(a)?, k(b)?, &|x, y| binary(*op, x, y))
+                each2(k(a)?, k(b)?, &|x, y| binary(false, *op, x, y))
             }
-            Expr::Convert(x, s) => each1(k(x)?, &|c| convert(c, *s)),
+            Expr::Convert(x, s) => each1(k(x)?, &|c| convert(false, c, *s)),
             Expr::Select { cond, if_true, if_false } => {
                 let (c, t, e) = (k(cond)?, k(if_true)?, k(if_false)?);
                 select(c, t, e)
             }
             Expr::Builtin(b, args) => {
                 let args = args.iter().map(k).collect::<Option<Vec<_>>>()?;
-                builtin(*b, &args)
+                builtin(false, *b, &args)
             }
             _ => None,
         }
@@ -505,14 +505,14 @@ fn zero(types: &Types, t: TypeId) -> Option<K> {
     }
 }
 
-fn each1(x: K, op: &dyn Fn(&Const) -> Option<Const>) -> Option<K> {
+pub(crate) fn each1(x: K, op: &dyn Fn(&Const) -> Option<Const>) -> Option<K> {
     match x {
         K::S(c) => op(&c).map(K::S),
         K::P(xs) => xs.into_iter().map(|x| each1(x, op)).collect::<Option<Vec<_>>>().map(K::P),
     }
 }
 
-fn each2(a: K, b: K, op: &dyn Fn(&Const, &Const) -> Option<Const>) -> Option<K> {
+pub(crate) fn each2(a: K, b: K, op: &dyn Fn(&Const, &Const) -> Option<Const>) -> Option<K> {
     match (a, b) {
         (K::S(x), K::S(y)) => op(&x, &y).map(K::S),
         (K::P(xs), K::P(ys)) if xs.len() == ys.len() => xs
@@ -531,7 +531,12 @@ fn each2(a: K, b: K, op: &dyn Fn(&Const, &Const) -> Option<Const>) -> Option<K> 
     }
 }
 
-fn each3(a: K, b: K, c: K, op: &dyn Fn(&Const, &Const, &Const) -> Option<Const>) -> Option<K> {
+pub(crate) fn each3(
+    a: K,
+    b: K,
+    c: K,
+    op: &dyn Fn(&Const, &Const, &Const) -> Option<Const>,
+) -> Option<K> {
     match (a, b, c) {
         (K::S(x), K::S(y), K::S(z)) => op(&x, &y, &z).map(K::S),
         (a, b, c) => {
@@ -551,12 +556,12 @@ fn each3(a: K, b: K, c: K, op: &dyn Fn(&Const, &Const, &Const) -> Option<Const>)
     }
 }
 
-/// A float result, where it's finite.
-fn float(x: f32) -> Option<Const> {
-    x.is_finite().then_some(Const::F32(x))
+/// A float result, where it's finite (or, `total`, whatever it is).
+fn float(total: bool, x: f32) -> Option<Const> {
+    (total || x.is_finite()).then_some(Const::F32(x))
 }
 
-fn unary(op: UnOp, c: &Const) -> Option<Const> {
+pub(crate) fn unary(op: UnOp, c: &Const) -> Option<Const> {
     Some(match (op, c) {
         (UnOp::Neg, Const::F32(x)) => Const::F32(-x),
         (UnOp::Neg, Const::I32(x)) => Const::I32(x.wrapping_neg()),
@@ -567,19 +572,19 @@ fn unary(op: UnOp, c: &Const) -> Option<Const> {
     })
 }
 
-fn binary(op: BinOp, a: &Const, b: &Const) -> Option<Const> {
+pub(crate) fn binary(total: bool, op: BinOp, a: &Const, b: &Const) -> Option<Const> {
     use BinOp as B;
     Some(match (a, b) {
         (Const::F32(x), Const::F32(y)) => {
             let (x, y) = (*x, *y);
             match op {
-                B::Add => float(x + y)?,
-                B::Sub => float(x - y)?,
-                B::Mul => float(x * y)?,
-                B::Div => float(x / y)?,
+                B::Add => float(total, x + y)?,
+                B::Sub => float(total, x - y)?,
+                B::Mul => float(total, x * y)?,
+                B::Div => float(total, x / y)?,
                 // WGSL's (and the GPU's `frem`): `x - y * trunc(x / y)`, in f32, not an exact
                 // `fmod`; they part where `x / y` rounds to a whole number.
-                B::Rem => float(x - y * (x / y).trunc())?,
+                B::Rem => float(total, x - y * (x / y).trunc())?,
                 B::Eq => Const::Bool(x == y),
                 B::Ne => Const::Bool(x != y),
                 B::Lt => Const::Bool(x < y),
@@ -597,6 +602,9 @@ fn binary(op: BinOp, a: &Const, b: &Const) -> Option<Const> {
                 B::Mul | B::WrappingMul => Const::I32(x.wrapping_mul(y)),
                 B::Div if y != 0 => Const::I32(x.wrapping_div(y)),
                 B::Rem if y != 0 => Const::I32(x.wrapping_rem(y)),
+                // WGSL's: a division by zero gives the dividend, a remainder by zero 0.
+                B::Div if total => Const::I32(x),
+                B::Rem if total => Const::I32(0),
                 B::BitAnd => Const::I32(x & y),
                 B::BitOr => Const::I32(x | y),
                 B::BitXor => Const::I32(x ^ y),
@@ -617,11 +625,16 @@ fn binary(op: BinOp, a: &Const, b: &Const) -> Option<Const> {
                 B::Mul | B::WrappingMul => Const::U32(x.wrapping_mul(y)),
                 B::Div if y != 0 => Const::U32(x / y),
                 B::Rem if y != 0 => Const::U32(x % y),
+                B::Div if total => Const::U32(x),
+                B::Rem if total => Const::U32(0),
                 B::BitAnd => Const::U32(x & y),
                 B::BitOr => Const::U32(x | y),
                 B::BitXor => Const::U32(x ^ y),
                 B::Shl if y < 32 => Const::U32(x << y),
                 B::Shr if y < 32 => Const::U32(x >> y),
+                // WGSL's: the amount is taken modulo the width.
+                B::Shl if total => Const::U32(x << (y & 31)),
+                B::Shr if total => Const::U32(x >> (y & 31)),
                 B::Eq => Const::Bool(x == y),
                 B::Ne => Const::Bool(x != y),
                 B::Lt => Const::Bool(x < y),
@@ -632,8 +645,8 @@ fn binary(op: BinOp, a: &Const, b: &Const) -> Option<Const> {
             }
         }
         (Const::I32(x), Const::U32(y)) => match op {
-            B::Shl if *y < 32 => Const::I32(x.wrapping_shl(*y)),
-            B::Shr if *y < 32 => Const::I32(x >> y),
+            B::Shl if *y < 32 || total => Const::I32(x.wrapping_shl(*y)),
+            B::Shr if *y < 32 || total => Const::I32(x >> (y & 31)),
             _ => return None,
         },
         (Const::Bool(x), Const::Bool(y)) => match op {
@@ -647,7 +660,7 @@ fn binary(op: BinOp, a: &Const, b: &Const) -> Option<Const> {
     })
 }
 
-fn convert(c: &Const, to: Scalar) -> Option<Const> {
+pub(crate) fn convert(total: bool, c: &Const, to: Scalar) -> Option<Const> {
     Some(match (c, to) {
         (Const::F32(x), Scalar::F32) => Const::F32(*x),
         (Const::I32(x), Scalar::F32) => Const::F32(*x as f32),
@@ -658,6 +671,9 @@ fn convert(c: &Const, to: Scalar) -> Option<Const> {
             Const::I32(*x as i32)
         }
         (Const::F32(x), Scalar::U32) if *x > -1.0 && *x < 4294967296.0 => Const::U32(*x as u32),
+        // Past the range, WGSL clamps (Rust's `as` saturates; a NaN is 0).
+        (Const::F32(x), Scalar::I32) if total => Const::I32(*x as i32),
+        (Const::F32(x), Scalar::U32) if total => Const::U32(*x as u32),
         (Const::I32(x), Scalar::U32) => Const::U32(*x as u32),
         (Const::U32(x), Scalar::I32) => Const::I32(*x as i32),
         (Const::I32(x), Scalar::I32) => Const::I32(*x),
@@ -670,7 +686,7 @@ fn convert(c: &Const, to: Scalar) -> Option<Const> {
     })
 }
 
-fn select(c: K, t: K, e: K) -> Option<K> {
+pub(crate) fn select(c: K, t: K, e: K) -> Option<K> {
     match c {
         K::S(Const::Bool(b)) => Some(if b { t } else { e }),
         // A vector condition picks each component.
@@ -707,41 +723,41 @@ fn floats(k: &K) -> Option<Vec<f32>> {
     }
 }
 
-fn builtin(b: Builtin, args: &[K]) -> Option<K> {
+pub(crate) fn builtin(total: bool, b: Builtin, args: &[K]) -> Option<K> {
     use Builtin as B;
     // Through `f64`, rounded once: within WGSL's error bound for each.
-    let wide = |g: fn(f64) -> f64| move |c: &Const| float(g(f64::from(f(c)?)) as f32);
+    let wide = |g: fn(f64) -> f64| move |c: &Const| float(total, g(f64::from(f(c)?)) as f32);
     match b {
         B::Sqrt => each1(args[0].clone(), &|c| {
             let x = f(c)?;
-            if x < 0.0 { None } else { float(x.sqrt()) }
+            if x < 0.0 && !total { None } else { float(total, x.sqrt()) }
         }),
         B::InverseSqrt => each1(args[0].clone(), &|c| {
             let x = f(c)?;
-            if x <= 0.0 { None } else { float((1.0 / f64::from(x).sqrt()) as f32) }
+            if x <= 0.0 && !total { None } else { float(total, (1.0 / f64::from(x).sqrt()) as f32) }
         }),
         B::Sin => each1(args[0].clone(), &wide(f64::sin)),
         B::Cos => each1(args[0].clone(), &wide(f64::cos)),
         B::Tan => each1(args[0].clone(), &wide(f64::tan)),
         B::Asin | B::Acos => each1(args[0].clone(), &|c| {
             let x = f64::from(f(c)?);
-            if !(-1.0..=1.0).contains(&x) {
+            if !(-1.0..=1.0).contains(&x) && !total {
                 return None;
             }
-            float(if b == B::Asin { x.asin() } else { x.acos() } as f32)
+            float(total, if b == B::Asin { x.asin() } else { x.acos() } as f32)
         }),
         B::Atan => each1(args[0].clone(), &wide(f64::atan)),
         B::Atan2 => each2(args[0].clone(), args[1].clone(), &|y, x| {
-            float(f64::from(f(y)?).atan2(f64::from(f(x)?)) as f32)
+            float(total, f64::from(f(y)?).atan2(f64::from(f(x)?)) as f32)
         }),
         B::Exp => each1(args[0].clone(), &wide(f64::exp)),
         B::Exp2 => each1(args[0].clone(), &wide(f64::exp2)),
         B::Log | B::Log2 => each1(args[0].clone(), &|c| {
             let x = f64::from(f(c)?);
-            if x <= 0.0 {
+            if x <= 0.0 && !total {
                 return None;
             }
-            float(if b == B::Log { x.ln() } else { x.log2() } as f32)
+            float(total, if b == B::Log { x.ln() } else { x.log2() } as f32)
         }),
         B::Sinh => each1(args[0].clone(), &wide(f64::sinh)),
         B::Cosh => each1(args[0].clone(), &wide(f64::cosh)),
@@ -750,39 +766,47 @@ fn builtin(b: Builtin, args: &[K]) -> Option<K> {
             let (x, y) = (f64::from(f(x)?), f64::from(f(y)?));
             // WGSL's `pow` is `exp2(y * log2(x))`: undefined for x < 0, and x = 0 with y <= 0.
             if x < 0.0 || (x == 0.0 && y <= 0.0) {
-                return None;
+                if !total {
+                    return None;
+                }
+                return float(total, (y * x.log2()).exp2() as f32);
             }
-            float(x.powf(y) as f32)
+            float(total, x.powf(y) as f32)
         }),
-        B::Floor => each1(args[0].clone(), &|c| float(f(c)?.floor())),
-        B::Ceil => each1(args[0].clone(), &|c| float(f(c)?.ceil())),
-        B::Round => each1(args[0].clone(), &|c| float(f(c)?.round_ties_even())),
-        B::Trunc => each1(args[0].clone(), &|c| float(f(c)?.trunc())),
+        B::Floor => each1(args[0].clone(), &|c| float(total, f(c)?.floor())),
+        B::Ceil => each1(args[0].clone(), &|c| float(total, f(c)?.ceil())),
+        B::Round => each1(args[0].clone(), &|c| float(total, f(c)?.round_ties_even())),
+        B::Trunc => each1(args[0].clone(), &|c| float(total, f(c)?.trunc())),
         B::Fract => each1(args[0].clone(), &|c| {
             let x = f(c)?;
-            float(x - x.floor())
+            float(total, x - x.floor())
         }),
         B::Abs => each1(args[0].clone(), &|c| match c {
-            Const::F32(x) => float(x.abs()),
+            Const::F32(x) => float(total, x.abs()),
             Const::I32(x) => Some(Const::I32(x.wrapping_abs())),
             Const::U32(x) => Some(Const::U32(*x)),
             _ => None,
         }),
         B::Sign => each1(args[0].clone(), &|c| match c {
-            Const::F32(x) => float(if *x > 0.0 {
-                1.0
-            } else if *x < 0.0 {
-                -1.0
-            } else {
-                0.0
-            }),
+            Const::F32(x) => float(
+                total,
+                if *x > 0.0 {
+                    1.0
+                } else if *x < 0.0 {
+                    -1.0
+                } else {
+                    0.0
+                },
+            ),
             Const::I32(x) => Some(Const::I32(x.signum())),
             _ => None,
         }),
         B::Min | B::Max => each2(args[0].clone(), args[1].clone(), &|x, y| {
             let max = b == B::Max;
             match (x, y) {
-                (Const::F32(x), Const::F32(y)) => float(if max { x.max(*y) } else { x.min(*y) }),
+                (Const::F32(x), Const::F32(y)) => {
+                    float(total, if max { x.max(*y) } else { x.min(*y) })
+                }
                 (Const::I32(x), Const::I32(y)) => {
                     Some(Const::I32(if max { *x.max(y) } else { *x.min(y) }))
                 }
@@ -795,62 +819,63 @@ fn builtin(b: Builtin, args: &[K]) -> Option<K> {
         B::Clamp => {
             each3(args[0].clone(), args[1].clone(), args[2].clone(), &|x, lo, hi| match (x, lo, hi)
             {
-                (Const::F32(x), Const::F32(lo), Const::F32(hi)) if lo <= hi => {
-                    float(x.max(*lo).min(*hi))
+                (Const::F32(x), Const::F32(lo), Const::F32(hi)) if lo <= hi || total => {
+                    float(total, x.max(*lo).min(*hi))
                 }
-                (Const::I32(x), Const::I32(lo), Const::I32(hi)) if lo <= hi => {
+                (Const::I32(x), Const::I32(lo), Const::I32(hi)) if lo <= hi || total => {
                     Some(Const::I32(*x.max(lo).min(hi)))
                 }
-                (Const::U32(x), Const::U32(lo), Const::U32(hi)) if lo <= hi => {
+                (Const::U32(x), Const::U32(lo), Const::U32(hi)) if lo <= hi || total => {
                     Some(Const::U32(*x.max(lo).min(hi)))
                 }
                 _ => None,
             })
         }
-        B::Saturate => each1(args[0].clone(), &|c| float(f(c)?.clamp(0.0, 1.0))),
+        B::Saturate => each1(args[0].clone(), &|c| float(total, f(c)?.clamp(0.0, 1.0))),
         B::Mix => each3(args[0].clone(), args[1].clone(), args[2].clone(), &|a, b, t| {
             let (a, b, t) = (f(a)?, f(b)?, f(t)?);
-            float(a * (1.0 - t) + b * t)
+            float(total, a * (1.0 - t) + b * t)
         }),
         B::Step => each2(args[0].clone(), args[1].clone(), &|edge, x| {
-            float(if f(x)? >= f(edge)? { 1.0 } else { 0.0 })
+            float(total, if f(x)? >= f(edge)? { 1.0 } else { 0.0 })
         }),
         B::Smoothstep => each3(args[0].clone(), args[1].clone(), args[2].clone(), &|lo, hi, x| {
             let (lo, hi, x) = (f(lo)?, f(hi)?, f(x)?);
-            if lo == hi {
+            if lo == hi && !total {
                 return None;
             }
             let t = ((x - lo) / (hi - lo)).clamp(0.0, 1.0);
-            float(t * t * (3.0 - 2.0 * t))
+            float(total, t * t * (3.0 - 2.0 * t))
         }),
         B::Length => {
             let v = floats(&args[0])?;
-            float(v.iter().map(|x| x * x).sum::<f32>().sqrt()).map(K::S)
+            float(total, v.iter().map(|x| x * x).sum::<f32>().sqrt()).map(K::S)
         }
         B::Distance => {
             let (a, b) = (floats(&args[0])?, floats(&args[1])?);
             (a.len() == b.len()).then_some(())?;
-            float(a.iter().zip(&b).map(|(x, y)| (x - y) * (x - y)).sum::<f32>().sqrt()).map(K::S)
+            float(total, a.iter().zip(&b).map(|(x, y)| (x - y) * (x - y)).sum::<f32>().sqrt())
+                .map(K::S)
         }
         B::Dot => {
             let (a, b) = (floats(&args[0])?, floats(&args[1])?);
             (a.len() == b.len()).then_some(())?;
-            float(a.iter().zip(&b).map(|(x, y)| x * y).sum()).map(K::S)
+            float(total, a.iter().zip(&b).map(|(x, y)| x * y).sum()).map(K::S)
         }
         B::Cross => {
             let (a, b) = (floats(&args[0])?, floats(&args[1])?);
             (a.len() == 3 && b.len() == 3).then_some(())?;
             let c =
                 [a[1] * b[2] - a[2] * b[1], a[2] * b[0] - a[0] * b[2], a[0] * b[1] - a[1] * b[0]];
-            c.iter().map(|x| float(*x).map(K::S)).collect::<Option<Vec<_>>>().map(K::P)
+            c.iter().map(|x| float(total, *x).map(K::S)).collect::<Option<Vec<_>>>().map(K::P)
         }
         B::Normalize => {
             let v = floats(&args[0])?;
             let l = v.iter().map(|x| x * x).sum::<f32>().sqrt();
-            if l == 0.0 || v.len() < 2 {
+            if (l == 0.0 && !total) || v.len() < 2 {
                 return None;
             }
-            v.iter().map(|x| float(x / l).map(K::S)).collect::<Option<Vec<_>>>().map(K::P)
+            v.iter().map(|x| float(total, x / l).map(K::S)).collect::<Option<Vec<_>>>().map(K::P)
         }
         _ => None,
     }

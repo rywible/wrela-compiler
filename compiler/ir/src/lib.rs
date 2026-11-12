@@ -17,6 +17,7 @@ mod const_fold;
 pub mod derive;
 mod error;
 pub mod gpu_memory;
+pub mod interp;
 pub mod layout;
 mod merge_calls;
 pub mod opt;
