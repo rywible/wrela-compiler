@@ -764,8 +764,5 @@ fn past() {
     let out = wrela_driver::test(&dir, None);
     let failure = out.results.iter().find_map(|r| r.failure.clone()).expect("the test fails");
     let rendered = wrela_diag::render::render_all(&out.sources, &[failure]);
-    assert!(
-        rendered.contains("a reverse gradient's trace passed 2^26 numbers"),
-        "{rendered}"
-    );
+    assert!(rendered.contains("a reverse gradient's trace passed 2^26 numbers"), "{rendered}");
 }
