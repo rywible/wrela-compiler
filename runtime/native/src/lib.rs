@@ -1438,6 +1438,12 @@ impl CpuHost {
         self.program.hash().value()
     }
 
+    /// In a metered build (`CpuBuild::load_metered`), the fuel the last call left of what each
+    /// call is given: so a test measures work in fuel, not time. `None` unmetered.
+    pub fn fuel_left(&self) -> Option<u64> {
+        self.program.fuel_left()
+    }
+
     /// Why the last call failed, if it trapped: where, by WASM offset, and how.
     pub fn last_failure(&self) -> Option<&Failure> {
         self.program.last_failure()

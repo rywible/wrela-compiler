@@ -1641,6 +1641,12 @@ impl<E: Executor> Program<E> {
         self.finish_call(result)
     }
 
+    /// The fuel left after the last call, in a metered build (each call starts with the
+    /// build's fuel): what it spent is that less this.
+    pub(crate) fn fuel_left(&self) -> Option<u64> {
+        self.fuel.and_then(|_| self.store.get_fuel().ok())
+    }
+
     /// Calls another export with numeric arguments.
     pub(crate) fn call(&mut self, name: &str, args: &[Value]) -> Result<Vec<Value>> {
         let func: Func = self

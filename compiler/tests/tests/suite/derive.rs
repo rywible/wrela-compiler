@@ -666,6 +666,87 @@ fn the_slope_is_the_weight() {
     assert_eq!(crate::tests_pass(&dir), 1);
 }
 
+/// A two-layer net over 4,096 weights: 64 inputs, 60 hidden `tanh`s, one output (W1 at 0, b1 at
+/// 3840, W2 at 3900, b2 at 3960; the rest unused).
+const NET: &str = "use std::derive::reverse
+
+fn input(i: u32) -> f32 {
+    sin(f32(i) * 0.37)
+}
+
+fn net(w: [f32; 4096]) -> f32 {
+    var out = w[3960]
+    for j in 0..60 {
+        var s = w[3840 + j]
+        for i in 0..64 {
+            s += w[j * 64 + i] * input(i)
+        }
+        out += w[3900 + j] * tanh(s)
+    }
+    out
+}
+
+fn weights() -> [f32; 4096] {
+    var w = [0.0; 4096]
+    for k in 0..4096 {
+        w[k] = 0.2 * sin(f32(k) * 1.618)
+    }
+    w
+}
+
+pub fn plain() -> f32 {
+    net(weights())
+}
+
+pub fn reversed(k: u32) -> f32 {
+    let (_, g) = reverse(net, weights())
+    g[k]
+}
+
+pub fn nudged(k: u32, h: f32) -> f32 {
+    var w = weights()
+    w[k] += h
+    net(w)
+}
+";
+
+/// Reverse mode at scale: a function of 4,096 numbers. Its gradient agrees with central
+/// differences on 16 of them within 1e-3 relative, and the reverse call costs less than ten
+/// plain evaluations, in fuel (work, not time).
+#[test]
+fn reverse_is_a_few_evaluations() {
+    let dir = crate::package("derive-reverse-net", NET);
+    wrela_tests::must_build(&dir, &dir.join("build"));
+    let fuel = 1u64 << 40;
+    let mut host = CpuBuild::load_metered(dir.join("build"), fuel)
+        .expect("load")
+        .start_with(1)
+        .expect("start");
+    let spent = |host: &mut CpuHost, name: &str, args: &[Value]| -> (f32, u64) {
+        let v = one_f32(host, name, args);
+        (v, fuel - host.fuel_left().expect("metered"))
+    };
+    let (_, plain) = spent(&mut host, "plain", &[]);
+    let (_, reversed) = spent(&mut host, "reversed", &[Value::I32(0)]);
+    let ratio = reversed as f64 / plain as f64;
+    let mut worst = 0.0f64;
+    for k in (0..3961i32).step_by(3961 / 16).take(16) {
+        let g = f64::from(one_f32(&mut host, "reversed", &[Value::I32(k)]));
+        let h = 1.0e-2f32;
+        let up = f64::from(one_f32(&mut host, "nudged", &[Value::I32(k), Value::F32(h)]));
+        let down = f64::from(one_f32(&mut host, "nudged", &[Value::I32(k), Value::F32(-h)]));
+        let central = (up - down) / (2.0 * f64::from(h));
+        let err = (g - central).abs() / central.abs().max(1e-2);
+        worst = worse(worst, err);
+        assert!(err <= 1e-3, "weight {k}: reverse {g}, central differences {central}");
+    }
+    println!(
+        "a net of 4,096 weights: a plain evaluation {plain} fuel, the reverse gradient {reversed} \
+         ({ratio:.2} times); worst relative difference from central differences {worst:.1e}"
+    );
+    assert!(ratio < 10.0, "the reverse gradient costs {ratio:.2} evaluations");
+}
+
 /// A trace past its most nodes panics, saying what to do (`Trace::holding` sets a small most).
 #[test]
 fn a_trace_past_its_most_panics() {
