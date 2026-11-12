@@ -1,6 +1,13 @@
 // A function that can't be derived (a gradient or an interval): it takes its own gradient
-// without end, writes through a place that depends on its input, or calls something that has no
-// derivation (a host call, an atomic). The message says which.
+// without end, writes through a place that depends on its input, reads or writes heap memory
+// (a `Vec`, a `String`, a `Box`), or calls something that has no derivation (a host call, an
+// atomic). The message says which.
+//
+// Heap memory: a derivation can't follow a float through it, so a derived function reads and
+// writes none, and no function it calls puts a value that depends on the input there (what
+// read it back would read a constant: a derivative of 0). Keep what depends on the input in
+// arrays and values, or make the heap value in a function that takes nothing that depends on
+// the input and returns a value: that function isn't derived, and runs as it is.
 // ---- wrong
 use std::derive::gradient
 

@@ -1,0 +1,41 @@
+{
+  "diagnostics": [
+    {
+      "code": "E0700",
+      "file": "main.wrela",
+      "fixes": [],
+      "help": [
+        "keep what depends on the input in arrays and values, or make the heap value in a function that takes nothing that depends on the input and returns a value"
+      ],
+      "internal": false,
+      "label": null,
+      "labels": [
+        {
+          "file": "main.wrela",
+          "message": "derived here",
+          "span": {
+            "column": 5,
+            "end": 227,
+            "end_column": 19,
+            "end_line": 9,
+            "line": 9,
+            "start": 213
+          }
+        }
+      ],
+      "message": "this reads or writes heap memory (a `Vec`, a `String`, a `Box`), where a derivation can't follow a float",
+      "notes": [],
+      "severity": "error",
+      "span": {
+        "column": 9,
+        "end": 369,
+        "end_column": 19,
+        "end_line": 15,
+        "line": 15,
+        "start": 359
+      },
+      "title": "a function that can't be derived"
+    }
+  ],
+  "version": 2
+}

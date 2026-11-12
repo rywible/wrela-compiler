@@ -1,11 +1,13 @@
 //! `wrela solve <package-dir> (--minimize <module>::<function> | --fit <module>::<function> |
-//! --spec) --free <file>[:<lines>]... [--steps n] [--exact] [--write] [--json]`: changes the
-//! literals on the lines named (a whole file, with no lines) until the function (a `pub fn` of
-//! no arguments returning `f32`, in a module of the package, not its main) is as small as it
-//! gets; with `--fit`, until the sum of the squares of the numbers the function gives (it
-//! returns `[f32; M]`: how far each of `M` things misses) is; or with `--spec` until the
-//! package's spec holds (its checks' `std::lift::Loss`, from `pub fn spec<C: Checks>(c: mut C)`
-//! in `spec.wrela`), reporting each check before and after (language.md §23).
+//! --spec) --free <file>[:<lines or names>]... [--steps n] [--exact] [--write] [--json]`:
+//! changes the literals named (those on the lines `12`, `12-20`; those of the value a `let`, a
+//! `var` or a `const` of the file gives a name, `reach`; a whole file's, with neither) until the
+//! function (a `pub fn` of no arguments returning `f32`, in a module of the package, not its
+//! main) is as small as it gets; with `--fit`, until the sum of the squares of the numbers the
+//! function gives (it returns `[f32; M]`: how far each of `M` things misses) is; or with
+//! `--spec` until the package's spec holds (its checks' `std::lift::Loss`, from
+//! `pub fn spec<C: Checks>(c: mut C)` in `spec.wrela`), reporting each check before and after
+//! (language.md §23).
 //!
 //! It writes a program around the function (`<package>/build/solve/`), builds it with the
 //! package's literals lifted, and runs it on the CPU, where `std::lift::Minimize` solves: BFGS
@@ -14,15 +16,19 @@
 //! Levenberg–Marquardt on every number's derivatives (`std::lift::jacobian`). The literals end
 //! rounded to their own decimals, as a drag's are: the one that changed most first, the
 //! rest solved again with it held, and the last given more decimals while rounding would cost
-//! more than 5% of the value (`--exact` keeps them as solved). This finds the literals on the
-//! lines named and their decimals, passes them in, and reports what came out; with `--write`,
-//! `wrela edit` writes them to the source. Exit status: 0 solved (and written), 1 the build or
-//! the write failed, 2 a usage error.
+//! more than 5% of the value (`--exact` keeps them as solved). This finds the literals named
+//! and their decimals, passes them in, and reports what came out, with a warning for each
+//! literal the function never changed with (its derivative by it was 0 wherever the solve took
+//! one). With `--write`, `wrela edit` writes them to the source, unless a spec's solve stopped
+//! short: with a check that still misses, nothing is written, and the checks that miss are
+//! said. Exit status: 0 solved (and written), 1 the build or the write failed or a spec that
+//! doesn't hold wasn't written, 2 a usage error.
 
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use wrela_driver::edit::LiteralEdit;
 use wrela_host::{CpuHost, Value};
+use wrela_syntax::ast;
 
 pub fn run(args: &[String]) -> ExitCode {
     let (mut dir, mut target, mut free, mut steps) = (None, None, Vec::new(), 200usize);
@@ -73,7 +79,9 @@ pub fn run(args: &[String]) -> ExitCode {
         return ExitCode::from(2);
     };
     if free.is_empty() {
-        eprintln!("error: name the literals to change with `--free <file>:<lines>`");
+        eprintln!(
+            "error: name the literals to change with `--free <file>:<lines>` or `--free <file>:<name>`"
+        );
         return ExitCode::from(2);
     }
     match solve(&dir, module, function, spec, fit, &free, steps, exact, write) {
@@ -83,7 +91,8 @@ pub fn run(args: &[String]) -> ExitCode {
             } else {
                 print_report(&report);
             }
-            ExitCode::SUCCESS
+            // A solve that stopped short, asked to write: reported, and not written.
+            if report["refused"].is_string() { ExitCode::from(1) } else { ExitCode::SUCCESS }
         }
         Err(why) => {
             if json {
@@ -96,31 +105,145 @@ pub fn run(args: &[String]) -> ExitCode {
     }
 }
 
-/// A file and the lines in it whose literals may change: `body.wrela:12`, `body.wrela:12-20`,
-/// `body.wrela:3,7-9`.
+/// A file and the literals in it that may change: those on lines (`body.wrela:12`,
+/// `body.wrela:12-20`), those of the value a name is bound to (`body.wrela:reach`: the file's
+/// `let reach = 0.62`), or both (`body.wrela:3,reach,7-9`). A name stays put when the file's
+/// lines move.
 struct Free {
     file: PathBuf,
     lines: Vec<(u32, u32)>,
+    names: Vec<String>,
 }
 
 fn parse_free(arg: &str) -> Option<Free> {
     // A file alone: every line of it.
     if !arg.contains(':') {
-        return Some(Free { file: PathBuf::from(arg), lines: vec![(1, u32::MAX)] });
+        return Some(Free { file: PathBuf::from(arg), lines: vec![(1, u32::MAX)], names: vec![] });
     }
-    let (file, lines) = arg.rsplit_once(':')?;
-    let mut ranges = Vec::new();
-    for part in lines.split(',') {
+    let (file, parts) = arg.rsplit_once(':')?;
+    let (mut lines, mut names) = (Vec::new(), Vec::new());
+    for part in parts.split(',') {
+        let part = part.trim();
+        if is_name(part) {
+            names.push(part.to_string());
+            continue;
+        }
         let (a, b) = match part.split_once('-') {
             Some((a, b)) => (a.trim().parse().ok()?, b.trim().parse().ok()?),
             None => {
-                let n = part.trim().parse().ok()?;
+                let n = part.parse().ok()?;
                 (n, n)
             }
         };
-        ranges.push((a, b));
+        lines.push((a, b));
     }
-    Some(Free { file: PathBuf::from(file), lines: ranges })
+    Some(Free { file: PathBuf::from(file), lines, names })
+}
+
+/// Whether `s` is written as a name is: a letter or `_`, then letters, digits and `_`.
+fn is_name(s: &str) -> bool {
+    let mut chars = s.chars();
+    chars.next().is_some_and(|c| c.is_alphabetic() || c == '_')
+        && chars.all(|c| c.is_alphanumeric() || c == '_')
+}
+
+/// A value a name is bound to in a file: where its expression is (bytes), and its line.
+struct Bound {
+    start: u32,
+    end: u32,
+    line: u32,
+}
+
+/// The values `name` is bound to in the `.wrela` file `text`: by a `let` or a `var` of that
+/// one name, in any function's body, or by a `const`.
+fn bound(text: &str, name: &str) -> Vec<Bound> {
+    let parsed = wrela_syntax::parser::parse(wrela_diag::FileId(0), text);
+    let mut values: Vec<wrela_diag::Span> = Vec::new();
+    let mut in_fn = |d: &ast::FnDecl| {
+        let Some(body) = &d.body else { return };
+        body.for_each_block(&mut |b| {
+            for s in &b.stmts {
+                match &s.kind {
+                    ast::StmtKind::Let {
+                        pat: ast::Pat { kind: ast::PatKind::Ident(id), .. },
+                        init,
+                        ..
+                    }
+                    | ast::StmtKind::Var { name: id, init, .. }
+                        if id.name == name =>
+                    {
+                        values.push(init.span);
+                    }
+                    _ => {}
+                }
+            }
+        });
+    };
+    for item in &parsed.file.items {
+        match &item.kind {
+            ast::ItemKind::Fn(d) => in_fn(d),
+            ast::ItemKind::Trait(t) => {
+                for m in &t.members {
+                    if let ast::TraitMemberKind::Fn(d) = &m.kind {
+                        in_fn(d);
+                    }
+                }
+            }
+            ast::ItemKind::Impl(i) => {
+                for m in &i.members {
+                    if let ast::ImplMemberKind::Fn(d) = &m.kind {
+                        in_fn(d);
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    for item in &parsed.file.items {
+        if let ast::ItemKind::Const(c) = &item.kind
+            && c.name.name == name
+        {
+            values.push(c.value.span);
+        }
+    }
+    let line = |at: u32| 1 + text.as_bytes()[..at as usize].iter().filter(|b| **b == b'\n').count();
+    values.sort_by_key(|v| v.start);
+    values
+        .iter()
+        .map(|v| Bound { start: v.start, end: v.end, line: line(v.start) as u32 })
+        .collect()
+}
+
+/// Where the names of `free` are bound in its file, each to one value: an error for a name the
+/// file doesn't bind, or binds more than once (its lines tell them apart).
+fn named(dir: &Path, free: &Free) -> Result<Vec<(String, Bound)>, String> {
+    if free.names.is_empty() {
+        return Ok(Vec::new());
+    }
+    let file = free.file.display();
+    let text = std::fs::read_to_string(dir.join(&free.file))
+        .map_err(|e| format!("can't read `{file}`: {e}"))?;
+    let mut out = Vec::new();
+    for name in &free.names {
+        let mut values = bound(&text, name);
+        match values.len() {
+            0 => {
+                return Err(format!(
+                    "`{file}` binds no `{name}`: `--free {file}:{name}` frees the literals of `let {name} = ...` (or a `var`'s, or a `const`'s)"
+                ));
+            }
+            1 => out.push((name.clone(), values.remove(0))),
+            n => {
+                let lines: Vec<String> = values.iter().map(|v| v.line.to_string()).collect();
+                return Err(format!(
+                    "`{file}` binds `{name}` {n} times (lines {}): name the one meant by its line, `--free {file}:{}`",
+                    lines.join(", "),
+                    lines[0]
+                ));
+            }
+        }
+    }
+    Ok(out)
 }
 
 /// The program around the function, as `wrela solve` writes it: around the spec's loss, and
@@ -166,7 +289,8 @@ fn glue(package: &str, module: &str, function: &str, spec: bool, fit: bool) -> S
          pub fn solve(m: mut Minimize, steps: u32, exact: bool) {{\n    m.{how}(|| {call}, steps, exact)\n}}\n\n\
          pub fn losses(m: Minimize) -> vec3 {{\n    vec3(m.before(), m.solved(), m.after())\n}}\n\n\
          pub fn steps(m: Minimize) -> u32 {{\n    m.steps()\n}}\n\n\
-         pub fn moved(m: Minimize, i: u32) -> vec2 {{\n    vec2(m.start(i), m.finish(i))\n}}\n"
+         pub fn moved(m: Minimize, i: u32) -> vec2 {{\n    vec2(m.start(i), m.finish(i))\n}}\n\n\
+         pub fn changes(m: Minimize, i: u32) -> bool {{\n    m.changes(i)\n}}\n"
     )
 }
 
@@ -176,6 +300,8 @@ struct Lit {
     index: u32,
     file: String,
     line: u32,
+    /// The name it was freed by (`--free <file>:<name>`), if by one.
+    name: Option<String>,
     /// Its text's decimals, and the unit they count in (`15cm`: 0.01; 1 with no unit suffix).
     decimals: u32,
     unit: f64,
@@ -194,6 +320,8 @@ fn solve(
     exact: bool,
     write: bool,
 ) -> Result<serde_json::Value, String> {
+    // Where each name is bound, before the build: a name the file doesn't have is said at once.
+    let names = free.iter().map(|f| named(dir, f)).collect::<Result<Vec<_>, _>>()?;
     let (glue_dir, package) =
         crate::glue_package(dir, "solve", |package| glue(package, module, function, spec, fit))?;
     let out = wrela_driver::build_lifted(
@@ -208,27 +336,44 @@ fn solve(
         &std::fs::read_to_string(built.join("lift.json")).map_err(|e| e.to_string())?,
     )
     .map_err(|e| e.to_string())?;
-    // The literals on the lines named.
+    // The literals named: on a line named, or in the value a name named is bound to.
     let files = report["files"].as_array().map_or(&[][..], Vec::as_slice);
     let canonical = |p: &Path| p.canonicalize().unwrap_or_else(|_| p.to_path_buf());
-    let wanted: Vec<(PathBuf, &Free)> =
-        free.iter().map(|f| (canonical(&dir.join(&f.file)), f)).collect();
+    // Each `--free`: its file, and where its names are bound.
+    let wanted: Vec<_> = free
+        .iter()
+        .zip(&names)
+        .map(|(f, names)| (canonical(&dir.join(&f.file)), f, names.as_slice()))
+        .collect();
     let mut lits = Vec::new();
     for l in report["literals"].as_array().into_iter().flatten() {
         let f = &files[l["file"].as_u64().unwrap_or(0) as usize];
         let path = canonical(&glue_dir.join(f["path"].as_str().unwrap_or("")));
         let line = l["line"].as_u64().unwrap_or(0) as u32;
-        let Some((_, fr)) = wanted
-            .iter()
-            .find(|(p, f)| *p == path && f.lines.iter().any(|&(a, b)| a <= line && line <= b))
-        else {
-            continue;
+        let at = l["start"].as_u64().unwrap_or(0) as u32;
+        let by_name = |names: &[(String, Bound)]| {
+            names.iter().find(|(_, b)| b.start <= at && at < b.end).map(|(n, _)| n.clone())
         };
+        // The first `--free` that names it; by a name, if any of them names it by one.
+        let mut freed: Option<(&Free, Option<String>)> = None;
+        for (_, f, names) in wanted.iter().filter(|(p, ..)| *p == path) {
+            let name = by_name(names);
+            if name.is_none() && !f.lines.iter().any(|&(a, b)| a <= line && line <= b) {
+                continue;
+            }
+            match &mut freed {
+                None => freed = Some((f, name)),
+                Some((_, by)) if by.is_none() => *by = name,
+                Some(_) => {}
+            }
+        }
+        let Some((fr, name)) = freed else { continue };
         let text = l["text"].as_str().unwrap_or("").to_string();
         lits.push(Lit {
             index: l["index"].as_u64().unwrap_or(0) as u32,
             file: fr.file.display().to_string(),
             line,
+            name,
             decimals: decimals(&text),
             unit: wrela_driver::edit::unit_of(&text),
             edit: LiteralEdit {
@@ -240,6 +385,18 @@ fn solve(
                 value: 0.0,
             },
         });
+    }
+    // A name was given for its literals: one whose value has none is said, not passed over.
+    for (f, names) in free.iter().zip(&names) {
+        for (name, b) in names {
+            if !lits.iter().any(|l| l.name.as_deref() == Some(name.as_str())) {
+                return Err(format!(
+                    "`{name}` in `{}` (line {}) is bound to a value with no lifted literal in it",
+                    f.file.display(),
+                    b.line
+                ));
+            }
+        }
     }
     if lits.is_empty() {
         return Err("no lifted literal is on the lines named".into());
@@ -282,7 +439,34 @@ fn solve(
             other => return Err(format!("`moved` returned {other:?}")),
         }
     }
+    // Whether the function changed with each literal, wherever the solve took its derivatives.
+    let mut changes = Vec::with_capacity(lits.len());
+    for k in 0..lits.len() {
+        match call(&mut host, "changes", &[Value::I32(k as i32)])?.as_slice() {
+            [Value::I32(b)] => changes.push(*b != 0),
+            other => return Err(format!("`changes` returned {other:?}")),
+        }
+    }
+    let what = if spec { "the spec's loss".to_string() } else { format!("{module}::{function}") };
+    let warnings: Vec<String> = lits
+        .iter()
+        .zip(&changes)
+        .filter(|(_, changed)| !**changed)
+        .map(|(l, _)| {
+            format!(
+                "{}:{}: {what} never changed with the literal `{}`: its derivative by it was 0 at every step, so the solve left it",
+                l.file, l.line, l.edit.text
+            )
+        })
+        .collect();
     let checks_after = if spec { spec_report(&mut host)? } else { serde_json::Value::Null };
+    // A spec's solve that stopped short isn't written: one with a check that misses. (A
+    // function minimized has no checks to hold it to: it's written where it ended.)
+    let missed = checks_after["missed"].as_u64().unwrap_or(0);
+    let refused = (write && spec && missed > 0).then(|| {
+        let all = checks_after["checks"].as_array().map_or(0, Vec::len);
+        format!("{missed} of the spec's {all} checks miss{}", if missed == 1 { "es" } else { "" })
+    });
     let mut answer = serde_json::json!({
         "solved": true,
         "minimize": format!("{module}::{function}"),
@@ -294,12 +478,16 @@ fn solve(
         "rounded": !exact,
         "spec_before": checks_before,
         "spec_after": checks_after,
-        "literals": lits.iter().zip(start.iter().zip(&finish)).map(|(l, (b, a))| serde_json::json!({
-            "literal": l.index, "file": l.file, "line": l.line, "text": l.edit.text, "before": num(*b), "after": num(*a),
+        "literals": lits.iter().zip(start.iter().zip(&finish)).zip(&changes).map(|((l, (b, a)), changed)| serde_json::json!({
+            "literal": l.index, "file": l.file, "line": l.line, "name": l.name, "text": l.edit.text,
+            "before": num(*b), "after": num(*a), "changes": changed,
         })).collect::<Vec<_>>(),
+        "warnings": warnings,
         "written": false,
     });
-    if write {
+    if let Some(why) = refused {
+        answer["refused"] = why.into();
+    } else if write {
         let edits: Vec<LiteralEdit> = lits
             .iter()
             .zip(&finish)
@@ -376,5 +564,24 @@ fn print_report(r: &serde_json::Value) {
     }
     if r["written"] == true {
         println!("written");
+    }
+    for w in r["warnings"].as_array().into_iter().flatten() {
+        eprintln!("warning: {}", w.as_str().unwrap_or(""));
+    }
+    // A solve not written says why where an error is read, with the checks that miss.
+    if let Some(why) = r["refused"].as_str() {
+        eprintln!("error: nothing written: {why}");
+        for c in r["spec_after"]["checks"].as_array().into_iter().flatten() {
+            if c["holds"] != true {
+                eprintln!(
+                    "  misses {}: {} ({} {}), off by {}",
+                    c["name"].as_str().unwrap_or(""),
+                    c["value"],
+                    c["check"].as_str().unwrap_or(""),
+                    c["target"],
+                    c["miss"]
+                );
+            }
+        }
     }
 }

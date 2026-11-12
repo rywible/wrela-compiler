@@ -3,6 +3,39 @@
 Each release's changes a program or a tool can see. The pull request of each release holds the
 detail; `docs/release.md` says how a release is cut.
 
+## 0.33.0
+
+- **`wrela solve --spec --write` writes only a spec that holds** (language.md §23.6). Where a
+  check still misses when the solve ends, it writes nothing, says which checks miss and exits
+  with status 1 (its JSON: `"written": false`, and `"refused"` saying why). It wrote wherever
+  the solve stopped. `--minimize` and `--fit` have no checks to hold a solve to, and write where
+  it ended, as before.
+- **`--free <file>:<name>`**: the literals of the value the file binds `<name>` to (`let reach =
+  0.62`, a `var`'s value, a `const`'s), beside `--free <file>:<lines>`, and with them
+  (`solved.wrela:reach,drive,40-44`). A name stays put when the file's lines move. A name the
+  file doesn't bind, binds more than once, or binds to a value with no lifted literal is an
+  error. The report's literals carry their `name`.
+- **A warning for each freed literal the solve couldn't feel**: `warning: <file>:<line>: <the
+  function> never changed with the literal ...` when its derivative by the literal was 0 at
+  every step (JSON: the literal's `"changes": false`, and `"warnings"`).
+  `std::lift::Minimize::changes(i)` says it of free literal `i`.
+- **E0700 says when it's heap memory** (§14.2). A derived function that reads or writes a
+  `Vec`, a `String` or a `Box` was told it "records GPU work"; it's now told it reads or writes
+  heap memory, where a derivation can't follow a float, and what to do: keep what depends on the
+  input in arrays and values, or make the heap value in a function that takes nothing that
+  depends on the input and returns a value. The error is at the program's line, not in std's
+  code (`derived here` and `in std's code here` point at the rest). Work with other threads (an
+  atomic, a task) has a message of its own.
+- **A value that depends on the input put in heap memory is E0700, not a derivative of 0.** A
+  gradient runs a function as it is when its result carries no derivative, as far as the
+  function's own code shows. A float read back out of a `Vec` shows none, so a function that
+  kept what depended on the input in a `Vec` and returned it (`fn posed(k: Key) -> Vec<Rigid>`),
+  read by another, was run as it was: `std::lift::gradient` gave 0 for every literal on that
+  path, and `wrela solve` took 0 steps and said nothing. The store is now an error where it is
+  written (`w[d] = ...`, `v.push(x)`), for gradients, intervals and tapes. Code that did this
+  compiled before and computed a wrong derivative; it now needs its input-dependent values in
+  arrays and values.
+
 ## 0.32.0
 
 - **Least-squares fits** (language.md §23): `wrela solve <package> --fit <module>::<function>`

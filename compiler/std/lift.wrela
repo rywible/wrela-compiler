@@ -298,6 +298,7 @@ pub struct Minimize {
     units: Vec<f64>,
     start: Vec<f32>,
     finish: Vec<f32>,
+    changes: Vec<bool>,
     before: f32,
     solved: f32,
     after: f32,
@@ -313,6 +314,7 @@ impl Minimize {
             units: Vec::new(),
             start: Vec::new(),
             finish: Vec::new(),
+            changes: Vec::new(),
             before: 0.0,
             solved: 0.0,
             after: 0.0,
@@ -333,6 +335,7 @@ impl Minimize {
     pub fn run(mut self, f: fn() -> f32, steps: u32, exact: bool) {
         let n = self.free.len()
         self.start = Vec::from_fn(n, |i| self.free[i].value())
+        self.changes = Vec::filled(n, value: false)
         self.before = f32(loss_at(self.free, f, self.start))
         let (x, taken) = bfgs(
             self.free,
@@ -340,6 +343,7 @@ impl Minimize {
             self.start,
             moves: Vec::filled(n, value: true),
             steps: steps,
+            changes: mut self.changes,
         )
         self.steps = taken
         self.solved = f32(loss_at(self.free, f, x))
@@ -355,6 +359,7 @@ impl Minimize {
                 f: f,
                 numbers: || [0.0],
                 fit: false,
+                changes: mut self.changes,
             )
         }
         self.after = f32(loss_at(self.free, f, self.finish))
@@ -367,13 +372,25 @@ impl Minimize {
     pub fn fit<const M: u32>(mut self, f: fn() -> [f32; M], steps: u32, exact: bool) {
         let n = self.free.len()
         self.start = Vec::from_fn(n, |i| self.free[i].value())
+        self.changes = Vec::filled(n, value: false)
         self.before = f32(squares_at(self.free, f, self.start))
+        if steps == 0 {
+            // No step takes the derivatives: once here, for `changes`.
+            jacobian_at(
+                self.free,
+                f,
+                self.start,
+                moves: Vec::filled(n, value: true),
+                changes: mut self.changes,
+            )
+        }
         let (x, taken) = least_squares(
             self.free,
             f,
             self.start,
             moves: Vec::filled(n, value: true),
             steps: steps,
+            changes: mut self.changes,
         )
         self.steps = taken
         self.solved = f32(squares_at(self.free, f, x))
@@ -389,6 +406,7 @@ impl Minimize {
                 f: || 0.0,
                 numbers: f,
                 fit: true,
+                changes: mut self.changes,
             )
         }
         self.after = f32(squares_at(self.free, f, self.finish))
@@ -424,6 +442,15 @@ impl Minimize {
     pub fn finish(self, i: u32) -> f32 {
         self.finish[i]
     }
+
+    /// Whether what was made small changed with free literal `i` anywhere the solve took its
+    /// derivatives (each step's point, and each solve again while rounding): `false` when its
+    /// derivative by the literal was 0 every time, so the solve left the literal where it was.
+    /// Then nothing on the function's path reads the literal, or the function doesn't change
+    /// with it anywhere the solve went.
+    pub fn changes(self, i: u32) -> bool {
+        self.changes[i]
+    }
 }
 
 /// What a solve makes small, with the literals `free` set to `x`: `f`'s value, or for a `fit`
@@ -439,7 +466,8 @@ fn value_at<const M: u32>(
     if fit { squares_at(free, numbers, x) } else { loss_at(free, f, x) }
 }
 
-/// The solve again from `x`, over the literals `moves` lets change: where it stops.
+/// The solve again from `x`, over the literals `moves` lets change: where it stops. `changes`
+/// notes the literals a derivative it takes isn't 0 by.
 fn solved_again<const M: u32>(
     free: [Literal],
     x: [f32],
@@ -448,12 +476,13 @@ fn solved_again<const M: u32>(
     f: fn() -> f32,
     numbers: fn() -> [f32; M],
     fit: bool,
+    changes: mut Vec<bool>,
 ) -> Vec<f32> {
     if fit {
-        let (again, _) = least_squares(free, numbers, x, moves, steps)
+        let (again, _) = least_squares(free, numbers, x, moves, steps, mut changes)
         take again
     } else {
-        let (again, _) = bfgs(free, f, x, moves, steps)
+        let (again, _) = bfgs(free, f, x, moves, steps, mut changes)
         take again
     }
 }
@@ -473,6 +502,7 @@ fn round_solution<const M: u32>(
     f: fn() -> f32,
     numbers: fn() -> [f32; M],
     fit: bool,
+    changes: mut Vec<bool>,
 ) -> Vec<f32> {
     let n = solved_x.len()
     var x = Vec::from(solved_x)
@@ -528,7 +558,7 @@ fn round_solution<const M: u32>(
         held[k] = true
         if left > 0 {
             let moves = Vec::from_fn(n, |i| !held[i])
-            x = solved_again(free, x, moves, steps, f, numbers, fit)
+            x = solved_again(free, x, moves, steps, f, numbers, fit, mut changes)
         }
     }
     x
@@ -550,8 +580,14 @@ fn loss_at(free: [Literal], f: fn() -> f32, x: [f32]) -> f64 {
 }
 
 /// `f`'s derivative by each of the literals `free` at `x`, 16 at a time; 0 for those `moves`
-/// holds still.
-fn gradient_at(free: [Literal], f: fn() -> f32, x: [f32], moves: [bool]) -> Vec<f64> {
+/// holds still. `changes` notes each literal the derivative isn't 0 by, held still or not.
+fn gradient_at(
+    free: [Literal],
+    f: fn() -> f32,
+    x: [f32],
+    moves: [bool],
+    changes: mut Vec<bool>,
+) -> Vec<f64> {
     for i in 0..free.len() {
         free[i].set(x[i])
     }
@@ -565,6 +601,9 @@ fn gradient_at(free: [Literal], f: fn() -> f32, x: [f32], moves: [bool]) -> Vec<
         }
         let (_, d) = gradient(f, which)
         for j in 0..min(16, n - k) {
+            if d[j] != 0.0 {
+                changes[k + j] = true
+            }
             g.push(if moves[k + j] { f64(d[j]) } else { 0.0 })
         }
         k += 16
@@ -573,12 +612,19 @@ fn gradient_at(free: [Literal], f: fn() -> f32, x: [f32], moves: [bool]) -> Vec<
 }
 
 /// BFGS from `x0` over the literals `moves` lets change, `steps` steps at most: where it
-/// stopped, and the steps it took.
-fn bfgs(free: [Literal], f: fn() -> f32, x0: [f32], moves: [bool], steps: u32) -> (Vec<f32>, u32) {
+/// stopped, and the steps it took. `changes` notes the literals a gradient it takes isn't 0 by.
+fn bfgs(
+    free: [Literal],
+    f: fn() -> f32,
+    x0: [f32],
+    moves: [bool],
+    steps: u32,
+    changes: mut Vec<bool>,
+) -> (Vec<f32>, u32) {
     let n = x0.len()
     var x: Vec<f64> = Vec::from_fn(n, |i| f64(x0[i]))
     var fx = loss_at(free, f, narrowed(x))
-    var g = gradient_at(free, f, narrowed(x), moves)
+    var g = gradient_at(free, f, narrowed(x), moves, mut changes)
     // The inverse Hessian's estimate, row-major: the identity to begin with.
     var h = identity(n)
     var taken = 0
@@ -612,7 +658,7 @@ fn bfgs(free: [Literal], f: fn() -> f32, x0: [f32], moves: [bool], steps: u32) -
         if x1.len() == 0 {
             break
         }
-        let g1 = gradient_at(free, f, narrowed(x1), moves)
+        let g1 = gradient_at(free, f, narrowed(x1), moves, mut changes)
         let s: Vec<f64> = Vec::from_fn(n, |i| x1[i] - x[i])
         let y: Vec<f64> = Vec::from_fn(n, |i| g1[i] - g[i])
         let sy = dot(s, y)
@@ -682,12 +728,14 @@ fn squares_at<const M: u32>(free: [Literal], f: fn() -> [f32; M], x: [f32]) -> f
 
 /// The numbers `f` gives with the literals `free` set to `x`, and each one's derivative by each
 /// literal (`jacobian`, 16 literals at a time), row by row: number `i`'s by literal `k` is at
-/// `i * free.len() + k`, 0 for a literal `moves` holds still.
+/// `i * free.len() + k`, 0 for a literal `moves` holds still. `changes` notes each literal some
+/// number's derivative isn't 0 by, held still or not.
 fn jacobian_at<const M: u32>(
     free: [Literal],
     f: fn() -> [f32; M],
     x: [f32],
     moves: [bool],
+    changes: mut Vec<bool>,
 ) -> (Vec<f64>, Vec<f64>) {
     for i in 0..free.len() {
         free[i].set(x[i])
@@ -708,6 +756,11 @@ fn jacobian_at<const M: u32>(
             }
         }
         for c in 0..min(16, n - k) {
+            for i in 0..M {
+                if d[c][i] != 0.0 {
+                    changes[k + c] = true
+                }
+            }
             if moves[k + c] {
                 for i in 0..M {
                     j[i * n + k + c] = f64(d[c][i])
@@ -796,6 +849,7 @@ fn least_squares<const M: u32>(
     x0: [f32],
     moves: [bool],
     steps: u32,
+    changes: mut Vec<bool>,
 ) -> (Vec<f32>, u32) {
     let n = x0.len()
     var x: Vec<f64> = Vec::from_fn(n, |i| f64(x0[i]))
@@ -806,7 +860,7 @@ fn least_squares<const M: u32>(
         if !(fx - fx == 0.0) {
             break
         }
-        let (r, j) = jacobian_at(free, f, narrowed(x), moves)
+        let (r, j) = jacobian_at(free, f, narrowed(x), moves, mut changes)
         // A's upper triangle and g, a number at a time (most of a row is 0: a number changes
         // with few literals).
         var a: Vec<f64> = Vec::filled(n * n, value: 0.0)

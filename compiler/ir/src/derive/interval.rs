@@ -181,7 +181,7 @@ fn derive(
         return Ok(d);
     }
     let orig = m.functions[f.index()].clone();
-    no_gpu_work(&orig.body)?;
+    no_gpu_or_heap_work(&orig.body)?;
     let returns = returns_active(m, cache, f, mask.clone(), Mode::Interval) != 0;
     let (func, result, act) = super::one_exit(m, cache, f, orig, &mask);
     if let Some(at) = act.active_loop_exit {
@@ -192,6 +192,7 @@ fn derive(
             at,
         ));
     }
+    no_heap_store(&act)?;
     no_write_through_mut(&func, &act, &mask, "a range")?;
     no_half_ranges(m, &func, &act)?;
     let mut nf = func.clone_signature();
@@ -1370,6 +1371,7 @@ impl<'a> Ivx<'a> {
             self.iv.insert(v, r);
             return Ok(());
         }
+        let at = self.track.at;
         let dg = derive(
             self.m,
             self.cache,
@@ -1378,7 +1380,8 @@ impl<'a> Ivx<'a> {
             self.target,
             self.speculative > 0,
             self.report,
-        )?;
+        )
+        .map_err(|e| e.through(at))?;
         let returns = returns_active(self.m, self.cache, g, mask.clone(), Mode::Interval) != 0;
         let mut new_args = Vec::new();
         let mut his = Vec::new();

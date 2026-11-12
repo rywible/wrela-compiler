@@ -1,7 +1,7 @@
 //! Derived interpretations of IR functions (language.md §14): forward-mode gradients ([`ad`])
 //! and sound interval bounds ([`interval`]). Nothing here knows what a field is (D-056); any
-//! function of floats qualifies, so long as it records no GPU work and has no loop whose exit
-//! depends on its input (for intervals).
+//! function of floats qualifies, so long as it records no GPU work, keeps what depends on its
+//! input out of heap memory, and has no loop whose exit depends on its input (for intervals).
 //!
 //! Both transforms are driven by an **activity analysis**: which values and locals depend on the
 //! input being derived for. Inactive code is copied as is, so a field's data (radii, offsets,
@@ -18,7 +18,8 @@ pub use literal::literal_gradient;
 pub use tape::{TapeFns, TapeOf};
 
 use crate::*;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
+use wrela_diag::Span;
 
 /// Derived functions already built in a module, so each is built once.
 #[derive(Debug, Default)]
@@ -308,6 +309,11 @@ pub(crate) struct Activity {
     /// Interval mode: a loop whose exit depends on the input (unsupported), and where its
     /// exit's condition is in the source, if known.
     pub active_loop_exit: Option<Option<wrela_diag::Span>>,
+    /// A value that depends on the input put in heap memory (stored through a raw address),
+    /// here or in a function called with what depends on the input: where the store is in the
+    /// source, if known, then the calls it was reached through, innermost first. Nothing
+    /// follows it there: what reads it back reads a constant, as far as a derivation can tell.
+    pub heap_store: Option<Vec<Span>>,
     /// The original function's local and parameter types, which the leaves are of.
     local_tys: Vec<TypeId>,
     param_tys: Vec<TypeId>,
@@ -418,6 +424,8 @@ pub(crate) struct Effect {
     pub returns: Bits,
     /// By parameter: whether it may write an active value through it (a `mut` one).
     pub writes: Vec<bool>,
+    /// Whether it puts an active value in heap memory, and where ([`Activity::heap_store`]).
+    pub heap_store: Option<Vec<Span>>,
 }
 
 /// How the activity analysis learns what a call does.
@@ -455,6 +463,7 @@ pub(crate) fn activity(
         params: params.to_vec(),
         returns: 0,
         active_loop_exit: None,
+        heap_store: None,
         local_tys: f.locals.iter().map(|l| l.ty).collect(),
         param_tys: f.params.iter().map(|p| p.ty).collect(),
     };
@@ -468,7 +477,7 @@ pub(crate) fn activity(
     };
     loop {
         let before = on(&a);
-        walk(&cx, &f.body, &mut a, None, callee);
+        walk(&cx, &f.body, &mut a, None, None, callee);
         if on(&a) == before {
             return a;
         }
@@ -519,6 +528,118 @@ impl Walk<'_> {
 /// too.
 pub(crate) struct Pointers {
     into: HashMap<ValueId, Vec<Place>>,
+    /// The pointers and runs into heap memory, not into a place, and the locals that hold one
+    /// ([`heap_views`]).
+    heap: HeapViews,
+}
+
+/// The values of a function that are, or hold, a pointer or a run into heap memory, and the
+/// locals such a value is stored in.
+#[derive(Default)]
+struct HeapViews {
+    values: HashSet<ValueId>,
+    locals: HashSet<LocalId>,
+}
+
+impl HeapViews {
+    /// Whether the place `p` of `f` is in heap memory: rooted at a pointer into it, or reached
+    /// through a local's run into it (`xs[i]`, for the run `xs` of a `Vec`). `through`: `p` is
+    /// lent to a callee that writes through it, so a local that holds such a view counts
+    /// wherever it holds it.
+    fn holds(&self, m: &Module, f: &Function, p: &Place, through: bool) -> bool {
+        match p.root {
+            PlaceRoot::Ptr(v) => self.values.contains(&v),
+            PlaceRoot::Local(l) if self.locals.contains(&l) => {
+                through
+                    || (0..p.path.len()).any(|k| {
+                        let prefix = Place { root: p.root.clone(), path: p.path[..k].to_vec() };
+                        m.place_ty(f, &prefix)
+                            .is_some_and(|t| matches!(m.types.get(t), TypeDef::Run(_)))
+                    })
+            }
+            _ => false,
+        }
+    }
+}
+
+/// Whether a value of type `t` is, or holds, a pointer or a run: a view of memory elsewhere.
+fn has_view(types: &Types, t: TypeId) -> bool {
+    match types.get(t) {
+        TypeDef::Ptr(_) | TypeDef::Run(_) => true,
+        TypeDef::Struct { fields, .. } => fields.iter().any(|(_, f)| has_view(types, *f)),
+        TypeDef::Enum { variants, .. } => {
+            variants.iter().any(|(_, p)| p.is_some_and(|p| has_view(types, p)))
+        }
+        TypeDef::Array(e, _) => has_view(types, *e),
+        _ => false,
+    }
+}
+
+/// The views of heap memory in `f`: a pointer made from a raw address ([`MemOp::Ptr`]: a
+/// `Vec`'s element, a `Box`'s value), a run made from one (a `Vec` lent as `[T]`), what a call
+/// returns when the function called returns one (a projection: `Box::get_mut`, a program's own
+/// `fn cell(mut self, i: u32) -> mut f32`), and what's built from these or loaded from a local
+/// one is stored in. `within`: the functions being asked about, so a recursion ends.
+fn heap_views(m: &Module, f: &Function, within: &mut Vec<FuncId>) -> HeapViews {
+    let mut heap = HeapViews::default();
+    // A local can be loaded before the statement that stores into it (a loop): to a fixpoint.
+    loop {
+        let before = heap.values.len() + heap.locals.len();
+        visit::walk(&f.body, &mut |s| match s {
+            Stmt::Let(v, e) if has_view(&m.types, f.value_ty(*v)) => {
+                let mut is = match e {
+                    Expr::Mem(MemOp::Ptr, _) => true,
+                    Expr::Construct(t, _) => matches!(m.types.get(*t), TypeDef::Run(_)),
+                    Expr::Call(g, _) => returns_heap_view(m, *g, within),
+                    Expr::Load(p) => {
+                        matches!(p.root, PlaceRoot::Local(l) if heap.locals.contains(&l))
+                    }
+                    // A pointer to, or a run of, a place that is in heap memory itself (what
+                    // a projection returns: `&*p`).
+                    Expr::Addr(p) | Expr::Run(p) => heap.holds(m, f, p, false),
+                    _ => false,
+                };
+                if matches!(
+                    e,
+                    Expr::Extract(..)
+                        | Expr::ExtractDyn(..)
+                        | Expr::Construct(..)
+                        | Expr::Select { .. }
+                ) {
+                    e.for_each_value(&mut |x| is |= heap.values.contains(&x));
+                }
+                if is {
+                    heap.values.insert(*v);
+                }
+            }
+            Stmt::Store(Place { root: PlaceRoot::Local(l), .. }, v) if heap.values.contains(v) => {
+                heap.locals.insert(*l);
+            }
+            _ => {}
+        });
+        if heap.values.len() + heap.locals.len() == before {
+            return heap;
+        }
+    }
+}
+
+/// Whether what the function `g` returns may be, or hold, a view of heap memory.
+fn returns_heap_view(m: &Module, g: FuncId, within: &mut Vec<FuncId>) -> bool {
+    let func = &m.functions[g.index()];
+    let views = func.ret_ref || func.ret.is_some_and(|t| has_view(&m.types, t));
+    if !views || within.contains(&g) {
+        return false;
+    }
+    within.push(g);
+    let heap = heap_views(m, func, within);
+    within.pop();
+    let mut returns = false;
+    visit::walk(&func.body, &mut |s| {
+        if let Stmt::Return(Some(v)) = s {
+            returns |= heap.values.contains(v);
+        }
+    });
+    returns
 }
 
 impl Pointers {
@@ -558,7 +679,13 @@ impl Pointers {
             };
             into.insert(*v, places);
         });
-        Pointers { into }
+        Pointers { into, heap: heap_views(m, f, &mut Vec::new()) }
+    }
+
+    /// Whether a write to the place `p` of `f` goes into heap memory ([`HeapViews::holds`]);
+    /// `through`: the write is a callee's, through `p` lent to it as a `mut` argument.
+    fn in_heap(&self, m: &Module, f: &Function, p: &Place, through: bool) -> bool {
+        self.heap.holds(m, f, p, through)
     }
 
     /// The locals and parameters the pointer `v` may point into. `None` when it can't tell.
@@ -577,33 +704,60 @@ impl Pointers {
 /// may run, and what they wrote is joined after the branch). `ctrl` then counts, by local, the
 /// places inside the innermost such branch that mention it. A local that only those places
 /// mention never reaches the join, so a store to it doesn't.
-fn walk(cx: &Walk<'_>, b: &Block, a: &mut Activity, ctrl: Option<&[u32]>, callee: &mut Callee<'_>) {
+///
+/// `at`: where in the source the block starts, if known (the last `At` before it).
+fn walk(
+    cx: &Walk<'_>,
+    b: &Block,
+    a: &mut Activity,
+    ctrl: Option<&[u32]>,
+    mut at: Option<Span>,
+    callee: &mut Callee<'_>,
+) {
     let (m, f, mode) = (cx.m, cx.f, cx.mode);
     let joined = |p: &Place| match (ctrl, &p.root) {
         (None, _) => false,
         (Some(inside), PlaceRoot::Local(l)) => inside[l.index()] != cx.uses[l.index()],
         (Some(_), _) => true,
     };
-    let mut at = None;
+    // A float stored at a raw address, when it depends on the input.
+    let stored_raw = |e: &Expr, a: &Activity| {
+        matches!(e, Expr::Mem(MemOp::Store(s), xs)
+            if s.is_float() && xs.get(1).is_some_and(|x| a.value(*x)))
+    };
+    // Where a loop is, for its exit: by the `At`s of this block alone.
+    let mut here = None;
     for s in b {
         match s {
             Stmt::Let(v, e) => {
                 let ty = f.value_ty(*v);
                 let bits = match e {
-                    Expr::Call(g, args) => call(cx, a, *g, args, &joined, callee),
+                    Expr::Call(g, args) => call(cx, a, *g, args, &joined, at, callee),
                     e => expr_bits(cx, e, a, ty),
                 };
                 a.values[v.index()] |= bits & carried(m, ty, mode);
+                if stored_raw(e, a) {
+                    a.heap_store.get_or_insert_with(|| at.into_iter().collect());
+                }
             }
             Stmt::Eval(Expr::Call(g, args)) => {
-                call(cx, a, *g, args, &joined, callee);
+                call(cx, a, *g, args, &joined, at, callee);
             }
-            Stmt::Eval(_) => {}
+            Stmt::Eval(e) => {
+                if stored_raw(e, a) {
+                    a.heap_store.get_or_insert_with(|| at.into_iter().collect());
+                }
+            }
             Stmt::Store(p, v) => {
+                let written = joined(p) || a.value(*v);
                 if joined(p) {
                     cx.mark(a, p, None);
                 } else if a.value(*v) {
                     cx.mark(a, p, Some(a.values[v.index()]));
+                }
+                // Into heap memory, where nothing follows it: a `Vec`'s element, a `Box`'s value.
+                if written && cx.ptrs.in_heap(m, f, p, false) {
+                    a.heap_store.get_or_insert_with(|| at.into_iter().collect());
                 }
             }
             Stmt::If { cond, then, else_ } => {
@@ -611,19 +765,19 @@ fn walk(cx: &Walk<'_>, b: &Block, a: &mut Activity, ctrl: Option<&[u32]>, callee
                     let mut inside = vec![0u32; f.locals.len()];
                     visit::count_local_mentions(then, &mut inside);
                     visit::count_local_mentions(else_, &mut inside);
-                    walk(cx, then, a, Some(&inside), callee);
-                    walk(cx, else_, a, Some(&inside), callee);
+                    walk(cx, then, a, Some(&inside), at, callee);
+                    walk(cx, else_, a, Some(&inside), at, callee);
                 } else {
-                    walk(cx, then, a, ctrl, callee);
-                    walk(cx, else_, a, ctrl, callee);
+                    walk(cx, then, a, ctrl, at, callee);
+                    walk(cx, else_, a, ctrl, at, callee);
                 }
             }
             Stmt::Loop { body, continuing } => {
-                walk(cx, body, a, ctrl, callee);
-                walk(cx, continuing, a, ctrl, callee);
+                walk(cx, body, a, ctrl, at, callee);
+                walk(cx, continuing, a, ctrl, at, callee);
                 if mode == Mode::Interval
                     && a.active_loop_exit.is_none()
-                    && let Some(exit) = loop_exit(body, a, at)
+                    && let Some(exit) = loop_exit(body, a, here)
                 {
                     a.active_loop_exit = Some(exit);
                 }
@@ -631,7 +785,10 @@ fn walk(cx: &Walk<'_>, b: &Block, a: &mut Activity, ctrl: Option<&[u32]>, callee
             Stmt::Return(Some(v)) => {
                 a.returns |= if ctrl.is_some() { !0 } else { a.values[v.index()] };
             }
-            Stmt::At(span) => at = Some(*span),
+            Stmt::At(span) => {
+                at = Some(*span);
+                here = Some(*span);
+            }
             Stmt::Return(None) | Stmt::Break | Stmt::Continue | Stmt::Trap => {}
         }
     }
@@ -673,26 +830,37 @@ fn loop_exit(
     None
 }
 
-/// A call: the active leaves of its result. A callee given active arguments may write active
-/// values through its `mut` parameters (those its own activity marks), and in interval mode,
-/// so may one that runs under a condition on the input (`joined`).
+/// A call (at `at` in the source, if known): the active leaves of its result. A callee given
+/// active arguments may write active values through its `mut` parameters (those its own
+/// activity marks), and in interval mode, so may one that runs under a condition on the input
+/// (`joined`). What it puts in heap memory, the caller does through it.
 fn call(
     cx: &Walk<'_>,
     a: &mut Activity,
     g: FuncId,
     args: &[Arg],
     joined: &dyn Fn(&Place) -> bool,
+    at: Option<Span>,
     callee: &mut Callee<'_>,
 ) -> Bits {
     let mask: Vec<Bits> = args.iter().map(|x| arg_bits(cx.m, cx.f, a, x)).collect();
     // Arguments map to the callee's parameters one to one.
     let effect = mask.iter().any(|b| *b != 0).then(|| callee(g, mask));
+    if a.heap_store.is_none()
+        && let Some(stored) = effect.as_ref().and_then(|e| e.heap_store.as_ref())
+    {
+        a.heap_store = Some(stored.iter().copied().chain(at).collect());
+    }
     for (i, (arg, p)) in args.iter().zip(&cx.m.functions[g.index()].params).enumerate() {
         let writes = effect.as_ref().is_some_and(|e| e.writes[i]);
         if let (Arg::Place(pl), true) = (arg, p.mutable)
             && (writes || joined(pl))
         {
             cx.mark(a, pl, None);
+            // A `Vec`'s element, or its elements as a run, lent to a callee that writes it.
+            if cx.ptrs.in_heap(cx.m, cx.f, pl, true) {
+                a.heap_store.get_or_insert_with(|| at.into_iter().collect());
+            }
         }
     }
     effect.map_or(0, |e| e.returns)
@@ -790,7 +958,7 @@ pub(super) fn effect(
         Some(Some(e)) => return e.clone(),
         Some(None) => {
             let writes = func.params.iter().map(|p| p.mutable).collect();
-            return Effect { returns: ret_bits, writes };
+            return Effect { returns: ret_bits, writes, heap_store: None };
         }
         None => {}
     }
@@ -813,7 +981,7 @@ pub(super) fn effect(
     let done = flagged.as_ref().unwrap_or(&a);
     let returns = done.returns & ret_bits;
     let writes = func.params.iter().zip(&done.params).map(|(p, w)| p.mutable && *w != 0).collect();
-    let e = Effect { returns, writes };
+    let e = Effect { returns, writes, heap_store: done.heap_store.clone() };
     cache.effects.insert(key.clone(), Some(e.clone()));
     // An activity that took no answer from a function still being analyzed is final: deriving
     // `f` would find it again.
@@ -1010,17 +1178,34 @@ fn harmless(op: &MemOp) -> bool {
     }
 }
 
-/// An error if a function's body records GPU work (a host operation) or moves memory other than
-/// harmlessly, which a derived function can't do.
-pub(super) fn no_gpu_work(body: &Block) -> Result<()> {
-    // Where: the last `At` before it (`at` before the block).
-    fn find(b: &Block, mut at: Option<wrela_diag::Span>) -> Option<Option<wrela_diag::Span>> {
+/// Whether a raw memory operation is work with other threads: an atomic, a wait or a wake, a
+/// task handed to the workers.
+fn threads(op: &MemOp) -> bool {
+    use MemOp as M;
+    matches!(
+        op,
+        M::Cas
+            | M::WaitFor
+            | M::AtomicAdd
+            | M::AtomicLoad
+            | M::AtomicStore
+            | M::Wait
+            | M::Notify
+            | M::RunTask
+    )
+}
+
+/// An error if a function's body does what a derived function can't: records GPU work (a host
+/// operation), works with other threads, or reads or writes heap memory other than harmlessly
+/// (the first of them in the body; where, by the last `At` before it).
+pub(super) fn no_gpu_or_heap_work(body: &Block) -> Result<()> {
+    fn find(b: &Block, mut at: Option<Span>) -> Option<(&Expr, Option<Span>)> {
         for s in b {
             match s {
                 Stmt::At(span) => at = Some(*span),
                 Stmt::Let(_, Expr::Mem(op, _)) | Stmt::Eval(Expr::Mem(op, _)) if harmless(op) => {}
-                Stmt::Let(_, Expr::Host(..) | Expr::Mem(..))
-                | Stmt::Eval(Expr::Host(..) | Expr::Mem(..)) => return Some(at),
+                Stmt::Let(_, e @ (Expr::Host(..) | Expr::Mem(..)))
+                | Stmt::Eval(e @ (Expr::Host(..) | Expr::Mem(..))) => return Some((e, at)),
                 _ => {
                     if let Some(r) = s.blocks().find_map(|inner| find(inner, at)) {
                         return Some(r);
@@ -1031,12 +1216,38 @@ pub(super) fn no_gpu_work(body: &Block) -> Result<()> {
         None
     }
     match find(body, None) {
-        Some(at) => {
+        Some((Expr::Mem(op, _), at)) if threads(op) => Err(Error::not_derivable(
+            "this works with other threads (an atomic, a wait, a task), which a derived \
+             function can't do",
+        )
+        .at(at)),
+        Some((Expr::Mem(..), at)) => Err(Error::heap_memory(
+            "this reads or writes heap memory (a `Vec`, a `String`, a `Box`), where a \
+             derivation can't follow a float",
+        )
+        .at(at)),
+        Some((_, at)) => {
             Err(Error::not_derivable("this records GPU work, which a derived function can't do")
                 .at(at))
         }
         None => Ok(()),
     }
+}
+
+/// An error if `act` found a value that depends on the input put in heap memory, in the
+/// function or in one it calls with what depends on the input ([`Activity::heap_store`]). A
+/// function that isn't derived (its result carries no derivative, as far as its activity
+/// shows) runs as it is, so the store would go unseen, and what reads the memory back would
+/// read a constant: a derivative of 0, with no error.
+pub(super) fn no_heap_store(act: &Activity) -> Result<()> {
+    let Some(stored) = &act.heap_store else { return Ok(()) };
+    Err(Error::HeapMemory(
+        "this puts a value that depends on the input in heap memory (a `Vec`, a `String`, a \
+         `Box`), where a derivation can't follow it"
+            .to_string(),
+        stored.first().copied(),
+        stored.iter().skip(1).copied().collect(),
+    ))
 }
 
 /// An error if deriving `func` would write `what` (a derivative, a range) through a `mut`
