@@ -1,0 +1,158 @@
+// CPU loops (plan stage L's bench): the loops programs write, each over 2^20 elements. A loop
+// over runs (`[f32]`, which runs four at a time today: the control); the same over `Vec`s; a
+// `Vec` loop with a branch; a loop over a `Vec<Particle>` that reads two of its eight fields;
+// an integer sum of a `Vec<u32>`. Each is an export (`k_*`, `reps` times, a checksum of what it
+// wrote: compiler/tests/tests/suite/loops.rs compares a build with SIMD against one without)
+// and a phase of the frame (`std::time::phase`, for `wrela profile --compare`).
+use std::time::phase
+
+const N: u32 = 1048576
+
+struct Particle: Copy {
+    px: f32,
+    py: f32,
+    pz: f32,
+    vx: f32,
+    vy: f32,
+    vz: f32,
+    mass: f32,
+    age: f32,
+}
+
+pub struct State {
+    a: Vec<f32>,
+    b: Vec<f32>,
+    out: Vec<f32>,
+    ps: Vec<Particle>,
+    idx: Vec<u32>,
+}
+
+pub fn init() -> State {
+    var a = Vec::new()
+    var b = Vec::new()
+    var out = Vec::new()
+    var ps = Vec::new()
+    var idx = Vec::new()
+    var h: u32 = 5
+    for i in 0..N {
+        h = h.wrapping_mul(1664525).wrapping_add(1013904223)
+        let x = f32(h >> 8) * (1.0 / 16777216.0) * 2.0 - 1.0
+        a.push(x)
+        b.push(x * 0.5 + 0.25)
+        out.push(0.0)
+        ps.push(
+            Particle {
+                px: x,
+                py: -x,
+                pz: 0.5,
+                vx: 0.25 * x,
+                vy: 1.0,
+                vz: 0.0,
+                mass: 2.0,
+                age: f32(i % 7),
+            },
+        )
+        idx.push(h >> 4)
+    }
+    State { a, b, out, ps, idx }
+}
+
+/// Over runs: the control, which runs four at a time today.
+fn over_runs(out: mut [f32], a: [f32], b: [f32], n: u32) {
+    for i in 0..n {
+        out[i] = a[i] * 1.5 + b[i]
+    }
+}
+
+/// The same over `Vec`s.
+fn over_vecs(out: mut Vec<f32>, a: Vec<f32>, b: Vec<f32>) {
+    for i in 0..a.len() {
+        out[i] = a[i] * 1.5 + b[i]
+    }
+}
+
+/// A branch in the loop.
+fn branchy(out: mut Vec<f32>, a: Vec<f32>) {
+    for i in 0..a.len() {
+        if a[i] > 0.0 {
+            out[i] = a[i] * 2.0
+        } else {
+            out[i] = -1.0
+        }
+    }
+}
+
+/// Two of a particle's eight fields.
+fn particles(out: mut Vec<f32>, ps: Vec<Particle>) {
+    for i in 0..ps.len() {
+        out[i] = ps[i].px * 0.5 + ps[i].vx
+    }
+}
+
+/// An integer sum.
+fn index_sum(idx: Vec<u32>) -> u32 {
+    var s: u32 = 0
+    for i in 0..idx.len() {
+        s = s.wrapping_add(idx[i])
+    }
+    s
+}
+
+/// `out`'s bits, hashed.
+fn checksum(out: Vec<f32>) -> u32 {
+    var h: u32 = 2166136261
+    for x in out {
+        h = (h ^ bitcast_u32(x)).wrapping_mul(16777619)
+    }
+    h
+}
+
+pub fn k_runs(s: mut State, reps: u32) -> u32 {
+    for _ in 0..reps {
+        over_runs(mut s.out, s.a, s.b, N)
+    }
+    checksum(s.out)
+}
+
+pub fn k_vecs(s: mut State, reps: u32) -> u32 {
+    for _ in 0..reps {
+        over_vecs(mut s.out, s.a, s.b)
+    }
+    checksum(s.out)
+}
+
+pub fn k_branchy(s: mut State, reps: u32) -> u32 {
+    for _ in 0..reps {
+        branchy(mut s.out, s.a)
+    }
+    checksum(s.out)
+}
+
+pub fn k_particles(s: mut State, reps: u32) -> u32 {
+    for _ in 0..reps {
+        particles(mut s.out, s.ps)
+    }
+    checksum(s.out)
+}
+
+pub fn k_index_sum(s: mut State, reps: u32) -> u32 {
+    var t: u32 = 0
+    for _ in 0..reps {
+        t = t.wrapping_add(index_sum(s.idx))
+    }
+    t
+}
+
+pub fn frame(s: mut State, time: f32, width: u32, height: u32) {
+    phase("runs")
+    over_runs(mut s.out, s.a, s.b, N)
+    phase("vecs")
+    over_vecs(mut s.out, s.a, s.b)
+    phase("branchy")
+    branchy(mut s.out, s.a)
+    phase("particles")
+    particles(mut s.out, s.ps)
+    phase("index sum")
+    let _ = index_sum(s.idx)
+    phase("rest")
+}

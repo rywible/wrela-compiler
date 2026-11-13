@@ -33,6 +33,7 @@ mod language;
 mod lift;
 mod limits;
 mod lipschitz;
+mod loops;
 mod lower_constants_sweep;
 mod lower_gpu_sweep;
 mod lower_sweep;
