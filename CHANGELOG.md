@@ -50,7 +50,8 @@ detail; `docs/release.md` says how a release is cut.
 - **`wrela build --report layout`** lists, for each loop over a container or array of structs,
   the bytes of the struct it reads and writes, the most skipped first (§6.10).
 - **GPU fixes the compiler's own tests found** (§11.3): `tanh` no longer gives NaN for large
-  arguments, `atan2(0, 0)` is 0 on every GPU as on the CPU, and an unsigned division whose
+  arguments, `atan2` of two zeros gives the CPU's bits on every GPU (y where x is +0, π with y's sign
+  where x is -0), and an unsigned division whose
   dividend is a constant near 2^32 is right on Apple's GPUs (Metal divided it wrongly).
 
 ## 0.33.0

@@ -1819,8 +1819,9 @@ impl<'a, 'm> Fb<'a, 'm> {
             }
         };
         let r = self.expr(e, out);
-        // `atan2(0, 0)` is 0 on the CPU (the WASM's, as C's for +0 and +0), and NaN on Metal (the
-        // typed programs' oracle O6 found it): written as 0 where both are 0, on every GPU.
+        // `atan2(y, x)` with both 0 is NaN on Metal (the typed programs' oracle O6 found it); on
+        // the CPU (the WASM's, as C's) it's y where x is +0 (+0 or -0, y's sign), and π with y's
+        // sign where x is -0. Written so, by the zeros' sign bits, on every GPU.
         if b == B::Atan2 {
             let n = match self.cx.m.types.get(self.f.value_ty(args[0])) {
                 ir::TypeDef::Vector(_, n) => Some(*n),
@@ -1837,8 +1838,40 @@ impl<'a, 'm> Fb<'a, 'm> {
             let (ey, ex) = (eq(self, hs[0], out), eq(self, hs[1], out));
             let both =
                 self.expr(Expression::Binary { op: BinaryOperator::And, left: ey, right: ex }, out);
+            let splat = |me: &mut Self, l: Handle<Expression>, out: &mut Block| match n {
+                Some(n) => me.expr(Expression::Splat { size: vsize(n), value: l }, out),
+                None => l,
+            };
+            // Whether a float's sign bit is set: its bits shifted down 31 aren't 0.
+            let negative = |me: &mut Self, h, out: &mut Block| {
+                let bits = me.expr(
+                    Expression::As { expr: h, kind: naga::ScalarKind::Uint, convert: None },
+                    out,
+                );
+                let l31 = me.lit(Literal::U32(31), out);
+                let s31 = splat(me, l31, out);
+                let top = me.expr(
+                    Expression::Binary { op: BinaryOperator::ShiftRight, left: bits, right: s31 },
+                    out,
+                );
+                let l0 = me.lit(Literal::U32(0), out);
+                let u0 = splat(me, l0, out);
+                me.expr(
+                    Expression::Binary { op: BinaryOperator::NotEqual, left: top, right: u0 },
+                    out,
+                )
+            };
+            let (sy, sx) = (negative(self, hs[0], out), negative(self, hs[1], out));
+            let lpi = self.lit(Literal::F32(std::f32::consts::PI), out);
+            let pi = splat(self, lpi, out);
+            let lnpi = self.lit(Literal::F32(-std::f32::consts::PI), out);
+            let npi = splat(self, lnpi, out);
+            let signed_pi =
+                self.expr(Expression::Select { condition: sy, accept: npi, reject: pi }, out);
+            let at_zero = self
+                .expr(Expression::Select { condition: sx, accept: signed_pi, reject: hs[0] }, out);
             return Ok(
-                self.expr(Expression::Select { condition: both, accept: zero, reject: r }, out)
+                self.expr(Expression::Select { condition: both, accept: at_zero, reject: r }, out)
             );
         }
         Ok(r)

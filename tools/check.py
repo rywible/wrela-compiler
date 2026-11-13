@@ -41,7 +41,8 @@ SOURCES = ("compiler/std", "compiler/tests/fields", "compiler/tests/math", "comp
            "compiler/tests/tiers", "compiler/tests/overrides", "compiler/tests/override_bench",
            "compiler/tests/tape_ops", "compiler/tests/tape_long", "compiler/tests/tape_cases",
            "compiler/tests/gather", "compiler/tests/assoc_consts",
-           "compiler/tests/passes8", "compiler/tests/sampled", "compiler/tests/png")
+           "compiler/tests/passes8", "compiler/tests/sampled", "compiler/tests/png",
+           "compiler/tests/atan2_zeros", "compiler/tests/stale")
 # Clippy and the doc tests hold Cargo's lock and many cores, so they run before the lanes.
 CARGO_STEPS = ("clippy", "doc")
 LIGHT_STEPS = ("rustfmt", "wrela-fmt", "tools", "browser-types", "browser-dist", "browser-size",
