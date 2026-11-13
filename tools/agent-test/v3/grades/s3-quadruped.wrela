@@ -1,0 +1,54 @@
+use shape::subject
+use std::field::{Surface, View, coverage, ellipsoid, round_cone}
+
+/// The blueprint: the silhouette the brief describes.
+fn blueprint() -> Surface {
+    let body = ellipsoid(vec3(0.5, 0.18, 0.15)).translate(vec3(0.0, 0.6, 0.0)).named("body")
+    let leg = |x: f32, z: f32| round_cone(vec3(x, 0.04, z), vec3(x, 0.6, z), r_top: 0.05, r_bottom: 0.04)
+    let legs = leg(0.35, 0.1).union(leg(0.35, -0.1)).union(leg(-0.35, 0.1)).union(leg(-0.35, -0.1)).named("legs")
+    let neck = round_cone(vec3(0.38, 0.62, 0.0), vec3(0.66, 0.92, 0.0), r_top: 0.06, r_bottom: 0.1).named("neck")
+    let head = ellipsoid(vec3(0.12, 0.08, 0.07)).translate(vec3(0.72, 0.95, 0.0)).named("head")
+    body.smooth_union(legs, k: 0.04).smooth_union(neck, k: 0.05).smooth_union(head, k: 0.03)
+}
+
+@test
+fn grade_inside_and_outside() {
+    let f = subject()
+    for p in [
+        vec3(0, 0.6, 0),
+        vec3(0.35, 0.2, 0.1),
+        vec3(-0.35, 0.2, -0.1),
+        vec3(0.72, 0.95, 0),
+        vec3(0.55, 0.78, 0),
+    ] {
+        assert(f.distance(p) < 0.0, f"{p.x}, {p.y}, {p.z} should be inside")
+    }
+    for p in [
+        vec3(0, 0.2, 0),
+        vec3(0, 0.9, 0),
+        vec3(0.72, 0.6, 0),
+    ] {
+        assert(f.distance(p) > 0.0, f"{p.x}, {p.y}, {p.z} should be outside")
+    }
+}
+
+/// Its front silhouette against the blueprint's: the root mean square difference of
+/// their coverage over a 40 by 40 grid, under 0.1.
+@test
+fn grade_outline() {
+    let (f, b) = (subject(), blueprint())
+    let lo = vec2(-0.6, -0.05)
+    let cell = (vec2(0.9, 1.1) - lo) / 40.0
+    var sum = 0.0
+    for j in 0..40 {
+        for i in 0..40 {
+            let c = lo + (vec2(f32(i), f32(j)) + vec2(0.5)) * cell
+            let w = max(cell.x, cell.y)
+            let d = coverage(f, View::Front, c, w, near: -0.25, far: 0.25) -
+                coverage(b, View::Front, c, w, near: -0.25, far: 0.25)
+            sum += d * d
+        }
+    }
+    let miss = sqrt(sum / 1600.0)
+    assert(miss < 0.1, f"its front outline misses the blueprint's by {miss}")
+}

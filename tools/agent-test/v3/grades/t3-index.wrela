@@ -1,0 +1,7 @@
+use main::slot
+
+@test
+fn grade_slot() {
+    assert(slot(30) == 3 && slot(35) == 9 && slot(37) == 6)
+    assert(slot(5) == 0 && slot(38) == 0 && slot(1000) == 0)
+}

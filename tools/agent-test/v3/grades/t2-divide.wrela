@@ -1,0 +1,9 @@
+use main::spread
+
+@test
+fn grade_spread() {
+    assert(spread(300.5) == 0)
+    assert(spread(310.0) == 100)
+    assert(spread(200.0) == -10)
+    assert(spread(301.0) == 1000)
+}

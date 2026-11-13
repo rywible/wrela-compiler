@@ -1,0 +1,9 @@
+use std::field::{Surface, round_cone}
+
+/// The pole is far too short: the shade floats.
+pub fn subject() -> Surface {
+    let base = round_cone(vec3(0.0, 0.0, 0.0), vec3(0.0, 0.02, 0.0), r_top: 0.15, r_bottom: 0.15).named("base")
+    let pole = round_cone(vec3(0.0, 0.02, 0.0), vec3(0.0, 0.15, 0.0), r_top: 0.03, r_bottom: 0.03).named("pole")
+    let shade = round_cone(vec3(0.0, 0.5, 0.0), vec3(0.0, 0.6, 0.0), r_top: 0.18, r_bottom: 0.09).named("shade")
+    base.union(pole).union(shade)
+}

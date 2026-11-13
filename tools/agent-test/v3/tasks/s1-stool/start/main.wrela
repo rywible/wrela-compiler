@@ -1,0 +1,2 @@
+// Write `pub fn subject() -> Surface` in shape.wrela.
+pub fn frame(time: f32, width: u32, height: u32) {}

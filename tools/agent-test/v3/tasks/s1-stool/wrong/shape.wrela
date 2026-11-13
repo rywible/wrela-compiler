@@ -1,0 +1,11 @@
+use std::field::{Surface, cuboid, round_cone}
+
+/// The legs stop short of the seat: four pieces apart from it.
+pub fn subject() -> Surface {
+    let seat = cuboid(vec3(0.3, 0.03, 0.3)).translate(vec3(0.0, 0.6, 0.0)).named("seat")
+    let leg = |x: f32, z: f32| round_cone(vec3(x, 0.03, z), vec3(x, 0.5, z), r_top: 0.03, r_bottom: 0.03)
+    seat.union(leg(0.24, 0.24).named("leg"))
+        .union(leg(-0.24, 0.24).named("leg"))
+        .union(leg(0.24, -0.24).named("leg"))
+        .union(leg(-0.24, -0.24).named("leg"))
+}

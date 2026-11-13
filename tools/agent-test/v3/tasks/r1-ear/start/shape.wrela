@@ -1,0 +1,8 @@
+use std::field::{Surface, sphere}
+
+pub fn subject() -> Surface {
+    let head = sphere(radius: 0.3).named("head")
+    let left = sphere(radius: 0.08).translate(vec3(-0.18, 0.28, 0.0)).named("left ear")
+    let right = sphere(radius: 0.08).translate(vec3(0.18, 0.46, 0.0)).named("right ear")
+    head.union(left).union(right)
+}

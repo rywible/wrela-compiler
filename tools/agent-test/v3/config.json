@@ -1,0 +1,36 @@
+{
+  "test": "wrela agent test, version 3: fresh agents change packages (make a shape, repair one, find a wrong pixel, stop a trap, make a GPU function cheaper), each graded by what was made and how it runs (grading.py), and each task run with and without the tools the superpowers plan added (run.py --tools). A new baseline, not comparable with version 2's.",
+  "version": 3,
+  "model": "claude-sonnet-5-5",
+  "max_attempts": 8,
+  "budget_usd": 2,
+  "context_sets": {
+    "full": [
+      "spec/language.md",
+      "spec/lexical.md",
+      "spec/grammar.ebnf",
+      "compiler/tests/frozen/hello-field/main.wrela",
+      "compiler/tests/frozen/hello-field/shape.wrela"
+    ]
+  },
+  "tools": {
+    "without": [
+      "doc",
+      "explain",
+      "primer"
+    ],
+    "with": [
+      "doc",
+      "explain",
+      "primer",
+      "pixel",
+      "inspect",
+      "sliders",
+      "fuzz",
+      "twin",
+      "solve",
+      "test"
+    ]
+  },
+  "brief": "You're changing a program in wrela, a new programming language for games, to measure how well agents use it. Read these files first, and only these (no other files in the repository: not the compiler, its tests or its standard library sources): {context}.\n\nYour task ({id}): {task}\n\nThe package is {dir}/pkg: change its files there (it exists, with the files the task starts from). To compile, run exactly `{attempt} {dir}`, as a command of its own (not joined to another with `&&` or `;`): it builds the package, records the attempt and prints the compiler's diagnostics. You may also run these, each alone: {tools}. Those are the only commands allowed; don't run the compiler any other way. You have at most {max_attempts} attempts. Every attempt is graded by what the program makes and how it runs, by checks you can't see, so a program that builds but doesn't do what the task says counts as wrong: stop when it builds and you are confident it does what the task says.\n\nWhen you're done, report: (1) whether it built, and on which attempt; (2) for each attempt, what you changed and why; (3) which commands helped, and anything in the language, its tools or its documentation that misled you."
+}

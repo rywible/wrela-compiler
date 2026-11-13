@@ -1,0 +1,10 @@
+use std::field::{Surface, round_cone}
+
+/// Solid: no inside to drink from.
+pub fn subject() -> Surface {
+    let cup = round_cone(vec3(0.0, 0.0, 0.0), vec3(0.0, 0.5, 0.0), r_top: 0.2, r_bottom: 0.2).named("cup")
+    let top = round_cone(vec3(0.17, 0.36, 0.0), vec3(0.31, 0.36, 0.0), r_top: 0.022, r_bottom: 0.022)
+    let side = round_cone(vec3(0.31, 0.14, 0.0), vec3(0.31, 0.36, 0.0), r_top: 0.022, r_bottom: 0.022)
+    let low = round_cone(vec3(0.17, 0.14, 0.0), vec3(0.31, 0.14, 0.0), r_top: 0.022, r_bottom: 0.022)
+    cup.union(top.union(side).union(low).named("handle"))
+}

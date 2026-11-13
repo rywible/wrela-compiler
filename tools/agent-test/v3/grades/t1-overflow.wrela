@@ -1,0 +1,9 @@
+use main::add_key
+
+@test
+fn grade_add_key() {
+    assert(add_key(1, 2) == 3)
+    assert(add_key(250, 10) == 4)
+    assert(add_key(255, 1) == 0)
+    assert(add_key(0, 300) == 44)
+}
