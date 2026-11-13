@@ -135,6 +135,7 @@ mod test;
 mod tool;
 mod toolchain;
 mod trace;
+mod twin;
 
 pub(crate) fn usage() -> ExitCode {
     let lines = [
@@ -150,6 +151,7 @@ pub(crate) fn usage() -> ExitCode {
         "wrela pipelines <package-dir> [--set NAME=VALUE]... [--json]",
         "wrela inspect <package-dir> <module>::<fn> [--depth <n>] [--region <lo>..<hi>,<lo>..<hi>,<lo>..<hi>] [--thin <metres>] [--lift] [--views <dir>] [--json]",
         "wrela sliders <package-dir> <module>::<fn> --free <file>[:<lines or names>]... [--top <k>] [--depth <n>] [--region <lo>..<hi>,<lo>..<hi>,<lo>..<hi>] [--move <i>=<amount>]... [--write] [--sheet <file.png>] [--json]",
+        "wrela twin <package-dir> <module>::<fn> --box <lo>..<hi>[,<lo>..<hi>]... --within <eps> [--name <twin>] [--write | --check] [--json]",
         "wrela pixel <package-dir> --frame <n> (--at <x>,<y> [--draw <k>] [--fragment <j>] | --kernel <label> --id <i>) [--input <script.json>] [--size <w>x<h>] [--line <file>:<line>] [--full] [--json]",
         "wrela fuzz <package-dir> [--ticks <n>] [--time <seconds> | --runs <n>] [--seed <n>] [--fuel <n>] [--seeds <dir>] [--out <dir>] [--replay <file-or-dir>] [--room] [--json]",
         "wrela profile <package-dir> [--frames n] [--warmup n] [--workers n] [--size WxH] [--input <script.json>] [--scenario name] [--serial] [--worst n] [--chrome [--features none|<list>] [--checked]] [--optimize size|speed] [--relaxed-simd] [--json] [--baseline <report.json> | --compare <build-dir> [--pairs n]]",
@@ -210,6 +212,7 @@ fn main() -> ExitCode {
         "inspect" => inspect::run(rest),
         "sliders" => sliders::run(rest),
         "fuzz" => fuzz::run(rest),
+        "twin" => twin::run(rest),
         "profile" => profile::run(rest),
         "test" => {
             // Each tool test runs in a process of this executable's (§13.2).
