@@ -251,6 +251,41 @@ fn total(xs: [f32], n: u32) -> f32 {
     s
 }
 
+/// `kernel` over `Vec`s: each element read behind its check, as `n` isn't any `Vec`'s length.
+fn vec_kernel(out: mut Vec<f32>, a: Vec<f32>, b: Vec<f32>, s: f32, n: u32) {
+    for i in 0..n {
+        let x = a[i] * s + b[i]
+        let y = select(if_false: -x, if_true: sqrt(x), cond: x > 0.0)
+        out[i] = min(x, y) + f32(i) * 0.5
+    }
+}
+
+/// Over a `Vec`'s own length, in place (its check proven away, `ir::ranges`).
+fn vec_in_place(xs: mut Vec<f32>, b: Vec<f32>) {
+    for i in 0..xs.len() {
+        xs[i] = clamp(xs[i] * xs[i] - b[i], -4.0, 1.0e30) / 3.0
+    }
+}
+
+/// `n` (at most 64) of case `seed`'s components in `Vec`s, through the `Vec` loops, hashed.
+fn vec_loops(seed: u32, n: u32) -> u32 {
+    var a = Vec::new()
+    var b = Vec::new()
+    var out = Vec::new()
+    for i in 0..n {
+        a.push(comp(seed, i))
+        b.push(comp(seed, i + 64))
+        out.push(0.0)
+    }
+    vec_kernel(mut out, a, b, comp(seed, 200), n)
+    vec_in_place(mut a, b)
+    var h = 2166136261
+    for i in 0..n {
+        h = mix_in(mix_in(h, out[i]), a[i])
+    }
+    h
+}
+
 /// Each loop above on `n` elements (at most 64) of case `seed`'s components, hashed.
 pub fn loops(seed: u32, n: u32) -> u32 {
     var a: [f32; 64] = [0.0; 64]
@@ -271,7 +306,7 @@ pub fn loops(seed: u32, n: u32) -> u32 {
     for i in 0..64 {
         h = mix_in(mix_in(h, out[i]), a[i])
     }
-    mix_in(h, total(out, n))
+    mix_in(h, total(out, n)) ^ vec_loops(seed, n)
 }
 
 /// `kernel` with a run of 40 for `b`: past 40 elements, it traps where it would one at a time,
@@ -288,13 +323,58 @@ pub fn short(n: u32) -> u32 {
     h
 }
 
-/// The same, but `out` holds what was written when a trap stops it: read it after.
+/// `vec_kernel` with a `Vec` of 40 for `b`: the same.
+pub fn vec_short(n: u32) -> u32 {
+    var a = Vec::new()
+    var b = Vec::new()
+    var out = Vec::new()
+    for i in 0..64 {
+        a.push(1.5)
+        out.push(0.0)
+        if i < 40 {
+            b.push(0.25)
+        }
+    }
+    vec_kernel(mut out, a, b, 2.0, n)
+    var h = 2166136261
+    for i in 0..64 {
+        h = mix_in(h, out[i])
+    }
+    h
+}
+
+/// The same, but `out` (or `vout`) holds what was written when a trap stops it: read it after.
 pub struct Shorts {
     out: [f32; 64],
+    vout: Vec<f32>,
 }
 
 pub fn init() -> Shorts {
-    Shorts { out: [0.0; 64] }
+    var vout = Vec::new()
+    for _ in 0..64 {
+        vout.push(0.0)
+    }
+    Shorts { out: [0.0; 64], vout }
+}
+
+pub fn vec_short_into(state: mut Shorts, n: u32) {
+    var a = Vec::new()
+    var b = Vec::new()
+    for i in 0..64 {
+        a.push(1.5)
+        if i < 40 {
+            b.push(0.25)
+        }
+    }
+    vec_kernel(mut state.vout, a, b, 2.0, n)
+}
+
+pub fn vec_short_written(state: Shorts) -> u32 {
+    var h = 2166136261
+    for i in 0..64 {
+        h = mix_in(h, state.vout[i])
+    }
+    h
 }
 
 pub fn short_into(state: mut Shorts, n: u32) {

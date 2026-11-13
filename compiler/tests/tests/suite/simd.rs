@@ -80,20 +80,23 @@ fn loops_four_at_a_time_have_the_same_bits() {
             assert!(same(&x, &y), "loops({seed}, {n}): {x:?} with SIMD, {y:?} without");
         }
     }
-    for n in [0, 3, 4, 36, 39, 40, 41, 43, 44, 45, 64] {
-        let [a, b] = &mut hosts;
-        let args = [Value::I32(n)];
-        let (x, y) = (a.call_export("short", &args), b.call_export("short", &args));
-        assert!(same(&x, &y), "short({n}): {x:?} with SIMD, {y:?} without");
-        assert_eq!(x.is_err(), n > 40, "short({n}): {x:?}");
-        // What a trap leaves written.
-        for h in [&mut *a, &mut *b] {
-            h.frame(0.0, 4, 4).expect("frame");
-            let _ = h.call_export("short_into", &args);
+    // Over runs, then over `Vec`s (each element behind its bounds check).
+    for k in ["short", "vec_short"] {
+        for n in [0, 3, 4, 36, 39, 40, 41, 43, 44, 45, 64] {
+            let [a, b] = &mut hosts;
+            let args = [Value::I32(n)];
+            let (x, y) = (a.call_export(k, &args), b.call_export(k, &args));
+            assert!(same(&x, &y), "{k}({n}): {x:?} with SIMD, {y:?} without");
+            assert_eq!(x.is_err(), n > 40, "{k}({n}): {x:?}");
+            // What a trap leaves written.
+            for h in [&mut *a, &mut *b] {
+                h.frame(0.0, 4, 4).expect("frame");
+                let _ = h.call_export(&format!("{k}_into"), &args);
+            }
+            let x = a.call_export(&format!("{k}_written"), &[]).expect("read");
+            let y = b.call_export(&format!("{k}_written"), &[]).expect("read");
+            assert_eq!(x, y, "{k}_into({n}) wrote different elements before it stopped");
         }
-        let x = a.call_export("short_written", &[]).expect("read");
-        let y = b.call_export("short_written", &[]).expect("read");
-        assert_eq!(x, y, "short_into({n}) wrote different elements before it stopped");
     }
 }
 
