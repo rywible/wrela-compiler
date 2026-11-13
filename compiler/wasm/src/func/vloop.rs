@@ -1,6 +1,7 @@
 //! Loops run four iterations at a time, in SIMD (language.md §11, AC12).
 //!
-//! A loop qualifies when it counts a `u32` up by one to a bound computed before it (a `for` over
+//! A loop qualifies when it counts a `u32` up by one (an `Add`, or the `WrappingAdd` a range proof
+//! makes it, `ir::ranges`) to a bound computed before it (a `for` over
 //! a range, `0..xs.len()`), and its body, after the exit test, is straight-line code that
 //!
 //! - reads and writes `f32` elements at the counter's index, and only there, of arrays and
@@ -93,7 +94,7 @@ pub(super) fn plan<'a>(fe: &Fe, body: &'a [ir::Stmt], continuing: &[ir::Stmt]) -
     let [
         ir::Stmt::Let(a, ir::Expr::Load(ap)),
         ir::Stmt::Let(one, ir::Expr::Const(ir::Const::U32(1))),
-        ir::Stmt::Let(sum, ir::Expr::Binary(ir::BinOp::Add, x, y)),
+        ir::Stmt::Let(sum, ir::Expr::Binary(ir::BinOp::Add | ir::BinOp::WrappingAdd, x, y)),
         ir::Stmt::Store(sp, z),
     ] = cont.as_slice()
     else {
