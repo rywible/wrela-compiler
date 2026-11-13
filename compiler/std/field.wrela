@@ -3637,7 +3637,7 @@ fn a_thin_plate_is_a_thin_part() {
 
 @test
 fn a_balls_middle_row_is_opaque_in_the_middle_clear_at_its_ends_and_lit_toward_the_light() {
-    let row = preview(sphere(0.5), View::Front, Box3 { lo: vec3(-0.6), hi: vec3(0.6) }, 64, 32)
+    let row = preview(sphere(0.5), View::Front, Box3 { lo: vec3(-0.6), hi: vec3(0.6) }, size: 64, row: 32)
     assert(row[0].w == 0.0 && row[63].w == 0.0)
     assert(row[32].w == 1.0)
     // The light is from +x, so the right of the ball is brighter than its left.

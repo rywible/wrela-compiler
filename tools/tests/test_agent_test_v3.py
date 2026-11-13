@@ -9,6 +9,7 @@ gives the release compiler it builds); without it, this checkout's release compi
 first. The pixel and make-it-cheaper grades run frames on this machine's GPU.
 """
 
+import importlib.util
 import json
 import os
 import subprocess
@@ -20,9 +21,26 @@ from concurrent.futures import ThreadPoolExecutor
 TESTS = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.dirname(os.path.dirname(TESTS))
 V3 = os.path.join(ROOT, "tools", "agent-test", "v3")
-sys.path.insert(0, V3)
-import grading  # noqa: E402
-import score  # noqa: E402
+
+
+def _load(name):
+    """v3's `name`.py, under a name of its own: version 2's modules have the same names, and
+    the test runner loads both versions' tests in one process."""
+    spec = importlib.util.spec_from_file_location(f"agent_test_v3_{name}", os.path.join(V3, name + ".py"))
+    m = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(m)
+    return m
+
+
+# score.py imports `grading`: while it loads, that is v3's.
+_other = sys.modules.get("grading")
+grading = _load("grading")
+sys.modules["grading"] = grading
+score = _load("score")
+if _other is not None:
+    sys.modules["grading"] = _other
+else:
+    del sys.modules["grading"]
 
 _built = []
 

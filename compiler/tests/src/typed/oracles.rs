@@ -12,6 +12,8 @@
 //! | O7 | the interpreter agrees | the GPU code interpreted (`wrela_ir::interp`) gives the GPU's value, within O6's bound |
 //! | O8 | reverse mode agrees | `std::derive::reverse`'s gradient within `1e-5 (1 + |g|)` of `gradient`'s |
 //! | O6 | the targets agree | the GPU's value inside its interval (within 8 ulps: Metal's fast math reassociates), and near the CPU's |
+//! | O9 | the error walk is sound | moving a function's sites within the walk's errors moves it no more than the walk's bound |
+//! | O10 | exact kernels agree | a `@deterministic` integer kernel's GPU result and `k.run`'s, every place the same bits |
 
 use super::{Features, Mode, REVERSE_HARNESS, TAPE_HARNESS, program};
 use crate::{Rng, u32s};

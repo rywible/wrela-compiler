@@ -26,13 +26,13 @@ pub mod print;
 pub mod ranges;
 pub mod same;
 pub mod scalarize;
-pub mod walked;
 mod single_exit;
 mod types;
 pub mod uniformity;
 mod unroll;
 mod verify;
 pub mod visit;
+pub mod walked;
 pub mod work;
 pub mod workgroup;
 
