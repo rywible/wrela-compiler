@@ -134,6 +134,14 @@ fn main() {
         proven.into_inner(),
         started.elapsed().as_secs_f64()
     );
+    let mut refusals = oracles::REFUSALS.lock().unwrap().clone();
+    if !refusals.is_empty() {
+        refusals.sort_by(|a, b| b.1.cmp(&a.1));
+        println!("refused, by reason:");
+        for (why, n) in refusals.iter().take(10) {
+            println!("  {n:>6}  {why}");
+        }
+    }
     if !failures.is_empty() {
         std::process::exit(1);
     }

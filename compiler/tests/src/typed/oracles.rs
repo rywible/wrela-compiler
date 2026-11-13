@@ -82,6 +82,19 @@ impl Oracle {
     }
 }
 
+/// O9's refusals over a run, by reason (the walk's message, its numbers taken out): what the
+/// walk can't prove, which the soak reports.
+pub static REFUSALS: std::sync::Mutex<Vec<(String, u64)>> = std::sync::Mutex::new(Vec::new());
+
+fn refused(why: &str) {
+    let key = class(why);
+    let mut r = REFUSALS.lock().expect("the refusals' lock");
+    match r.iter_mut().find(|(k, _)| *k == key) {
+        Some((_, n)) => *n += 1,
+        None => r.push((key, 1)),
+    }
+}
+
 std::thread_local! {
     /// O8's worst difference on this thread's programs, relative to the gradient's size.
     pub static WORST_O8: std::cell::Cell<f64> = const { std::cell::Cell::new(0.0) };
@@ -548,6 +561,7 @@ fn o9(dir: &Path, seed: u64) -> Result<Counts, Failure> {
             if debug {
                 eprintln!("refused: {e}");
             }
+            refused(&e.to_string());
             return Ok(Counts { points: N, counted: 0 });
         }
     };
@@ -576,6 +590,7 @@ fn o9(dir: &Path, seed: u64) -> Result<Counts, Failure> {
             if debug {
                 eprintln!("refused with sites: {e}");
             }
+            refused(&format!("with its sites: {e}"));
             return Ok(Counts { points: N, counted: 0 });
         }
     };
@@ -660,13 +675,19 @@ pub fn class(why: &str) -> String {
     }
     let mut out = String::new();
     let mut depth = 0;
+    let mut prev = ' ';
     for c in why.chars() {
         match c {
             '[' | '(' | '{' => depth += 1,
             ']' | ')' | '}' => depth -= 1,
             _ if depth > 0 => {}
+            // A digit in a name (`atan2`, `E0712`) stays; a number goes.
+            c if c.is_ascii_digit() && prev.is_ascii_alphabetic() => out.push(c),
             c if c.is_ascii_digit() || c == '.' || c == '-' || c == '+' => {}
             c => out.push(c),
+        }
+        if !(c.is_ascii_digit() && prev.is_ascii_alphabetic()) {
+            prev = c;
         }
     }
     let line = out.lines().next().unwrap_or("").to_string();

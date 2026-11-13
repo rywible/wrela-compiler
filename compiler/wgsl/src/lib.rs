@@ -1762,7 +1762,30 @@ impl<'a, 'm> Fb<'a, 'm> {
                 }
             }
         };
-        Ok(self.expr(e, out))
+        let r = self.expr(e, out);
+        // `atan2(0, 0)` is 0 on the CPU (the WASM's, as C's for +0 and +0), and NaN on Metal (the
+        // typed programs' oracle O6 found it): written as 0 where both are 0, on every GPU.
+        if b == B::Atan2 {
+            let n = match self.cx.m.types.get(self.f.value_ty(args[0])) {
+                ir::TypeDef::Vector(_, n) => Some(*n),
+                _ => None,
+            };
+            let l = self.lit(Literal::F32(0.0), out);
+            let zero = match n {
+                Some(n) => self.expr(Expression::Splat { size: vsize(n), value: l }, out),
+                None => l,
+            };
+            let eq = |me: &mut Self, h, out: &mut Block| {
+                me.expr(Expression::Binary { op: BinaryOperator::Equal, left: h, right: zero }, out)
+            };
+            let (ey, ex) = (eq(self, hs[0], out), eq(self, hs[1], out));
+            let both =
+                self.expr(Expression::Binary { op: BinaryOperator::And, left: ey, right: ex }, out);
+            return Ok(
+                self.expr(Expression::Select { condition: both, accept: zero, reject: r }, out)
+            );
+        }
+        Ok(r)
     }
 }
 
