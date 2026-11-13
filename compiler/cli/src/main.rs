@@ -2,7 +2,7 @@
 //!
 //! ```text
 //! wrela check <package-dir> [--json]      check a package; exit 1 if it has errors
-//! wrela build <package-dir> [-o <dir>] [--debug] [--testing] [--optimize] [--lift <package>]... [--report data|consts]
+//! wrela build <package-dir> [-o <dir>] [--debug] [--testing] [--optimize] [--lift <package>]... [--report data|consts|layout]
 //!                                         check and build; writes <dir> (default
 //!                                         <package>/build); --debug adds checks (§11);
 //!                                         --testing keeps the `@testing` exports (§9);
@@ -143,7 +143,7 @@ mod twin;
 pub(crate) fn usage() -> ExitCode {
     let lines = [
         "wrela check <package-dir> [--json]",
-        "wrela build <package-dir> [-o <out-dir>] [--debug] [--testing] [--optimize [size|speed]] [--relaxed-simd] [--lift <package>]... [--set NAME=VALUE]... [--report data|consts] [--json]",
+        "wrela build <package-dir> [-o <out-dir>] [--debug] [--testing] [--optimize [size|speed]] [--relaxed-simd] [--lift <package>]... [--set NAME=VALUE]... [--report data|consts|layout] [--json]",
         "wrela fmt <file-or-dir>... [--check]",
         "wrela fix <package-dir> [--dry-run] [--json]",
         "wrela migrate <package-dir> [--dry-run] [--json]",
@@ -295,6 +295,9 @@ pub(crate) struct PackageArgs {
     /// `--report consts`, which only `build` takes: each computed constant, and whether it was
     /// computed or read from the cache.
     pub report_consts: bool,
+    /// `--report layout`, which only `build` takes: for each loop over a container or array of
+    /// structs, the bytes of the struct it reads and writes (`wrela_ir::walked`).
+    pub report_layout: bool,
     /// `--set NAME=VALUE`, which `build` and `pipelines` take: the program's root-module
     /// constants given other values (language.md §13).
     pub set: Vec<(String, String)>,
@@ -311,6 +314,7 @@ pub(crate) fn package_args(args: &[String], takes_out: bool) -> Result<PackageAr
     let mut optimize = None;
     let mut report_data = false;
     let mut report_consts = false;
+    let mut report_layout = false;
     let mut set = Vec::new();
     let mut relaxed_simd = false;
     let mut lift = Vec::new();
@@ -338,6 +342,7 @@ pub(crate) fn package_args(args: &[String], takes_out: bool) -> Result<PackageAr
             "--report" if takes_out => match it.next().map(String::as_str) {
                 Some("data") => report_data = true,
                 Some("consts") => report_consts = true,
+                Some("layout") => report_layout = true,
                 _ => return Err(usage()),
             },
             "--set" => {
@@ -386,6 +391,7 @@ pub(crate) fn package_args(args: &[String], takes_out: bool) -> Result<PackageAr
         optimize,
         report_data,
         report_consts,
+        report_layout,
         set,
         relaxed_simd,
     })

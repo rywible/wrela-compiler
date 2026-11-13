@@ -19,3 +19,23 @@ fn the_kernels_agree() {
         assert_eq!(x, y, "{k}: {x:#x} with SIMD, {y:#x} without");
     }
 }
+
+/// `wrela build --report layout` (plan stage L.4, `wrela_ir::walked`): the particle loop reads
+/// two of a `Particle`'s eight `f32`s and skips the other 24 bytes; the loop that pushes them
+/// takes each whole.
+#[test]
+fn the_layout_report_finds_the_particle_loop() {
+    let out = wrela_driver::build(&wrela_tests::repo_root().join("compiler/tests/loops"));
+    let rows: Vec<_> = out.layout.iter().filter(|(_, w)| w.ty == "Particle").collect();
+    let kernel = rows
+        .iter()
+        .find(|(_, w)| w.function.starts_with("k_particles"))
+        .unwrap_or_else(|| panic!("no row for k_particles: {rows:?}"));
+    let w = &kernel.1;
+    assert_eq!((w.size, w.read, w.written, w.skipped(), w.whole), (32, 8, 0, 24, false), "{w:?}");
+    assert!(kernel.0.starts_with("main.wrela:"), "{}", kernel.0);
+    let pushed = rows.iter().find(|(_, w)| w.function.starts_with("init")).expect("init's row");
+    assert!(pushed.1.whole, "{:?}", pushed.1);
+    // The most skipped first.
+    assert!(out.layout.windows(2).all(|p| p[0].1.skipped() >= p[1].1.skipped()));
+}

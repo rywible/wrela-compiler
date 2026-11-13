@@ -69,6 +69,9 @@ pub struct Output {
     /// What the client build's constant data holds (`wrela build --report data`), when it was
     /// built.
     pub data: Option<wrela_wasm::DataReport>,
+    /// Which bytes of a struct each loop of the client build's CPU code walks, with where each
+    /// loop is (`wrela build --report layout`, `wrela_ir::walked`), the most skipped first.
+    pub layout: Vec<(String, wrela_ir::walked::Walked)>,
     /// Each GPU pipeline's module as the WGSL is written from it, when [`gpu_modules`] asked.
     pub gpu: Vec<GpuModule>,
 }
@@ -1011,6 +1014,7 @@ fn compile_loaded_in(
             program_files: Vec::new(),
             consts: consts::ConstStats::default(),
             data: None,
+            layout: Vec::new(),
             gpu: Vec::new(),
         });
     };
@@ -1037,6 +1041,7 @@ fn compile_loaded_in(
     let mut files = Vec::new();
     let mut pipelines = Vec::new();
     let mut data_report = None;
+    let mut layout = Vec::new();
     let mut gpu: Vec<GpuModule> = Vec::new();
     let mut data = wrela_lower::BuildData {
         debug: mode.debug,
@@ -1080,6 +1085,15 @@ fn compile_loaded_in(
                 // manifest's tiers (§18.9).
                 pipelines = summarize(&checked, &sources, &lowered, mode.conditions || mode.emit);
                 data_report = wrela_wasm::data_report(&lowered.cpu).ok();
+                layout = wrela_ir::walked::walked(&lowered.cpu)
+                    .into_iter()
+                    .map(|w| {
+                        let at = w.at.map_or_else(String::new, |sp| {
+                            sources.file(sp.file).location(sp.start)
+                        });
+                        (at, w)
+                    })
+                    .collect();
             }
             if !ok || !mode.emit {
                 continue;
@@ -1176,6 +1190,7 @@ fn compile_loaded_in(
         program_files,
         consts: stats,
         data: data_report,
+        layout,
         gpu,
     })
 }

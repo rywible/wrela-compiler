@@ -26,6 +26,7 @@ pub mod print;
 pub mod ranges;
 pub mod same;
 pub mod scalarize;
+pub mod walked;
 mod single_exit;
 mod types;
 pub mod uniformity;
