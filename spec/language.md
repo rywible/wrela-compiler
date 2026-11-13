@@ -22,7 +22,7 @@ Where this text and the tests disagree, the tests are right.
 | §3 | Items | Functions, structs, enums, traits and impls, constants, modules and packages |
 | §4 | Types | Scalars, vectors and matrices, arrays, runs, tuples, aliases, text and encodings |
 | §5 | Units | SI constants written as number suffixes: `15cm` |
-| §6 | Memory | Values, moves, projections, exclusivity, closures, arenas, plain data and snapshots |
+| §6 | Memory | Values, moves, projections, exclusivity, closures, arenas, plain data, layout and snapshots |
 | §7 | Generics and traits | Monomorphization, inference and trait sets |
 | §8 | Effects and contexts | The seven effects, and what each context forbids |
 | §9 | Attributes | The closed set of `@` attributes |
@@ -34,12 +34,12 @@ Where this text and the tests disagree, the tests are right.
 | §15 | Programs and hosts | Exports, a program's state, client and server builds, and hand-over |
 | §16 | Concurrency | Threads, ticks, hand-offs, tasks, jobs, the audio thread and caches |
 | §17 | Host services | Requests, input, messages, printing and the clock |
-| §18 | GPU code | Entry points, buffers, kernel outputs, bindings, commands, textures, passes and pipelines |
+| §18 | GPU code | Entry points, buffers, kernel outputs, bindings, commands, textures, passes and pipelines, and kernels the same on every GPU |
 | §19 | Rooms | A server's ordered log of what its peers propose, kept and served over the network |
 | §20 | The stdlib boundary | What the compiler knows about std, the map of std's modules, and fields as std code |
 | §21 | What Wrela leaves out | Each missing feature, and what a program uses instead |
 | §22 | A complete program | One program with a field, a kernel and a shader |
-| §23 | Lifted builds, provenance and the tools | Changing a program's numbers while it runs, and the tools for agents |
+| §23 | Lifted builds, provenance and the tools | Changing a program's numbers while it runs, the tools for agents, and reading what was made |
 | | The rules by ID | Every rule of the conformance suite, with its section |
 
 ## How Wrela differs from Rust and TypeScript
@@ -931,7 +931,9 @@ The compiler chooses how a container stores its elements: one after another, fie
 - projections never escape (§6.6);
 - a value's bytes exist only where they are viewed: an upload to the GPU, a bitcast or a network message. There the bytes are canonical, as above.
 
-Saves don't depend on layout either, because `Serialize` is derived field by field. Today every container stores its elements one after another. The language keeps the choice open: no feature exposes layout.
+Saves don't depend on layout either, because `Serialize` is derived field by field. Today every container stores its elements one after another, but one: `std::collections::Columns<T>` keeps each field of `T` in its own array, so a loop over one field reads only that field (and runs four at a time, §11.2). Its element isn't one place: `c[i].x` reads and writes a field, and `c[i]` read whole gathers a copy; lending `c[i]` to a `mut` parameter, binding it `mut`, or assigning it whole is E0339. The language keeps the choice open: no feature exposes layout.
+
+`wrela build <package> --report layout` lists, for each loop over a container or array of structs, the struct's size, the bytes of it the loop reads and writes, and whether it takes an element whole, the most bytes skipped first: where `Columns` would pay.
 
 ### 6.11 Snapshots
 
@@ -1192,9 +1194,10 @@ Vector math uses WASM's 128-bit SIMD wherever the result is the same.
 - A `vec2`, `vec3` or `vec4` is one SIMD value. Its arithmetic, comparisons and componentwise built-ins are SIMD instructions.
 - A loop also runs four iterations at a time when all of these are true:
   - It counts a `u32` up by one to a bound computed before the loop (a `for` over `a..b`).
-  - Its body is straight-line `f32` code.
-  - The body reads and writes elements only at the counter's index, of arrays and runs that it doesn't replace.
+  - Its body is `f32` code, whose branches compare `f32`s. Both sides of a branch run for every lane, and a store under it keeps the old value in the lanes whose condition is false.
+  - The body reads and writes `f32` elements only at the counter's index, of arrays, runs, `Vec`s and `Columns`' fields that it doesn't replace or resize.
   - The body keeps nothing from one iteration to the next.
+- A check that the counter is below a length, as indexing a `Vec` makes, is part of the four-wide loop's test, and one the compiler proves (the loop's own bound, or the length of the `Vec` it walks, which it doesn't change) is gone.
 - The last iterations, and an iteration that would index out of range, run one at a time. So a trap happens at the same iteration, with the same elements written.
 - Standard SIMD rounds each lane exactly as the scalar operation does, and has no fused multiply-add, so the bits are identical. Relaxed SIMD is forbidden, except in a relaxed-SIMD build's presentation code (below).
 - An operation whose SIMD form behaves differently stays scalar. For example, float-to-int conversion saturates in SIMD but traps in scalar code (§11.3).
@@ -1219,6 +1222,8 @@ GPU code follows WGSL's semantics, and its results are for presentation only: GP
 | Float → int | Truncates; out of range or NaN traps | WGSL-defined values |
 | Float `%` | `a - b * trunc(a / b)`, exact (C's `fmod`): `a`'s sign, smaller than `b` in magnitude; NaN if `a` is infinite or `b` is 0 | WGSL's `a - b * trunc(a / b)`, rounded at each step |
 | Int → int | Keeps the low bits (`u32(-1)` is 4294967295) | Keeps the low bits |
+| `atan2(y, x)` with both zeros | C's: `y` where `x` is +0, π with `y`'s sign where `x` is -0 | The same bits: WGSL leaves it undefined (Metal gives NaN), so the compiler writes it out by the zeros' signs |
+| Out-of-bounds index in a `@deterministic` kernel | Its CPU form (`k.run`) reads the last element | Clamped to the last element (§18.14) |
 | Out-of-bounds index | Traps | WebGPU's robust access (a value from inside the buffer, or zero). A debug build checks each index. An index out of range sets a flag that the host reads after each frame, and the host stops with an error that names the pipeline. Not checked: vertex shaders (WebGPU forbids them to write storage), and a pipeline that already binds 8 storage buffers |
 | NaN | Canonical (`0x7fc00000`, `0x7ff8000000000000`) wherever its bits are observed, in all CPU code: bit casts (so `Serialize` too), uploads to the GPU (`write` and uniforms), and hashing. Nothing else shows a NaN's bits, its sign included. A debug build (`wrela build --debug`) traps where a float operation creates a NaN from operands that hold none. | WGSL |
 
@@ -1250,6 +1255,7 @@ Deterministic code gives the same results on every engine and every client; `@de
   - relaxed SIMD;
   - anything that depends on memory addresses;
   - recursion deeper than 256 calls (§8.4), because stack limits differ between engines.
+- **A kernel's work can reach it:** a `@deterministic` kernel's `k.run(input, params, mut out)` is ordinary CPU code, lowered from the kernel's own body, so the simulation and a server (which has no GPU) compute what the kernel computes, to the bit (§18.14).
 - **Checked through every call, instantiation included.** A call whose target only instantiation decides (a trait method of a generic parameter) is checked where the function is instantiated. Each body that its instance reaches is checked for `io`, `nondet` and `host`, with the call chain.
 - **A panic is a deterministic trap:** every client traps on the same tick.
 - **Parallelism is data-parallel only,** through std's combinators (`par_each_mut`, `par_map_reduce`).
@@ -1495,6 +1501,7 @@ The compiler derives a function's gradient and its interval over a box from the 
 | Interpretation | What it gives |
 |---|---|
 | `gradient` | The forward-mode derivative |
+| `reverse` | The derivative by each number of an array, from one recorded evaluation swept back (reverse mode); CPU only |
 | `interval` | A conservative range over a box |
 | `filtered` | The value box-filtered over a footprint (antialiasing) |
 | Lipschitz bound | Not a compiler feature: a std method, `lipschitz(near)` (§14.5, §20.3). Debug builds and tests check it against the derived local bound, the `interval` of the `gradient`. |
@@ -1515,6 +1522,7 @@ The derivations are `std::derive::{gradient, value_and_gradient, value_gradient_
 - `value_gradient_with` takes a function that returns `(f32, T)` and gives `(f32, X, T)`: the value, its gradient, and the rest as the function computes it, from one derived evaluation. So a shader gets a field's normal and channels without computing its distance twice.
 - `interval` takes the input's box type (`Interval`, `Box2`, `Box3`, `Box4`) and returns an `Interval`. For a vector result, it returns the vector's box: each component's range, from one derived function, the same as the per-component intervals.
 - `filtered(f, at, width)` gives `f(at)` averaged over a footprint `width` wide along each of `at`'s components: a pixel's spread in `f`'s input, from `fwidth`, for example. It is forward-mode differentiation with each direction's seed its width, so each value's tangents span its range over the footprint, to first order. Each `fract`, `floor`, `ceil`, `round`, `trunc`, `step`, `sign`, `abs`, `min`, `max`, `clamp` and `saturate` on the input's path takes the average of its operand's range in place of its point value: the point value plus what the jumps or kinks inside the footprint add. So a footprint that crosses none keeps the point's value exactly, at any magnitude, and a footprint under 10⁻⁶ keeps it too. Each value is averaged alone: a product of patterns along different components averages exactly, but `abs` of a difference of two averaged patterns does not, and what a branch on the input chooses is not filtered.
+- `reverse(f, at)` takes a function of an array, `fn([f32; N]) -> f32`, and gives `(f32, [f32; N])`: the value, and its derivative by each of `at`'s numbers, from one evaluation that records each operation's local partials on a `Trace` and one sweep back through it. It costs about a few evaluations however large `N` is: a two-layer net of 4,096 weights costs 7.2 plain evaluations, in fuel. It runs on the CPU. The input is an array, so what the derivation follows stays out of heap memory; arrays live on the stack, so `N` can be 196,608 (a larger one traps, as a value too large for the stack does, §2.4).
 - `std::field::Surface` provides `gradient`, `sample` (distance and gradient) and `interval` for every surface.
 
 ### 14.2 How they're derived
@@ -1522,6 +1530,7 @@ The derivations are `std::derive::{gradient, value_and_gradient, value_gradient_
 The compiler derives them from the function's body, and from every function it calls.
 
 - **Gradients** are forward mode, one tangent per input component. They agree with central differences within 3.4e-4 relative, across the test corpus. Where a vector's `length` is zero and nothing moves it (inside a box's `length(max(q, 0))`), its tangent is zero. Where `min`'s or `max`'s arguments are equal, the tangent is the average of theirs, so std's `smin` has its true gradient on a blend's seam.
+- **Reverse mode is forward mode with one direction whose tangent is a place on a trace.** A value's place travels as the bits of a value of its type, moved by the same instructions that move the value; each arithmetic operation pushes a node of its local partials onto the trace, found by running the forward rules with unit seeds, and `reverse` sweeps the trace back from the result. No rule is written twice. It refuses `f64` and matrices on the input's path (E0700). The function it derives is held to the heap rule as a forward one is; the trace is the derivation's own, so a recorded function can't be derived again: a `reverse` inside a `gradient` or an `interval` is E0700 (it allocates its trace, §8.3). A trace holds at most 2²⁶ numbers; past it, `reverse` panics.
 - **Derivations nest.** A derived function is ordinary code, so it can be derived again. The `gradient` of a `gradient` component is a Hessian row (and once more, a third derivative). The `interval` of a `gradient` component bounds the gradient over a box, which is a local Lipschitz bound. A closure can pass part of its input to an inner derivation as data: `interval(|q: vec4| gradient(|s: vec3| f(s, q.w), q.xyz).x, b)` bounds the spatial gradient over space and time.
 - **Intervals** bound every value a point in the box can give, as the target computes it.
   - On the CPU, each rounded result is widened by its rounding: an ulp, or four for std's transcendentals.
@@ -1563,13 +1572,19 @@ The compiler derives them from the function's body, and from every function it c
 - **Constants are taken as they are.** A constant or a captured value is exact in both walks, so one that a half float can't hold (`1000.1`) is the reader's to see.
 - **Its verdicts are advice.** The half walk is a model of the rounding, not a bound. A twin written in `f16` where the report says `safe` is proven by measuring it.
 
+**A twin proven within a tolerance (`wrela twin`, experimental).** A twin is a cheaper function written beside one GPU code calls, whose result is proven within a tolerance of the original's over a box. `wrela twin <package> <module>::<fn> --box ... --within eps` finds one. It runs the function's GPU code over the box with, for each value, a range and an error: how far the twin's value can be from the original's there. Each rule is a line of Lipschitz reasoning over the real numbers; the rules are written in `wrela_ir::interp::error`, and the typed fuzzer's oracle O9 checks them by moving values within their bounds. Where a changed value could decide a jump (a comparison, a `floor`, an index), or a division's divisor could reach 0, the walk refuses: no proof, and no rewrite there.
+- **Its rewrites:** a term dropped where its size over the box is small; `pow(x, 2.0)` to `4.0` as products; a division by a constant as a product with its reciprocal. Each is kept, most work saved first, while the bound stays within the tolerance. Where a walk is refused or over the tolerance, the box is cut in two along each axis and walked again, to depth 3.
+- **The twin is source.** It is the original's text with each edit, named `<fn>_twin`, under a doc comment that is its certificate: what it drops or rewrites and each bound, its work before and after, and the box and tolerance. `--write` puts it beside the original. `--check` derives it again and fails where the file's twin differs, as a stale golden does.
+- **`proven` covers real arithmetic over the box.** Each target's rounding is as §14.2 says. A point outside the box has no promise.
+- **It's experimental.** On the frozen programs' GPU code, the walk refuses the costly functions (a noise's lattice hash, which the box doesn't fix to one cell), and the twins it proves saved 7% of their work at most (plan stage I's measurements, in the pull request that brought it).
+
 ### 14.4 Fields built at run time
 
 A field built while the program runs is a tape: `std::stage::Tape` holds up to 4,096 operations over the point and a table of up to 2,048 constants (`TAPE_LEN`, `TAPE_CONSTS`); `ShortTape` holds 256 of each, for a pruned tape. Both are `Taped<N, K>` of their sizes, so code written for one takes the other. Each operation writes its own register, and the last register is the field's value.
 
 - A program builds a tape while it runs, from an edit log or a sculpting tool: `let d = tape.sphere(center, r)`, `tape.smooth_min(a, b, k)`, and arithmetic over registers.
 - The operations: the point's coordinates and constants; `+ - * /`, `min`, `max`, `smooth_min`, `-`, `abs`, `sqrt`, `sin`, `cos`, `exp`, `log`, `pow` (to a constant power), `floor`, `fract`, `saturate` (`clamp01`), `a - b * floor(a / b)` (`modulo`); `step` (1 where `a < b`), `select` (`b` where `a > 0`, else a third register) and `mix` (`a + (b - a) * t`), the ternary ones reading a third register; a table read at a computed index (`load`, clamped to the table's entries) and between two entries (`lerp_load`); `std::field`'s own value noise (`noise`), fractal noise (`fbm`) and lattice hash (`hash`), so a tape and a compiled field agree bit for bit; `dot3`, `length3` and `normalize3` over three registers in a row; and `noise_box`, `std::field::value_noise_box` (value noise averaged over a box, a filtered field's), over two such rows, the point and the box's half widths. A box noise's interval is [-1, 1] (`tape.interval`), and an interval derived through the tape (a `Taped`'s `Surface::interval`) is every number's where a box noise reaches the value (its loops run as often as its box is wide). Each is one line of `interpret`'s step, and each matches the std function it stands for within an ulp at 10⁶ points on both targets (bit for bit, on the M4 and in Chrome).
-- `stage::interpret(tape, p)` evaluates a tape. A `Taped` is a `Surface`, so it goes wherever a compiled field goes, on the CPU and the GPU: a `ShortTape` as a uniform-sized block, a `Tape` (72 KiB, over the 64 KiB a uniform holds) as read-only storage. On the M4 a 1,024-operation tape costs 0.32 ns an operation a point on the GPU.
+- `stage::interpret(tape, p)` evaluates a tape. A `Taped` is a `Surface`, so it goes wherever a compiled field goes, on the CPU and the GPU: a `ShortTape` as a uniform-sized block, a `Tape` (72 KiB, over the 64 KiB a uniform holds) as read-only storage. On the M4 a 1,024-operation tape costs 0.32 ns an operation a point on the GPU. `stage::interpret_at(tapes, i, p)` interprets the tape at `tapes[i]` where it lies, in a buffer of tapes: the GPU code reads each operation from the buffer and holds no copy.
 - Nothing about a tape is special to the compiler: its gradient and interval are derived from `interpret`'s own code.
 - Integers on a tape are two registers in a row, a 32-bit integer's high and low 16 bits, each exact as a float, so a tape hashes the point's lattice cells exactly, as compiled code does: wrapping `+ - *`, `& | ^`, shifts, `/` and `%` (0 where they'd trap), `<` and `==` (1 or 0), `min` and `max` of `u32`s and `i32`s, conversions between them and floats, a multiply-add (`IMAD`) and `std::hash::pcg`, PCG's output step, which `hash_u32` ends with (`integer`, `integer3`, `integer_constant`). An operation that gives an integer is two operations, one for each half. `atan2` is one too.
 - **A tape of a compiled field.** `std::derive::tape(f)` derives, from the body of `f`, a function of the point, the function that builds `f`'s tape, and runs it on the CPU: the point is active, and each operation on what depends on it puts its tape operation on the tape, while everything else (a part's placement, a radius, a seed, a loop's count) runs as ordinary code and reaches the tape as constants. `Surface::to_tape()` is `tape(|p| self.distance(p))`, and a `Taped`'s is itself. `tape_with(f)`, of an `f` that returns `(f32, T)`, puts the value and `T`'s floats (scalars and vectors of `f32`) in the tape's last registers, which `interpret_with::<N, K, M>(tape, p)` reads as `(f32, [f32; M])`: a field's channels travel with its distance. `tape_sized` builds into a `Taped<N, K>` of another room.
@@ -2008,6 +2023,11 @@ All three are in std, built on the unsafe core (§6.12), and none of them is spe
   - `wrela-host --no-gpu <build> --ticks N` runs the ticker alone, with no frames, and prints each tick's hash. `--log out.ticks` writes the log.
   - `wrela-host --replay <log> [--no-gpu] <build>` replays a log's records. It fails at the first tick whose hash differs, and names that tick. It gives the ticks the log's records alone: what the program posts as it runs again is dropped.
   - A build of `wrela-host` without its `gpu` feature has only these two commands. An x86-64 build under Rosetta checks the sim's bits on x86's code generation.
+- **Fuzzing the ticks.** A trap in `@deterministic` code is a trap on every client at the same tick (§12), so one peer's input that causes it stops a whole room. `wrela fuzz <package>` looks for that input. It builds the program for fuzzing (a debug build whose code marks a coverage map; no other build does) and runs it in process on the CPU, each input from `init` on a fresh instance, each tick given a fixed amount of work (`--fuel`, 2²⁸ unless said).
+  - An input is the records of `--ticks` ticks (64 unless said). An input that runs code no input ran before joins the corpus, and later inputs are mutations of the corpus: a field changed, an event dropped, copied or added, two inputs spliced. `--seeds <dir>` starts the corpus from scripts and tick logs.
+  - A finding is a trap, with its message and source line; a tick past its fuel (`hang`); or an input whose state hashes differ when it runs again (`not-deterministic`: something the checker let through). Each is made as small as it can be while it gives the same finding (Zeller and Hildebrandt's delta debugging), and written to `--out` (`build/fuzz` unless said) as a tick log and as a script. `wrela-host --replay <log> --no-gpu <package>/build/fuzz-build` replays the log and fails at the finding's tick and line.
+  - `wrela fuzz <package> --replay <file-or-dir>` runs saved findings and says which still fail. A log made by another build (the program has changed since) runs as a script, its records alone: a fixed bug's finding passes.
+  - `--room` fuzzes a server's rooms instead (§19.2): an input is connections opening and closing, messages of bytes and time passing, driven through the room host. A message the program traps on alone is `poison` (the room refuses it and goes on, but its reducer has a bug: the bytes are the report); a room that can't go on is `quarantine`.
 - **Test mode's two schedules:**
   - **Lockstep:** before frame i, the ticks up to ⌊(i + 1)·hz/fps⌋ run, and the frame waits for them. Both hosts do the same, so frames and hashes compare across hosts.
   - **Paced** (`#test&paced=1`): ticks run on the ticker's own clock, and neither ticks nor frames wait for the other, as in play.
@@ -2628,6 +2648,30 @@ fn far_flat(_pixel: FragCoord, shot: Shot, _field: Texture3d<Rgba16Float>, _smp:
 - **The browser builds stand-ins first**, then the rest as §18.9 says. A command whose pipeline isn't built runs on its stand-in once that is, and waits only while neither is (a command that needs one starts its stand-in's build, not its own). Once its own pipeline is built, the next command runs on it. So the first frames may draw what the stand-ins draw: what a stand-in draws should be something a player may see for a moment, such as a flat colour or the scene's last bake. Test mode waits for each command's own pipeline, so the frames are the native host's, unless `standins=1`; its `starts.json` lists each frame a pipeline's commands ran on its stand-in (`stood_in`). The native host builds every pipeline before the first frame and runs none on its stand-in.
 - What a stand-in draws or computes is presentation, never state: a readback is `nondet` already (§17.1), and a GPU result reaches the simulation only through a tick's input.
 
+**A stand-in for a field can draw the field: through its tape.** The real shader takes one more parameter it doesn't use, a buffer of the field's tape, and its stand-in reads the tape there (`stage::interpret_at`, §14.4) where the real one calls the field. The parameters match, so the rule above holds as it is, and a command carries the buffer's handle, not a tape's 72 KiB:
+
+```wrela
+use std::field::Surface
+use std::gpu::FragCoord
+use std::stage::{Tape, interpret_at}
+
+@fragment
+@standin(shade_taped)
+fn shade<F: Surface>(pixel: FragCoord, field: F, _tapes: [Tape]) -> vec4 {
+    let d = field.distance(vec3(pixel.position.xy / 256.0, 0.0))
+    vec4(vec3(d), 1.0)
+}
+
+/// The same picture through the field's tape, until `shade` is built.
+@fragment
+fn shade_taped<F: Surface>(pixel: FragCoord, _field: F, tapes: [Tape]) -> vec4 {
+    let d = interpret_at(tapes, 0, vec3(pixel.position.xy / 256.0, 0.0))
+    vec4(vec3(d), 1.0)
+}
+```
+
+It draws the field, not a flat colour (compiler/tests/standin_tape: frame 0 on the stand-in was the real frame's to the 8-bit step). But it doesn't come first: in Chrome on an Apple M4, cold, eight creatures each its own pipeline, the first frame was submitted 355 to 380 ms after the page opened with tape stand-ins, 136 to 155 ms with flat-colour ones, and 193 to 320 ms with none. The tape interpreter's shader takes longer to build than the creatures' own pipelines did, so a flat colour remains the stand-in for a first frame there.
+
 ### 18.13 How often code runs
 
 A shader runs once a pixel and a kernel once an invocation, but not everything in it changes that often. What it computes from constants is the same every time the shader is built; what it computes from what a command gives every invocation alike is the same for the whole command, a frame's or a load's. The compiler sorts each value of GPU code by which of these it is, computes the first kind itself, and refuses much of the second.
@@ -2636,7 +2680,54 @@ A shader runs once a pixel and a kernel once an invocation, but not everything i
 - **A value the same for every invocation** is computed only from such constants and from what the command gives every invocation alike: its uniform block (the entry point's `GpuData` parameters), a buffer it reads or a texture it samples at a place that is itself the same, the result of a call given only such values, and the number of workgroups. A builtin input (`GlobalId`, `FragCoord`, ...), a writable buffer, workgroup memory, an atomic, a subgroup operation and a derivative vary, and so does a variable a branch on a varying condition sets, or a loop sets that a varying condition leaves.
 - **In a shipped build, every invocation computing more than 256 work of such a value again is E0712** (as E0707, a check, a test's build and a debug build don't report it), at the value: its own work and that of the same values it's computed from, as §18.11 counts work, each value as many times as the loops it's in pass (a loop §18.11 can't bound, once; a call or a step with no bound, over the limit). What's computed only from constants and a loop's own counter (`d = vec3i(dx - 1, dy - 1, dz - 1)`) is the loop's structure, not counted, and it is so whatever leads to the loop, where the counter is a variable of the block the loop is in alone, set there before anything reads it (a net's `w[FIRST + r * INPUTS + c]`, the whole walk under `if g.learned != 0`: the branch is the command's to say, the walk's sums are not); values that only share a cheaper one are counted apart, and the costliest reported. The work is done once for the whole command on the CPU, or in a kernel of one invocation, and its result passed in. A kernel whose workgroup is one invocation (`@compute(1)`) isn't checked: it is how GPU code computes something once. (The opening scene's weather shader read the sky sixteen times a pixel for the light low on the horizon, the same for every pixel: 1,040 work.)
 - A value a little alike work makes (a direction normalized, a colour scaled) is no error: hoisting it would cost more in the uniform block than it saves.
-- **A call that varies in few numbers is a table's to answer.** `wrela pipelines` lists, under each pipeline, the functions each entry point calls with at most three numbers that vary between invocations, all else it's given the same for every invocation (a direction's three numbers, a distance's one): how many times an invocation calls each, as §18.11's count walks the code (each pass of the loops it's in, one for a loop the count can't bound; every side of a branch it doesn't know; each call of a function it's called through), the most numbers that vary at any of those calls, their work together (§18.11, each call's given what's known of its arguments there) and the first call's place, the costliest first, each call more than 32 work and all of them from 100 work up, six an entry point (`--json`: `few`, a list for each entry point of `function`, `varying`, `calls`, `work`, `at`, all of them). Such a call is a function of those numbers for the whole command: worked out once over their range into a texture, each invocation could read it there (a sample and its coordinates, about 32 work) instead. Not listed, but looked into for the calls in them: a call given only the invocation's place (its builtin inputs, and what's computed from them and same values by arithmetic and by calls that read no texture or buffer), since a table over the place is as large as the dispatch; a call lent a place, or that returns nothing; and a call to a function that writes, synchronizes, takes a derivative or samples with one. A call to a function that reads what the command writes (workgroup memory, a writable buffer) varies, whatever it's given. Calls to functions the source names alike (a generic function's instantiations) are one. Whether a table pays is the reader's to judge, and its measure: it does where what the call computes changes slowly enough over those numbers that a table smaller than the calls it replaces holds it, or where the table outlives the frame. Only the pipeline-count query looks for these calls; a build doesn't. (The opening scene's paint shader read the sky along a direction 21 times a pixel, every branch taken (a facet's mirror, the deck's light on a face, the sky behind a far rock): 9,333 work, where a table of the sky is a read a call. Its sea's four facets now read the sky they mirror from one.)
+- **A call that varies in few numbers is a table's to answer.** `wrela pipelines` lists, under each pipeline, the functions each entry point calls with at most three numbers that vary between invocations, all else it's given the same for every invocation (a direction's three numbers, a distance's one): how many times an invocation calls each, as §18.11's count walks the code (each pass of the loops it's in, one for a loop the count can't bound; every side of a branch it doesn't know; each call of a function it's called through), the most numbers that vary at any of those calls, their work together (§18.11, each call's given what's known of its arguments there) and the first call's place, the costliest first, each call more than 32 work and all of them from 100 work up, six an entry point (`--json`: `few`, a list for each entry point of `function`, `varying`, `calls`, `work`, `at`, all of them). Such a call is a function of those numbers for the whole command: worked out once over their range into a texture, each invocation could read it there (a sample and its coordinates, about 32 work) instead. Not listed, but looked into for the calls in them: a call given only the invocation's place (its builtin inputs, and what's computed from them and same values by arithmetic and by calls that read no texture or buffer), since a table over the place is as large as the dispatch; a call lent a place, or that returns nothing; and a call to a function that writes, synchronizes, takes a derivative or samples with one. A call to a function that reads what the command writes (workgroup memory, a writable buffer) varies, whatever it's given. Calls to functions the source names alike (a generic function's instantiations) are one. Whether a table pays is the reader's to judge, and its measure: it does where what the call computes changes slowly enough over those numbers that a table smaller than the calls it replaces holds it, or where the table outlives the frame. Only the pipeline-count query looks for these calls; a build doesn't. (The opening scene's paint shader read the sky along a direction 21 times a pixel, every branch taken (a facet's mirror, the deck's light on a face, the sky behind a far rock): 9,333 work, where a table of the sky is a read a call. Its sea's four facets now read the sky they mirror from one.) A table must also cost less than the call to read: a table of a sky of twelve suns, read 16 times a pixel by eight texel loads each (with its error proven, so not sampled), drew 2.6 times slower than computing the sky on an Apple M4, so std has no table builder.
+
+### 18.14 Kernels the same on every GPU
+
+A `@deterministic` kernel gives the same bits on every GPU and on the CPU. GPUs round floats their own way, and invocations interleave as the GPU schedules them, so such a kernel computes with integers, whose arithmetic WGSL defines exactly, and moves floats only as bits.
+
+- **Its shape:** `fn k(input: [A], params: P, out: mut Slots<B>, id: GlobalId)`: one buffer it reads, at most one `GpuData` value, the places it writes, each invocation its own, and its place.
+- **What it can't do,** in it or in any function it reaches: float arithmetic, a float comparison or builtin, a conversion between floats and integers (a float may be loaded, stored, selected and bit-cast: its bits are data); an atomic, workgroup memory, a subgroup operation, a barrier, a texture or a derivative. Each is E0713, naming what and where, when the kernel is built.
+- **An index past the end is clamped** to the last element, in the WGSL and on the CPU alike: every index into its buffer, an array or an array value whose range the compiler can't prove. (WebGPU's robust access would give any value from inside the buffer, or zero.)
+- **Its CPU form is `k.run(input, params, mut out)`,** with `out` a `Vec<B>`: the kernel's body run once for each of `out`'s places, its place `(i, 0, 0)`. It's made from the kernel's GPU module, so it runs the same code: integer `+ - *` wrap; a division or remainder by zero, or `MIN / -1`, gives WGSL's result (the dividend, and 0); a shift's amount is masked to the width. It's callable from `@deterministic` code, on any role.
+
+```wrela
+use std::gpu::{GlobalId, Slots}
+
+struct Grid: Copy + GpuData {
+    side: u32,
+}
+
+/// One step of Life on a torus: the same bits on every GPU and on the CPU.
+@deterministic
+@compute(64)
+fn life(cells: [u32], grid: Grid, out: mut Slots<u32>, id: GlobalId) {
+    let n = grid.side
+    let (x, y) = (id.x % n, id.x / n)
+    var alive = 0
+    for dy in 0..3 {
+        for dx in 0..3 {
+            if dx != 1 || dy != 1 {
+                alive += cells[(y + n + dy - 1) % n * n + (x + n + dx - 1) % n]
+            }
+        }
+    }
+    out[id] = if alive == 3 || (alive == 2 && cells[id.x] == 1) { 1 } else { 0 }
+}
+
+/// The step on the CPU, in a tick or on a server.
+@deterministic
+fn step(cells: [u32], side: u32) -> Vec<u32> {
+    var next = Vec::new()
+    for _ in 0..side * side {
+        next.push(0)
+    }
+    life.run(cells, Grid { side }, mut next)
+    next
+}
+```
+
+The GPU's answer isn't used in place of `run`'s: a tick would still hash its inputs to find a held answer, and copy it in. On an Apple M4, a 1,024 × 1,024 Life step by `run` took 7.6 to 7.8 ms, and the hash and the copy alone 2.5 to 2.6 ms, so a held answer could make the tick at most 3 times faster, before the lookup and the check that an answer is right. The CPU form is the kernel's one form in the simulation.
 
 ## 19. Rooms
 
@@ -2849,8 +2940,8 @@ The compiler knows the language, a closed list of std items and its targets; the
   - `std::io`: `next_request`, `request_status`, `storage_read_command`, `storage_write_command`, `fetch_command`, `print_command`, `post_command`, `Shipped`
   - `std::input`: `Script`
   - `std::tool::browser`: `Script`
-  - `std::mem`: `take_answer`, `take_input`, `take_payload`, `keep_bytes`, `kept_bytes`, `read_clock`, `Drop`, `size_of`, `align_of`, `needs_drop`, `is_copy`, `read`, `zeroed`, `write`, `drop_at`, `at`, `at_mut`, `at_mut_pair`, `heap_base`, `memory_pages`, `memory_grow`, `load_u32`, `store_u32`, `load_u8`, `store_u8`, `copy`, `fill`, `compare_swap`, `atomic_add`, `atomic_load`, `atomic_store`, `wait`, `notify`, `run_task`, `task`, `thread_block`, `wait_for`, `abort`, `debug_build`, `test_build`, `tool_request`, `tool_wait`, `tool_any`, `tool_take`, `tool_idle`, `tool_active`, `tool_join`, `tool_done`
-  - `std::derive`: `Interval`, `Domain`, `gradient`, `value_and_gradient`, `value_gradient_with`, `interval`, `precision`, `precision_note`, `filtered`, `tape`, `tape_with`, `tape_sized`
+  - `std::mem`: `take_answer`, `take_input`, `take_payload`, `keep_bytes`, `kept_bytes`, `read_clock`, `Drop`, `size_of`, `align_of`, `column_bytes`, `column_read`, `column_write`, `needs_drop`, `is_copy`, `read`, `zeroed`, `write`, `drop_at`, `at`, `at_mut`, `at_mut_pair`, `heap_base`, `memory_pages`, `memory_grow`, `load_u32`, `store_u32`, `load_u8`, `store_u8`, `copy`, `fill`, `compare_swap`, `atomic_add`, `atomic_load`, `atomic_store`, `wait`, `notify`, `run_task`, `task`, `thread_block`, `wait_for`, `abort`, `debug_build`, `test_build`, `tool_request`, `tool_wait`, `tool_any`, `tool_take`, `tool_idle`, `tool_active`, `tool_join`, `tool_done`
+  - `std::derive`: `Interval`, `Domain`, `gradient`, `value_and_gradient`, `value_gradient_with`, `interval`, `precision`, `precision_note`, `filtered`, `tape`, `tape_with`, `tape_sized`, `recorded`, `Trace`, `trace_one`, `trace_two`, `trace_leaf`
   - `std::field`: `smin`, `value_noise`, `value_noise_box`, `lattice_coord`
   - `std::hash`: `pcg`
   - `std::stage`: `Building`, `push_one`, `push_two`, `push_new`, `finish`
@@ -2860,12 +2951,12 @@ The compiler knows the language, a closed list of std items and its targets; the
   - `std::time`: `phase_command`
   - `std::tick`: `start_ticker`
   - `std::reload`: `prepare_command`, `unprepare_command`, `hand_over_command`
-  - `std::collections`: `Vec`, `Bounded`, `Box`, `swap`, `replace`
+  - `std::collections`: `Vec`, `Bounded`, `Columns`, `Box`, `swap`, `replace`
   - `std::string`: `Text`, `Bytes`, `String`, `str_addr`, `str_len`, `str_part`
   - `std::cmp`: `Eq`, `Ord`, `Ordering`
   - `std::fmt`: `Format`, `Spec`, `assert_failed1`, `assert_failed2`
   - `std::arena`: `Arena`, `Handle`
-  - `std::lift`: `gradient`, `jacobian`, `reads`, `literal_count`, `literal_value`, `literal_built_value`, `set_literal`, `literal_generation`, `literal_source`, `lifted_files`, `lifted_file`
+  - `std::lift`: `gradient`, `jacobian`, `recorded`, `reads`, `literal_count`, `literal_value`, `literal_built_value`, `set_literal`, `literal_generation`, `literal_source`, `lifted_files`, `lifted_file`
   - `std::job`: `Job`, `Step`
 - **Each std module passes an admission test:** it makes sense in a program that is not a game. The compiler knows nothing about the engine; a feature that only makes sense in a game belongs in the engine. Acoustics, creatures, terrain and timelines are engine code, in the `engine` package, not in std.
 - **std is written in Wrela** with a small unsafe core (§6.12). The core is these files, and only they contain `unsafe`: `std::mem` (raw memory), `std::alloc` (the allocator), `std::collections` (`Vec` and `Box`), `std::string`, `std::par` (the helpers and jobs), `std::audio` (the voice and its ring), `std::tick` (the ticker), `std::handoff` (the triple buffer), `std::time` (the clock) and `std::tool` (a tool's calls and tasks).
@@ -2883,7 +2974,7 @@ The compiler knows the language, a closed list of std items and its targets; the
 | `std::prelude` | In scope in every module: `Option`, `Result`, `Copy`, `Clone`, `GpuData`, `Plain`, and, from their modules, `Eq`, `Ord`, `Ordering`, `Vec`, `Bounded`, `Box`, `swap`, `replace`, `String`, `Text`, `Bytes`, `Arena`, `Handle`, `SortedMap` and `Quat` |
 | `std::cmp` | `Eq`, `Ord` and `Ordering`: `==` and `<` for the types that declare them (§3.4) |
 | `std::transform` | Matrices for skeletons, cameras and shadow maps, on the CPU and the GPU, in WebGPU's conventions (right-handed, +y up, column vectors, depth 0 to 1): `identity`, `translate`, `scale`, `rotate_x`, `rotate_y`, `rotate_z`, `rotate(axis, angle)`, `from_mat3`, `look_at(eye, at, up)`, `perspective`, `ortho`; `inverse` and `determinant` of any `mat4` |
-| `std::collections` | `Vec` and `Box`. `Bounded<T, N>`: at most `N` values held in place (an array and a count of the values in use). It is `Copy`, and it is `Plain` and `GpuData` where `T` is, so it can be in a snapshot or on the GPU, where a `Vec` cannot. It has `push`, `pop`, `remove`, `clear`, `len`, `is_full` and `Bounded::from(xs)`; `b[i]` projects an element in use (an index past `len()` panics on the CPU), `for x in b` walks the elements in use, and it hashes, saves and compares only those. `swap` and `replace` move values out of places. `Vec::filled(n, value)`, and `Vec::from_fn(n, make)` for a `T` that is not `Clone`. `sort_by` is a stable O(n log n) sort of a run of `Copy` values; `Vec::sort_by` sorts any `Vec`, and `Vec::sort_by_in` keeps its working space in a `Vec<u8>`, so a tick that sorts allocates nothing once that space has grown (§16.2) |
+| `std::collections` | `Vec` and `Box`. `Columns<T>`: each field of a `Copy` `T` in its own array, with `push`, `len` and `clear`; `c[i].x` is a place, and `c[i]` read whole gathers a copy (§6.10). `Bounded<T, N>`: at most `N` values held in place (an array and a count of the values in use). It is `Copy`, and it is `Plain` and `GpuData` where `T` is, so it can be in a snapshot or on the GPU, where a `Vec` cannot. It has `push`, `pop`, `remove`, `clear`, `len`, `is_full` and `Bounded::from(xs)`; `b[i]` projects an element in use (an index past `len()` panics on the CPU), `for x in b` walks the elements in use, and it hashes, saves and compares only those. `swap` and `replace` move values out of places. `Vec::filled(n, value)`, and `Vec::from_fn(n, make)` for a `T` that is not `Clone`. `sort_by` is a stable O(n log n) sort of a run of `Copy` values; `Vec::sort_by` sorts any `Vec`, and `Vec::sort_by_in` keeps its working space in a `Vec<u8>`, so a tick that sorts allocates nothing once that space has grown (§16.2) |
 | `std::string` | `String`; `Text`, text known at build time; `Bytes`, bytes known at build time, with `at(i)` and little-endian reads at any byte (`u16_le`, `u32_le`, `i32_le`, `f32_le`, `u64_le`, `f64_le`); numbers read from text (`parse_u32`, `parse_i32`, `parse_f32`), and `parse_f64` and `parse_f64_at(bytes, from, to)`, which read a decimal as the nearest f64, as Rust's `parse` does |
 | `std::fmt` | `Format`, which `f"…"` calls, and `Spec`, a hole's format spec; `json_text` and `json_number`, which write text and floats as JSON (a NaN or an infinity is `null`) |
 | `std::json` | JSON read: `parse` gives a `Doc`, its values found by index from `TOP` (`kind`, `get`, `at`, `count`, `num`, `text`, `is_true`, `write`); a number keeps its text, and `number_of` reads it as the nearest f64 |
@@ -3141,7 +3232,7 @@ The command-line tools for agents (§23.9) and a tool's toolchain service (§15.
 
 A lifted build reads a package's `f32` literals from a table instead of building them into the code, so a tool can change them while the program runs.
 
-- **`wrela build <package> --lift <name>`** lifts the `f32` literals of package `<name>`: the program's own package or a dependency. `--lift <name>/<file>` lifts one file of the package, by its path in the package, and the rest runs at a normal build's speed (for example, a floor's `map.wrela` alone).
+- **`wrela build <package> --lift <name>`** lifts the `f32` literals of package `<name>`: the program's own package or a dependency. `--lift <name>/<file>` lifts one file of the package, by its path in the package, and the rest runs at a normal build's speed (for example, a floor's `map.wrela` alone); a file the package doesn't have is an error that names it. The same entries reach `wrela run --lift` and a tool's `std::tool::toolchain::BuildOptions.lift`, so a tool's test can build with one file lifted: the file that holds a spec's solved numbers, when the rest of the package keeps what depends on its literals in heap memory (E0700).
 - **Which literals are lifted:**
   - A constant whose value is a literal is built where it is used, so every use of `EAR_H` reads one table entry. A parameter's default and a field's default are built the same way.
   - A literal that only a computed constant reads is not lifted: the build runs that code once (§13.1).
@@ -3151,6 +3242,7 @@ A lifted build reads a package's `f32` literals from a table instead of building
 - **`std::lift`** is the program's view of its table: `count()` and `literal(i)`; a `Literal`'s `value()`, `built_value()`, `set(v)` and `source()` (file, bytes, line, column, and the written mantissa's unit including its exponent and suffix); `files()`, `file_name(i)`, `file_path(i)`, `file_text(i)` and `file_hash(i)`. A build that is not lifted has no literals: `count()` is 0.
 - **`std::lift::gradient(f, which)`** gives `f`'s value and its derivative by each literal of `which`. This is a parameter gradient, derived in forward mode as `gradient` is (§14.2), through everything that `f` calls, including the code that builds values from literals. It runs on the CPU. `reads(f)` gives the literals that `f`'s code can read on the CPU, through everything that it calls, for any `fn() -> T`.
 - **`std::lift::jacobian(f, which)`** is `gradient` of a function that gives more than one number (an array of `f32`, a vector, a struct of them): `f`'s value, and for each literal of `which` how every part of the value changes with it, as a value of the same type. One derived evaluation gives all of them; a `gradient` of each part would run `f` again for each.
+- **`std::lift::reverse(f, which)`** is `gradient` by reverse mode (§14.1): from one recorded evaluation and one sweep back through it, at the cost of a few evaluations however many literals, with no limit of 255. `reverse_sum(n, term, which)` does the same for a sum of `n` terms, one record and sweep a term, so the trace holds one term at a time. A literal named twice is derived once, at its first place. Both take `f` through a parameter, as `Minimize` does, so the code `f` reaches is held to the heap rule alone.
 - **A host changes a literal** through the export that a lifted build has, `__lift_set(literal, value)`, as `set` does. `std::lift::generation()` counts the table's changes. A `Watch` (`Watch::new(reads(f))`) says when a literal that it watches has a new value (`changed()`, once per change). A program cooks again, at that time, what it cooked from literals at load.
 
 ### 23.2 Hot reload
@@ -3240,11 +3332,22 @@ pub fn spec<C: Checks>(c: mut C) {
   - `width`: across x, at a height and a depth;
   - `front` and `back`: along z;
   - `farthest`: how far the surface reaches in a direction, within a box;
-  - `part_named`.
+  - `part_named`;
+  - `coverage`, `outline_miss` and `image_miss`: how far the silhouette from the side, the front or the top (`View`) is from an outline, such as a blueprint's (§23.7), or from an image's opaque part.
 
-  Each measure searches with values, then takes one Newton step along its ray, so its derivative by a lifted literal is exact.
+  Each measure along a ray searches with values, then takes one Newton step along its ray, so its derivative by a lifted literal is exact.
+- **An outline is a measure too.** `coverage(f, view, at, width, near, far)` is how much of a footprint `width` across the silhouette covers, the least of the field's distances at 48 depths from `near` to `far` along the view's axis, box-filtered (`filtered`, §14.1): its derivative by a literal is the edge's where the edge crosses the footprint, and 0 away from it. `outline_miss(f, view, outline, cell, near, far)` is the root of the mean square difference between the silhouette's coverage and the outline's (even-odd, of a 4 × 4 grid of points a cell) over a grid of cells `cell` across round the outline, at most 64 a side: 0 a match, 1 no overlap. `image_miss(f, view, image, lo, hi, near, far)` is the same against an image's opaque part (alpha at least a half), laid over the rectangle from `lo` to `hi`. The outline is read by a function given nothing the derivation follows, so a blueprint's `Vec` is lent to the measure as it is (§14.2). On a test sphere, the coverage's derivative by its radius is within 2.4% of a hard edge's central difference.
+
+  ```text
+  c.at_most("side outline", outline_miss(f, View::Side, blueprint::side(), cell: 0.02, near: -1.0, far: 1.0), 0.0, within: 0.05)
+  ```
 - **Run with a `Report`,** the checks say how they stand: each check's value, target and miss, and how many hold. **Run with a `Loss`,** they are one number: the sum of each miss over its `within`, squared. The loss touches no memory, so `std::lift::gradient` derives it.
 - **`wrela solve <package> --spec --free <file>[:<lines or names>]`** changes the literals named until the spec holds. It runs BFGS on the loss's gradient, then rounds each literal to its decimals, with more decimals where rounding would undo the solve. It reports each check before and after.
+  - **Only the files freed are lifted.** A literal of another file (a blueprint's outline, a spec's targets) is a reference: the solve neither moves it nor derives through it.
+  - **A spec whose every check already holds is left as it is:** there is nothing to solve, so no literal moves and `--write` writes nothing. The report says so (`"held_before": true` in its JSON), and that isn't a failure. To make such a spec's loss smaller still, minimize a function that returns it (`--minimize`).
+  - **Steps:** no step moves a literal farther than its own size: its size now, or where the solve began if that was larger (so it can cross 0), or 1 if it began at 0. The loss's derivatives say nothing of it that far off, and a step as long as a steep loss's gradient would try a literal thousands of times its size, where a program may take hours or fail. A literal can still double each step. A step that would take a literal farther is shortened whole, by the one factor that brings that literal to its size, so the step keeps its direction.
+  - **A program that fails where the solve tries it** (a trap) ends the solve with the trap and the literals the solve was trying: ``(the solve was trying hook.wrela:47 `0.205` at 0.41)``. The program doesn't run at those values; make it, or free fewer literals.
+  - **Rounding:** a literal gets no decimals that buy nothing. Where no number of them keeps what the solve gained (the literals rounded before it gave it up), it gets the fewest whose loss is within 5% of the least any gives. Where the rounded literals leave the loss above the one before the solve, they stay where they began: a solve never leaves a loss larger than it found it. `--minimize` and `--fit` round the same way.
   - **Which literals:** those on lines (`body.wrela:12`, `body.wrela:12-20`), those of the value the file binds a name to (`body.wrela:reach`: the literals of `let reach = 0.62`, of a `var`'s value or of a `const`'s), several of either (`body.wrela:reach,drive,40-44`), or the whole file's with neither. A name stays where it is when the file's lines move. A name the file doesn't bind, binds more than once, or binds to a value with no lifted literal is an error.
   - **`--write`** writes the literals back through `wrela edit`, only if every check holds where the solve ended. Otherwise it writes nothing, says which checks miss, and fails (exit status 1): a solve that stopped short isn't one to keep.
   - **A literal the loss never changed with** is warned of, by its file and line: its derivative was 0 at every step, so the solve left it. Nothing on the loss's path reads it, or the loss is flat in it wherever the solve went. (A literal the path reads through heap memory is E0700, §14.2.)
@@ -3258,7 +3361,7 @@ A blueprint is outlines of the subject from the side, the front and the top, wri
 - from the front: (x, y);
 - from the top: (x, z).
 
-An outline is a reference: a tool can draw it over its view, measure where the subject's silhouette misses it, and fit literals to it.
+An outline is a reference. A spec holds the subject to it with `std::field::outline_miss` (§23.6), which measures where the subject's silhouette misses it, and `wrela solve --spec` fits the subject's literals to it; a tool can also draw it over its view.
 
 ### 23.8 What the medium gives an author
 
@@ -3312,12 +3415,17 @@ These commands let an agent read what the compiler knows about a package, instea
 | `wrela migrate <package-dir> [--dry-run] [--json]` | Makes every migration's fix and nothing else (§10.2): after a workspace moves its toolchain pin, one command brings each member to the new forms |
 | `wrela solve <package> --minimize <fn> --free <file>:<lines or names>` | Minimizes a function of no arguments over the literals named (on those lines, or of the values the file binds those names to, §23.6), and rounds them to their decimals. It builds a program around the function that uses `std::lift::Minimize` (BFGS on `std::lift::gradient`). It warns of each literal the function never changed with. `--write` writes the literals through `wrela edit` |
 | `wrela solve <package> --fit <fn> --free <file>:<lines or names>` | The same for a least-squares fit: `<fn>` returns `[f32; M]`, how far each of `M` things misses, and the sum of their squares is made small (`Minimize::fit`: Levenberg–Marquardt on `std::lift::jacobian`). A fit takes far fewer steps than `--minimize` of the same sum, since each step has every number's derivatives |
+| `wrela twin <package> <module>::<fn> --box <lo>..<hi>,... --within <eps>` | Experimental. Writes a cheaper twin of a function GPU code calls, proven within `eps` of it over the box (§14.3), as source with its certificate; `--write` puts it beside the original, `--check` fails where it's stale |
 | `wrela precision <package> <fn> --box <lo>..<hi>,...` | Says, operation by operation, where a half-float twin of a function of a point would be safe, from `std::derive::precision` over each box (§14.3), and names the first operation that isn't. `<fn>` is `<module>::<name>` in the package, or a path in std |
 | `wrela run <package> [--port N] [--lan]` | Serves the program lifted on 127.0.0.1 with hot reload (§23.2): a saved literal reaches the running program at its next frame, and any other edit swaps in a new build, in the same page. `--lan` serves this machine's private addresses too, to this machine and private networks only, and prints each (§15.5) |
 | `wrela trace <package> --watch <exports>` | Runs frames, in lockstep with the program's ticker if it has one (as `wrela-host` does), and prints what the exports say after each frame (`--csv`) |
 | `wrela bisect <package> --until "<export> <op> <number>"` | Finds the first frame at which a condition holds (`nan <export>` too) |
 | `wrela same <package> --against <build-dir>` | Whether the package built now behaves as a saved build of it does (below) |
 | `wrela profile <package> [--frames n]` | Shows where a frame's time goes on this machine (below) |
+| `wrela inspect <package> <module>::<fn>` | Says what a surface is made of, as findings with a point each: its pieces (certified), necks and specks, the parts that decide it nowhere, the parts thinner than a size, the literals that move it nowhere (`--lift`), and pictures of it from three sides (`--views`) (§23.10) |
+| `wrela sliders <package> <module>::<fn> --free <file>:<lines or names>` | Finds the independent ways a surface's freed literals move it, each named by what it moves and how, with the literals that make it; lists dead and redundant literals; moves along a slider (`--move i=a`, `--write`); draws each (`--sheet`) (§23.10) |
+| `wrela fuzz <package> [--time <s> \| --runs <n>]` | Looks for the inputs that trap the program's ticks, or with `--room` its server's rooms, by mutating inputs that run new code; writes each finding, made as small as it can be, as a tick log and a script that replay it, and `--replay` runs saved ones until they pass (§16.2). Exits 1 on a finding |
+| `wrela pixel <package> --frame <n> --at <x>,<y>` | Says why a pixel of the screen has its colour: every draw of the frame that changed it, with the pixel before and after each; the draw that decided it, and that draw's fragment there; and the fragment shader run again for that one pixel in an interpreter of the GPU code the build wrote, with each source line's values (how often it ran, its first and last values, its extremes), the first value that wasn't finite, and each operation WGSL leaves undefined. `--kernel <label> --id <i>` does the same for one invocation of a kernel (below) |
 | `wrela primer [area]` | Teaches the language area by area: each rule of the conformance suite, with a program that keeps it and one that breaks it |
 
 **`wrela query`** takes its queries from the arguments, or one per line on standard input:
@@ -3347,11 +3455,31 @@ It also answers on a program with errors. A function whose body has an error has
 
 Each time is a median, with its 95th percentile beside it, because a budget is about the slow frames too. `--worst n` (5 by default) names the slowest frames as well: natively by their call, and with `--chrome` by their paced interval. Each shows its call, its GPU span, its phases and its labels' GPU time. `--serial` runs each pass alone, so a label's time is its own where passes overlap (as on Apple GPUs). Times belong to the machine: compare a change with a profile from before it. `--baseline <report.json>` (an earlier `--json` report) does this: each time shows its earlier value and how it changed, and the report lists the labels that no longer run.
 
+**`wrela pixel`** runs the program from `init`, with its input (`--input`), on the native host's GPU, for `--frame` frames at `--size` (640 × 360 unless said). The frame is run again for each of its draws, its GPU work stopped before that draw (the host's probe), which draws the same picture as the whole frame: so it knows the pixel before and after each draw, and, stopped before the draw it traces (the last that changed the pixel, or `--draw k`), what that draw's resources held. It runs the draw's vertex shader for its vertices in the interpreter, finds the triangles that cover the pixel's centre by homogeneous edge functions (so one that crosses the near plane needs no clipping), interpolates the varyings perspective-correct, and runs the fragment shader for the pixel's block of four, in passes until each derivative (`dpdx`, `dpdy`, `fwidth`, a sample's level) settles. The interpreter computes each operation as WGSL defines it, from the module the WGSL is written from; where WGSL leaves a result undefined, it computes IEEE's and says so. It doesn't run atomics, workgroup memory, subgroup operations, barriers, indexed or indirect draws, or a depth test (each fragment is taken to pass), and says which it met. A GPU may compute floats in another order than the code's (Metal's shader compiler reassociates), so the interpreted colour and the GPU's can differ in their last bits; on `compiler/tests/fields`' shade they agree within 0.5/255. `--line <file>:<line>` gives one line's values, `--full` every value in order, a JSON object a line.
+
 **Agent runs are debug builds.** `wrela test` builds the program as a debug build (§11.3). `wrela trace` and `wrela bisect` do too, unless given `--release`. So a simulation that makes a NaN, or indexes a GPU buffer out of range, stops at the frame where it did, and the agent looks there.
 
 - `trace` and `bisect` accept `--no-gpu`: the CPU host checks submitted commands but does not execute shaders. Use it to watch CPU state that needs no GPU readbacks.
 - Both accept `--workers N`; without it, worker counts follow the available CPUs.
 - CPU-only frame and tick tests keep language checks and command validation, and generate no unused shader or browser files. Tests marked `gpu: true` still build and execute shaders.
+
+### 23.10 Reading what was made
+
+`wrela inspect` reads what a surface is made of, as a compiler's lints read code: a report of findings, each with a stable `kind`, a `proof` and a point, and pictures that need no GPU.
+
+```text
+wrela inspect <package> <module>::<fn> [--depth <n>] [--region <lo>..<hi>,<lo>..<hi>,<lo>..<hi>] [--thin <metres>] [--lift] [--views <dir>] [--json]
+```
+
+- **`<fn>`** takes nothing and returns a `Surface`, as a spec's subject does. The region is the surface's `bound()` grown by a tenth; an unbounded surface needs `--region`. `--depth` is 7 unless said (cells a 128th of the region), at most 9.
+- **Pieces** come from `std::field::pieces(field, region, depth)`: an octree, each cell classed by the field's interval as inside, outside or edge. Inside cells joined by faces are one body, so each group of them is one piece, **certified** connected. A path through the body passes only through inside and edge cells, so two pieces apart in those are certified apart, by at least a cell. A piece apart from the largest is `floating`, with the parts that make it and the gap. Two bodies joined only through edge cells are a `neck` (joined, if at all, by something thinner than a cell); a group of edge cells with no inside cell is a `speck` (something smaller than a cell may be here). `Pieces::one()` is true when the surface is certified to be one body down to the cell size.
+- **`dead-part`** is a part that decides the surface at no edge cell's centre (`part_at` never names it, and `part_share` is under 1e-3): **sampled**. **`thin`** is a part whose own inside fits a box thinner than `--thin` (5 mm unless said): certified, from the part's own octree.
+- **`dead-literal`** and **`faint-literal`** (with `--lift`): a literal of the subject's package whose derivative of the distance is 0 at every sampled edge cell (up to 512), or under 1e-6 of the largest literal's: **sampled**, from `std::lift::jacobian`, by its file, line and text. Code that keeps what depends on a literal in heap memory is the finding `not-derivable`, with the compiler's message.
+- **`certified`** means an interval proved it; anything else says `sampled`.
+- **Sliders:** `wrela sliders <package> <module>::<fn> --free <file>[:<lines or names>]` takes up to 512 points on the surface (its edge cells' centres, two Newton steps onto it) and how far the surface moves along its normal at each for a unit change of each freed literal, from `std::lift::jacobian` of the distances: a matrix of points by literals. Each literal's unit is its own size (at least ten of its last written decimal), and the sliders are that matrix's leading right singular vectors (`--top k`, 8 unless said), by orthogonal iteration: the directions in literal space that move the surface most, each at right angles to those before. Each is named by rule, the same every run: the two parts that move most, then `grows`, `shrinks` or `shifts`, then `(mirrored)` or `(one side)`. The report gives each one's root mean square motion for a unit, the literals that make it (at most 12, with their shares) and the parts it moves; and the dead literals (a zero column) and redundant pairs (two columns at a cosine over 0.999). `--move 2=1.5` adds 1.5 units of slider 2, each literal rounded to its decimals; `--write` writes them as `wrela solve --write` does. `--sheet <file.png>` draws a row a slider, the subject from the side at -1, 0 and +1 units. On the frozen wolf, with its 436 literals free, it takes 15 s on the M4.
+
+- **Pictures:** `std::field::preview(field, view, region, size, row)` is a row of a picture from a view, lit by the surface's normal and darker with depth. `--views <dir>` writes `side.png`, `front.png` and `top.png`, 128 pixels across, so an agent with no GPU can look at what it made.
+- Findings are advice: the command exits 0 with them, 1 if the package doesn't build. On the frozen wolf it takes 19 s on the M4.
 
 ## The rules by ID
 
@@ -3430,6 +3558,7 @@ Each rule of the conformance suite (`compiler/tests/conformance`), with what it 
 | `eff.deterministic-fn` | A function passed as a `@deterministic fn` is deterministic | §6.7 |
 | `mem.arenas` | An arena's values are named by handles: `arena[h]` projects, and a stale handle panics | §6.8 |
 | `mem.plain` | `Plain` data has no pointers, and every field of a type that declares it is `Plain` | §6.10 |
+| `mem.columns` | A `Columns` keeps each field in its own array: `c[i].x` is a place, and `c[i]` is read whole, never lent | §6.10 |
 | `mem.unsafe` | `unsafe` only in std's core, and only in packages that declare it | §6.12 |
 | `gen.bounds` | Generic code is checked against its bounds, and monomorphized | §7 |
 | `gen.impl-trait` | A trait in parameter position makes a function generic | §7 |
@@ -3477,4 +3606,5 @@ Each rule of the conformance suite (`compiler/tests/conformance`), with what it 
 | `gpu.textures` | Textures are sampled in fragment shaders, read anywhere on the GPU, and drawn into in passes, by their mip levels and layers | §18.8 |
 | `gpu.formats` | A texture's format is a type: its texel, and whether it's filtered, written by kernels and drawn into | §18.8 |
 | `gpu.features` | Half floats are GPU code's, and subgroup operations a kernel's, in uniform control flow, on a device with the feature | §18.10 |
+| `gpu.exact` | A `@deterministic` kernel computes with integers and moves floats only as bits, reading one buffer and writing its own place | §18.14 |
 | `build.budget` | A shipped build's pipelines have at most 256 KiB of WGSL each | §18.9 |

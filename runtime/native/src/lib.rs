@@ -100,6 +100,16 @@ pub enum Timing {
     Serial,
 }
 
+/// `wrela pixel`'s probe: in frame `frame` (0 the first), the GPU work stops before the
+/// frame's draw number `draws + 1` (counting every draw, from 1): what that draw would see is
+/// what the GPU holds after the frame, and what the screen shows is the picture as it was
+/// before it. Every pass still ends and presents. Without a probe, every command runs.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Probe {
+    pub frame: u32,
+    pub draws: u32,
+}
+
 /// How to run a program.
 #[derive(Clone, Debug, Default)]
 pub struct Options {
@@ -1060,6 +1070,33 @@ impl Host {
         self.p().executor().buffer_size(handle)
     }
 
+    /// For tests: each dispatch and draw runs on its pipeline's stand-in (language.md §18.12), as
+    /// a browser runs it until the pipeline is built; `false`, on the pipeline itself.
+    pub fn use_standins(&mut self, on: bool) {
+        self.p().executor().use_standins = on;
+    }
+
+    /// Sets `wrela pixel`'s probe ([`Probe`]), or clears it.
+    pub fn set_probe(&mut self, probe: Option<Probe>) {
+        self.p().executor().probe = probe;
+    }
+
+    /// The handles of the textures that exist, oldest first.
+    pub fn textures(&mut self) -> Vec<u32> {
+        self.p().executor().textures()
+    }
+
+    /// A texture's level, raw in its own format (rows top to bottom; a 3D texture's every
+    /// slice, else layer `layer`), with its size (width, height, slices) and format.
+    pub fn read_texture(
+        &mut self,
+        handle: u32,
+        level: u32,
+        layer: u32,
+    ) -> Result<([u32; 3], wrela_abi::stream::TextureFormat, Vec<u8>)> {
+        self.p().executor().read_texture(handle, level, layer)
+    }
+
     /// Reads a GPU buffer back after a run. For tests: it waits for the GPU.
     pub fn read_buffer(&mut self, handle: u32) -> Result<Vec<u8>> {
         self.p().executor().read_buffer(handle)
@@ -1407,9 +1444,22 @@ impl CpuHost {
         self.program.hash().value()
     }
 
+    /// In a metered build (`CpuBuild::load_metered`), the fuel the last call left of what each
+    /// call is given: so a test measures work in fuel, not time. `None` unmetered.
+    pub fn fuel_left(&self) -> Option<u64> {
+        self.program.fuel_left()
+    }
+
     /// Why the last call failed, if it trapped: where, by WASM offset, and how.
     pub fn last_failure(&self) -> Option<&Failure> {
         self.program.last_failure()
+    }
+
+    /// A fuzzer's build's coverage map (`wrela_abi::COVERAGE_GLOBAL`): the byte of each site
+    /// that has run since the program started is 1.
+    /// `None` for a build without one.
+    pub fn coverage(&mut self) -> Option<Vec<u8>> {
+        self.program.coverage()
     }
 
     /// Runs the program's `init`, for a host [`CpuBuild::instantiate_in`] made.

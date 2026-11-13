@@ -1,4 +1,4 @@
-//! `wrela build <package-dir> [-o <out-dir>] [--debug] [--testing] [--optimize [size|speed]] [--lift <package>]... [--json]`: checks and builds a package, writing
+//! `wrela build <package-dir> [-o <out-dir>] [--debug] [--testing] [--optimize [size|speed]] [--lift <package>[/<file>]]... [--json]`: checks and builds a package, writing
 //! `game.wasm`, the WGSL, `manifest.json` and the runtime into the output directory (default
 //! `<package>/build`). With `--optimize`, `game.wasm` goes through Binaryen (for size, `-Oz`, or
 //! speed, `-O3`; alone, `wrela_driver::optimize::Level::DEFAULT`) and its trap
@@ -48,6 +48,10 @@ pub fn run(args: &[String]) -> ExitCode {
     if args.report_consts {
         let runs = &output.consts.runs;
         print!("{}", if args.json { consts_json(runs) } else { consts_table(runs) });
+    }
+    if args.report_layout {
+        let rows = &output.layout;
+        print!("{}", if args.json { layout_json(rows) } else { layout_table(rows) });
     }
     if let Some(level) = args.optimize
         && !failed
@@ -146,6 +150,57 @@ fn consts_json(runs: &[wrela_driver::ConstRun]) -> String {
         })
         .collect();
     format!("{}\n", serde_json::json!({ "consts": rows }))
+}
+
+/// `--report layout`'s table: for each loop over a container or array of structs, the struct,
+/// its size, the bytes of it the loop reads and writes, whether it takes an element whole, and
+/// the bytes each pass skips; the most skipped first.
+pub(crate) fn layout_table(rows: &[(String, wrela_ir::walked::Walked)]) -> String {
+    let mut s = format!(
+        "{:>7} {:>5} {:>5} {:>7} {:>5}  {:<24} {:<32} {}\n",
+        "skipped", "size", "read", "written", "whole", "struct", "function", "loop"
+    );
+    for (at, w) in rows {
+        let whole = if w.whole { "yes" } else { "no" };
+        // A generic struct's name can run long: its start, and an ellipsis.
+        let ty = if w.ty.chars().count() > 24 {
+            format!("{}…", w.ty.chars().take(23).collect::<String>())
+        } else {
+            w.ty.clone()
+        };
+        s.push_str(&format!(
+            "{:>7} {:>5} {:>5} {:>7} {:>5}  {:<24} {:<32} {at}\n",
+            w.skipped(),
+            w.size,
+            w.read,
+            w.written,
+            whole,
+            ty,
+            w.function
+        ));
+    }
+    s.push_str(&format!("layout: {} loops over structs\n", rows.len()));
+    s
+}
+
+/// `--report layout --json`.
+fn layout_json(rows: &[(String, wrela_ir::walked::Walked)]) -> String {
+    let rows: Vec<_> = rows
+        .iter()
+        .map(|(at, w)| {
+            serde_json::json!({
+                "loop": at,
+                "function": w.function,
+                "struct": w.ty,
+                "size": w.size,
+                "read": w.read,
+                "written": w.written,
+                "skipped": w.skipped(),
+                "whole": w.whole,
+            })
+        })
+        .collect();
+    format!("{}\n", serde_json::json!({ "layout": rows }))
 }
 
 /// How many of the largest constants `--report data` lists.

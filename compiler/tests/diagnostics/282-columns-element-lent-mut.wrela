@@ -1,0 +1,21 @@
+// mistake: an element of a Columns lent to a mut parameter
+// expect: E0339
+// fix: no
+use std::collections::Columns
+
+struct P: Copy {
+    x: f32,
+    v: f32,
+}
+
+fn step(p: mut P) {
+    p.x += p.v
+}
+
+pub fn frame(time: f32, width: u32, height: u32) {
+    var ps: Columns<P> = Columns::new()
+    ps.push(P { x: 0.0, v: 1.0 })
+    for i in 0..ps.len() {
+        step(mut ps[i])
+    }
+}

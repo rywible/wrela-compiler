@@ -1392,13 +1392,15 @@ pub(crate) fn intrinsic(
             | Lang::Filtered
             | Lang::TapeOf
             | Lang::TapeWith
-            | Lang::TapeSized),
+            | Lang::TapeSized
+            | Lang::Recorded),
         ) => {
             return crate::derive::call(fl, l, substs, c, ty);
         }
         Some(
             l @ (Lang::LiftGradient
             | Lang::LiftJacobian
+            | Lang::LiftRecorded
             | Lang::LiftReads
             | Lang::LiftCount
             | Lang::LiftValue
@@ -1417,7 +1419,10 @@ pub(crate) fn intrinsic(
                 ));
                 return None;
             }
-            if matches!(l, Lang::LiftGradient | Lang::LiftJacobian | Lang::LiftReads) {
+            if matches!(
+                l,
+                Lang::LiftGradient | Lang::LiftJacobian | Lang::LiftRecorded | Lang::LiftReads
+            ) {
                 return crate::derive::call(fl, l, substs, c, ty);
             }
             return crate::lift::intrinsic(fl, l, c, ty);
@@ -3005,6 +3010,106 @@ fn non_filtering(m: &ir::Module, bindings: &mut [ResourceBinding]) {
     }
 }
 
+/// A `@deterministic` kernel (§18.14) gives the same bits on every GPU, and on the CPU: E0713
+/// where its module does what a GPU may do its own way (`ir::exact`), or where its parameters
+/// aren't one read-only buffer, at most one value, one output it writes at its own place, and
+/// its place.
+fn check_exact(cx: &mut Cx, kernel: FnId, m: &ir::Module) {
+    let def = cx.checked.program.func(kernel);
+    let Some(at) = def.attrs.deterministic else { return };
+    if !cx.exact_checked.insert(kernel) {
+        return;
+    }
+    let (name, span) = (def.name.clone(), def.name_span);
+    let note = "a deterministic kernel computes with integers, and moves floats only as bits: its \
+                result is then the same on every GPU and on the CPU (§18.14)";
+    for p in ir::exact::problems(m) {
+        // Where std does it for the kernel (an atomic's method), the kernel's name says it.
+        let here = p.at.filter(|a| a.file == span.file).unwrap_or(span);
+        let mut d = Diagnostic::new(
+            codes::E0713,
+            here,
+            format!("`{name}` is `@deterministic`, and {} isn't the same on every GPU", p.what),
+        )
+        .with_note(note)
+        .with_help(if p.what.contains("float") {
+            "compute with integers (fixed point for a fraction), and move floats only as bits"
+        } else {
+            "drop it: each invocation computes from what it reads and writes only its own place"
+        });
+        d = d.with_secondary(at, "deterministic here");
+        cx.err(d);
+    }
+    use ir::ResourceKind as K;
+    let count =
+        |k: fn(&ir::ResourceKind) -> bool| m.resources.iter().filter(|r| k(&r.kind)).count();
+    let reads = count(|k| *k == K::StorageRead);
+    let writes = count(|k| *k == K::StorageReadWrite);
+    let values = count(|k| matches!(k, K::Uniform { .. }));
+    let others = count(|k| {
+        !matches!(k, K::StorageRead | K::StorageReadWrite | K::Uniform { .. } | K::Private)
+    });
+    let shape = if reads > 1 {
+        Some("more than one buffer to read")
+    } else if writes != 1 {
+        Some("no output, or more than one")
+    } else if values > 1 {
+        Some("more than one value")
+    } else if others > 0 {
+        Some("a texture, a sampler, atomics or workgroup memory")
+    } else {
+        None
+    };
+    if let Some(what) = shape {
+        cx.err(
+            Diagnostic::new(
+                codes::E0713,
+                span,
+                format!("`{name}` is `@deterministic`, and its parameters have {what}"),
+            )
+            .with_note("a deterministic kernel is `fn k(input: [A], params: P, out: mut Slots<B>, id: GlobalId)`: one buffer it reads, one value, the places it writes, its own place (§18.14)")
+            .with_help("put what it reads side by side in one buffer, and what it's given in one `GpuData` value")
+            .with_secondary(at, "deterministic here"),
+        );
+    }
+}
+
+/// A `@deterministic` kernel's module (§18.14), checked (E0713), its indexes clamped and its
+/// calls inlined into its entry point: what its CPU form (`k.run`, `crate::exact`) is made from,
+/// the same code the GPU runs. With its workgroup size.
+pub(crate) fn exact_module(
+    cx: &mut Cx,
+    kernel: FnId,
+    substs: &[TyId],
+) -> Option<(ir::Module, [u32; 3])> {
+    let key =
+        PipelineKey::Compute { kernel, substs: substs.to_vec(), over: false, consts: Vec::new() };
+    let iface = Rc::new(interface(cx, &key));
+    let Some(Entry::Compute(wg)) = cx.entry_of(kernel) else { return None };
+    let name = cx.checked.program.func(kernel).name.clone();
+    let EntryModule { mut mb, keys, .. } =
+        entry_module(cx, iface.clone(), Entry::Compute(wg), Some(Vec::new()));
+    let entry = entry_function(&mut mb, &keys[0], &name, None, None);
+    cx.drain(&mut mb);
+    let inputs = entry_inputs(&iface.entries[0], true, iface.over);
+    mb.m.entry_points.push(ir::EntryPoint {
+        name: ir::ident(&name),
+        stage: ir::Stage::Compute { workgroup_size: wg },
+        function: entry,
+        inputs,
+    });
+    check_exact(cx, kernel, &mb.m);
+    if wrela_diag::has_errors(&cx.diags) {
+        return None;
+    }
+    ir::exact::clamp_indexes(&mut mb.m);
+    if let Err(e) = ir::opt::flatten_gpu(&mut mb.m) {
+        cx.err(Diagnostic::internal(format!("flattening `{name}` for its CPU form: {e}")));
+        return None;
+    }
+    Some((mb.m, wg))
+}
+
 fn lower_compute(cx: &mut Cx, iface: Rc<Interface>, consts: Vec<ir::Const>) -> Option<PipelineOut> {
     let kernel = iface.entries[0].func;
     let Some(Entry::Compute(wg)) = cx.entry_of(kernel) else { return None };
@@ -3024,6 +3129,10 @@ fn lower_compute(cx: &mut Cx, iface: Rc<Interface>, consts: Vec<ir::Const>) -> O
         function: entry,
         inputs,
     });
+    if cx.checked.program.func(kernel).attrs.deterministic.is_some() {
+        check_exact(cx, kernel, &mb.m);
+        ir::exact::clamp_indexes(&mut mb.m);
+    }
     let (work, unbounded, weight, same, few) = verify(cx, &mut mb, name)?;
     non_filtering(&mb.m, &mut bindings);
     let instances = mb.fn_instances();

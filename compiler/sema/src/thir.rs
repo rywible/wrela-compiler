@@ -121,6 +121,12 @@ pub enum Callee {
         func: FnId,
         args: Vec<TyId>,
     },
+    /// `k.run(input, params, mut out)`: a `@deterministic` kernel's CPU form (§18.14), run over
+    /// `out`'s places; `args` are the kernel's generics.
+    ExactRun {
+        func: FnId,
+        args: Vec<TyId>,
+    },
 }
 
 #[derive(Clone, Debug)]

@@ -2,7 +2,7 @@
 //!
 //! ```text
 //! wrela check <package-dir> [--json]      check a package; exit 1 if it has errors
-//! wrela build <package-dir> [-o <dir>] [--debug] [--testing] [--optimize] [--lift <package>]... [--report data|consts]
+//! wrela build <package-dir> [-o <dir>] [--debug] [--testing] [--optimize] [--lift <package>[/<file>]]... [--report data|consts|layout]
 //!                                         check and build; writes <dir> (default
 //!                                         <package>/build); --debug adds checks (§11);
 //!                                         --testing keeps the `@testing` exports (§9);
@@ -23,6 +23,23 @@
 //!                                         has it and the program fixed
 //! wrela doc <item> [<package-dir>]        an item's signature, doc comment and examples
 //! wrela pipelines <package-dir> [--json]  each GPU entry point's instantiations (§18.9)
+//! wrela inspect <package-dir> <module>::<fn> [--lift] [--views <dir>]
+//!                                         what a surface is made of: its pieces, necks,
+//!                                         specks, dead and thin parts and dead literals, each
+//!                                         with a point, and pictures of it
+//! wrela sliders <package-dir> <module>::<fn> --free <file>:<lines or names>... [--move i=a] [--write]
+//!                                         the independent ways a surface's literals move it,
+//!                                         each named, and moving along one
+//! wrela twin <package-dir> <module>::<fn> --box ... --within eps [--write | --check]
+//!                                         experimental: a cheaper twin of a GPU function,
+//!                                         proven within eps over the box, as source
+//! wrela fuzz <package-dir> [--ticks n] [--time s | --runs n] [--seed n] [--room]
+//!                                         the inputs that trap the program's ticks (or its
+//!                                         rooms), found by mutating inputs that run new
+//!                                         code, minimized and saved; --replay runs them
+//! wrela pixel <package-dir> --frame n (--at x,y | --kernel <label> --id i)
+//!                                         why a pixel has its colour: each draw that changed
+//!                                         it, and the shader interpreted for it, line by line
 //! wrela profile <package-dir> [--frames n] [--size WxH] [--input <script.json>] [--serial]
 //!     [--json] [--baseline <report.json>] [--compare <build-dir>] where a frame's time goes on this machine: the GPU's
 //!                                         by label, the CPU's and its phases (medians and
@@ -100,9 +117,12 @@ mod explain;
 mod export;
 mod fix;
 mod fmt;
+mod fuzz;
+mod inspect;
 mod migrate;
 mod pin;
 mod pipelines;
+mod pixel;
 mod precision;
 mod primer;
 mod profile;
@@ -111,17 +131,19 @@ mod refactor;
 mod run;
 mod same;
 mod script;
+mod sliders;
 mod solve;
 mod suite;
 mod test;
 mod tool;
 mod toolchain;
 mod trace;
+mod twin;
 
 pub(crate) fn usage() -> ExitCode {
     let lines = [
         "wrela check <package-dir> [--json]",
-        "wrela build <package-dir> [-o <out-dir>] [--debug] [--testing] [--optimize [size|speed]] [--relaxed-simd] [--lift <package>]... [--set NAME=VALUE]... [--report data|consts] [--json]",
+        "wrela build <package-dir> [-o <out-dir>] [--debug] [--testing] [--optimize [size|speed]] [--relaxed-simd] [--lift <package>[/<file>]]... [--set NAME=VALUE]... [--report data|consts|layout] [--json]",
         "wrela fmt <file-or-dir>... [--check]",
         "wrela fix <package-dir> [--dry-run] [--json]",
         "wrela migrate <package-dir> [--dry-run] [--json]",
@@ -130,6 +152,11 @@ pub(crate) fn usage() -> ExitCode {
         "wrela doc <item> [<package-dir>]",
         "wrela doc --export <dir> [--commit <sha>] [<package-dir>...]",
         "wrela pipelines <package-dir> [--set NAME=VALUE]... [--json]",
+        "wrela inspect <package-dir> <module>::<fn> [--depth <n>] [--region <lo>..<hi>,<lo>..<hi>,<lo>..<hi>] [--thin <metres>] [--lift] [--views <dir>] [--json]",
+        "wrela sliders <package-dir> <module>::<fn> --free <file>[:<lines or names>]... [--top <k>] [--depth <n>] [--region <lo>..<hi>,<lo>..<hi>,<lo>..<hi>] [--move <i>=<amount>]... [--write] [--sheet <file.png>] [--json]",
+        "wrela twin <package-dir> <module>::<fn> --box <lo>..<hi>[,<lo>..<hi>]... --within <eps> [--name <twin>] [--write | --check] [--json]   (experimental)",
+        "wrela pixel <package-dir> --frame <n> (--at <x>,<y> [--draw <k>] [--fragment <j>] | --kernel <label> --id <i>) [--input <script.json>] [--size <w>x<h>] [--line <file>:<line>] [--full] [--json]",
+        "wrela fuzz <package-dir> [--ticks <n>] [--time <seconds> | --runs <n>] [--seed <n>] [--fuel <n>] [--seeds <dir>] [--out <dir>] [--replay <file-or-dir>] [--room] [--json]",
         "wrela profile <package-dir> [--frames n] [--warmup n] [--workers n] [--size WxH] [--input <script.json>] [--scenario name] [--serial] [--worst n] [--chrome [--features none|<list>] [--checked]] [--optimize size|speed] [--relaxed-simd] [--json] [--baseline <report.json> | --compare <build-dir> [--pairs n]]",
         "wrela test <package-dir> [<filter>] [--exact] [--std] [--bless] [--json]",
         "wrela script <package-dir> <module>::<NAME> [-o <file>]",
@@ -141,7 +168,7 @@ pub(crate) fn usage() -> ExitCode {
         "wrela refactor <package-dir> (rename <item> <new-name> | move <item> <module> | add-param <fn> \"<name>: <type>\" (--value <expr> | --default <expr>) | change-mode <fn> <param> <borrow|mut|take> | extract-const <file>:<line>:<col> <NAME> | inline <fn> | extract-fn <file>:<first>-<last> <name> | apply <plan.json>) [--dry-run] [--json]",
         "wrela trace <package-dir> --watch <export>[,<export>...] [--frames n] [--csv] [--fps f] [--size WxH] [--input <script.json>] [--release] [--no-gpu] [--workers N]",
         "wrela bisect <package-dir> --until \"<export> <op> <number>\" [--frames n] [--json] [--fps f] [--size WxH] [--input <script.json>] [--release] [--no-gpu] [--workers N]",
-        "wrela run <package-dir> [--port N] [--lan] [--lift <package>]... [--debug]",
+        "wrela run <package-dir> [--port N] [--lan] [--lift <package>[/<file>]]... [--debug]",
         "wrela same <package-dir> --against <build-dir> [--set NAME=VALUE]... [--frames n] [--fps f] [--size WxH] [--input <script.json>] [--within x] [--no-gpu] [--json]",
         "wrela suite [fmt | allow | wrela::<package-path>::[<test-name>]] [--workspace <dir>]",
         "wrela tool (<package-dir> | <name>) [--read NAME=DIR]... [--write NAME=DIR]... [--secret NAME]... [--net HOST]... [--allow-run NAME[=PATH]]... [--browser] [--timeout S] [--workers N] [--blob-budget B] [-- args...]",
@@ -184,6 +211,11 @@ fn main() -> ExitCode {
         "doc" if rest.iter().any(|a| a == "--export") => export::run(rest),
         "doc" => doc::run(rest),
         "pipelines" => pipelines::run(rest),
+        "pixel" => pixel::run(rest),
+        "inspect" => inspect::run(rest),
+        "sliders" => sliders::run(rest),
+        "fuzz" => fuzz::run(rest),
+        "twin" => twin::run(rest),
         "profile" => profile::run(rest),
         "test" => {
             // Each tool test runs in a process of this executable's (§13.2).
@@ -252,8 +284,8 @@ pub(crate) struct PackageArgs {
     /// `--testing`, which only `build` takes: a test build, with the program's `@testing`
     /// exports (§9).
     pub testing: bool,
-    /// `--lift <package>`, which only `build` takes: the packages whose literals a lifted
-    /// build lifts.
+    /// `--lift <package>[/<file>]`, which only `build` takes: the packages whose literals a
+    /// lifted build lifts, or one file of a package, by its path in the package.
     pub lift: Vec<String>,
     /// `--optimize [size|speed]`, which only `build` takes: the WASM through `wasm-opt`
     /// (`wrela_driver::optimize`), for size or speed (alone, `Level::DEFAULT`).
@@ -263,6 +295,9 @@ pub(crate) struct PackageArgs {
     /// `--report consts`, which only `build` takes: each computed constant, and whether it was
     /// computed or read from the cache.
     pub report_consts: bool,
+    /// `--report layout`, which only `build` takes: for each loop over a container or array of
+    /// structs, the bytes of the struct it reads and writes (`wrela_ir::walked`).
+    pub report_layout: bool,
     /// `--set NAME=VALUE`, which `build` and `pipelines` take: the program's root-module
     /// constants given other values (language.md §13).
     pub set: Vec<(String, String)>,
@@ -279,6 +314,7 @@ pub(crate) fn package_args(args: &[String], takes_out: bool) -> Result<PackageAr
     let mut optimize = None;
     let mut report_data = false;
     let mut report_consts = false;
+    let mut report_layout = false;
     let mut set = Vec::new();
     let mut relaxed_simd = false;
     let mut lift = Vec::new();
@@ -306,6 +342,7 @@ pub(crate) fn package_args(args: &[String], takes_out: bool) -> Result<PackageAr
             "--report" if takes_out => match it.next().map(String::as_str) {
                 Some("data") => report_data = true,
                 Some("consts") => report_consts = true,
+                Some("layout") => report_layout = true,
                 _ => return Err(usage()),
             },
             "--set" => {
@@ -354,6 +391,7 @@ pub(crate) fn package_args(args: &[String], takes_out: bool) -> Result<PackageAr
         optimize,
         report_data,
         report_consts,
+        report_layout,
         set,
         relaxed_simd,
     })

@@ -1,0 +1,35 @@
+use std::hash::{StateHash, state_hash}
+use std::input::Event
+use std::tick::{Ticked, start}
+
+struct Sim: Clone + StateHash {
+    total: i32,
+}
+
+/// A press at `x`, spread.
+pub fn spread(x: f32) -> i32 {
+    1000 / (i32(x) - 300)
+}
+
+@deterministic
+fn step(sim: mut Sim, t: Ticked) {
+    for e in t.records {
+        if let Event::PointerDown { at, .. } = e {
+            if at.x >= 0.0 && at.x < 1000.0 {
+                sim.total = sim.total.wrapping_add(spread(at.x))
+            }
+        }
+    }
+}
+
+@deterministic
+fn hash(sim: Sim) -> u64 {
+    state_hash(sim)
+}
+
+pub fn init() -> u32 {
+    start(Sim { total: 0 }, hz: 60, step: step, hash: hash)
+    0
+}
+
+pub fn frame(state: mut u32, time: f32, width: u32, height: u32) {}

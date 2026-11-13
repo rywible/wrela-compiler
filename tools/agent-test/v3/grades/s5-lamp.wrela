@@ -1,0 +1,52 @@
+use shape::subject
+use std::field::{Surface, View, coverage, round_cone}
+
+/// The blueprint: the silhouette the brief describes.
+fn blueprint() -> Surface {
+    let base = round_cone(vec3(0.0, 0.0, 0.0), vec3(0.0, 0.02, 0.0), r_top: 0.15, r_bottom: 0.15).named("base")
+    let pole = round_cone(vec3(0.0, 0.02, 0.0), vec3(0.0, 0.5, 0.0), r_top: 0.03, r_bottom: 0.03).named("pole")
+    let shade = round_cone(vec3(0.0, 0.5, 0.0), vec3(0.0, 0.6, 0.0), r_top: 0.18, r_bottom: 0.09).named("shade")
+    base.union(pole).union(shade)
+}
+
+@test
+fn grade_inside_and_outside() {
+    let f = subject()
+    for p in [
+        vec3(0, 0.02, 0),
+        vec3(0.12, 0.02, 0),
+        vec3(0, 0.25, 0),
+        vec3(0, 0.65, 0),
+        vec3(0.1, 0.55, 0),
+    ] {
+        assert(f.distance(p) < 0.0, f"{p.x}, {p.y}, {p.z} should be inside")
+    }
+    for p in [
+        vec3(0.1, 0.25, 0),
+        vec3(0.21, 0.5, 0),
+        vec3(0, 0.75, 0),
+    ] {
+        assert(f.distance(p) > 0.0, f"{p.x}, {p.y}, {p.z} should be outside")
+    }
+}
+
+/// Its front silhouette against the blueprint's: the root mean square difference of
+/// their coverage over a 40 by 40 grid, under 0.1.
+@test
+fn grade_outline() {
+    let (f, b) = (subject(), blueprint())
+    let lo = vec2(-0.25, -0.05)
+    let cell = (vec2(0.25, 0.7) - lo) / 40.0
+    var sum = 0.0
+    for j in 0..40 {
+        for i in 0..40 {
+            let c = lo + (vec2(f32(i), f32(j)) + vec2(0.5)) * cell
+            let w = max(cell.x, cell.y)
+            let d = coverage(f, View::Front, c, w, near: -0.25, far: 0.25) -
+                coverage(b, View::Front, c, w, near: -0.25, far: 0.25)
+            sum += d * d
+        }
+    }
+    let miss = sqrt(sum / 1600.0)
+    assert(miss < 0.1, f"its front outline misses the blueprint's by {miss}")
+}

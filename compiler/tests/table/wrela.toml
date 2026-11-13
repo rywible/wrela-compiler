@@ -1,0 +1,5 @@
+[package]
+name = "table"
+
+[dependencies]
+tables = { path = "../tables" }

@@ -1,0 +1,49 @@
+// A `@deterministic` kernel (§18.14) that does something a GPU may do its own way: float
+// arithmetic (each GPU rounds its own way), an atomic, workgroup memory or a subgroup operation
+// (the result depends on how invocations interleave), a texture, or parameters other than one
+// buffer it reads, at most one value, one output it writes at its own place, and its place. Its
+// result would then differ between GPUs, and from the CPU's. Compute with integers (fixed point
+// for a fraction), and move floats only as bits.
+// ---- wrong
+use std::gpu::{GlobalId, GpuBuffer, Slots, buffer, dispatch}
+
+@deterministic
+@compute(64)
+fn spread(heat: [f32], out: mut Slots<f32>, id: GlobalId) {
+    out[id] = heat[id.x] * 0.5
+}
+
+pub struct S {
+    heat: GpuBuffer<f32>,
+    next: GpuBuffer<f32>,
+}
+
+pub fn init() -> S {
+    S { heat: buffer(64), next: buffer(64) }
+}
+
+pub fn frame(s: mut S, time: f32, width: u32, height: u32) {
+    dispatch(spread.bind(s.heat, mut s.next), groups: 1)
+}
+// ---- fixed
+use std::gpu::{GlobalId, GpuBuffer, Slots, buffer, dispatch}
+
+/// Heat in 1/65536ths of a degree: integers, the same on every GPU.
+@deterministic
+@compute(64)
+fn spread(heat: [u32], out: mut Slots<u32>, id: GlobalId) {
+    out[id] = heat[id.x] / 2
+}
+
+pub struct S {
+    heat: GpuBuffer<u32>,
+    next: GpuBuffer<u32>,
+}
+
+pub fn init() -> S {
+    S { heat: buffer(64), next: buffer(64) }
+}
+
+pub fn frame(s: mut S, time: f32, width: u32, height: u32) {
+    dispatch(spread.bind(s.heat, mut s.next), groups: 1)
+}

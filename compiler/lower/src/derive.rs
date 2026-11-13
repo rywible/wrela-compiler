@@ -26,6 +26,8 @@ pub(crate) fn call(
         Lang::LiftGradient | Lang::LiftJacobian => DeriveKind::Literals,
         Lang::LiftReads => DeriveKind::Reads,
         Lang::TapeOf | Lang::TapeWith | Lang::TapeSized => DeriveKind::Tape,
+        Lang::Recorded => DeriveKind::Recorded,
+        Lang::LiftRecorded => DeriveKind::LiteralsRecorded,
         _ => DeriveKind::ValueAndGradient,
     };
     let Some(Repr::Callable(callable, srcs)) = fl.callable_arg(&c.args[0]) else {
@@ -51,6 +53,11 @@ pub(crate) fn call(
         DeriveKind::ValueAndGradient => {
             (substs[0], if lang == Lang::ValueGradientWith { substs.get(1).copied() } else { None })
         }
+        DeriveKind::Recorded => (substs[0], ty.map(|t| fl.concrete(t))),
+        DeriveKind::LiteralsRecorded => {
+            let which = fl.place_src_ty(c.args[1].place()?);
+            (which, ty.map(|t| fl.concrete(t)))
+        }
     };
     let key = InstanceKey::Derived { of: callable, kind, input, output };
     let callee = fl.cx.instance(fl.mb, key, Some((fl.id, c.span)));
@@ -62,6 +69,20 @@ pub(crate) fn call(
     if kind == DeriveKind::Filtered {
         let width = fl.arg_value(&c.args[2])?;
         args.push(ir::Arg::Value(width));
+    }
+    if kind == DeriveKind::LiteralsRecorded {
+        let trace = fl.place(c.args[2].place()?)?;
+        args.push(ir::Arg::Place(trace));
+    }
+    if kind == DeriveKind::Recorded {
+        if fl.is_gpu() {
+            fl.cx.err(Diagnostic::new(codes::E0700, c.span, "a reverse gradient runs on the CPU"));
+            return None;
+        }
+        let slots = fl.arg_value(&c.args[2])?;
+        args.push(ir::Arg::Value(slots));
+        let trace = fl.place(c.args[3].place()?)?;
+        args.push(ir::Arg::Place(trace));
     }
     let Some(ret) = fl.mb.m.functions[callee.index()].ret else {
         // `precision`: a report, which returns nothing.
@@ -107,6 +128,27 @@ fn tape_fns(
         two: f(cx, mb, Lang::PushTwo)?,
         new: f(cx, mb, Lang::PushNew)?,
         finish: f(cx, mb, Lang::TapeFinish)?,
+    })
+}
+
+/// std's `trace_one` and `trace_two`, which a recording derivation calls (`id` the derived
+/// instance that calls them), and the `Trace` they push onto.
+fn record_fns(
+    cx: &mut Cx,
+    mb: &mut ModuleBuilder,
+    id: ir::FuncId,
+    trace: Option<ir::TypeId>,
+) -> Option<ir::derive::RecordFns> {
+    let at = mb.callers.get(&id).map(|c| (id, c.1));
+    let mut f = |l: Lang| {
+        let func = cx.checked.program.lang_fn(l)?;
+        Some(cx.instance(mb, InstanceKey::plain(func, Vec::new()), at))
+    };
+    Some(ir::derive::RecordFns {
+        one: f(Lang::TraceOne)?,
+        two: f(Lang::TraceTwo)?,
+        trace: trace?,
+        leaf: f(Lang::TraceLeaf),
     })
 }
 
@@ -177,6 +219,31 @@ pub(crate) fn signature(cx: &mut Cx, mb: &mut ModuleBuilder, key: &InstanceKey) 
         }
         // `input` is the tape's type.
         DeriveKind::Tape => ir::Function::new("tape", params, x),
+        DeriveKind::Recorded | DeriveKind::LiteralsRecorded => {
+            let r = output.and_then(|o| cx.lower_ty(mb, o, span));
+            let trace = cx
+                .checked
+                .program
+                .lang_adt(Lang::Trace)
+                .map(|a| cx.checked.program.types.adt(a, Vec::new()))
+                .and_then(|t| cx.lower_ty(mb, t, span));
+            if let (Some(x), Some(trace)) = (x, trace) {
+                params.push(ir::Param::value(
+                    if *kind == DeriveKind::Recorded { "x" } else { "which" },
+                    x,
+                ));
+                if *kind == DeriveKind::Recorded {
+                    params.push(ir::Param::value("slots", x));
+                }
+                params.push(ir::Param {
+                    name: "trace".into(),
+                    ty: trace,
+                    by_ref: true,
+                    mutable: true,
+                });
+            }
+            ir::Function::new("recorded", params, r)
+        }
         DeriveKind::Interval | DeriveKind::Precision => {
             let (bt, it) = box_types(cx, mb, *input, *output, span);
             if let Some(bt) = bt {
@@ -387,6 +454,38 @@ fn build(
     let target = mb.target();
     let result = match kind {
         DeriveKind::Reads => return build_reads(mb, id, inner),
+        DeriveKind::LiteralsRecorded => {
+            let sig = &mb.m.functions[id.index()];
+            let n = sig.params.len();
+            let (which, trace, ret) = (
+                sig.params.get(n.wrapping_sub(2)).map(|p| p.ty),
+                sig.params.last().map(|p| p.ty),
+                sig.ret,
+            );
+            match (record_fns(cx, mb, id, trace), which, ret) {
+                (Some(fns), Some(which), Some(ret)) => ir::derive::literal_recorded(
+                    &mut mb.m,
+                    &mut mb.derived,
+                    inner,
+                    mb.lift.map(|t| t.table),
+                    which,
+                    fns,
+                    ret,
+                ),
+                _ => Err(ir::Error::internal("a literals' record's signature is incomplete")),
+            }
+        }
+        DeriveKind::Recorded => {
+            let sig = &mb.m.functions[id.index()];
+            let (ncap, ret) = ((sig.params.len() as u32).saturating_sub(3), sig.ret);
+            let trace = sig.params.last().map(|p| p.ty);
+            match (record_fns(cx, mb, id, trace), ret) {
+                (Some(fns), Some(ret)) => {
+                    ir::derive::recorded(&mut mb.m, &mut mb.derived, inner, ncap, fns, ret)
+                }
+                _ => Err(ir::Error::internal("a recorded evaluation's signature is incomplete")),
+            }
+        }
         DeriveKind::Literals => {
             let sig = &mb.m.functions[id.index()];
             match (sig.params.last().map(|p| p.ty), sig.ret) {

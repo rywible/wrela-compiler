@@ -1,0 +1,22 @@
+// accepts: mem.columns
+// A `Columns` keeps each field in its own array: a field of an element is read and written in
+// place, and an element read whole is a copy gathered from every array.
+use std::collections::Columns
+
+struct P: Copy {
+    pos: vec3,
+    x: f32,
+    v: f32,
+}
+
+pub fn frame(time: f32, width: u32, height: u32) {
+    var ps: Columns<P> = Columns::new()
+    ps.push(P { pos: vec3(0.0), x: 0.0, v: 1.0 })
+    for i in 0..ps.len() {
+        ps[i].x += ps[i].v * time
+        ps[i].pos.y = ps[i].x
+    }
+    let first = ps[0]
+    let _ = first.x + ps[0].pos.y
+    ps.clear()
+}

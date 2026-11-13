@@ -1,0 +1,19 @@
+use shape::subject
+use std::field::Surface
+
+@test
+fn grade_inside_and_outside() {
+    let f = subject()
+    for p in [
+        vec3(0, 0, 0.32),
+        vec3(0, 0, 0),
+    ] {
+        assert(f.distance(p) < 0.0, f"{p.x}, {p.y}, {p.z} should be inside")
+    }
+    for p in [
+        vec3(0, 0, 0.4),
+        vec3(0.0, 0.1, 0.33),
+    ] {
+        assert(f.distance(p) > 0.0, f"{p.x}, {p.y}, {p.z} should be outside")
+    }
+}

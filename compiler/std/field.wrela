@@ -15,7 +15,8 @@
 // name, so a tool can say what a point belongs to without knowing what made the surface.
 
 use std::collections::Vec
-use std::derive::{Box3, Interval, gradient, interval, tape, value_and_gradient}
+use std::derive::{Box3, Interval, filtered, gradient, interval, tape, value_and_gradient}
+use std::png::Image
 use std::stage::Tape
 use std::quat::Quat
 use std::hash::{StateHash, pcg}
@@ -358,6 +359,544 @@ pub fn front<S: Surface>(field: S, x: f32, y: f32) -> f32 {
 pub fn back<S: Surface>(field: S, x: f32, y: f32) -> f32 {
     let t = hit(field, vec3(x, y, -10.0), vec3(0.0, 0.0, 1.0), far: 20.0)
     if t < 0.0 { 10.0 } else { t - 10.0 }
+}
+
+// ---- outlines (§23.6, §23.7) ------------------------------------------------------------
+//
+// A silhouette held to an outline or an image, as a number a spec can hold it to, with a
+// derivative a solve can follow through the silhouette's edge: each cell's coverage is the
+// share of its footprint inside the silhouette, box-filtered (`filtered`), so moving the edge
+// across the cell changes it smoothly.
+
+/// The axis a subject is seen along, with a blueprint's coordinates for what is seen (§23.7):
+/// from the side (z, y), the front (x, y) or the top (x, z).
+pub enum View: Copy {
+    Side,
+    Front,
+    Top,
+}
+
+impl View {
+    /// The point of space at `at` in this view's coordinates, `depth` along its axis.
+    pub fn point(self, at: vec2, depth: f32) -> vec3 {
+        match self {
+            View::Side => vec3(depth, at.y, at.x),
+            View::Front => vec3(at.x, at.y, depth),
+            View::Top => vec3(at.x, depth, at.y),
+        }
+    }
+}
+
+/// How many depths `coverage` looks at along a view's axis.
+const DEPTHS: u32 = 48
+
+/// The least of `field`'s distances at 48 depths from `near` to `far` along `view`'s axis at
+/// `u`: at most 0 where the silhouette covers `u`. The depths are fixed, so they don't depend on
+/// anything the field reads.
+fn least<S: Surface>(field: S, view: View, u: vec2, near: f32, far: f32) -> f32 {
+    var m = 1.0e30
+    for k in 0..DEPTHS {
+        let t = near + (far - near) * (f32(k) + 0.5) / f32(DEPTHS)
+        m = min(m, field.distance(view.point(u, t)))
+    }
+    m
+}
+
+/// How much of a footprint `width` across, at `at` in `view`'s coordinates, `field`'s
+/// silhouette covers, from 0 to 1. The silhouette is looked for between `near` and `far` along
+/// the view's axis (48 depths, so a part thinner than their spacing can be missed). Its
+/// derivative by anything the field reads is the edge's where the edge crosses the footprint,
+/// and 0 away from it.
+pub fn coverage<S: Surface>(
+    field: S,
+    view: View,
+    at: vec2,
+    width: f32,
+    near: f32,
+    far: f32,
+) -> f32 {
+    filtered(|u: vec2| step(least(field, view, u, near, far), 0.0), at, vec2(width))
+}
+
+/// The most cells a side of an outline's grid has.
+pub const MOST_CELLS: u32 = 64
+
+/// The grid round a polygon: its lower corner, and its cells across and up (the polygon's box
+/// and two cells round it, `cell` across). Panics past 64 cells a side, saying how many.
+fn grid_of(outline: [vec2], cell: f32) -> (vec2, [u32; 2]) {
+    var lo = vec2(1.0e30)
+    var hi = vec2(-1.0e30)
+    for p in outline {
+        lo = min(lo, p)
+        hi = max(hi, p)
+    }
+    let lo = lo - vec2(2.0 * cell)
+    let n = ceil((hi - lo) / cell + vec2(2.0))
+    if n.x > f32(MOST_CELLS) || n.y > f32(MOST_CELLS) {
+        panic(
+            f"an outline's grid would be {u32(n.x)} by {u32(n.y)} cells: make `cell` larger (at most 64 a side)",
+        )
+    }
+    (lo, [u32(n.x), u32(n.y)])
+}
+
+/// Whether `p` is inside the closed polygon `outline` (the even-odd rule).
+fn inside(outline: [vec2], p: vec2) -> bool {
+    var odd = false
+    let n = outline.len()
+    var j = n - 1
+    for i in 0..n {
+        let (a, b) = (outline[i], outline[j])
+        if (a.y > p.y) != (b.y > p.y) && p.x < a.x + (p.y - a.y) / (b.y - a.y) * (b.x - a.x) {
+            odd = !odd
+        }
+        j = i
+    }
+    odd
+}
+
+/// Every cell's share of the polygon (of a 4 × 4 grid of points in it, those inside), row by
+/// row, 64 to a row. Given nothing a derivation follows, so it may walk the polygon's memory.
+fn wanted(outline: [vec2], lo: vec2, cell: f32, cells: [u32; 2]) -> [f32; 4096] {
+    var out = [0.0; 4096]
+    for j in 0..cells[1] {
+        for i in 0..cells[0] {
+            var count = 0.0
+            for k in 0..16 {
+                let q = vec2(f32(i) + (f32(k % 4) + 0.5) / 4.0, f32(j) + (f32(k / 4) + 0.5) / 4.0)
+                if inside(outline, lo + q * cell) {
+                    count += 1.0
+                }
+            }
+            out[j * MOST_CELLS + i] = count / 16.0
+        }
+    }
+    out
+}
+
+/// The root of the mean square difference between `field`'s coverage of each cell and how much
+/// of it `want` holds, over `cells` cells `cell` across from `lo`.
+fn coverage_miss<S: Surface>(
+    field: S,
+    view: View,
+    want: [f32; 4096],
+    lo: vec2,
+    cell: vec2,
+    cells: [u32; 2],
+    near: f32,
+    far: f32,
+) -> f32 {
+    var sum = 0.0
+    for j in 0..cells[1] {
+        for i in 0..cells[0] {
+            let c = lo + (vec2(f32(i), f32(j)) + vec2(0.5)) * cell
+            let d = coverage(field, view, c, max(cell.x, cell.y), near, far) -
+                want[j * MOST_CELLS + i]
+            sum += d * d
+        }
+    }
+    sqrt(sum / f32(cells[0] * cells[1]))
+}
+
+/// How far `field`'s silhouette in `view` is from `outline` (a closed polygon in the view's
+/// coordinates, a blueprint's, §23.7): the root of the mean square difference of their
+/// coverages over a grid of cells `cell` across that holds the outline and two cells round it.
+/// 0 is a match; 1 is no overlap at all. A grid past 64 cells a side panics. A derivation
+/// derives it through the field alone: the polygon is read by a function given nothing it
+/// follows (§14.2).
+pub fn outline_miss<S: Surface>(
+    field: S,
+    view: View,
+    outline: [vec2],
+    cell: f32,
+    near: f32,
+    far: f32,
+) -> f32 {
+    let (lo, cells) = grid_of(outline, cell)
+    let want = wanted(outline, lo, cell, cells)
+    coverage_miss(field, view, want, lo, vec2(cell), cells, near, far)
+}
+
+/// Every cell's share of `image`'s opaque part (alpha at least a half), of a 4 × 4 grid of
+/// points in it, the image over the rectangle from `lo` to `hi`, its top row at `hi.y`.
+fn wanted_of(image: Image, lo: vec2, hi: vec2, cells: [u32; 2]) -> [f32; 4096] {
+    var out = [0.0; 4096]
+    let size = vec2(f32(image.width), f32(image.height))
+    for j in 0..cells[1] {
+        for i in 0..cells[0] {
+            var count = 0.0
+            for k in 0..16 {
+                let q = vec2(f32(i) + (f32(k % 4) + 0.5) / 4.0, f32(j) + (f32(k / 4) + 0.5) / 4.0)
+                let t = q / vec2(f32(cells[0]), f32(cells[1]))
+                // Row 0 is the image's top, at `hi.y`.
+                let x = min(u32(t.x * size.x), image.width - 1)
+                let y = min(u32((1.0 - t.y) * size.y), image.height - 1)
+                if image.texel(x, y).w >= 0.5 {
+                    count += 1.0
+                }
+            }
+            out[j * MOST_CELLS + i] = count / 16.0
+        }
+    }
+    out
+}
+
+/// `outline_miss` against an image's opaque part (its alpha at least a half), the image laid
+/// over the rectangle from `lo` to `hi` in the view's coordinates, its top row at `hi.y`: a grid
+/// of the image's pixels, at most 64 a side.
+pub fn image_miss<S: Surface>(
+    field: S,
+    view: View,
+    image: Image,
+    lo: vec2,
+    hi: vec2,
+    near: f32,
+    far: f32,
+) -> f32 {
+    let cells = [min(image.width, MOST_CELLS), min(image.height, MOST_CELLS)]
+    let want = wanted_of(image, lo, hi, cells)
+    let cell = (hi - lo) / vec2(f32(cells[0]), f32(cells[1]))
+    coverage_miss(field, view, want, lo, cell, cells, near, far)
+}
+
+// ---- reading what was made (§23.10) --------------------------------------------------------
+//
+// What a surface is made of, as findings a reader can act on: its pieces, from an octree of its
+// interval (certified), the parts that decide it nowhere, the parts thinner than a size, and
+// small pictures of it that need no GPU.
+
+/// A cell of an octree over a region: its level and place in one key.
+fn cell_key(level: u32, x: u32, y: u32, z: u32) -> u64 {
+    (u64(level) << 60) | (u64(x) << 40) | (u64(y) << 20) | u64(z)
+}
+
+/// The box of the cell at `level`, (`x`, `y`, `z`), of `region`.
+fn cell_box(region: Box3, level: u32, x: u32, y: u32, z: u32) -> Box3 {
+    let size = (region.hi - region.lo) / f32(1 << level)
+    let lo = region.lo + vec3(f32(x), f32(y), f32(z)) * size
+    Box3 { lo, hi: lo + size }
+}
+
+/// A piece of a surface: the cells joined by faces that hold some of its inside, the box they
+/// span, the bounds of its volume (its inside cells', and with its edge cells), and the centre
+/// of one of its inside cells.
+pub struct Piece: Copy {
+    pub lo: vec3,
+    pub hi: vec3,
+    pub volume_lo: f32,
+    pub volume_hi: f32,
+    pub at: vec3,
+}
+
+/// What `pieces` found: the pieces certainly there, largest first; the necks (two parts of a
+/// piece joined, if at all, by something thinner than a cell: a point between them); the specks
+/// (something smaller than a cell may be here: a point); and the centres of the edge cells, where
+/// the surface may be.
+pub struct Pieces {
+    pub region: Box3,
+    pub cell: f32,
+    pub pieces: Vec<Piece>,
+    pub necks: Vec<vec3>,
+    pub specks: Vec<vec3>,
+    pub edges: Vec<vec3>,
+}
+
+impl Pieces {
+    /// Whether the surface is certified to be one body down to the cell size: one piece, no
+    /// neck, no speck.
+    pub fn one(self) -> bool {
+        self.pieces.len() == 1 && self.necks.len() == 0 && self.specks.len() == 0
+    }
+}
+
+/// A union-find's root of `i`, its path halved on the way.
+fn root(parent: mut Vec<u32>, i: u32) -> u32 {
+    var x = i
+    while parent[x] != x {
+        parent[x] = parent[parent[x]]
+        x = parent[x]
+    }
+    x
+}
+
+fn join(parent: mut Vec<u32>, a: u32, b: u32) {
+    let (ra, rb) = (root(mut parent, a), root(mut parent, b))
+    if ra != rb {
+        parent[max(ra, rb)] = min(ra, rb)
+    }
+}
+
+/// The index of the leaf at a key, if one is (`keys` sorted).
+fn leaf_at(keys: [u64], key: u64) -> Option<u32> {
+    var lo = 0
+    var hi = keys.len()
+    while lo < hi {
+        let mid = (lo + hi) / 2
+        if keys[mid] < key {
+            lo = mid + 1
+        } else {
+            hi = mid
+        }
+    }
+    if lo < keys.len() && keys[lo] == key { Some(lo) } else { None }
+}
+
+/// The leaves that hold the face of the cell (`level`, `x`, `y`, `z`) on its low side along
+/// `axis`: the cell itself or an ancestor if it's a leaf, else its children on that face.
+fn on_face(keys: [u64], depth: u32, level: u32, c: vec3u, axis: u32, out: mut Vec<u32>) {
+    for up in 0..level + 1 {
+        let l = level - up
+        let k = cell_key(l, c.x >> up, c.y >> up, c.z >> up)
+        if let Some(i) = leaf_at(keys, k) {
+            out.push(i)
+            return
+        }
+    }
+    if level >= depth {
+        return
+    }
+    for j in 0..4 {
+        let (u, v) = (j & 1, j >> 1)
+        let child = if axis == 0 {
+            vec3u(2 * c.x, 2 * c.y + u, 2 * c.z + v)
+        } else if axis == 1 {
+            vec3u(2 * c.x + u, 2 * c.y, 2 * c.z + v)
+        } else {
+            vec3u(2 * c.x + u, 2 * c.y + v, 2 * c.z)
+        }
+        on_face(keys, depth, level + 1, child, axis, mut out)
+    }
+}
+
+/// `field`'s pieces in `region` (§23.10): an octree, `depth` levels at most, each cell classed by
+/// `field.interval` as inside (`hi < 0`), outside (`lo > 0`) or edge (neither, split until
+/// `depth`). Inside cells joined by faces are one body, so each group of them is one piece,
+/// certified connected; a path through the body passes only through inside and edge cells, so
+/// two such groups apart in those are certified apart.
+pub fn pieces<S: Surface>(field: S, region: Box3, depth: u32) -> Pieces {
+    var leaves: Vec<(u64, bool)> = Vec::new()
+    var stack: Vec<(u32, vec3u)> = Vec::new()
+    stack.push((0, vec3u(0, 0, 0)))
+    while let Some((level, c)) = stack.pop() {
+        let b = cell_box(region, level, c.x, c.y, c.z)
+        let r = field.interval(b)
+        if r.lo > 0.0 {
+            continue
+        }
+        if r.hi < 0.0 {
+            leaves.push((cell_key(level, c.x, c.y, c.z), true))
+        } else if level >= depth {
+            leaves.push((cell_key(level, c.x, c.y, c.z), false))
+        } else {
+            for j in 0..8 {
+                stack.push(
+                    (
+                        level + 1,
+                        vec3u(2 * c.x + (j & 1), 2 * c.y + ((j >> 1) & 1), 2 * c.z + (j >> 2)),
+                    ),
+                )
+            }
+        }
+    }
+    leaves.sort_by(|a, b| a.0 < b.0)
+    let n = leaves.len()
+    let keys: Vec<u64> = Vec::from_fn(n, |i| leaves[i].0)
+    var sure: Vec<u32> = Vec::from_fn(n, |i| i)
+    var maybe: Vec<u32> = Vec::from_fn(n, |i| i)
+    var across: Vec<u32> = Vec::new()
+    for i in 0..n {
+        let k = keys[i]
+        let level = u32(k >> 60)
+        let c = vec3u(u32((k >> 40) & 1048575), u32((k >> 20) & 1048575), u32(k & 1048575))
+        let side = 1 << level
+        for axis in 0..3 {
+            let next = if axis == 0 { vec3u(c.x + 1, c.y, c.z) } else if axis == 1 {
+                vec3u(c.x, c.y + 1, c.z)
+            } else { vec3u(c.x, c.y, c.z + 1) }
+            if next.x >= side || next.y >= side || next.z >= side {
+                continue
+            }
+            across.clear()
+            on_face(keys, depth, level, next, axis, mut across)
+            for j in across {
+                join(mut maybe, i, j)
+                if leaves[i].1 && leaves[j].1 {
+                    join(mut sure, i, j)
+                }
+            }
+        }
+    }
+    let size = region.hi - region.lo
+    let finest = size / f32(1 << depth)
+    var out = Pieces {
+        region,
+        cell: max(finest.x, max(finest.y, finest.z)),
+        pieces: Vec::new(),
+        necks: Vec::new(),
+        specks: Vec::new(),
+        edges: Vec::new(),
+    }
+    // Each `maybe` group: its box, volumes, an inside cell, its `sure` groups.
+    var group_of: Vec<u32> = Vec::filled(n, value: 4294967295)
+    var groups: Vec<(Piece, u32, bool, vec3)> = Vec::new()
+    var first_sure: Vec<u32> = Vec::new()
+    for i in 0..n {
+        let k = keys[i]
+        let level = u32(k >> 60)
+        let b = cell_box(
+            region,
+            level,
+            u32((k >> 40) & 1048575),
+            u32((k >> 20) & 1048575),
+            u32(k & 1048575),
+        )
+        let v = (b.hi.x - b.lo.x) * (b.hi.y - b.lo.y) * (b.hi.z - b.lo.z)
+        if !leaves[i].1 {
+            out.edges.push(b.center())
+        }
+        let r = root(mut maybe, i)
+        if group_of[r] == 4294967295 {
+            group_of[r] = groups.len()
+            groups.push(
+                (
+                    Piece { lo: b.lo, hi: b.hi, volume_lo: 0.0, volume_hi: 0.0, at: b.center() },
+                    0,
+                    false,
+                    b.center(),
+                ),
+            )
+            first_sure.push(4294967295)
+        }
+        let g = group_of[r]
+        groups[g].0.lo = min(groups[g].0.lo, b.lo)
+        groups[g].0.hi = max(groups[g].0.hi, b.hi)
+        groups[g].0.volume_hi += v
+        if leaves[i].1 {
+            groups[g].0.volume_lo += v
+            if !groups[g].2 {
+                groups[g].2 = true
+                groups[g].0.at = b.center()
+            }
+            let s = root(mut sure, i)
+            if first_sure[g] == 4294967295 {
+                first_sure[g] = s
+            } else if first_sure[g] != s && groups[g].1 == 0 {
+                // Two bodies in one group: joined, if at all, thinner than a cell.
+                groups[g].1 = 1
+            }
+        } else {
+            groups[g].3 = b.center()
+        }
+    }
+    for g in groups {
+        if !g.2 {
+            out.specks.push(g.3)
+        } else {
+            if g.1 == 1 {
+                out.necks.push(g.3)
+            }
+            out.pieces.push(g.0)
+        }
+    }
+    out.pieces.sort_by(|a, b| a.volume_lo > b.volume_lo)
+    out
+}
+
+/// The parts of `field` that decide its surface nowhere it was sampled: at the centre of every
+/// edge cell of `pieces`, `part_at` doesn't name it and `part_share` is under 1e-3. Sampled, not
+/// certified.
+pub fn dead_parts<S: Surface>(field: S, pieces: Pieces) -> Vec<u32> {
+    var out: Vec<u32> = Vec::new()
+    let n = field.parts()
+    if n < 2 {
+        return out
+    }
+    var alive: Vec<bool> = Vec::filled(n, value: false)
+    for p in pieces.edges {
+        let (_, i) = field.part_at(p)
+        alive[i] = true
+        for j in 0..n {
+            if !alive[j] && abs(part_share(field, p, j)) >= 0.001 {
+                alive[j] = true
+            }
+        }
+    }
+    for j in 0..n {
+        if !alive[j] {
+            out.push(j)
+        }
+    }
+    out
+}
+
+/// Each part of `field` whose own inside fits a box thinner than `thin` in some axis, with that
+/// box's thinnest side: its own octree in `region` (`depth` levels) by its own interval, so the
+/// box holds all of it, and a side under `thin` is certified.
+pub fn thin_parts<S: Surface>(field: S, region: Box3, depth: u32, thin: f32) -> Vec<(u32, f32)> {
+    var out: Vec<(u32, f32)> = Vec::new()
+    for i in 0..field.parts() {
+        var lo = vec3(1.0e30)
+        var hi = vec3(-1.0e30)
+        var stack: Vec<(u32, vec3u)> = Vec::new()
+        stack.push((0, vec3u(0, 0, 0)))
+        while let Some((level, c)) = stack.pop() {
+            let b = cell_box(region, level, c.x, c.y, c.z)
+            let r = interval(|q: vec3| field.part_distance(q, i), b)
+            if r.lo > 0.0 {
+                continue
+            }
+            if r.hi < 0.0 || level >= depth {
+                lo = min(lo, b.lo)
+                hi = max(hi, b.hi)
+            } else {
+                for j in 0..8 {
+                    stack.push(
+                        (
+                            level + 1,
+                            vec3u(2 * c.x + (j & 1), 2 * c.y + ((j >> 1) & 1), 2 * c.z + (j >> 2)),
+                        ),
+                    )
+                }
+            }
+        }
+        let e = hi - lo
+        let side = min(e.x, min(e.y, e.z))
+        if side > 0.0 && side < thin {
+            out.push((i, side))
+        }
+    }
+    out
+}
+
+/// Row `row` of a picture `size` pixels across (at most 128) of `field` in `region` seen from
+/// `view` (§23.10): each pixel a `hit` along the view's axis from outside the region, its colour
+/// the surface's normal against a fixed light (`0.2 + 0.8 max(n · l, 0)`), darker with depth,
+/// alpha 0 where nothing is hit. Row 0 is the top.
+pub fn preview<S: Surface>(field: S, view: View, region: Box3, size: u32, row: u32) -> [vec4; 128] {
+    var out = [vec4(0.0); 128]
+    let n = min(size, 128)
+    let c = region.center()
+    let e = region.hi - region.lo
+    let (cu, ext, depth, axis) = match view {
+        View::Side => (vec2(c.z, c.y), vec2(e.z, e.y), e.x, vec3(1.0, 0.0, 0.0)),
+        View::Front => (vec2(c.x, c.y), vec2(e.x, e.y), e.z, vec3(0.0, 0.0, 1.0)),
+        View::Top => (vec2(c.x, c.z), vec2(e.x, e.z), e.y, vec3(0.0, 1.0, 0.0)),
+    }
+    let span = max(ext.x, ext.y)
+    let light = normalize(vec3(0.4, 0.8, 0.5))
+    let start = dot(c, axis) + depth
+    for i in 0..n {
+        let u = cu + vec2((f32(i) + 0.5) / f32(n) - 0.5, 0.5 - (f32(row) + 0.5) / f32(n)) * span
+        let o = view.point(u, start)
+        let t = hit(field, o, -axis, far: 2.0 * depth)
+        if t >= 0.0 {
+            let g = field.gradient(o - axis * t)
+            let lit = 0.2 + 0.8 * max(dot(normalize(g), light), 0.0)
+            let fade = 1.0 - 0.5 * clamp((t - depth * 0.5) / (depth + 0.000001), 0.0, 1.0)
+            out[i] = vec4(vec3(lit * fade), 1.0)
+        }
+    }
+    out
 }
 
 /// How far the surface reaches in direction `dir` (a unit vector) within `region`: the
@@ -2987,4 +3526,126 @@ fn certified_checks_prove_what_holds_and_find_what_fails() {
         ),
         _ => assert(false, "overlapping parts are found"),
     }
+}
+
+@test
+fn a_spheres_coverage_is_whole_inside_none_outside_and_half_on_its_edge() {
+    let s = sphere(0.5)
+    for view in [View::Side, View::Front, View::Top] {
+        assert(coverage(s, view, vec2(0.0), 0.05, near: -1.0, far: 1.0) == 1.0)
+        assert(coverage(s, view, vec2(1.0, 0.0), 0.05, near: -1.0, far: 1.0) == 0.0)
+        let edge = coverage(s, view, vec2(0.5, 0.0), 0.05, near: -1.0, far: 1.0)
+        assert(edge > 0.4 && edge < 0.6)
+    }
+}
+
+/// A closed polygon of `n` corners round a circle of radius `r`.
+fn polygon(n: u32, r: f32) -> Vec<vec2> {
+    Vec::from_fn(n, |i| {
+        let a = 6.2831853 * f32(i) / f32(n)
+        vec2(r * cos(a), r * sin(a))
+    })
+}
+
+@test
+fn a_sphere_misses_an_outline_of_its_own_size_by_little() {
+    let s = sphere(0.5)
+    let own = polygon(64, 0.5)
+    let twice = polygon(64, 1.0)
+    // Cells of 2 cm, as a spec's are (§23.6); the outline twice the size needs 4 cm to be held
+    // in 64 cells a side.
+    for view in [View::Side, View::Front, View::Top] {
+        assert(outline_miss(s, view, own, 0.02, near: -1.0, far: 1.0) < 0.03)
+        assert(outline_miss(s, view, twice, 0.04, near: -1.0, far: 1.0) > 0.3)
+    }
+}
+
+@test
+fn a_sphere_misses_an_image_of_its_disc_by_little() {
+    // A 32 × 32 image of a disc of radius 0.5 over the square from -0.6 to 0.6.
+    var pixels: Vec<u8> = Vec::filled(32 * 32 * 4, value: 0)
+    for y in 0..32 {
+        for x in 0..32 {
+            let p = vec2(-0.6 + 1.2 * (f32(x) + 0.5) / 32.0, 0.6 - 1.2 * (f32(y) + 0.5) / 32.0)
+            if length(p) < 0.5 {
+                pixels[(y * 32 + x) * 4 + 3] = 255
+            }
+        }
+    }
+    let disc = Image { width: 32, height: 32, pixels }
+    let s = sphere(0.5)
+    let near_fit = image_miss(s, View::Front, disc, vec2(-0.6), vec2(0.6), near: -1.0, far: 1.0)
+    assert(near_fit < 0.1)
+    let big = sphere(1.0)
+    assert(image_miss(big, View::Front, disc, vec2(-0.6), vec2(0.6), near: -1.5, far: 1.5) > 0.3)
+}
+
+@test
+fn one_ball_is_one_piece() {
+    let p = pieces(sphere(0.5), Box3 { lo: vec3(-0.6), hi: vec3(0.6) }, depth: 5)
+    assert(p.one())
+    assert(p.pieces[0].volume_lo <= 0.5236 && 0.5236 <= p.pieces[0].volume_hi)
+}
+
+@test
+fn two_balls_apart_are_two_pieces_certified_apart() {
+    let two = sphere(0.3)
+        .translate(vec3(-0.4, 0.0, 0.0))
+        .union(sphere(0.3).translate(vec3(0.4, 0.0, 0.0)))
+    let p = pieces(two, Box3 { lo: vec3(-0.9), hi: vec3(0.9) }, depth: 5)
+    assert(p.pieces.len() == 2)
+    assert(p.necks.len() == 0)
+    // The gap, 0.2, is more than a cell (1.8 / 32).
+    assert(p.cell < 0.2)
+}
+
+@test
+fn balls_joined_by_a_rod_thinner_than_a_cell_have_a_neck() {
+    let rod = round_cone(vec3(-0.4, 0.0, 0.0), vec3(0.4, 0.0, 0.0), r_top: 0.004, r_bottom: 0.004)
+    let joined = sphere(0.3)
+        .translate(vec3(-0.45, 0.0, 0.0))
+        .union(sphere(0.3).translate(vec3(0.45, 0.0, 0.0)))
+        .union(rod)
+    let p = pieces(joined, Box3 { lo: vec3(-0.9), hi: vec3(0.9) }, depth: 5)
+    assert(p.necks.len() >= 1)
+    assert(!p.one())
+}
+
+@test
+fn a_ball_smaller_than_half_a_cell_is_a_speck() {
+    let both = sphere(0.5).union(sphere(0.01).translate(vec3(0.75, 0.75, 0.75)))
+    let p = pieces(both, Box3 { lo: vec3(-0.9), hi: vec3(0.9) }, depth: 5)
+    assert(p.pieces.len() == 1)
+    assert(p.specks.len() >= 1)
+}
+
+@test
+fn a_ball_wholly_inside_another_is_a_dead_part_unless_a_blend_reaches_the_surface() {
+    let region = Box3 { lo: vec3(-0.6), hi: vec3(0.6) }
+    let inside = sphere(0.5).union(sphere(0.2))
+    assert(dead_parts(inside, pieces(inside, region, depth: 5)).len() == 1)
+    let blended = sphere(0.5).smooth_union(sphere(0.2).translate(vec3(0.25, 0.0, 0.0)), k: 0.3)
+    assert(dead_parts(blended, pieces(blended, region, depth: 5)).len() == 0)
+}
+
+@test
+fn a_thin_plate_is_a_thin_part() {
+    let plate = cuboid(vec3(0.4, 0.002, 0.4)).union(sphere(0.3).translate(vec3(0.0, 0.5, 0.0)))
+    let thin = thin_parts(plate, Box3 { lo: vec3(-0.9), hi: vec3(0.9) }, depth: 7, thin: 0.05)
+    assert(thin.len() == 1 && thin[0].0 == 0)
+}
+
+@test
+fn a_balls_middle_row_is_opaque_in_the_middle_clear_at_its_ends_and_lit_toward_the_light() {
+    let row = preview(
+        sphere(0.5),
+        View::Front,
+        Box3 { lo: vec3(-0.6), hi: vec3(0.6) },
+        size: 64,
+        row: 32,
+    )
+    assert(row[0].w == 0.0 && row[63].w == 0.0)
+    assert(row[32].w == 1.0)
+    // The light is from +x, so the right of the ball is brighter than its left.
+    assert(row[40].x > row[24].x)
 }

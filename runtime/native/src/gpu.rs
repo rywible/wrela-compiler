@@ -608,6 +608,17 @@ impl Counters {
 }
 
 pub(crate) struct Gpu {
+    /// `wrela pixel`'s probe: the frame whose GPU work stops before a draw, and how many draws
+    /// it has run ([`Probe`]).
+    pub(crate) probe: Option<crate::Probe>,
+    /// For tests: each command runs on its pipeline's stand-in (§18.12), as the browser runs it
+    /// until the pipeline is built ([`Host::use_standins`](crate::Host::use_standins)).
+    pub(crate) use_standins: bool,
+    /// Each pipeline's stand-in, as the manifest names it.
+    standin_of: Vec<Option<u32>>,
+    frames_begun: u32,
+    probe_draws: u32,
+    probe_stopped: bool,
     counters: Counters,
     device: wgpu::Device,
     queue: wgpu::Queue,
@@ -814,6 +825,12 @@ impl Gpu {
         let upload = Ring::new(&device, "upload ring", usage, u64::from(stream::UPLOAD_START));
         let timer = timestamps.then(|| Timer::new(&device, timing == Timing::Serial, true));
         let mut gpu = Gpu {
+            probe: None,
+            use_standins: false,
+            standin_of: manifest.pipelines.iter().map(|p| p.standin).collect(),
+            frames_begun: 0,
+            probe_draws: 0,
+            probe_stopped: false,
             counters: Counters::default(),
             device,
             queue,
@@ -1788,6 +1805,7 @@ impl Gpu {
         bindings: &[Binding],
         uniforms: &[u8],
     ) -> Result<()> {
+        let pipeline = self.stood(pipeline);
         // Everything that can flush happens before anything is recorded for this dispatch.
         self.reserve_uniforms(Opcode::Dispatch, self.aligned(uniforms.len()))?;
         self.reserve_timestamps()?;
@@ -1846,7 +1864,16 @@ impl Gpu {
         self.pass = Some(OpenPass { pass, draws: Vec::new(), label, uses: None, rect_set: false });
     }
 
+    /// The pipeline a command runs on: its stand-in, where tests asked for stand-ins.
+    fn stood(&self, pipeline: u32) -> u32 {
+        match self.standin_of.get(pipeline as usize) {
+            Some(Some(s)) if self.use_standins => *s,
+            _ => pipeline,
+        }
+    }
+
     fn draw(&mut self, pipeline: u32, how: DrawHow, bindings: &[Binding], uniforms: &[u8]) {
+        let pipeline = self.stood(pipeline);
         let draw =
             PendingDraw { pipeline, how, bindings: bindings.to_vec(), uniforms: uniforms.to_vec() };
         self.pass_item(PassItem::Draw(draw));
@@ -2204,6 +2231,86 @@ impl Gpu {
         out
     }
 
+    /// The handles of the textures that exist, oldest first: for tests and `wrela pixel`.
+    pub(crate) fn textures(&self) -> Vec<u32> {
+        let mut out: Vec<u32> = self
+            .resources
+            .iter()
+            .filter(|(_, r)| matches!(r, Resource::Texture(_)))
+            .map(|(&h, _)| h)
+            .collect();
+        out.sort_unstable();
+        out
+    }
+
+    /// A texture's level `level`, raw in its own format, rows top to bottom with no padding:
+    /// of a 3D texture every slice, else layer `layer` (a depth texture through its depth
+    /// aspect). With its size (width, height, slices) and format. Waits for the GPU.
+    pub(crate) fn read_texture(
+        &mut self,
+        handle: u32,
+        level: u32,
+        layer: u32,
+    ) -> Result<([u32; 3], TextureFormat, Vec<u8>)> {
+        self.flush()?;
+        let Some(Resource::Texture(Texture { texture, format, .. })) = self.resources.get(&handle)
+        else {
+            return Err(Error::Gpu(format!("there's no texture {handle}")));
+        };
+        let format = *format;
+        if format.is_compressed() {
+            return Err(Error::Gpu(format!("texture {handle} is compressed")));
+        }
+        if level >= texture.mip_level_count() {
+            return Err(Error::Gpu(format!("texture {handle} has no level {level}")));
+        }
+        let (width, height) = stream::level_size(texture.width(), texture.height(), level);
+        let three = texture.dimension() == wgpu::TextureDimension::D3;
+        let slices = if three { (texture.depth_or_array_layers() >> level).max(1) } else { 1 };
+        if !three && layer >= texture.depth_or_array_layers() {
+            return Err(Error::Gpu(format!("texture {handle} has no layer {layer}")));
+        }
+        let texel = u64::from(format.bytes_per_texel());
+        let row = u64::from(width) * texel;
+        let padded = align_to(row, u64::from(wgpu::COPY_BYTES_PER_ROW_ALIGNMENT));
+        let size = padded * u64::from(height) * u64::from(slices);
+        let staging = staging(&self.device, &mut self.image_readback, size);
+        let mut encoder =
+            self.device.create_command_encoder(&wgpu::CommandEncoderDescriptor::default());
+        let aspect = if format == TextureFormat::Depth32Float {
+            wgpu::TextureAspect::DepthOnly
+        } else {
+            wgpu::TextureAspect::All
+        };
+        encoder.copy_texture_to_buffer(
+            wgpu::TexelCopyTextureInfo {
+                texture,
+                mip_level: level,
+                origin: wgpu::Origin3d { x: 0, y: 0, z: if three { 0 } else { layer } },
+                aspect,
+            },
+            wgpu::TexelCopyBufferInfo {
+                buffer: &staging,
+                layout: wgpu::TexelCopyBufferLayout {
+                    offset: 0,
+                    bytes_per_row: Some(padded as u32),
+                    rows_per_image: Some(height),
+                },
+            },
+            wgpu::Extent3d { width, height, depth_or_array_layers: slices },
+        );
+        self.queue.submit([encoder.finish()]);
+        let bytes = map_read_with(&self.device, &staging, size, |bytes| {
+            let mut out = Vec::with_capacity((row * u64::from(height * slices)) as usize);
+            for padded_row in bytes.chunks_exact(padded as usize) {
+                out.extend_from_slice(&padded_row[..row as usize]);
+            }
+            out
+        })?;
+        self.check_errors()?;
+        Ok(([width, height, slices], format, bytes))
+    }
+
     /// A buffer's size in bytes.
     pub(crate) fn buffer_size(&self, handle: u32) -> Result<u64> {
         match self.resources.get(&handle) {
@@ -2388,12 +2495,56 @@ fn staging(device: &wgpu::Device, slot: &mut Option<wgpu::Buffer>, size: u64) ->
     }
 }
 
+impl Gpu {
+    /// Whether the probe skips `cmd`: in the probed frame, once its draws have run, no more
+    /// GPU work runs (a draw, a dispatch, a write or a copy); passes still begin, end and
+    /// present, so what was drawn is there to read.
+    fn probed(&mut self, cmd: &Command<'_>) -> bool {
+        let Some(p) = self.probe else { return false };
+        if self.frames_begun != p.frame + 1 {
+            return false;
+        }
+        let draw = matches!(
+            cmd,
+            Command::Draw { .. }
+                | Command::DrawIndirect { .. }
+                | Command::DrawIndexed { .. }
+                | Command::DrawIndexedIndirect { .. }
+        );
+        let work = draw
+            || matches!(
+                cmd,
+                Command::Dispatch { .. }
+                    | Command::DispatchIndirect { .. }
+                    | Command::WriteBuffer { .. }
+                    | Command::WriteTexture { .. }
+                    | Command::CopyBuffer { .. }
+                    | Command::CopyTexture { .. }
+                    | Command::CopyTextureToBuffer { .. }
+                    | Command::CopyBufferToTexture { .. }
+            );
+        if draw && !self.probe_stopped {
+            self.probe_draws += 1;
+            if self.probe_draws > p.draws {
+                self.probe_stopped = true;
+            }
+        }
+        work && self.probe_stopped
+    }
+}
+
 impl Executor for Gpu {
     fn begin_frame(&mut self) {
         self.label = None;
+        self.frames_begun += 1;
+        self.probe_draws = 0;
+        self.probe_stopped = false;
     }
 
     fn execute(&mut self, cmd: &Command<'_>) -> Result<()> {
+        if self.probed(cmd) {
+            return Ok(());
+        }
         // A pass that ended waits only for one that may continue it: a `Label` records it too,
         // since a pass joins only one of its own label.
         if let Some(ended) = &self.ended {

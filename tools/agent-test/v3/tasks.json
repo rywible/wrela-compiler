@@ -1,0 +1,324 @@
+[
+ {
+  "id": "s1-stool",
+  "kind": "shape",
+  "task": "A stool, in `shape.wrela` as `pub fn subject() -> Surface` (std::field), metres, y up: a square seat 0.6 wide and deep and 0.06 thick, its top at y = 0.63, on four legs 0.06 thick, each standing on y = 0 under a corner of the seat, their centres 0.24 from the middle in x and z. One body.",
+  "grade": {
+   "tests": true,
+   "inspect": {
+    "subject": "shape::subject",
+    "region": "-0.5..0.5,-0.1..0.8,-0.5..0.5",
+    "depth": 6,
+    "pieces": 1,
+    "absent": [
+     "floating",
+     "dead-part",
+     "neck",
+     "speck"
+    ]
+   }
+  }
+ },
+ {
+  "id": "s2-mug",
+  "kind": "shape",
+  "task": "A mug, in `shape.wrela` as `pub fn subject() -> Surface` (std::field), metres, y up: an upright round cup 0.2 in outer radius, its base on y = 0 and its rim at y = 0.5, walls and base 0.03 thick, open at the top (hollow inside), with a handle on its +x side that a finger fits through: a loop reaching out to x = 0.33 between y = 0.12 and y = 0.38, joined to the wall at both ends. One body.",
+  "grade": {
+   "tests": true,
+   "inspect": {
+    "subject": "shape::subject",
+    "region": "-0.45..0.45,-0.1..0.6,-0.3..0.3",
+    "depth": 6,
+    "pieces": 1,
+    "absent": [
+     "floating",
+     "dead-part",
+     "neck",
+     "speck"
+    ]
+   }
+  }
+ },
+ {
+  "id": "s3-quadruped",
+  "kind": "shape",
+  "task": "A four-legged animal, in `shape.wrela` as `pub fn subject() -> Surface` (std::field), metres, y up, facing +x: a body 1.0 long (x from -0.5 to 0.5), 0.36 tall and 0.3 wide, its middle at y = 0.6; four legs from the ground (y = 0) into the body, under its four quarters (x = \u00b10.35, z = \u00b10.1), each about 0.08 thick; a neck rising forward from the body's front to a head about 0.24 long whose middle is at x = 0.72, y = 0.95. One body.",
+  "grade": {
+   "tests": true,
+   "inspect": {
+    "subject": "shape::subject",
+    "region": "-0.7..1.0,-0.1..1.2,-0.4..0.4",
+    "depth": 6,
+    "pieces": 1,
+    "absent": [
+     "floating",
+     "dead-part",
+     "neck",
+     "speck"
+    ]
+   }
+  }
+ },
+ {
+  "id": "s4-snowman",
+  "kind": "shape",
+  "task": "A snowman, in `shape.wrela` as `pub fn subject() -> Surface` (std::field), metres, y up: three balls stacked on the y axis, radii 0.3, 0.22 and 0.15 from the bottom, the lowest resting on y = 0, each sunk into the one below by 0.06 (so the top of the head is at 1.22), and a carrot nose: a blunt cone about 0.15 long, its tip about 0.07 across, pointing +z from the middle of the head. One body.",
+  "grade": {
+   "tests": true,
+   "inspect": {
+    "subject": "shape::subject",
+    "region": "-0.5..0.5,-0.1..1.35,-0.5..0.5",
+    "depth": 6,
+    "pieces": 1,
+    "absent": [
+     "floating",
+     "dead-part",
+     "neck",
+     "speck"
+    ]
+   }
+  }
+ },
+ {
+  "id": "s5-lamp",
+  "kind": "shape",
+  "task": "A table lamp, in `shape.wrela` as `pub fn subject() -> Surface` (std::field), metres, y up: a flat round base 0.3 across and 0.04 tall on y = 0; a pole 0.06 thick up the y axis from the base to y = 0.5; a shade over the pole's top: a solid rounded cone (std::field's `round_cone`) whose wide end, 0.36 across, is centred at y = 0.5 and whose narrow end, 0.18 across, at y = 0.6. One body.",
+  "grade": {
+   "tests": true,
+   "inspect": {
+    "subject": "shape::subject",
+    "region": "-0.3..0.3,-0.1..0.75,-0.3..0.3",
+    "depth": 6,
+    "pieces": 1,
+    "absent": [
+     "floating",
+     "dead-part",
+     "neck",
+     "speck"
+    ]
+   }
+  }
+ },
+ {
+  "id": "r1-ear",
+  "kind": "repair",
+  "task": "This package's `shape::subject` (shape.wrela) is a head with two ears, but the right ear (+x) has come off: it floats above the head. Put it back on the head where it belongs, the mirror image of the left ear, without changing anything else.",
+  "wrong": "start",
+  "grade": {
+   "tests": true,
+   "inspect": {
+    "subject": "shape::subject",
+    "region": "-0.5..0.5,-0.45..0.65,-0.45..0.45",
+    "depth": 6,
+    "pieces": 1,
+    "absent": [
+     "floating"
+    ],
+    "lift": false
+   }
+  }
+ },
+ {
+  "id": "r2-nose",
+  "kind": "repair",
+  "task": "This package's `shape::subject` (shape.wrela) is a head with a nose, but the nose doesn't show: it's swallowed whole by the head. Make it stick out of the front of the face (+z), its tip about 0.05 past the head's surface, without changing anything else.",
+  "wrong": "start",
+  "grade": {
+   "tests": true,
+   "inspect": {
+    "subject": "shape::subject",
+    "region": "-0.45..0.45,-0.45..0.45,-0.45..0.5",
+    "depth": 6,
+    "pieces": 1,
+    "absent": [
+     "dead-part"
+    ],
+    "lift": false
+   }
+  }
+ },
+ {
+  "id": "r3-tail",
+  "kind": "repair",
+  "task": "This package's `shape::subject` (shape.wrela) is a body with a tail, but the tail's length, the literal `0.4` in `let tail = 0.4`, does nothing: change it and the shape stays the same. Make the tail reach `tail` metres behind (in -x from) the body's end at x = -0.3, so the literal decides it, without changing anything else.",
+  "wrong": "start",
+  "grade": {
+   "tests": true,
+   "inspect": {
+    "subject": "shape::subject",
+    "region": "-0.85..0.4,-0.25..0.25,-0.25..0.25",
+    "depth": 6,
+    "pieces": 1,
+    "absent": [
+     "dead-literal",
+     "floating"
+    ],
+    "lift": true
+   }
+  }
+ },
+ {
+  "id": "r4-neck",
+  "kind": "repair",
+  "task": "This package's `shape::subject` (shape.wrela) is a body and a head joined by a neck, but the neck is far thinner than the rest: `wrela inspect` reports it as a neck, joined, if at all, by something thinner than its cells. Make the neck about 0.1 thick so the body and head are one solid, without moving the body or the head.",
+  "wrong": "start",
+  "grade": {
+   "tests": true,
+   "inspect": {
+    "subject": "shape::subject",
+    "region": "-0.45..0.45,-0.45..0.85,-0.45..0.45",
+    "depth": 6,
+    "pieces": 1,
+    "absent": [
+     "neck",
+     "floating",
+     "speck"
+    ],
+    "lift": false
+   }
+  }
+ },
+ {
+  "id": "p1-nan",
+  "kind": "pixel",
+  "task": "This package lights the right half of the screen: a pixel's brightness is `normalize(v).x` for `v = vec3(max(uv.x, 0.0), 0.0, 0.0)`. But the left half is wrong: there `v` is zero, its length is 0, and the colour is not a number. Where `v` is zero the light faces nowhere: draw the left half with a brightness of 0.5, and change nothing else. `wrela pixel` can show what a pixel computes.",
+  "wrong": "start",
+  "grade": {
+   "tests": true,
+   "golden": "p1-nan.png"
+  }
+ },
+ {
+  "id": "p2-sign",
+  "kind": "pixel",
+  "task": "This package paints a sky over the ground: blue above the horizon (`uv.y` above 0) and brown below. But the picture is upside down: the branch tests the wrong sign. Fix it so the sky is on top, with no other change. `wrela pixel` can show what a pixel computes.",
+  "wrong": "start",
+  "grade": {
+   "tests": true,
+   "golden": "p2-sign.png"
+  }
+ },
+ {
+  "id": "p3-channel",
+  "kind": "pixel",
+  "task": "This package draws a vertical gradient: dark at the bottom of the screen, bright at the top, the same across each row. But it reads the wrong coordinate, so the gradient runs left to right instead. Fix it so it runs bottom to top, with no other change. `wrela pixel` can show what a pixel computes.",
+  "wrong": "start",
+  "grade": {
+   "tests": true,
+   "golden": "p3-channel.png"
+  }
+ },
+ {
+  "id": "p4-clamp",
+  "kind": "pixel",
+  "task": "This package draws a soft spot of light in the middle of the screen, `(1 - d)\u00b2` where `d` is a pixel's distance from the middle over 0.6 (in `uv`, which runs from -1 to 1), fading to black at `d` = 1. But past it the spot brightens again: `1 - d` goes negative and its square grows, so the corners glow. Fix it so everything past `d` = 1 is black, with no other change. `wrela pixel` can show what a pixel computes.",
+  "wrong": "start",
+  "grade": {
+   "tests": true,
+   "golden": "p4-clamp.png"
+  }
+ },
+ {
+  "id": "t1-overflow",
+  "kind": "trap",
+  "task": "This package's ticks add each key pressed into a `u8` total (`add_key`), and some input makes a tick trap. Find it (`wrela fuzz` looks for such inputs) and fix it: the total wraps around past 255 (250 plus a key of 10 is 4). Keep `pub fn add_key(total: u8, key: u32) -> u8`.",
+  "wrong": "start",
+  "grade": {
+   "tests": true,
+   "fuzz": {
+    "runs": 100000,
+    "seed": 7
+   }
+  }
+ },
+ {
+  "id": "t2-divide",
+  "kind": "trap",
+  "task": "This package's ticks spread a pointer press over a thousand units, `1000 / (x - 300)` for the press's whole-number x (`spread`), and some input makes a tick trap. Find it (`wrela fuzz` looks for such inputs) and fix it: where the divisor is 0 the spread is 0. Keep `pub fn spread(x: f32) -> i32`.",
+  "wrong": "start",
+  "grade": {
+   "tests": true,
+   "fuzz": {
+    "runs": 100000,
+    "seed": 7
+   }
+  }
+ },
+ {
+  "id": "t3-index",
+  "kind": "trap",
+  "task": "This package's ticks look each key pressed up in a table of eight slots (`slot`), for keys 30 to 37, and some input makes a tick trap. Find it (`wrela fuzz` looks for such inputs) and fix it: a key outside 30 to 37 has slot 0. Keep `pub fn slot(key: u32) -> u32` and the table.",
+  "wrong": "start",
+  "grade": {
+   "tests": true,
+   "fuzz": {
+    "runs": 100000,
+    "seed": 7
+   }
+  }
+ },
+ {
+  "id": "c1-repeat",
+  "kind": "cheaper",
+  "task": "This package's fragment shader `paint` costs too much: `wrela pipelines <package> --json` gives its work, the most one call can do, and it must be at most 27. Make it cheaper without changing the picture (`wrela same` against the package as it is now must say the same, within 1).",
+  "wrong": "start",
+  "grade": {
+   "pipeline": {
+    "entry": "paint",
+    "work": 27
+   },
+   "same": {
+    "within": 1,
+    "frames": 3
+   }
+  }
+ },
+ {
+  "id": "c2-hoist",
+  "kind": "cheaper",
+  "task": "This package's fragment shader `paint` costs too much: `wrela pipelines <package> --json` gives its work, the most one call can do, and it must be at most 383. Make it cheaper without changing the picture (`wrela same` against the package as it is now must say the same, within 1).",
+  "wrong": "start",
+  "grade": {
+   "pipeline": {
+    "entry": "paint",
+    "work": 383
+   },
+   "same": {
+    "within": 1,
+    "frames": 3
+   }
+  }
+ },
+ {
+  "id": "c3-power",
+  "kind": "cheaper",
+  "task": "This package's fragment shader `paint` costs too much: `wrela pipelines <package> --json` gives its work, the most one call can do, and it must be at most 20. Make it cheaper without changing the picture (`wrela same` against the package as it is now must say the same, within 1).",
+  "wrong": "start",
+  "grade": {
+   "pipeline": {
+    "entry": "paint",
+    "work": 20
+   },
+   "same": {
+    "within": 1,
+    "frames": 3
+   }
+  }
+ },
+ {
+  "id": "c4-sort",
+  "kind": "cheaper",
+  "task": "This package's fragment shader `paint` costs too much: `wrela pipelines <package> --json` gives its work, the most one call can do, and it must be at most 138. Make it cheaper without changing the picture (`wrela same` against the package as it is now must say the same, within 1).",
+  "wrong": "start",
+  "grade": {
+   "pipeline": {
+    "entry": "paint",
+    "work": 138
+   },
+   "same": {
+    "within": 1,
+    "frames": 3
+   }
+  }
+ }
+]

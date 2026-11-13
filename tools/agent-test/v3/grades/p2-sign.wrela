@@ -1,0 +1,6 @@
+use main::State
+
+/// The picture the brief describes, within 1 (mean, in 8-bit steps).
+@test(frames: 2, gpu: true, golden: "goldens/p2-sign.png", within: 1.0)
+fn grade_frame(s: State) {
+}

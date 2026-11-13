@@ -1,0 +1,30 @@
+{
+  "diagnostics": [
+    {
+      "code": "E0339",
+      "file": "main.wrela",
+      "fixes": [],
+      "help": [
+        "write a field, `c[i].x = ...`, or read the element, `let e = c[i]`"
+      ],
+      "internal": false,
+      "label": null,
+      "labels": [],
+      "message": "an element of a `Columns<P>` isn't one place: its fields are in arrays of their own",
+      "notes": [
+        "`c[i].x` reads and writes one field, and `c[i]` read whole gathers a copy (§6.10)"
+      ],
+      "severity": "error",
+      "span": {
+        "column": 18,
+        "end": 375,
+        "end_column": 23,
+        "end_line": 19,
+        "line": 19,
+        "start": 370
+      },
+      "title": "an element of a `Columns` taken whole as a place"
+    }
+  ],
+  "version": 2
+}

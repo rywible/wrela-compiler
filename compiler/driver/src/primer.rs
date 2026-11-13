@@ -182,6 +182,10 @@ pub const RULES: &[(&str, &str)] = &[
         "mem.plain",
         "`Plain` data has no pointers, and every field of a type that declares it is `Plain`",
     ),
+    (
+        "mem.columns",
+        "a `Columns` keeps each field in its own array: `c[i].x` is a place, and `c[i]` is read whole, never lent",
+    ),
     // §6.12 the unsafe core
     ("mem.unsafe", "`unsafe` only in std's core, and only in packages that declare it"),
     // §7 generics and traits
@@ -341,6 +345,11 @@ pub const RULES: &[(&str, &str)] = &[
     (
         "gpu.features",
         "half floats are GPU code's, and subgroup operations a kernel's, in uniform control flow, on a device with the feature",
+    ),
+    // §18.14 kernels the same on every GPU
+    (
+        "gpu.exact",
+        "a `@deterministic` kernel computes with integers and moves floats only as bits, reading one buffer and writing its own place",
     ),
     ("build.budget", "a shipped build's pipelines have at most 256 KiB of WGSL each"),
 ];

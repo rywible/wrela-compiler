@@ -13,7 +13,9 @@
 
 use std::derive::{Box2, Box3, Interval, interval}
 use std::math::is_finite
-use std::field::{Bound, Surface, UNBOUNDED, lattice, lattice_coord, smin, value_noise, value_noise_box}
+use std::field::{
+    Bound, Surface, UNBOUNDED, lattice, lattice_coord, smin, value_noise, value_noise_box,
+}
 use std::hash::pcg
 
 /// The most operations a `Tape` holds, and the most constants in its table.
@@ -277,6 +279,14 @@ pub type Tape = Taped<4096, 2048>
 /// A tape of up to `TAPE_SHORT` operations and constants (5 KiB): a pruned tape, which a kernel
 /// reads from a uniform-sized block.
 pub type ShortTape = Taped<256, 256>
+
+/// `interpret` of the tape at `tapes[i]`, read where it lies: a buffer of tapes binds as
+/// read-only storage, so a command carries its handle rather than a tape's 72 KiB, and the GPU
+/// code reads each operation from the buffer (it holds no copy of the tape). For a stand-in that
+/// draws a field through its tape while the field's own pipeline compiles (§18.12).
+pub fn interpret_at(tapes: [Tape], i: u32, p: vec3) -> f32 {
+    interpret(tapes[i], p)
+}
 
 /// The value of `tape`'s field at `p`: its last register. (Its loop is `run`'s, written out, as
 /// measured fastest.)

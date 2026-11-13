@@ -9,6 +9,7 @@
 // each file's hash when it was built, so a tool can show a literal's line and write a change
 // back (`wrela edit`). In a build that isn't lifted there are no literals: `count()` is 0.
 
+use std::derive::Trace
 use std::fmt::{json_number, json_string}
 use std::string::String
 
@@ -111,6 +112,55 @@ pub fn gradient<const N: u32>(f: fn() -> f32, which: [Literal; N]) -> (f32, [f32
 /// them, where a `gradient` of each part would run `f` again for each.
 @intrinsic
 pub fn jacobian<const N: u32, R>(f: fn() -> R, which: [Literal; N]) -> (R, [R; N]) {}
+
+/// `f()`, every operation on a literal's path recorded onto `trace`, the literals of `which` its
+/// next nodes in order (none where `f` reads none): the value, and its node (as its bits).
+@intrinsic
+fn recorded<const N: u32>(f: fn() -> f32, which: [Literal; N], trace: mut Trace) -> (f32, f32) {}
+
+/// `gradient` by reverse mode: `f`'s value and its derivative by each literal of `which`, from
+/// one recorded evaluation and one sweep back through it (Griewank and Walther), at the cost of
+/// a few evaluations however many literals, with no limit of 255 (§23.1). It takes `f` through a
+/// parameter, as `Minimize` does, so the code `f` reaches is held to the heap rule alone.
+pub fn reverse<const N: u32>(f: fn() -> f32, which: [Literal; N]) -> (f32, [f32; N]) {
+    var trace = Trace::new()
+    let (value, slot) = recorded(f, which, mut trace)
+    (value, adjoints(trace, slot, N))
+}
+
+/// `reverse` of a sum of `n` terms, `term(i)` for each `i` below `n`: one record and sweep a
+/// term, so the trace holds one term at a time.
+pub fn reverse_sum<const N: u32>(
+    n: u32,
+    term: fn(u32) -> f32,
+    which: [Literal; N],
+) -> (f32, [f32; N]) {
+    var trace = Trace::new()
+    var sum = 0.0
+    var g: [f32; N] = [0.0; N]
+    for i in 0..n {
+        trace.clear()
+        let (value, slot) = recorded(|| term(i), which, mut trace)
+        let d: [f32; N] = adjoints(trace, slot, N)
+        sum += value
+        for k in 0..N {
+            g[k] += d[k]
+        }
+    }
+    (sum, g)
+}
+
+/// The adjoints of a record's `N` literals, nodes 1 to `N`, by the value at node `slot`.
+fn adjoints<const N: u32>(trace: Trace, slot: f32, n: u32) -> [f32; N] {
+    let adj = trace.sweep(bitcast_u32(slot))
+    var g: [f32; N] = [0.0; N]
+    for k in 0..n {
+        if k + 1 < adj.len() {
+            g[k] = adj[k + 1]
+        }
+    }
+    g
+}
 
 /// The literals `f`'s code can read, through everything it calls on the CPU, in index order:
 /// those that can change what it gives. (GPU work it records reads its own literals when it
@@ -287,11 +337,19 @@ impl Checks for Report {
 ///   derivatives of every number from `jacobian`, 16 literals at a time. Each step has what BFGS
 ///   learns over many, so it takes far fewer.
 ///
+/// Neither tries a step that moves a literal farther than its own size (`within_reach`): its
+/// size now, or where the solve began if that was larger, or 1 if it began at 0. A step that
+/// would is shortened whole, by the one factor that brings its farthest-reaching literal to its
+/// size, so it keeps its direction (the quasi-Newton step's, or Levenberg–Marquardt's).
+///
 /// Then the literals are rounded to their sources' decimals: all at once where that costs no
 /// more than 5% of the solved value; else one at a time, the one that changed most first and
 /// the rest solved again with it held, a literal getting more decimals while rounding would
 /// cost more than 5% of the value (the last one, against the solved value; each before it, up
-/// to three more, against the value before rounding it).
+/// to three more, against the value before rounding it). Where no number of decimals keeps the
+/// cost within that, the literal gets the fewest whose value is within 5% of the least any of
+/// them gives: more decimals are kept only for what they buy. Where the rounded literals leave
+/// the value above the one before the solve, they stay where they began.
 pub struct Minimize {
     free: Vec<Literal>,
     decimals: Vec<u32>,
@@ -341,6 +399,7 @@ impl Minimize {
             self.free,
             f,
             self.start,
+            began: self.start,
             moves: Vec::filled(n, value: true),
             steps: steps,
             changes: mut self.changes,
@@ -353,6 +412,7 @@ impl Minimize {
                 self.start,
                 self.decimals,
                 self.units,
+                before: f64(self.before),
                 solved: f64(self.solved),
                 solved_x: x,
                 steps: steps,
@@ -388,6 +448,7 @@ impl Minimize {
             self.free,
             f,
             self.start,
+            began: self.start,
             moves: Vec::filled(n, value: true),
             steps: steps,
             changes: mut self.changes,
@@ -400,6 +461,7 @@ impl Minimize {
                 self.start,
                 self.decimals,
                 self.units,
+                before: f64(self.before),
                 solved: f64(self.solved),
                 solved_x: x,
                 steps: steps,
@@ -471,6 +533,7 @@ fn value_at<const M: u32>(
 fn solved_again<const M: u32>(
     free: [Literal],
     x: [f32],
+    began: [f32],
     moves: [bool],
     steps: u32,
     f: fn() -> f32,
@@ -479,19 +542,55 @@ fn solved_again<const M: u32>(
     changes: mut Vec<bool>,
 ) -> Vec<f32> {
     if fit {
-        let (again, _) = least_squares(free, numbers, x, moves, steps, mut changes)
+        let (again, _) = least_squares(free, numbers, x, began, moves, steps, mut changes)
         take again
     } else {
-        let (again, _) = bfgs(free, f, x, moves, steps, mut changes)
+        let (again, _) = bfgs(free, f, x, began, moves, steps, mut changes)
         take again
     }
+}
+
+/// The solution `solved_x` rounded (`rounded`), or the literals where they began (`start`,
+/// whose value is `before`) where rounding left the value above `before`: a solve never leaves
+/// what it makes small larger than it found it.
+fn round_solution<const M: u32>(
+    free: [Literal],
+    start: [f32],
+    decimals: [u32],
+    units: [f64],
+    before: f64,
+    solved: f64,
+    solved_x: [f32],
+    steps: u32,
+    f: fn() -> f32,
+    numbers: fn() -> [f32; M],
+    fit: bool,
+    changes: mut Vec<bool>,
+) -> Vec<f32> {
+    let x = rounded(
+        free,
+        start,
+        decimals,
+        units,
+        solved,
+        solved_x,
+        steps,
+        f,
+        numbers,
+        fit,
+        mut changes,
+    )
+    if !(value_at(free, x, f, numbers, fit) <= before) {
+        return Vec::from(start)
+    }
+    x
 }
 
 /// The solution `solved_x` (whose value is `solved`) rounded to the literals' `decimals` of
 /// their `units`. All at once, where that leaves the value within `rounding_limit` of `solved`:
 /// one evaluation. Else a literal at a time, as `Minimize` says, the rest solved again each
 /// time (`value_at`'s `f`, `numbers` and `fit` say what is solved).
-fn round_solution<const M: u32>(
+fn rounded<const M: u32>(
     free: [Literal],
     start: [f32],
     decimals: [u32],
@@ -545,23 +644,68 @@ fn round_solution<const M: u32>(
         } else {
             (rounding_limit(value_at(free, x, f, numbers, fit)), min(d + 3, 7))
         }
+        // The value at each number of decimals that isn't within `enough`, from its own.
+        var over: Vec<f64> = Vec::new()
+        var met = false
         while d < most {
             var trial = x.clone()
             trial[k] = v
-            if value_at(free, trial, f, numbers, fit) <= enough {
+            let value = value_at(free, trial, f, numbers, fit)
+            if value <= enough {
+                met = true
                 break
             }
+            over.push(value)
             d += 1
             v = round_to(x[k], d, unit)
+        }
+        if !met && over.len() > 0 {
+            var trial = x.clone()
+            trial[k] = v
+            let value = value_at(free, trial, f, numbers, fit)
+            if !(value <= enough) {
+                // No number of decimals is within `enough`: the fewest whose value is within
+                // the limit of the least any gives, so none is spent on a value out of reach.
+                over.push(value)
+                let fewest = fewest_decimals(over)
+                if fewest < over.len() {
+                    d = decimals[k] + fewest
+                    v = round_to(x[k], d, unit)
+                }
+            }
         }
         x[k] = v
         held[k] = true
         if left > 0 {
             let moves = Vec::from_fn(n, |i| !held[i])
-            x = solved_again(free, x, moves, steps, f, numbers, fit, mut changes)
+            x = solved_again(free, x, start, moves, steps, f, numbers, fit, mut changes)
         }
     }
     x
+}
+
+/// Of `values` (a literal's value at each number of decimals, from its own), the first within
+/// `rounding_limit` of the least: how many more decimals than its own buy something. Their
+/// count where none is a number.
+fn fewest_decimals(values: [f64]) -> u32 {
+    let n = values.len()
+    var least = n
+    for j in 0..n {
+        let value = values[j]
+        if value - value == 0.0 && (least == n || value < values[least]) {
+            least = j
+        }
+    }
+    if least == n {
+        return n
+    }
+    let limit = rounding_limit(values[least])
+    for j in 0..least {
+        if values[j] <= limit {
+            return j
+        }
+    }
+    least
 }
 
 /// The largest loss rounding may leave: five percent of the loss's magnitude above it. Using
@@ -579,8 +723,14 @@ fn loss_at(free: [Literal], f: fn() -> f32, x: [f32]) -> f64 {
     f64(f())
 }
 
-/// `f`'s derivative by each of the literals `free` at `x`, 16 at a time; 0 for those `moves`
-/// holds still. `changes` notes each literal the derivative isn't 0 by, held still or not.
+/// From how many free literals a gradient is taken by reverse mode (`reverse`): one recorded
+/// evaluation and a sweep for each 256, in place of forward mode's 16 at a time. Measured on a
+/// wolf's spec solve on the M4: 1.0 times as fast at 18 literals, 1.32 at 65, 2.66 at 259.
+pub const REVERSE_FROM: u32 = 65
+
+/// `f`'s derivative by each of the literals `free` at `x`, 16 at a time by forward mode, or
+/// past `REVERSE_FROM` of them 256 at a time by reverse mode; 0 for those `moves` holds still.
+/// `changes` notes each literal the derivative isn't 0 by, held still or not.
 fn gradient_at(
     free: [Literal],
     f: fn() -> f32,
@@ -594,29 +744,51 @@ fn gradient_at(
     let n = free.len()
     var g: Vec<f64> = Vec::new()
     var k = 0
+    let reversed = n >= REVERSE_FROM
+    let chunk = if reversed { 256 } else { 16 }
     while k < n {
-        var which = [free[k]; 16]
-        for j in 1..min(16, n - k) {
-            which[j] = free[k + j]
-        }
-        let (_, d) = gradient(f, which)
-        for j in 0..min(16, n - k) {
-            if d[j] != 0.0 {
-                changes[k + j] = true
+        let m = min(chunk, n - k)
+        if reversed {
+            // The chunk's first literal fills the rest: a literal named twice is derived once.
+            var which = [free[k]; 256]
+            for j in 1..m {
+                which[j] = free[k + j]
             }
-            g.push(if moves[k + j] { f64(d[j]) } else { 0.0 })
+            let (_, d) = reverse(f, which)
+            for j in 0..m {
+                note(mut g, mut changes, moves[k + j], d[j], k + j)
+            }
+        } else {
+            var which = [free[k]; 16]
+            for j in 1..m {
+                which[j] = free[k + j]
+            }
+            let (_, d) = gradient(f, which)
+            for j in 0..m {
+                note(mut g, mut changes, moves[k + j], d[j], k + j)
+            }
         }
-        k += 16
+        k += chunk
     }
     g
 }
 
+/// A literal's derivative into the gradient (0 if it doesn't move), and whether it changes.
+fn note(g: mut Vec<f64>, changes: mut Vec<bool>, moves: bool, d: f32, at: u32) {
+    if d != 0.0 {
+        changes[at] = true
+    }
+    g.push(if moves { f64(d) } else { 0.0 })
+}
+
 /// BFGS from `x0` over the literals `moves` lets change, `steps` steps at most: where it
 /// stopped, and the steps it took. `changes` notes the literals a gradient it takes isn't 0 by.
+/// `began` is where the whole solve began, for each literal's size (`within_reach`).
 fn bfgs(
     free: [Literal],
     f: fn() -> f32,
     x0: [f32],
+    began: [f32],
     moves: [bool],
     steps: u32,
     changes: mut Vec<bool>,
@@ -641,18 +813,31 @@ fn bfgs(
             slope = -gg
             h = identity(n)
         }
-        // Armijo's rule, halving the step from 1.
+        // Armijo's rule along the step, halved from 1, the step shortened whole where a literal
+        // would go past its own size (`within_reach`). A try the same as the last (the step
+        // still shortened to the same literal's size) is passed over, and isn't one of the 40.
         var t: f64 = 1.0
         var x1: Vec<f64> = Vec::new()
         var f1: f64 = 0.0
-        for _ in 0..40 {
-            let trial: Vec<f64> = Vec::from_fn(n, |i| x[i] + t * p[i])
+        var last: Vec<f64> = Vec::new()
+        var tries = 0
+        while tries < 40 && t > 0.0 {
+            let step = within_reach(x, began, p, t)
+            if same(step, last) {
+                t *= 0.5
+                continue
+            }
+            tries += 1
+            let trial: Vec<f64> = Vec::from_fn(n, |i| x[i] + step[i])
             let ft = loss_at(free, f, narrowed(trial))
-            if ft - ft == 0.0 && ft <= fx + 1.0e-4 * t * slope {
+            // The slope along what was tried: the step's own, where no literal was held.
+            let down = if whole(step, p, t) { t * slope } else { dot(step, g) }
+            if ft - ft == 0.0 && down < 0.0 && ft <= fx + 1.0e-4 * down {
                 x1 = take trial
                 f1 = ft
                 break
             }
+            last = take step
             t *= 0.5
         }
         if x1.len() == 0 {
@@ -684,6 +869,68 @@ fn bfgs(
         }
     }
     (narrowed(x), taken)
+}
+
+/// How far a literal at `x` goes in one step of a solve it began at `began`: its size now, or
+/// where the solve began if that was larger (so it can cross 0), or 1 if it began at 0.
+fn size(x: f64, began: f32) -> f64 {
+    let from = abs(f64(began))
+    max(abs(x), if from == 0.0 { 1.0 } else { from })
+}
+
+/// `t` of the step `p` from `x`, shortened whole, by one factor, until no literal's part of it
+/// is longer than the literal's own `size`.
+/// The function's derivatives say nothing of it farther off than that, and a step can be far
+/// longer than any literal: BFGS's first is as long as the gradient (its estimate starts as
+/// the identity), which for a loss of 1,149 that rises 164 for a thousandth of a second of a
+/// key's time was a time of -164,460 s, where one evaluation ran for hours. A literal can
+/// still double each step, so one that has far to go gets there in a few.
+///
+/// The whole step is shortened by one factor, not each literal clamped by itself: a clamp of
+/// each changes the step's direction, and the quasi-Newton direction is what the solve learned
+/// (on the humanoid's hook with six literals free, clamping each ended at a loss of 36.4 with
+/// 38 of 41 checks held; one factor ends at 0.36 with all 41). A literal that began at 0 is
+/// sized from where the solve began (`began`), so a re-solve doesn't hold everything to the
+/// hair it has moved, which, not the one factor, stopped a solve of ten literals against two
+/// outlines at a loss of 52 before.
+///
+/// The most a step may go, its whole length shortened to it before the line search tries it:
+/// J. E. Dennis and R. B. Schnabel, "Numerical Methods for Unconstrained Optimization and
+/// Nonlinear Equations" (1983), §6.3 and algorithm A6.3.1, their line search with its maximum
+/// step length (`maxstep`), here measured literal by literal, each against its own size.
+fn within_reach(x: [f64], began: [f32], p: [f64], t: f64) -> Vec<f64> {
+    var k = 1.0
+    for i in 0..x.len() {
+        let step = abs(t * p[i])
+        let most = size(x[i], began[i])
+        if step > most {
+            k = min(k, most / step)
+        }
+    }
+    Vec::from_fn(x.len(), |i| k * t * p[i])
+}
+
+/// Whether `step` is all of `t` of `p`: no literal's part was held.
+fn whole(step: [f64], p: [f64], t: f64) -> bool {
+    for i in 0..step.len() {
+        if step[i] != t * p[i] {
+            return false
+        }
+    }
+    true
+}
+
+/// Whether two steps are the same, number for number.
+fn same(a: [f64], b: [f64]) -> bool {
+    if a.len() != b.len() {
+        return false
+    }
+    for i in 0..a.len() {
+        if a[i] != b[i] {
+            return false
+        }
+    }
+    true
 }
 
 fn narrowed(x: [f64]) -> Vec<f32> {
@@ -847,6 +1094,7 @@ fn least_squares<const M: u32>(
     free: [Literal],
     f: fn() -> [f32; M],
     x0: [f32],
+    began: [f32],
     moves: [bool],
     steps: u32,
     changes: mut Vec<bool>,
@@ -902,7 +1150,8 @@ fn least_squares<const M: u32>(
         for _ in 0..40 {
             let d = damped_step(a, g, n, live, lambda)
             if d.len() == n {
-                let trial: Vec<f64> = Vec::from_fn(n, |i| x[i] + d[i])
+                let step = within_reach(x, began, d, 1.0)
+                let trial: Vec<f64> = Vec::from_fn(n, |i| x[i] + step[i])
                 let ft = squares_at(free, f, narrowed(trial))
                 if ft - ft == 0.0 && ft < fx {
                     x1 = take trial
@@ -1000,6 +1249,49 @@ fn a_damped_step_solves_its_equations() {
     assert(one[0] == 0.0 && abs(one[1] - 2.0 / 3.0) < 1.0e-12)
     // A matrix that isn't positive definite has no step.
     assert(damped_step([1.0, 2.0, 2.0, 1.0], [-1.0, -2.0], 2, [0, 1], 0.0).len() == 0)
+}
+
+@test
+fn a_step_moves_no_literal_farther_than_its_size() {
+    // A step within every literal's size is taken whole.
+    let small = within_reach([0.5, -32.0], [0.5, -32.0], [0.25, 20.0], 1.0)
+    assert(small[0] == 0.25 && small[1] == 20.0 && whole(small, [0.25, 20.0], 1.0))
+    // A key's time of 0.5 s and a step as long as its gradient: 0.5 s of it, at any `t` that
+    // still leaves it longer.
+    let long = within_reach([0.5], [0.5], [-164460.0], 1.0)
+    assert(long[0] == -0.5 && !whole(long, [-164460.0], 1.0))
+    assert(same(long, within_reach([0.5], [0.5], [-164460.0], 0.5)))
+    assert(abs(within_reach([0.5], [0.5], [-164460.0], 0.000001)[0] + 0.16446) < 1.0e-12)
+    // One literal's size holds the whole step to it, so the step keeps its direction: the other
+    // goes the same fraction of its part.
+    let one = within_reach([2.0, 100.0], [2.0, 100.0], [-8.0, 50.0], 1.0)
+    assert(one[0] == -2.0 && one[1] == 12.5)
+    // One that has come near 0 can still move as far as it began from it, and so cross it.
+    assert(within_reach([0.125], [0.5], [-2.0], 1.0)[0] == -0.5)
+    // One that began at 0 has no size to go by: 1.
+    assert(within_reach([0.0], [0.0], [5.0], 1.0)[0] == 1.0)
+    // A step that isn't a number is neither whole nor the same as itself: a search tries it,
+    // finds no value there and halves.
+    let quiet: u64 = 0x7ff8000000000000
+    let nan = within_reach([1.0], [1.0], [bitcast_f64(quiet)], 1.0)
+    assert(!whole(nan, [bitcast_f64(quiet)], 1.0) && !same(nan, nan))
+}
+
+@test
+fn decimals_are_kept_only_for_what_they_buy() {
+    // More decimals lower the value by a hair: its own are within 5% of the least.
+    assert(fewest_decimals([0.3719011, 0.371805, 0.371805, 0.37180242]) == 0)
+    // One more decimal buys most of it, and the rest a hair.
+    assert(fewest_decimals([5.0, 1.1, 1.06, 1.06]) == 1)
+    // The least itself, where nothing before it is near.
+    assert(fewest_decimals([5.0, 3.0, 2.0, 1.0]) == 3)
+    // A negative value's limit is above it.
+    assert(fewest_decimals([-90.0, -99.0, -100.0]) == 1)
+    // A value that isn't a number is no value: passed over, and all of them is no answer.
+    let quiet: u64 = 0x7ff8000000000000
+    let nan = bitcast_f64(quiet)
+    assert(fewest_decimals([nan, 2.0, 1.99]) == 1)
+    assert(fewest_decimals([nan, nan]) == 2)
 }
 
 @test

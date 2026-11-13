@@ -1,12 +1,13 @@
-// Collections: `Vec`, `Box`, `Bounded` and `Flags`, sorting, and `swap` and `replace`, which
+// Collections: `Vec`, `Columns`, `Box`, `Bounded` and `Flags`, sorting, and `swap` and `replace`, which
 // move values out of places (language.md §6.9, §20). A collection owns its elements, frees them
 // when it's dropped, and iterates in an order that doesn't depend on addresses.
 
 use std::alloc::{alloc, free, realloc}
 use std::par::{chunks_for, par_each}
 use std::mem::{
-    Drop, align_of, at, at_mut, at_mut_pair, copy, drop_at, is_copy, keep_bytes, kept_bytes, read,
-    size_of, take_answer, take_input, take_payload, write, zeroed,
+    Drop, align_of, at, at_mut, at_mut_pair, column_bytes, column_read, column_write, copy, drop_at,
+    is_copy, keep_bytes, kept_bytes, read, size_of, take_answer, take_input, take_payload, write,
+    zeroed,
 }
 pub use std::mem::Pair
 use std::serialize::Serialize
@@ -676,6 +677,83 @@ pub fn sort_by<T: Copy>(xs: mut [T], before: fn(T, T) -> bool) {
     }
 }
 
+/// `T`s on the heap, each field in its own array (language.md §6.10): a loop over one field
+/// reads only that field's array, four elements at a time where it can (§11.2). `c[i].x`
+/// reads and writes field `x` of element `i`, and an index past the end panics; `c[i]` read
+/// whole gathers a `T` from every array. An element isn't one place: `mut e = c[i]`, or lending
+/// `c[i]` to a `mut` parameter, is E0339; read it, or name a field. Dropping it frees its
+/// memory; `clear()` keeps its capacity.
+///
+/// ```wrela
+/// use std::collections::Columns
+///
+/// struct P: Copy {
+///     x: f32,
+///     v: f32,
+/// }
+///
+/// var ps: Columns<P> = Columns::new()
+/// ps.push(P { x: 1.0, v: 0.5 })
+/// ps.push(P { x: 2.0, v: -0.5 })
+/// for i in 0..ps.len() {
+///     ps[i].x += ps[i].v
+/// }
+/// let p = ps[1]
+/// assert(p.x == 1.5 && ps[0].x == 1.5 && ps.len() == 2)
+/// ```
+pub struct Columns<T: Copy> {
+    // The compiler indexes `Columns` in place: these three fields, in this order.
+    data: u32,
+    len: u32,
+    cap: u32,
+}
+
+impl<T: Copy> Columns<T> {
+    /// An empty `Columns`, which allocates nothing until an element is pushed.
+    pub fn new() -> Columns<T> {
+        Columns { data: 0, len: 0, cap: 0 }
+    }
+
+    /// How many elements it holds.
+    pub fn len(self) -> u32 {
+        self.len
+    }
+
+    /// Adds `value` at the end: each field at the end of its array.
+    pub fn push(mut self, value: T) {
+        if self.len == self.cap {
+            // Every array moves: each starts at the capacity times the bytes before it.
+            let cap = max(self.cap * 2, 8)
+            unsafe {
+                let data = alloc(cap * column_bytes::<T>(), align_of::<T>())
+                for i in 0..self.len {
+                    column_write::<T>(data, cap, i, column_read::<T>(self.data, self.cap, i))
+                }
+                free(self.data, self.cap * column_bytes::<T>())
+                self.data = data
+            }
+            self.cap = cap
+        }
+        unsafe {
+            column_write::<T>(self.data, self.cap, self.len, value)
+        }
+        self.len += 1
+    }
+
+    /// Removes every element. The capacity stays.
+    pub fn clear(mut self) {
+        self.len = 0
+    }
+}
+
+impl<T: Copy> Drop for Columns<T> {
+    fn drop(mut self) {
+        unsafe {
+            free(self.data, self.cap * column_bytes::<T>())
+        }
+    }
+}
+
 impl<T> Drop for Vec<T> {
     fn drop(mut self) {
         self.clear()
@@ -1063,4 +1141,32 @@ fn a_run_says_whether_it_is_empty() {
 
 fn run_is_empty(xs: [u32]) -> bool {
     xs.is_empty()
+}
+
+/// A point with fields of three sizes and alignments: a `vec3`, a `u32`, an `f32`.
+struct Spot: Copy {
+    at: vec3,
+    n: u32,
+    w: f32,
+}
+
+@test
+fn columns_keep_each_field_through_growth() {
+    var c: Columns<Spot> = Columns::new()
+    for i in 0..100 {
+        c.push(Spot { at: vec3(f32(i), -f32(i), 0.5), n: i * 3, w: f32(i) * 0.25 })
+    }
+    for i in 0..c.len() {
+        c[i].w += 1.0
+        c[i].at.z = f32(c[i].n)
+    }
+    for i in 0..c.len() {
+        let s = c[i]
+        assert(s.at == vec3(f32(i), -f32(i), f32(i * 3)) && s.n == i * 3)
+        assert(s.w == f32(i) * 0.25 + 1.0)
+    }
+    c.clear()
+    assert(c.len() == 0)
+    c.push(Spot { at: vec3(1.0), n: 7, w: 2.0 })
+    assert(c[0].n == 7 && c.len() == 1)
 }

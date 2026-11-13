@@ -1,0 +1,15 @@
+// mistake: an element of a Columns assigned whole
+// expect: E0339
+// fix: no
+use std::collections::Columns
+
+struct P: Copy {
+    x: f32,
+    v: f32,
+}
+
+pub fn frame(time: f32, width: u32, height: u32) {
+    var ps: Columns<P> = Columns::new()
+    ps.push(P { x: 0.0, v: 1.0 })
+    ps[0] = P { x: 1.0, v: 2.0 }
+}

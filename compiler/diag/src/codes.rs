@@ -190,6 +190,7 @@ codes! {
     E0336 = "E0336", "a `@job fn` that can't be a job, or a job used as a function";
     E0337 = "E0337", "a walk over `fields(self)` outside a `@fieldwise` trait, or one it can't unroll";
     E0338 = "E0338", "a GPU-only type (`f16`, `vecNh`) in CPU code";
+    E0339 = "E0339", "an element of a `Columns` taken whole as a place";
 
     // ---- E04xx: traits and generics --------------------------------------------------------
     E0400 = "E0400", "a type that doesn't implement a trait";
@@ -265,6 +266,7 @@ codes! {
     E0710 = "E0710", "a GPU function over its `@budget` of work";
     E0711 = "E0711", "a `@standin` that can't stand in for its entry point";
     E0712 = "E0712", "GPU code that computes a value the same for every invocation, each invocation again";
+    E0713 = "E0713", "a `@deterministic` kernel that does something a GPU may do its own way";
 
     // ---- E09xx: not in tier 0 --------------------------------------------------------------
 

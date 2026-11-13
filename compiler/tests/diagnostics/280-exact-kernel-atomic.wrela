@@ -1,0 +1,23 @@
+// mistake: a deterministic kernel that counts with an atomic, whose result depends on how invocations interleave
+// expect: E0713
+// fix: no
+use std::gpu::{Atomics, GlobalId, GpuBuffer, buffer, dispatch}
+
+@deterministic
+@compute(64)
+fn count(cells: [u32], bins: mut Atomics<u32>, id: GlobalId) {
+    let _ = bins.add(i: cells[id.x] % 16, value: 1)
+}
+
+pub struct S {
+    cells: GpuBuffer<u32>,
+    bins: GpuBuffer<u32>,
+}
+
+pub fn init() -> S {
+    S { cells: buffer(64), bins: buffer(16) }
+}
+
+pub fn frame(s: mut S, time: f32, width: u32, height: u32) {
+    dispatch(count.bind(s.cells, mut s.bins), groups: 1)
+}

@@ -101,6 +101,31 @@ fn tapes_match_their_compiled_fields_on_the_gpu() {
     report("tape values on the GPU", measured, TOLERANCE);
 }
 
+/// `interpret_at` (stage J.2): each corpus field's tape, read in place from one buffer of all 25
+/// tapes, gives what the same tape given by value gives, bit for bit, on the GPU.
+#[test]
+#[ignore = "needs a GPU"]
+fn a_tape_read_in_place_gives_what_it_gives_by_value() {
+    let dir = built("fields");
+    let mut host = Host::load(&dir).expect("load");
+    for k in 0..crate::derive::NAMES.len() as i32 {
+        let args = [Value::I32(k), Value::I32(29), Value::I32(POINTS as i32)];
+        host.call_export("tape_at_gpu", &args).expect("dispatch");
+        let made = host.buffers();
+        let [.., at, by_value] = made[..] else { panic!("two buffers") };
+        let at = host.read_buffer(at).expect("in place");
+        let by_value = host.read_buffer(by_value).expect("by value");
+        assert_eq!(at.len(), 4 * POINTS as usize);
+        let differ = at.chunks(4).zip(by_value.chunks(4)).filter(|(a, b)| a != b).count();
+        assert_eq!(
+            differ,
+            0,
+            "{}: {differ} of {POINTS} points differ",
+            crate::derive::NAMES[k as usize]
+        );
+    }
+}
+
 /// A creature's tape, the herd's grazer's, holds under 2,048 operations.
 #[test]
 fn a_creature_tapes_in_under_2048_operations() {

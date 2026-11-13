@@ -13,10 +13,15 @@
 //! package's literals lifted, and runs it on the CPU, where `std::lift::Minimize` solves: BFGS
 //! on the function's derivatives by the literals (`std::lift::gradient`, forward mode), each
 //! step along a line searched until the value falls enough (Armijo's rule); a fit, by
-//! Levenberg–Marquardt on every number's derivatives (`std::lift::jacobian`). The literals end
+//! Levenberg–Marquardt on every number's derivatives (`std::lift::jacobian`). No step moves a
+//! literal farther than its own size, and a solve the program fails under says which literals
+//! it was trying where. The literals end
 //! rounded to their own decimals, as a drag's are: the one that changed most first, the
 //! rest solved again with it held, and the last given more decimals while rounding would cost
-//! more than 5% of the value (`--exact` keeps them as solved). This finds the literals named
+//! more than 5% of the value, and only the decimals that buy something where none keeps the
+//! cost within that (`--exact` keeps them as solved); they stay where they began where rounding
+//! left the value above the one before the solve. A spec whose every check already holds isn't
+//! solved or written: its literals stay. This finds the literals named
 //! and their decimals, passes them in, and reports what came out, with a warning for each
 //! literal the function never changed with (its derivative by it was 0 wherever the solve took
 //! one). With `--write`, `wrela edit` writes them to the source, unless a spec's solve stopped
@@ -109,13 +114,13 @@ pub fn run(args: &[String]) -> ExitCode {
 /// `body.wrela:12-20`), those of the value a name is bound to (`body.wrela:reach`: the file's
 /// `let reach = 0.62`), or both (`body.wrela:3,reach,7-9`). A name stays put when the file's
 /// lines move.
-struct Free {
-    file: PathBuf,
+pub(crate) struct Free {
+    pub(crate) file: PathBuf,
     lines: Vec<(u32, u32)>,
     names: Vec<String>,
 }
 
-fn parse_free(arg: &str) -> Option<Free> {
+pub(crate) fn parse_free(arg: &str) -> Option<Free> {
     // A file alone: every line of it.
     if !arg.contains(':') {
         return Some(Free { file: PathBuf::from(arg), lines: vec![(1, u32::MAX)], names: vec![] });
@@ -148,7 +153,7 @@ fn is_name(s: &str) -> bool {
 }
 
 /// A value a name is bound to in a file: where its expression is (bytes), and its line.
-struct Bound {
+pub(crate) struct Bound {
     start: u32,
     end: u32,
     line: u32,
@@ -216,7 +221,7 @@ fn bound(text: &str, name: &str) -> Vec<Bound> {
 
 /// Where the names of `free` are bound in its file, each to one value: an error for a name the
 /// file doesn't bind, or binds more than once (its lines tell them apart).
-fn named(dir: &Path, free: &Free) -> Result<Vec<(String, Bound)>, String> {
+pub(crate) fn named(dir: &Path, free: &Free) -> Result<Vec<(String, Bound)>, String> {
     if free.names.is_empty() {
         return Ok(Vec::new());
     }
@@ -286,6 +291,7 @@ fn glue(package: &str, module: &str, function: &str, spec: bool, fit: bool) -> S
         "{head}pub fn init() -> Minimize {{\n    Minimize::new()\n}}\n\n\
          pub fn free(m: mut Minimize, literal: u32, decimals: u32, unit: f64) {{\n    \
          m.free(Literal {{ index: literal }}, decimals, unit)\n}}\n\n\
+         pub fn literal_now(literal: u32) -> f32 {{\n    Literal {{ index: literal }}.value()\n}}\n\n\
          pub fn solve(m: mut Minimize, steps: u32, exact: bool) {{\n    m.{how}(|| {call}, steps, exact)\n}}\n\n\
          pub fn losses(m: Minimize) -> vec3 {{\n    vec3(m.before(), m.solved(), m.after())\n}}\n\n\
          pub fn steps(m: Minimize) -> u32 {{\n    m.steps()\n}}\n\n\
@@ -296,16 +302,16 @@ fn glue(package: &str, module: &str, function: &str, spec: bool, fit: bool) -> S
 
 /// A literal that may change: its index, where it is, and its edit for `wrela edit` (its value
 /// set when it's written).
-struct Lit {
-    index: u32,
-    file: String,
-    line: u32,
+pub(crate) struct Lit {
+    pub(crate) index: u32,
+    pub(crate) file: String,
+    pub(crate) line: u32,
     /// The name it was freed by (`--free <file>:<name>`), if by one.
-    name: Option<String>,
+    pub(crate) name: Option<String>,
     /// Its text's decimals, and the unit they count in (`15cm`: 0.01; 1 with no unit suffix).
-    decimals: u32,
-    unit: f64,
-    edit: LiteralEdit,
+    pub(crate) decimals: u32,
+    pub(crate) unit: f64,
+    pub(crate) edit: LiteralEdit,
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -324,80 +330,22 @@ fn solve(
     let names = free.iter().map(|f| named(dir, f)).collect::<Result<Vec<_>, _>>()?;
     let (glue_dir, package) =
         crate::glue_package(dir, "solve", |package| glue(package, module, function, spec, fit))?;
-    let out = wrela_driver::build_lifted(
-        &glue_dir,
-        std::slice::from_ref(&package),
-        Default::default(),
-        &[],
-    )?;
+    // Only the files freed are lifted: a literal of another file (a blueprint's outline, a
+    // spec's targets) is a reference, which the solve neither moves nor derives through.
+    let mut lifted: Vec<String> = free
+        .iter()
+        .map(|f| format!("{package}/{}", f.file.to_string_lossy().replace('\\', "/")))
+        .collect();
+    lifted.sort();
+    lifted.dedup();
+    let out = wrela_driver::build_lifted(&glue_dir, &lifted, Default::default(), &[])?;
     let built = glue_dir.join("out");
     crate::write_build(&out, &built)?;
     let report: serde_json::Value = serde_json::from_str(
         &std::fs::read_to_string(built.join("lift.json")).map_err(|e| e.to_string())?,
     )
     .map_err(|e| e.to_string())?;
-    // The literals named: on a line named, or in the value a name named is bound to.
-    let files = report["files"].as_array().map_or(&[][..], Vec::as_slice);
-    let canonical = |p: &Path| p.canonicalize().unwrap_or_else(|_| p.to_path_buf());
-    // Each `--free`: its file, and where its names are bound.
-    let wanted: Vec<_> = free
-        .iter()
-        .zip(&names)
-        .map(|(f, names)| (canonical(&dir.join(&f.file)), f, names.as_slice()))
-        .collect();
-    let mut lits = Vec::new();
-    for l in report["literals"].as_array().into_iter().flatten() {
-        let f = &files[l["file"].as_u64().unwrap_or(0) as usize];
-        let path = canonical(&glue_dir.join(f["path"].as_str().unwrap_or("")));
-        let line = l["line"].as_u64().unwrap_or(0) as u32;
-        let at = l["start"].as_u64().unwrap_or(0) as u32;
-        let by_name = |names: &[(String, Bound)]| {
-            names.iter().find(|(_, b)| b.start <= at && at < b.end).map(|(n, _)| n.clone())
-        };
-        // The first `--free` that names it; by a name, if any of them names it by one.
-        let mut freed: Option<(&Free, Option<String>)> = None;
-        for (_, f, names) in wanted.iter().filter(|(p, ..)| *p == path) {
-            let name = by_name(names);
-            if name.is_none() && !f.lines.iter().any(|&(a, b)| a <= line && line <= b) {
-                continue;
-            }
-            match &mut freed {
-                None => freed = Some((f, name)),
-                Some((_, by)) if by.is_none() => *by = name,
-                Some(_) => {}
-            }
-        }
-        let Some((fr, name)) = freed else { continue };
-        let text = l["text"].as_str().unwrap_or("").to_string();
-        lits.push(Lit {
-            index: l["index"].as_u64().unwrap_or(0) as u32,
-            file: fr.file.display().to_string(),
-            line,
-            name,
-            decimals: decimals(&text),
-            unit: wrela_driver::edit::unit_of(&text),
-            edit: LiteralEdit {
-                file: f["path"].as_str().unwrap_or("").into(),
-                start: l["start"].as_u64().unwrap_or(0) as u32,
-                end: l["end"].as_u64().unwrap_or(0) as u32,
-                text,
-                hash: f["hash"].as_str().unwrap_or("").into(),
-                value: 0.0,
-            },
-        });
-    }
-    // A name was given for its literals: one whose value has none is said, not passed over.
-    for (f, names) in free.iter().zip(&names) {
-        for (name, b) in names {
-            if !lits.iter().any(|l| l.name.as_deref() == Some(name.as_str())) {
-                return Err(format!(
-                    "`{name}` in `{}` (line {}) is bound to a value with no lifted literal in it",
-                    f.file.display(),
-                    b.line
-                ));
-            }
-        }
-    }
+    let lits = freed(dir, &glue_dir, free, &names, &report)?;
     if lits.is_empty() {
         return Err("no lifted literal is on the lines named".into());
     }
@@ -410,7 +358,19 @@ fn solve(
         call(&mut host, "free", &args)?;
     }
     let checks_before = if spec { spec_report(&mut host)? } else { serde_json::Value::Null };
-    call(&mut host, "solve", &[Value::I32(steps as i32), Value::I32(i32::from(exact))])?;
+    // A spec whose every check already holds has nothing to solve: no step is taken and
+    // nothing is rounded, so its literals stay. (The derivatives are still taken once, for
+    // the warnings.)
+    let held_before = spec && checks_before["missed"].as_u64() == Some(0);
+    let (steps, exact) = if held_before { (0, true) } else { (steps, exact) };
+    let began = values(&mut host, &lits);
+    if let Err(why) =
+        call(&mut host, "solve", &[Value::I32(steps as i32), Value::I32(i32::from(exact))])
+    {
+        // The program failed where the solve set its literals: which, and where.
+        let now = values(&mut host, &lits);
+        return Err(why + &trying(&lits, began.as_deref(), now.as_deref()));
+    }
     let (before, solved_loss, after) = match call(&mut host, "losses", &[])?.as_slice() {
         [Value::F32(a), Value::F32(b), Value::F32(c)] => (*a, *b, *c),
         other => return Err(format!("`losses` returned {other:?}")),
@@ -476,6 +436,7 @@ fn solve(
         "loss_after": num(after),
         "steps": taken,
         "rounded": !exact,
+        "held_before": held_before,
         "spec_before": checks_before,
         "spec_after": checks_after,
         "literals": lits.iter().zip(start.iter().zip(&finish)).zip(&changes).map(|((l, (b, a)), changed)| serde_json::json!({
@@ -487,7 +448,7 @@ fn solve(
     });
     if let Some(why) = refused {
         answer["refused"] = why.into();
-    } else if write {
+    } else if write && !held_before {
         let edits: Vec<LiteralEdit> = lits
             .iter()
             .zip(&finish)
@@ -504,6 +465,111 @@ fn solve(
     Ok(answer)
 }
 
+/// The literals `free` names, from a lifted build's `lift.json` (`report`) of the program in
+/// `glue_dir` around the package in `dir`: on a line named, or in the value a name named is bound
+/// to, each by the first `--free` that names it. What `wrela solve` and `wrela sliders` move.
+pub(crate) fn freed(
+    dir: &Path,
+    glue_dir: &Path,
+    free: &[Free],
+    names: &[Vec<(String, Bound)>],
+    report: &serde_json::Value,
+) -> Result<Vec<Lit>, String> {
+    let files = report["files"].as_array().map_or(&[][..], Vec::as_slice);
+    let canonical = |p: &Path| p.canonicalize().unwrap_or_else(|_| p.to_path_buf());
+    // Each `--free`: its file, and where its names are bound.
+    let wanted: Vec<_> = free
+        .iter()
+        .zip(names)
+        .map(|(f, names)| (canonical(&dir.join(&f.file)), f, names.as_slice()))
+        .collect();
+    let mut lits = Vec::new();
+    for l in report["literals"].as_array().into_iter().flatten() {
+        let f = &files[l["file"].as_u64().unwrap_or(0) as usize];
+        let path = canonical(&glue_dir.join(f["path"].as_str().unwrap_or("")));
+        let line = l["line"].as_u64().unwrap_or(0) as u32;
+        let at = l["start"].as_u64().unwrap_or(0) as u32;
+        let by_name = |names: &[(String, Bound)]| {
+            names.iter().find(|(_, b)| b.start <= at && at < b.end).map(|(n, _)| n.clone())
+        };
+        // The first `--free` that names it; by a name, if any of them names it by one.
+        let mut freed: Option<(&Free, Option<String>)> = None;
+        for (_, f, names) in wanted.iter().filter(|(p, ..)| *p == path) {
+            let name = by_name(names);
+            if name.is_none() && !f.lines.iter().any(|&(a, b)| a <= line && line <= b) {
+                continue;
+            }
+            match &mut freed {
+                None => freed = Some((f, name)),
+                Some((_, by)) if by.is_none() => *by = name,
+                Some(_) => {}
+            }
+        }
+        let Some((fr, name)) = freed else { continue };
+        let text = l["text"].as_str().unwrap_or("").to_string();
+        lits.push(Lit {
+            index: l["index"].as_u64().unwrap_or(0) as u32,
+            file: fr.file.display().to_string(),
+            line,
+            name,
+            decimals: decimals(&text),
+            unit: wrela_driver::edit::unit_of(&text),
+            edit: LiteralEdit {
+                file: f["path"].as_str().unwrap_or("").into(),
+                start: l["start"].as_u64().unwrap_or(0) as u32,
+                end: l["end"].as_u64().unwrap_or(0) as u32,
+                text,
+                hash: f["hash"].as_str().unwrap_or("").into(),
+                value: 0.0,
+            },
+        });
+    }
+    // A name was given for its literals: one whose value has none is said, not passed over.
+    for (f, names) in free.iter().zip(names) {
+        for (name, b) in names {
+            if !lits.iter().any(|l| l.name.as_deref() == Some(name.as_str())) {
+                return Err(format!(
+                    "`{name}` in `{}` (line {}) is bound to a value with no lifted literal in it",
+                    f.file.display(),
+                    b.line
+                ));
+            }
+        }
+    }
+    Ok(lits)
+}
+
+/// Each literal's value in the program now (the glue's `literal_now`), if it can say.
+fn values(host: &mut CpuHost, lits: &[Lit]) -> Option<Vec<f32>> {
+    lits.iter()
+        .map(|l| {
+            let value = host.call_export("literal_now", &[Value::I32(l.index as i32)]).ok()?;
+            match value.as_slice() {
+                [Value::F32(v)] => Some(*v),
+                _ => None,
+            }
+        })
+        .collect()
+}
+
+/// What a solve was trying when the program failed under it: the literals that weren't where
+/// they began (`began`), and where they were (`now`). The program doesn't run there, which its
+/// author can't see from the trap alone. Nothing, where the program couldn't say.
+fn trying(lits: &[Lit], began: Option<&[f32]>, now: Option<&[f32]>) -> String {
+    let (Some(began), Some(now)) = (began, now) else { return String::new() };
+    let moved: Vec<String> = lits
+        .iter()
+        .zip(began.iter().zip(now))
+        .filter(|(_, (b, n))| b.to_bits() != n.to_bits())
+        .map(|(l, (_, n))| format!("{}:{} `{}` at {n}", l.file, l.line, l.edit.text))
+        .collect();
+    if moved.is_empty() {
+        String::new()
+    } else {
+        format!(" (the solve was trying {})", moved.join(", "))
+    }
+}
+
 /// The spec's report at the literals' values now (the glue's `report` prints it).
 fn spec_report(host: &mut CpuHost) -> Result<serde_json::Value, String> {
     let _ = host.take_logs();
@@ -514,7 +580,7 @@ fn spec_report(host: &mut CpuHost) -> Result<serde_json::Value, String> {
 }
 
 /// How many decimals a literal's text has (its mantissa's; 0 for an integer).
-fn decimals(text: &str) -> u32 {
+pub(crate) fn decimals(text: &str) -> u32 {
     let t = text.trim_start_matches('-');
     let mantissa = t.split(['e', 'E']).next().unwrap_or(t);
     let digits = mantissa.trim_end_matches(|c: char| c.is_ascii_alphabetic());
@@ -561,6 +627,9 @@ fn print_report(r: &serde_json::Value) {
                 if c["holds"] == true { String::new() } else { format!(", off by {}", c["miss"]) }
             );
         }
+    }
+    if r["held_before"] == true {
+        println!("every check already held: nothing solved, nothing to write");
     }
     if r["written"] == true {
         println!("written");

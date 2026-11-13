@@ -45,6 +45,12 @@ pub enum DeriveKind {
     Literals,
     /// The lifted literals the callable can read (§23): `output` is the run's type.
     Reads,
+    /// A recorded evaluation (`std::derive::recorded`, reverse mode): `(value, slot)`, the
+    /// input's slots and the trace passed after the input; `output` is the result's type.
+    Recorded,
+    /// A recorded evaluation by lifted literals (`std::lift::recorded`): `input` is the
+    /// literals' array type, `output` the result's; the trace is passed after them.
+    LiteralsRecorded,
     /// The tape of a function of a point (`std::derive::tape`): `input` is the tape's type;
     /// with an `output` `T`, `tape_with`'s, whose function returns `(f32, T)`.
     Tape,

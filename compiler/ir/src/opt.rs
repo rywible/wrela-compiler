@@ -1540,6 +1540,11 @@ pub fn inline_cpu(m: &mut Module) -> Result<()> {
         m.functions[i] = func;
     }
     remove_unreached(m);
+    // Range proofs (stage L.1): a loop's checks against its own bound, and its counter's `+ 1`.
+    let removed = crate::ranges::prove(m);
+    if std::env::var_os("WRELA_RANGES").is_some() {
+        eprintln!("range proofs: {removed} checks removed");
+    }
     Ok(())
 }
 

@@ -150,7 +150,8 @@ pub fn walk_tys(e: &mut Expr, f: &mut impl FnMut(&mut TyId)) {
             match &mut c.callee {
                 Callee::Fn { args, .. }
                 | Callee::JobStart { args, .. }
-                | Callee::JobResume { args, .. } => args.iter_mut().for_each(&mut *f),
+                | Callee::JobResume { args, .. }
+                | Callee::ExactRun { args, .. } => args.iter_mut().for_each(&mut *f),
                 Callee::TraitMethod { self_ty, trait_args, method_args, .. } => {
                     f(self_ty);
                     trait_args.iter_mut().for_each(&mut *f);
@@ -740,7 +741,8 @@ impl Markers<'_> {
                     Callee::Fn { .. }
                     | Callee::TraitMethod { .. }
                     | Callee::JobStart { .. }
-                    | Callee::JobResume { .. } => true,
+                    | Callee::JobResume { .. }
+                    | Callee::ExactRun { .. } => true,
                     // A call through a local is checked against the modes its type gives.
                     Callee::Local(_) | Callee::Value(_) => true,
                     Callee::Builtin(_) | Callee::Clone => false,

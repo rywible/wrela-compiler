@@ -1,4 +1,4 @@
-//! `wrela run <package-dir> [--port N] [--lan] [--rooms-port N] [--lift <package>]... [--debug]`:
+//! `wrela run <package-dir> [--port N] [--lan] [--rooms-port N] [--lift <package>[/<file>]]... [--debug]`:
 //! builds the program lifted (by default its own package's literals) and serves it to Chrome on
 //! 127.0.0.1 (with `--lan`, to the LAN too: each of this machine's addresses), with hot reload (language.md §23): an edit of a literal (by `wrela edit`, or a saved
 //! file) shows in the running program at its next frame, and any other edit builds it again and

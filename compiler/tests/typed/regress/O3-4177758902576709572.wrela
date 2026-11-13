@@ -1,0 +1,92 @@
+// oracle: O3
+// mode: Tame
+// seed: 4177758902576709572
+const T: [f32; 8] = [2.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]
+
+fn f(p: vec3) -> f32 {
+    var acc0 = 0.0
+    if (0.0 < 1.0) {
+        acc0 = dot(vec2(min(cos(min(0.0, (0.0 + 0.0))), abs(step(0.0, 0.0))), atan(pow(abs(sqrt(abs(dot(vec3(0.0), vec3(0.0))))) + 0.1, clamp(((0.0 + p.x) / (abs(clamp(0.0, min(0.0, 0.0), max(0.0, 0.0))) + 0.5)), -2.0, 2.0)))), ((min((-(p * 0.0)), (abs(p) * ((-2.02) / (abs(2.63) + 0.5))))).xzy).zx)
+    }
+    var acc1 = dot(cross(vec3((pow(abs((0.0 / (abs(0.0) + 0.5))) + 0.1, clamp((if (acc0 < 0.0) { 0.0 } else { 0.0 }), -2.0, 2.0)) + (if ((0.0 < 0.0) && (0.0 < 2.0)) { (0.0 + 0.0) } else { (if (0.0 < 0.0) { 0.0 } else { 0.0 }) })), min((0.0 / (abs(0.0) + 0.5)), 0.0), 0.0), ((vec3(0.0, 0.0, (acc0 + 0.0))).yzx + (vec3(0.0) + vec3(0.0)))), vec3((((if (0.0 < 0.0) { 0.0 } else { 0.0 }) / (abs((if (0.0 < 0.0) { 0.0 } else { 0.0 })) + 0.5)) + ((0.0 / (abs((acc0 / (abs(0.0) + 0.5))) + 0.5)) / (abs(clamp(0.0, min(0.0, 0.0), max(0.0, 0.0))) + 0.5))), 0.0, (-(((0.0 / (abs(0.0) + 0.5)) + 0.0) + sin((0.0 + 0.0))))))
+    if ((0.0 < (-0.0)) && ((if !((acc0 < (0.0 + 0.0))) { 0.0 } else { ((if (0.0 < 0.0) { (0.0 + 0.0) } else { 0.0 }) + 0.0) }) < ((0.0 + 0.0) / (abs((dot(vec3(0.0, acc0, acc0), vec3(0.0)) + (if (0.0 < 0.0) { 0.0 } else { sin(0.0) }))) + 0.5)))) {
+        acc1 = (((acc0 + (-(acc0 / (abs((if (acc0 < 0.0) { 0.0 } else { acc0 })) + 0.5)))) + min(dot(vec2(0.0, (0.0 + 0.0)), vec2(0.0, acc0)), (((acc0 + 0.0) / (abs(0.0) + 0.5)) / (abs((if (0.0 < 0.0) { sin(0.0) } else { (0.0 + 0.0) })) + 0.5)))) + 0.0)
+    }
+    var acc2 = dot((vec2(0.0) + vec2((-T[u32(clamp((0.0 + 0.0), 0.0, 7.0))]), (sin((if (0.0 < acc0) { 0.0 } else { 0.0 })) + T[u32(clamp((0.0 / (abs(acc0) + 0.5)), 0.0, 7.0))]))), (vec2(((0.0 / (abs(clamp(0.0, min(0.0, 0.0), max(0.0, 0.0))) + 0.5)) / (abs((0.0 / (abs((if (0.0 < 0.0) { 0.0 } else { 0.0 })) + 0.5))) + 0.5)), min(sin(0.0), (clamp(acc0, min(0.0, 0.0), max(0.0, 0.0)) / (abs(0.0) + 0.5)))) + ((-mix((p + p), normalize(vec3(tanh(0.0), tanh(acc0), tanh(0.0)) + vec3(0.0, 0.0, 2.5)), 0.0))).xy))
+    if ((-(clamp(0.0, min(min((acc0 / (abs(acc0) + 0.5)), (if (0.0 < 0.0) { 0.0 } else { 0.0 })), 0.0), max(min((acc0 / (abs(acc0) + 0.5)), (if (0.0 < 0.0) { 0.0 } else { 0.0 })), 0.0)) / (abs(((0.0 / (abs(acc0) + 0.5)) + min((0.0 + 0.0), 0.0))) + 0.5))) < min(((0.0 / (abs((if (0.0 < acc0) { clamp(0.0, min(0.0, 0.0), max(0.0, 0.0)) } else { (0.0 / (abs(0.0) + 0.5)) })) + 0.5)) / (abs((if (0.0 > (0.0 + 0.0)) { (if (0.0 < 0.0) { 0.0 } else { 0.0 }) } else { ((0.0 + 2.0) + (0.0 + 0.0)) })) + 0.5)), min((clamp((if (acc0 < 0.0) { 0.0 } else { 0.0 }), min(min(0.0, 0.0), 0.0), max(min(0.0, 0.0), 0.0)) + dot(vec2(0.0), vec2(0.0, 0.0))), length(vec3(sin(0.0), sin(0.0), (0.0 / (abs(0.0) + 0.5))))))) {
+        acc2 = sqrt(abs(sqrt(abs((if (dot(vec3(0.0), normalize(vec3(tanh(0.0), tanh(acc0), tanh(acc0)) + vec3(0.0, 0.0, 2.5))) < (-(if (acc0 < 0.0) { 0.0 } else { 0.0 }))) { sin(T[u32(clamp(sqrt(abs(acc0)), 0.0, 7.0))]) } else { sqrt(abs((if (0.0 < 0.0) { (0.0 + 0.0) } else { clamp(0.0, min(0.0, 0.0), max(0.0, 0.0)) }))) })))))
+    }
+    let x3 = 0.0
+    pow(abs(pow(abs((max(T[u32(clamp((if (0.0 < 0.0) { 0.0 } else { 0.0 }), 0.0, 7.0))], acc0) - (if ((if (acc2 < 0.0) { 0.0 } else { 0.0 }) < (0.0 / (abs(0.0) + 0.5))) { ((acc0 / (abs(0.0) + 0.5)) / (abs(0.0) + 0.5)) } else { atan2(pow(abs(1.0) + 0.1, clamp(p.z, -2.0, 2.0)), p.x) }))) + 0.1, clamp((acc0 + 1.0), -2.0, 2.0))) + 0.1, clamp((-3.0), -2.0, 2.0)) + acc1 + x3
+}
+
+// ---- the harness (compiler/tests/src/typed.rs) -------------------------------------------------
+use std::derive::{Box3, gradient, interval}
+use std::field::hash_u32
+use std::gpu::{GlobalId, GpuBuffer, Slots, buffer, buffer_of, dispatch}
+
+pub fn value(x: f32, y: f32, z: f32) -> f32 {
+    f(vec3(x, y, z))
+}
+
+pub fn grad(x: f32, y: f32, z: f32) -> vec3 {
+    gradient(f, vec3(x, y, z))
+}
+
+pub fn range(lx: f32, ly: f32, lz: f32, hx: f32, hy: f32, hz: f32) -> vec2 {
+    let r = interval(f, Box3 { lo: vec3(lx, ly, lz), hi: vec3(hx, hy, hz) })
+    vec2(r.lo, r.hi)
+}
+
+pub struct Outs {
+    points: GpuBuffer<vec4>,
+    values: GpuBuffer<vec4>,
+    ranges: GpuBuffer<vec2>,
+}
+
+pub fn init() -> Outs {
+    Outs { points: buffer(0), values: buffer(0), ranges: buffer(0) }
+}
+
+fn unit(h: u32) -> f32 {
+    f32(h >> 8) * (1.0 / 16777216.0)
+}
+
+/// Point `i` of `seed`'s points in [-2, 2]³.
+fn point(seed: u32, i: u32) -> vec3 {
+    let h0 = hash_u32(i ^ seed)
+    let h1 = hash_u32(h0)
+    let h2 = hash_u32(h1)
+    vec3(unit(h0), unit(h1), unit(h2)) * 4.0 - vec3(2.0)
+}
+
+// The kernels read their points from a buffer the CPU wrote: computed in the kernel, a
+// shader compiler may fuse the point's arithmetic with `f`'s (Metal reassociates), and `f`
+// would be evaluated at another point than the one stored.
+@compute(64)
+fn values_k(points: [vec4], out: mut Slots<vec4>, id: GlobalId) {
+    let p = points[id.x].xyz
+    out[id] = vec4(p, f(p))
+}
+
+@compute(64)
+fn ranges_k(points: [vec4], out: mut Slots<vec2>, id: GlobalId) {
+    let p = points[id.x].xyz
+    let r = interval(f, Box3 { lo: p, hi: p })
+    out[id] = vec2(r.lo, r.hi)
+}
+
+/// 64 points of `seed` on the GPU: each point and `f` there, and `f`'s interval over it.
+pub fn on_gpu(state: mut Outs, seed: u32) {
+    var ps = [vec4(0.0); 64]
+    for i in 0..64 {
+        ps[i] = vec4(point(seed, i), 0.0)
+    }
+    state.points = buffer_of(ps)
+    state.values = buffer(64)
+    state.ranges = buffer(64)
+    dispatch(values_k.bind(points: state.points, out: mut state.values), groups: 1)
+    dispatch(ranges_k.bind(points: state.points, out: mut state.ranges), groups: 1)
+}
+
+pub fn frame(state: mut Outs, time: f32, width: u32, height: u32) {}

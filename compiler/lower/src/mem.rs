@@ -203,6 +203,103 @@ impl Fl<'_, '_> {
         Some(ir::Place::root(ir::PlaceRoot::Ptr(ptr)))
     }
 
+    /// The columns of a `Columns<et>` (§6.10): each field's type (a type without fields is one
+    /// column, itself), where its column starts per element of capacity, and its stride; and the
+    /// bytes an element takes across them. Each column starts where the one before it ends,
+    /// aligned for its field, so for any capacity it's aligned and apart from the others.
+    pub(crate) fn columns(types: &ir::Types, et: ir::TypeId) -> (Vec<(ir::TypeId, u32, u32)>, u32) {
+        let fields: Vec<ir::TypeId> = match types.get(et) {
+            ir::TypeDef::Struct { .. } => {
+                ir::layout::parts(types, et).into_iter().map(|(t, _)| t).collect()
+            }
+            _ => vec![et],
+        };
+        let mut at = 0;
+        let mut out = Vec::new();
+        for t in fields {
+            let l = ir::layout::layout(types, t);
+            at = ir::layout::round_up(l.align, at);
+            out.push((t, at, l.stride()));
+            at += l.stride();
+        }
+        (out, at)
+    }
+
+    /// The address of column `k`'s element `i`, of the columns of `et` at `data` with room for
+    /// `cap`: `data + cap * start`, then `+ i * stride`.
+    pub(crate) fn column_addr(
+        &mut self,
+        et: ir::TypeId,
+        k: usize,
+        data: ir::ValueId,
+        cap: ir::ValueId,
+        i: ir::ValueId,
+    ) -> Option<(ir::TypeId, ir::ValueId)> {
+        let (cols, _) = Self::columns(&self.mb.m.types, et);
+        let &(ft, start, stride) = cols.get(k)?;
+        let u = self.u32_ty();
+        let start = self.u32c(start);
+        let off = self.value(u, ir::Expr::Binary(ir::BinOp::Mul, cap, start));
+        let base = self.value(u, ir::Expr::Binary(ir::BinOp::Add, data, off));
+        let stride = self.u32c(stride);
+        let at = self.value(u, ir::Expr::Binary(ir::BinOp::Mul, i, stride));
+        Some((ft, self.value(u, ir::Expr::Binary(ir::BinOp::Add, base, at))))
+    }
+
+    /// Element `i` of the columns of `et` at `data` (room for `cap`), gathered from each.
+    pub(crate) fn column_gather(
+        &mut self,
+        et: ir::TypeId,
+        data: ir::ValueId,
+        cap: ir::ValueId,
+        i: ir::ValueId,
+    ) -> Option<ir::ValueId> {
+        let (cols, _) = Self::columns(&self.mb.m.types, et);
+        let mut parts = Vec::new();
+        for k in 0..cols.len() {
+            let (ft, addr) = self.column_addr(et, k, data, cap, i)?;
+            let place = self.ptr_place(ft, addr);
+            parts.push(self.load(place, ft));
+        }
+        match self.mb.m.types.get(et) {
+            ir::TypeDef::Struct { .. } => Some(self.value(et, ir::Expr::Construct(et, parts))),
+            _ => parts.pop(),
+        }
+    }
+
+    /// Element `i` of the `Columns<elem>` at `c`, a place: field `field` of it (behind a check
+    /// that `i` is below its length) in its column, or, with no field, a copy of the element
+    /// gathered from every column (which sema lets only be read, E0339).
+    pub fn columns_elem(
+        &mut self,
+        c: ir::Place,
+        c_ty: TyId,
+        elem: TyId,
+        i: ir::ValueId,
+        field: Option<u32>,
+    ) -> Option<ir::Place> {
+        let span = self.code.span;
+        let et = self.cx.lower_ty(self.mb, elem, span)?;
+        let u = self.u32_ty();
+        let (fd, _) = self.cx.field(self.mb, c_ty, None, 0, span)?;
+        let (fl, _) = self.cx.field(self.mb, c_ty, None, 1, span)?;
+        let (fc, _) = self.cx.field(self.mb, c_ty, None, 2, span)?;
+        let data = self.load(c.clone().with(ir::Proj::Field(fd)), u);
+        let len = self.load(c.clone().with(ir::Proj::Field(fl)), u);
+        self.check_below(i, len, "index out of range: past the end of a `Columns`");
+        let cap = self.load(c.with(ir::Proj::Field(fc)), u);
+        match field {
+            Some(k) => {
+                let (ft, addr) = self.column_addr(et, k as usize, data, cap, i)?;
+                Some(self.ptr_place(ft, addr))
+            }
+            None => {
+                let v = self.column_gather(et, data, cap, i)?;
+                Some(self.temp_place(v))
+            }
+        }
+    }
+
     /// Element `i` of the `Bounded` at `b`: its array's, in place. On the CPU, an index at or
     /// past the elements in use panics; the GPU indexes the array as any other.
     pub fn bounded_elem(&mut self, b: ir::Place, b_ty: TyId, i: ir::ValueId) -> Option<ir::Place> {
@@ -396,11 +493,14 @@ impl Fl<'_, '_> {
                 | L::StrAddr
                 | L::StrLen
                 | L::StrPart
+                | L::MemColumnRead
+                | L::MemColumnWrite
         );
         let known = raw
             || matches!(
                 lang,
                 L::MemSizeOf
+                    | L::MemColumnBytes
                     | L::MemAlignOf
                     | L::MemZeroed
                     | L::MemNeedsDrop
@@ -433,6 +533,30 @@ impl Fl<'_, '_> {
             Lang::MemSizeOf => {
                 let n = elem(self, 0).map_or(0, |e| ir::layout::array_stride(&self.mb.m.types, e));
                 Some(self.u32c(n))
+            }
+            Lang::MemColumnBytes => {
+                let n = elem(self, 0).map_or(0, |e| Self::columns(&self.mb.m.types, e).1);
+                Some(self.u32c(n))
+            }
+            Lang::MemColumnRead => {
+                let Some(et) = elem(self, 0) else { return Some(None) };
+                let (data, cap, i) = (arg(self, 0)?, arg(self, 1)?, arg(self, 2)?);
+                self.column_gather(et, data, cap, i)
+            }
+            Lang::MemColumnWrite => {
+                let Some(et) = elem(self, 0) else { return Some(None) };
+                let (data, cap, i, v) =
+                    (arg(self, 0)?, arg(self, 1)?, arg(self, 2)?, arg(self, 3)?);
+                let n = Self::columns(&self.mb.m.types, et).0.len();
+                let is_struct = matches!(self.mb.m.types.get(et), ir::TypeDef::Struct { .. });
+                for k in 0..n {
+                    let (ft, addr) = self.column_addr(et, k, data, cap, i)?;
+                    let part =
+                        if is_struct { self.value(ft, ir::Expr::Extract(v, k as u32)) } else { v };
+                    let place = self.ptr_place(ft, addr);
+                    self.emit(ir::Stmt::Store(place, part));
+                }
+                None
             }
             Lang::MemAlignOf => {
                 let n = elem(self, 0).map_or(1, |e| ir::layout::layout(&self.mb.m.types, e).align);

@@ -149,6 +149,150 @@ fn a_negative_loss_uses_its_magnitude_for_rounding_tolerance() {
     assert!((x - 1.3).abs() < 1e-6, "the source-precision value is kept: {answer}");
 }
 
+/// A solve that gains 7%, all of it given up when `a` and `c` are rounded to their own decimals
+/// (each within the 5% a rounding may cost). No number of decimals of `b`, rounded last, brings
+/// it back: `b` keeps its own two, not seven.
+const OUT_OF_REACH: &str = "pub fn miss() -> f32 {
+    let a = 1.0
+    let c = 3.0
+    let b = 2.00
+    let da = a - 1.04
+    let dc = c - 3.03
+    let db = b - 2.0043217
+    1.0 + 25.0 * da * da + 44.444443 * dc * dc + 50.0 * db * db
+}
+";
+
+/// The same with one more decimal of `b` keeping the solve within 5%: it gets that one.
+const IN_REACH: &str = "pub fn miss() -> f32 {
+    let a = 1.0
+    let b = 2.00
+    let da = a - 1.04
+    let db = b - 2.004
+    1.0 + 25.0 * da * da + 1250.0 * db * db
+}
+";
+
+#[test]
+fn a_literal_gets_no_decimals_that_buy_nothing() {
+    let solve = |name: &str, fit: &str, lines: &str| {
+        let dir = common::package(
+            name,
+            &[
+                ("wrela.toml", &common::manifest("decimals")),
+                ("fit.wrela", fit),
+                ("main.wrela", common::FRAME),
+            ],
+        );
+        common::answer(common::wrela().arg("solve").arg(&dir).args([
+            "--minimize",
+            "fit::miss",
+            "--free",
+            lines,
+            "--json",
+        ]))
+    };
+    let after = |answer: &serde_json::Value, text: &str| {
+        let literals = answer["literals"].as_array().unwrap();
+        let literal = literals.iter().find(|l| l["text"] == text).expect("the literal freed");
+        literal["after"].as_f64().unwrap()
+    };
+    let out = solve("solve-decimals-out-of-reach", OUT_OF_REACH, "fit.wrela:2-4");
+    let (before, solved) =
+        (out["loss_before"].as_f64().unwrap(), out["loss_solved"].as_f64().unwrap());
+    assert!(before > 1.08 && solved < 1.001, "the solve gains 7%: {out}");
+    assert!((after(&out, "1.0") - 1.0).abs() < 1e-6, "{out}");
+    assert!((after(&out, "3.0") - 3.0).abs() < 1e-6, "{out}");
+    assert!((after(&out, "2.00") - 2.0).abs() < 1e-6, "decimals that buy nothing: {out}");
+    let within = solve("solve-decimals-in-reach", IN_REACH, "fit.wrela:2-3");
+    assert!((after(&within, "1.0") - 1.0).abs() < 1e-6, "{within}");
+    assert!((after(&within, "2.00") - 2.004).abs() < 1e-6, "the decimal that buys it: {within}");
+    assert!(within["loss_after"].as_f64().unwrap() < 1.05, "{within}");
+}
+
+/// A steep function (its gradient where `X` is written is -100,000) of a program that fails far
+/// from there: it reads a table by `X`, and traps off its end. The first step tried is no
+/// farther from `X` than its size, not as long as the gradient, so the solve never leaves the
+/// table.
+#[test]
+fn a_step_moves_no_literal_farther_than_its_size() {
+    let fit = "pub const X: f32 = 0.2\n\npub fn miss() -> f32 {\n    let table = [1.0, 1.0, 1.0, 1.0]\n    let d = X - 0.25\n    1.0e6 * d * d * table[u32(X * 2.0 + 1.0)]\n}\n";
+    let dir = common::package(
+        "solve-step-size",
+        &[
+            ("wrela.toml", &common::manifest("step_size")),
+            ("fit.wrela", fit),
+            ("main.wrela", common::FRAME),
+        ],
+    );
+    let answer = common::answer(common::wrela().arg("solve").arg(&dir).args([
+        "--minimize",
+        "fit::miss",
+        "--free",
+        "fit.wrela:1",
+        "--json",
+    ]));
+    assert_eq!(answer["solved"], true, "{answer}");
+    assert!(answer["loss_before"].as_f64().unwrap() > 2499.0, "{answer}");
+    assert!(answer["loss_after"].as_f64().unwrap() < 1e-3, "{answer}");
+    let x = answer["literals"][0]["after"].as_f64().unwrap();
+    assert!((x - 0.25).abs() < 1e-6, "{answer}");
+}
+
+/// The same with a table that ends nearer than `X`'s size: the first step tried is off it. The
+/// solve fails with the trap, and says which literal it was trying where.
+#[test]
+fn a_solve_the_program_fails_under_says_what_it_was_trying() {
+    let fit = "pub const X: f32 = 0.2\n\npub fn miss() -> f32 {\n    let table = [1.0, 1.0, 1.0, 1.0]\n    let d = X - 0.25\n    1.0e6 * d * d * table[u32(X * 10.0)]\n}\n";
+    let dir = common::package(
+        "solve-trying",
+        &[
+            ("wrela.toml", &common::manifest("trying")),
+            ("fit.wrela", fit),
+            ("main.wrela", common::FRAME),
+        ],
+    );
+    let out = common::wrela()
+        .arg("solve")
+        .arg(&dir)
+        .args(["--minimize", "fit::miss", "--free", "fit.wrela:1", "--json"])
+        .output()
+        .expect("run wrela");
+    assert_eq!(out.status.code(), Some(1));
+    let answer: serde_json::Value = serde_json::from_slice(&out.stdout).expect("JSON");
+    assert_eq!(answer["solved"], false);
+    let why = answer["why"].as_str().unwrap();
+    assert!(why.contains("trapped"), "{answer}");
+    assert!(why.contains("(the solve was trying fit.wrela:1 `0.2` at 0.4"), "{answer}");
+}
+
+/// A solve that gains under 1%, where `X` rounded to its one decimal lands on the steep side:
+/// within the 5% a rounding may cost, and above where the solve began. `X` stays where it was.
+#[test]
+fn rounding_never_leaves_a_function_larger_than_the_solve_found_it() {
+    let fit = "pub const X: f32 = 1.0\n\npub fn miss() -> f32 {\n    let d = X - 1.06\n    let steep = if d > 0.0 { 8.0 } else { 1.0 }\n    1.0 + 2.0 * steep * d * d\n}\n";
+    let dir = common::package(
+        "solve-never-larger",
+        &[
+            ("wrela.toml", &common::manifest("never_larger")),
+            ("fit.wrela", fit),
+            ("main.wrela", common::FRAME),
+        ],
+    );
+    let answer = common::answer(common::wrela().arg("solve").arg(&dir).args([
+        "--minimize",
+        "fit::miss",
+        "--free",
+        "fit.wrela:1",
+        "--json",
+    ]));
+    let loss = |key: &str| answer[key].as_f64().unwrap();
+    assert!(loss("loss_before") > 1.007 && loss("loss_solved") < 1.0001, "{answer}");
+    assert!(loss("loss_after") <= loss("loss_before"), "{answer}");
+    let x = answer["literals"][0]["after"].as_f64().unwrap();
+    assert!((x - 1.0).abs() < 1e-6, "1.1 is within 5% of the solve, and above its start: {answer}");
+}
+
 #[test]
 fn repeated_free_options_include_each_range_of_the_same_file_once() {
     let dir = common::package(
@@ -216,6 +360,7 @@ fn a_spec_is_solved_over_a_files_literals() {
         "--json",
     ]));
     assert_eq!(r["spec_before"]["held"], 0, "{r}");
+    assert_eq!(r["held_before"], false, "{r}");
     assert_eq!(r["spec_after"]["held"], 2, "{r}");
     assert_eq!(r["spec_after"]["missed"], 0, "{r}");
     let names: Vec<&str> = r["spec_after"]["checks"]
@@ -330,6 +475,55 @@ fn a_spec_that_misses_is_not_written() {
         .output()
         .expect("run wrela");
     assert_eq!(out.status.code(), Some(0));
+}
+
+/// The ball's spec holding as the ball is written, 10cm off a target it may miss by 20.
+const SPEC_HELD: &str = "use ball::ball
+use std::field::top
+use std::lift::Checks
+
+pub fn spec<C: Checks>(c: mut C) {
+    let f = ball()
+    c.near(\"height\", top(f, x: 0.0, z: 0.0), 0.90, within: 0.20)
+}
+";
+
+/// `--spec` of a spec whose every check already holds takes no step: no literal moves, though
+/// a solve could lower its loss, and `--write` writes nothing.
+#[test]
+fn a_spec_that_already_holds_is_left_as_it_is() {
+    let dir = spec_package("solve-spec-held", SPEC_HELD);
+    let r = common::answer(common::wrela().arg("solve").arg(&dir).args([
+        "--spec",
+        "--free",
+        "ball.wrela",
+        "--write",
+        "--json",
+    ]));
+    assert_eq!(r["held_before"], true, "{r}");
+    assert_eq!(r["spec_before"]["missed"], 0, "{r}");
+    assert!(r["loss_before"].as_f64().unwrap() > 0.1, "a loss a solve could lower: {r}");
+    assert_eq!(r["steps"], 0, "{r}");
+    assert_eq!(r["rounded"], false, "{r}");
+    assert_eq!(r["written"], false, "nothing to write: {r}");
+    assert!(r["refused"].is_null(), "{r}");
+    assert_eq!(r["loss_after"], r["loss_before"], "{r}");
+    for l in r["literals"].as_array().unwrap() {
+        assert_eq!(l["after"], l["before"], "{r}");
+    }
+    assert_eq!(std::fs::read_to_string(dir.join("ball.wrela")).unwrap(), BALL, "nothing changed");
+    // As text, it says so, and that isn't a failure.
+    let (code, stdout, all) = common::outputs(&[
+        "solve",
+        dir.to_str().unwrap(),
+        "--spec",
+        "--free",
+        "ball.wrela",
+        "--write",
+    ]);
+    assert_eq!(code, Some(0), "{all}");
+    assert!(stdout.contains("every check already held: nothing solved"), "{all}");
+    assert!(!stdout.lines().any(|l| l == "written"), "{all}");
 }
 
 const NAMED: &str = "/// How far the reach misses.
@@ -509,4 +703,96 @@ fn a_literal_kept_in_heap_memory_is_an_error_not_a_solve_of_no_steps() {
     assert!(all.contains("error[E0700]") && all.contains("in heap memory"), "{all}");
     assert!(all.contains("fit.wrela:8:5"), "at the `push`: {all}");
     assert!(all.contains("keep what depends on the input in arrays and values"), "{all}");
+}
+
+/// A sphere above a box, each size 20% from the blueprint's.
+const BODY: &str = "use std::field::{Surface, cuboid, sphere}
+
+pub fn body() -> Surface {
+    let head = sphere(0.30).translate(vec3(0.0, 0.70, 0.0))
+    let block = cuboid(vec3(0.48, 0.18, 0.24)).translate(vec3(0.0, 0.15, 0.0))
+    head.union(block)
+}
+";
+
+/// The blueprint, drawn from the sizes the body should have: a head of radius 0.25 and a box
+/// half 0.40 across, 0.15 high and 0.20 deep. Each view's outline is its two shapes, one loop
+/// after the other (the step between them and back cancels in the even-odd rule).
+const BLUEPRINT: &str = "use std::collections::Vec
+
+fn loops(r: f32, hw: f32) -> Vec<vec2> {
+    var v: Vec<vec2> = Vec::new()
+    for i in 0..49 {
+        let a = 6.2831853 * f32(i % 48) / 48.0
+        v.push(vec2(r * cos(a), 0.70 + r * sin(a)))
+    }
+    let corners = [vec2(-hw, 0.0), vec2(hw, 0.0), vec2(hw, 0.30), vec2(-hw, 0.30), vec2(-hw, 0.0)]
+    for c in corners {
+        v.push(c)
+    }
+    v.push(vec2(r, 0.70))
+    v
+}
+
+/// From the side, (z, y).
+pub fn side() -> Vec<vec2> {
+    loops(0.25, 0.20)
+}
+
+/// From the front, (x, y).
+pub fn front() -> Vec<vec2> {
+    loops(0.25, 0.40)
+}
+";
+
+const OUTLINE_SPEC: &str = "use body::body
+use std::field::{View, outline_miss}
+use std::lift::Checks
+
+pub fn spec<C: Checks>(c: mut C) {
+    let f = body()
+    c.at_most(\"side outline\", outline_miss(f, View::Side, blueprint::side(), 0.02, near: -1.0, far: 1.0), 0.0, within: 0.05)
+    c.at_most(\"front outline\", outline_miss(f, View::Front, blueprint::front(), 0.02, near: -1.0, far: 1.0), 0.0, within: 0.05)
+}
+";
+
+/// A spec that holds a body to its blueprint's outlines (§23.6, §23.7), solved from sizes 20%
+/// off, recovers each size within 2 mm, writes them, and feels every size it freed: the
+/// outline's derivative reaches each through the silhouette's edge.
+#[test]
+fn a_spec_of_outlines_recovers_the_sizes() {
+    let dir = common::package(
+        "solve-outlines",
+        &[
+            ("wrela.toml", &common::manifest("outlined")),
+            ("body.wrela", BODY),
+            ("blueprint.wrela", BLUEPRINT),
+            ("spec.wrela", OUTLINE_SPEC),
+            ("main.wrela", common::FRAME),
+        ],
+    );
+    let out = common::wrela()
+        .arg("solve")
+        .arg(&dir)
+        .args(["--spec", "--free", "body.wrela:4-5", "--write", "--json"])
+        .output()
+        .expect("run wrela");
+    let all =
+        format!("{}{}", String::from_utf8_lossy(&out.stdout), String::from_utf8_lossy(&out.stderr));
+    let r: serde_json::Value =
+        serde_json::from_slice(&out.stdout).unwrap_or_else(|e| panic!("{e}: {all}"));
+    println!("{}", serde_json::to_string_pretty(&r["literals"]).unwrap());
+    println!("{}", serde_json::to_string_pretty(&r["spec_after"]).unwrap());
+    assert_eq!(r["written"], true, "{all}");
+    assert_eq!(r["spec_after"]["missed"], 0, "{all}");
+    assert!(!all.contains("never changed"), "a freed size wasn't felt: {all}");
+    let want: std::collections::BTreeMap<&str, f64> =
+        [("0.30", 0.25), ("0.48", 0.40), ("0.18", 0.15), ("0.24", 0.20)].into();
+    for lit in r["literals"].as_array().expect("literals") {
+        let text = lit["text"].as_str().unwrap();
+        if let Some(w) = want.get(text) {
+            let after = lit["after"].as_f64().unwrap();
+            assert!((after - w).abs() <= 0.002, "{text}: solved to {after}, the blueprint's {w}");
+        }
+    }
 }

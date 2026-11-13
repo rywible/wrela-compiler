@@ -306,3 +306,19 @@ fn an_integer_vector_component_traps_on_overflow() {
     let mut h = CpuHost::load(built("vectors")).expect("load");
     traps(&mut h, "overflow", &[]);
 }
+
+/// `atan2` where both arguments are zeros (the review of 92de9d8e): on the GPU (Metal gives NaN
+/// there) as on the CPU, y where x is +0 and π with y's sign where x is -0, scalar and vector,
+/// to the bit (compiler/tests/atan2_zeros).
+#[test]
+#[ignore = "needs a GPU"]
+fn atan2_of_zeros_is_the_cpus_on_the_gpu() {
+    let dir = wrela_tests::repo_root().join("compiler/tests/atan2_zeros");
+    let out = wrela_driver::test(&dir, None);
+    let failed: Vec<_> = out.results.iter().filter_map(|r| r.failure.clone()).collect();
+    assert!(
+        out.passed() && failed.is_empty() && !out.results.is_empty(),
+        "{}",
+        wrela_diag::render::render_all(&out.sources, &failed)
+    );
+}

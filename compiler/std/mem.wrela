@@ -20,6 +20,22 @@ pub fn size_of<T>() -> u32 {}
 @intrinsic
 pub fn align_of<T>() -> u32 {}
 
+/// The bytes one element of a `std::collections::Columns<T>` takes across its columns: each
+/// field's column starts where the one before it ends, aligned for the field, and holds the
+/// field's elements at their stride (a `T` without fields is one column).
+@intrinsic
+pub(package) fn column_bytes<T>() -> u32 {}
+
+/// Element `i` of the columns of `T` at `data`, which have room for `cap`: each field read from
+/// its column. Nothing is checked.
+@intrinsic
+pub(package) fn column_read<T>(data: u32, cap: u32, i: u32) -> T {}
+
+/// Writes `value`'s fields into element `i` of the columns of `T` at `data`, which have room for
+/// `cap`. Nothing is checked.
+@intrinsic
+pub(package) fn column_write<T>(data: u32, cap: u32, i: u32, value: T) {}
+
 /// Whether dropping a `T` does anything: whether it holds memory to free.
 @intrinsic
 pub fn needs_drop<T>() -> bool {}

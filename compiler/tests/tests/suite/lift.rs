@@ -244,6 +244,32 @@ fn parameter_gradients_agree_with_central_differences() {
     assert!(never.is_empty(), "literals whose derivative is 0 at every point: {never:?}");
 }
 
+/// Reverse mode by literals (`std::lift::reverse`) gives forward mode's derivative by every
+/// literal, within 1e-5 relative, at 32 points.
+#[test]
+fn reverse_gradients_by_literals_agree_with_forward_ones() {
+    let dir = built("lift-reverse", true);
+    let mut host = CpuHost::load(&dir).expect("load");
+    let n = one_u32(&mut host, "literals", &[]);
+    let mut worst = 0.0f64;
+    for k in 0..32 {
+        let p = sample(&mut host, k);
+        let at =
+            |i: u32| [Value::F32(p[0]), Value::F32(p[1]), Value::F32(p[2]), Value::I32(i as i32)];
+        for i in (0..n.saturating_sub(3)).step_by(4) {
+            let four = host.call_export("reverse4", &at(i)).expect("reverse4");
+            for (j, r) in four.iter().enumerate() {
+                let Value::F32(r) = *r else { panic!("{r:?}") };
+                let f = one_f32(&mut host, "derivative", &at(i + j as u32));
+                let err = f64::from((r - f).abs()) / f64::from(1.0f32.max(f.abs()));
+                worst = worst.max(err);
+                assert!(err <= 1e-5, "literal {} at {p:?}: reverse {r}, forward {f}", i + j as u32);
+            }
+        }
+    }
+    eprintln!("reverse against forward by {n} literals at 32 points: worst {worst:.2e}");
+}
+
 #[test]
 fn several_literals_derived_at_once_each_get_their_own() {
     let dir = built("lift-gradients4", true);

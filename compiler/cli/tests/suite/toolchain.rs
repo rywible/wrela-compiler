@@ -824,3 +824,66 @@ fn a_cancelled_edit_leaves_its_source_as_it_was() {
         lift_probe(&tool, &work, &["edit-timed", "work/subject", "work/build", "1", "0.75"]);
     assert!(code == Some(0) && printed.contains("\"written\":true"), "{printed}");
 }
+
+/// A lift entry names one file of a package, `<package>/<file>`, by its path in the package
+/// (language.md §23.1): `wrela build --lift` lifts that file's literals alone, and a file the
+/// package doesn't have is an error that names it, not a build that lifts nothing.
+#[test]
+fn wrela_build_lifts_one_file_of_a_package() {
+    let dir = package(
+        "lift-one-file",
+        &[
+            ("wrela.toml", &manifest("onefile")),
+            (
+                "main.wrela",
+                "pub fn frame(time: f32, width: u32, height: u32) {}\n\npub fn both() -> f32 {\n    a::a() + b::b()\n}\n",
+            ),
+            ("a.wrela", "pub fn a() -> f32 {\n    0.25\n}\n"),
+            ("b.wrela", "pub fn b() -> f32 {\n    0.5\n}\n"),
+        ],
+    );
+    let out = dir.join("build");
+    let (code, printed) =
+        run(wrela().arg("build").arg(&dir).arg("-o").arg(&out).args(["--lift", "onefile/a.wrela"]));
+    assert_eq!(code, Some(0), "{printed}");
+    let lift: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(out.join("lift.json")).expect("lift.json"))
+            .expect("JSON");
+    let files: Vec<&str> =
+        lift["files"].as_array().unwrap().iter().map(|f| f["path"].as_str().unwrap()).collect();
+    assert_eq!(files, ["a.wrela"], "{lift:#}");
+    let texts: Vec<&str> =
+        lift["literals"].as_array().unwrap().iter().map(|l| l["text"].as_str().unwrap()).collect();
+    assert_eq!(texts, ["0.25"], "b.wrela's 0.5 isn't lifted: {lift:#}");
+    let (code, printed) = run(wrela()
+        .arg("build")
+        .arg(&dir)
+        .arg("-o")
+        .arg(dir.join("build2"))
+        .args(["--lift", "onefile/c.wrela"]));
+    assert_eq!(code, Some(2), "{printed}");
+    assert!(printed.contains("has no file `c.wrela`"), "{printed}");
+}
+
+/// A tool's lifted build of one file (`BuildOptions { lift: ["shape/ball.wrela"] }`): the
+/// toolchain service takes the file form as `wrela build --lift` does, and `literals` gives
+/// that file's alone; a file the package doesn't have fails the request, naming it.
+#[test]
+fn a_tool_lifts_one_file_of_a_package() {
+    let (tool, work) = lifted_packages("toolchain-lift-one-file");
+    std::fs::write(work.join("shape/other.wrela"), "pub fn other() -> f32 {\n    3.5\n}\n")
+        .expect("write");
+    let (code, printed) =
+        lift_probe(&tool, &work, &["lift", "work/subject", "work/build", "shape/ball.wrela"]);
+    assert_eq!(code, Some(0), "{printed}");
+    assert!(printed.contains("built ok=true"), "{printed}");
+    let (code, printed) = lift_probe(&tool, &work, &["literals", "work/subject", "work/build"]);
+    assert_eq!(code, Some(0), "{printed}");
+    assert!(printed.contains("file work/shape/ball.wrela"), "{printed}");
+    assert!(!printed.contains("other.wrela") && !printed.contains("3.5"), "{printed}");
+    assert!(printed.contains("value 1\nvalue 0.5\nvalue 0.25"), "{printed}");
+    let (code, printed) =
+        lift_probe(&tool, &work, &["lift", "work/subject", "work/build3", "shape/none.wrela"]);
+    assert_eq!(code, Some(1), "{printed}");
+    assert!(printed.contains("has no file `none.wrela`"), "{printed}");
+}

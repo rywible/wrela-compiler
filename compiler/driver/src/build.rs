@@ -122,18 +122,21 @@ pub fn emit(
 /// [`VERIFIER_WASM`], [`VERIFIER_JSON`]). It has no pipelines and no browser runtime. A server's
 /// memory is its own (not shared: it runs on one thread, and its host caps the memory); a
 /// tool's is imported and shared, as a client's is, so its host's helpers run `std::par`'s
-/// work on it, and may grow to 4 GiB.
+/// work on it, and may grow to 4 GiB. With `coverage`, its module marks the code it runs
+/// (`wrela_wasm::Options::coverage`): a fuzzer's.
 pub fn emit_headless(
     l: &Lowered,
     sources: &SourceMap,
     simd: bool,
     role: wrela_sema::defs::Role,
+    coverage: bool,
 ) -> BuildOutput {
     let tool = role == wrela_sema::defs::Role::Tool;
     let module = if tool { TOOL_WASM } else { SERVER_WASM };
     let max_pages =
         if tool { wrela_abi::memory::TOOL_MAX_PAGES } else { wrela_abi::memory::MAX_PAGES };
-    let options = wrela_wasm::Options { simd, shared_memory: tool, max_pages, relaxed: false };
+    let options =
+        wrela_wasm::Options { simd, shared_memory: tool, max_pages, relaxed: false, coverage };
     let mut out = emit_in(l, sources, options, false, false, &[], &[]);
     out.files.retain(|(path, _)| path == "game.wasm");
     for (path, _) in &mut out.files {
@@ -184,6 +187,12 @@ pub fn pair(
 /// There are no shader or browser files; `CpuBuild`'s explicit CPU-only loaders read it.
 pub(crate) fn emit_for_cpu(l: &Lowered, sources: &SourceMap, simd: bool) -> BuildOutput {
     emit_in(l, sources, wrela_wasm::Options { simd, ..Default::default() }, false, false, &[], &[])
+}
+
+/// [`emit_for_cpu`] with coverage (`wrela_wasm::Options::coverage`): what `wrela fuzz` runs.
+pub(crate) fn emit_for_fuzz(l: &Lowered, sources: &SourceMap) -> BuildOutput {
+    let options = wrela_wasm::Options { coverage: true, ..Default::default() };
+    emit_in(l, sources, options, false, false, &[], &[])
 }
 
 /// Where each of a module's code offsets came from (`wrela_wasm::Emitted::lines`).

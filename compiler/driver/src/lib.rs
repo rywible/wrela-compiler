@@ -9,6 +9,10 @@
 //! the deepest tree the parser accepts (`wrela_syntax::MAX_NESTING`, `MAX_EXPR_DEPTH`).
 
 pub mod build;
+#[cfg(feature = "gpu")]
+pub mod captured;
+#[cfg(feature = "gpu")]
+pub mod pixel;
 pub use wrela_wasm::DataReport;
 pub mod const_cache;
 pub mod consts;
@@ -65,6 +69,34 @@ pub struct Output {
     /// What the client build's constant data holds (`wrela build --report data`), when it was
     /// built.
     pub data: Option<wrela_wasm::DataReport>,
+    /// Which bytes of a struct each loop of the client build's CPU code walks, with where each
+    /// loop is (`wrela build --report layout`, `wrela_ir::walked`), the most skipped first.
+    pub layout: Vec<(String, wrela_ir::walked::Walked)>,
+    /// Each GPU pipeline's module as the WGSL is written from it, when [`gpu_modules`] asked.
+    pub gpu: Vec<GpuModule>,
+}
+
+/// A GPU pipeline as the build writes it: its name, its entry points' names, the flattened
+/// module its WGSL is written from (`wrela_wgsl::emit`'s input), and its manifest entry. What
+/// interpreting a pipeline needs (`wrela_ir::interp`).
+#[derive(Clone, Debug)]
+pub struct GpuModule {
+    pub name: String,
+    pub entries: Vec<String>,
+    pub module: wrela_ir::Module,
+    pub manifest: Option<wrela_abi::manifest::Pipeline>,
+}
+
+/// The package at `root` built as `wrela build` builds it (a debug build, or a test build, as
+/// `kind` says), with each GPU pipeline's [`GpuModule`] in its `gpu` (and its files and sources
+/// as any build's): or the build's output, if it doesn't build.
+pub fn gpu_modules(root: &Path, kind: BuildKind) -> Result<Output, Box<Output>> {
+    let mode = Mode { debug: kind.debug, testing: kind.testing, keep_gpu: true, ..Mode::RELEASE };
+    let out = on_compiler_thread(|| compile(root, mode, wrela_lower::Roots::of, &[]));
+    if out.has_errors() {
+        return Err(Box::new(out));
+    }
+    Ok(out)
 }
 
 /// One pipeline: an instantiation of its entry points, and why it exists.
@@ -275,6 +307,30 @@ pub fn build_for_tests(root: &Path, debug: bool) -> Output {
     on_compiler_thread(|| compile(root, mode, wrela_lower::Roots::of, &[]))
 }
 
+/// [`build_for_tests`], and with `no_opt` the CPU module left as lowering made it, unoptimized
+/// (no inlining or folding): for the test that the optimizer keeps every bit. Nothing else
+/// builds this way.
+pub fn build_for_tests_with(root: &Path, debug: bool, no_opt: bool) -> Output {
+    let mode = Mode { debug, testing: true, no_opt, ..Mode::RELEASE };
+    on_compiler_thread(|| compile(root, mode, wrela_lower::Roots::of, &[]))
+}
+
+/// [`build_for_tests_with`] unoptimized and with no SIMD in the WASM either, so its loops run
+/// one iteration at a time: what the typed programs' oracle O5 compares a loop program's
+/// optimized build with (four at a time against one at a time, §11.2).
+pub fn build_for_tests_plain(root: &Path) -> Output {
+    let mode = Mode { testing: true, no_opt: true, no_simd: true, ..Mode::RELEASE };
+    on_compiler_thread(|| compile(root, mode, wrela_lower::Roots::of, &[]))
+}
+
+/// A build for `wrela fuzz` alone: a debug build (so a float operation that makes a NaN traps)
+/// whose WASM marks the code it runs in a coverage map (`wrela_wasm::Options::coverage`), with
+/// no GPU output. Nothing else builds this way (language.md §16.2).
+pub fn build_fuzz(root: &Path) -> Output {
+    let mode = Mode { debug: true, coverage: true, ..Mode::RELEASE };
+    on_compiler_thread(|| compile(root, mode, wrela_lower::Roots::of, &[]))
+}
+
 /// [`build`], lowering every function of the package that can be lowered on its own, exported
 /// or not ([`wrela_lower::Roots::every_fn`]): for tests of code that nothing calls.
 pub fn build_every_fn(root: &Path) -> Output {
@@ -432,9 +488,14 @@ fn lifts_file(lift: &[String], pkg: &str, dir: &Path, path: &Path) -> bool {
         None => e == pkg,
         Some((p, file)) => {
             p == pkg
-                && path
-                    .canonicalize()
-                    .is_ok_and(|c| c.strip_prefix(dir).is_ok_and(|r| r == Path::new(file)))
+                && path.canonicalize().is_ok_and(|c| {
+                    // `./a.wrela` names `a.wrela`: a path's `.` parts name nothing.
+                    let want: std::path::PathBuf = Path::new(file)
+                        .components()
+                        .filter(|k| !matches!(k, std::path::Component::CurDir))
+                        .collect();
+                    c.strip_prefix(dir).is_ok_and(|r| r == want)
+                })
         }
     })
 }
@@ -875,6 +936,12 @@ struct Mode {
     conditions: bool,
     /// A second module, with relaxed SIMD outside deterministic code ([`build_relaxed`]).
     relaxed_simd: bool,
+    /// The CPU module left unoptimized ([`build_for_tests_with`]).
+    no_opt: bool,
+    /// Each GPU pipeline's module kept in the output ([`gpu_modules`]).
+    keep_gpu: bool,
+    /// The CPU module with coverage and no GPU output ([`build_fuzz`]).
+    coverage: bool,
 }
 
 impl Mode {
@@ -885,6 +952,9 @@ impl Mode {
         testing: false,
         conditions: false,
         relaxed_simd: false,
+        no_opt: false,
+        keep_gpu: false,
+        coverage: false,
     };
     const RELEASE: Mode = Mode { emit: true, ..Mode::CHECK };
 }
@@ -957,6 +1027,8 @@ fn compile_loaded_in(
             program_files: Vec::new(),
             consts: consts::ConstStats::default(),
             data: None,
+            layout: Vec::new(),
+            gpu: Vec::new(),
         });
     };
     // The program package's own files: package 1's (std is 0).
@@ -977,16 +1049,33 @@ fn compile_loaded_in(
         })
         .map(|(f, _, path)| (*f, lift::relative(path, root)))
         .collect();
+    // A file named alone must be one of its package's: lifting nothing is no build of it.
+    for e in lift.iter().filter(|e| e.contains('/')) {
+        let one = std::slice::from_ref(e);
+        let found = all_files.iter().any(|(_, pkg, path)| {
+            *pkg > 0 && lifts_file(one, &packages[*pkg].name, &dirs[*pkg], path)
+        });
+        if !found {
+            let (p, file) = e.split_once('/').unwrap_or((e, ""));
+            return Err(format!(
+                "lift: the package `{p}` has no file `{file}` (a file is named by its path in its \
+                 package, `{p}/<file>.wrela`)"
+            ));
+        }
+    }
     let checked = wrela_sema::check_packages_set(units, &packages, &scope.set, &mut diagnostics);
     scope.stop()?;
     let mut files = Vec::new();
     let mut pipelines = Vec::new();
     let mut data_report = None;
+    let mut layout = Vec::new();
+    let mut gpu: Vec<GpuModule> = Vec::new();
     let mut data = wrela_lower::BuildData {
         debug: mode.debug,
         no_simd: mode.no_simd,
         testing: mode.testing,
         relaxed_simd: mode.relaxed_simd,
+        no_opt: mode.no_opt,
         few: mode.conditions && !mode.emit,
         ..Default::default()
     };
@@ -1023,12 +1112,29 @@ fn compile_loaded_in(
                 // manifest's tiers (§18.9).
                 pipelines = summarize(&checked, &sources, &lowered, mode.conditions || mode.emit);
                 data_report = wrela_wasm::data_report(&lowered.cpu).ok();
+                layout = wrela_ir::walked::walked(&lowered.cpu)
+                    .into_iter()
+                    .map(|w| {
+                        let at = w.at.map_or_else(String::new, |sp| {
+                            sources.file(sp.file).location(sp.start)
+                        });
+                        (at, w)
+                    })
+                    .collect();
             }
             if !ok || !mode.emit {
                 continue;
             }
+            if mode.coverage && role == wrela_sema::defs::Role::Client {
+                let out = build::emit_for_fuzz(&lowered, &sources);
+                diagnostics.extend(out.diagnostics);
+                files.extend(out.files);
+                continue;
+            }
             if role != wrela_sema::defs::Role::Client {
-                let out = build::emit_headless(&lowered, &sources, !data.no_simd, role);
+                // A fuzzer's server module marks its code too (`wrela fuzz --room`).
+                let coverage = mode.coverage && role == wrela_sema::defs::Role::Server;
+                let out = build::emit_headless(&lowered, &sources, !data.no_simd, role, coverage);
                 diagnostics.extend(out.diagnostics);
                 files.extend(out.files);
                 continue;
@@ -1050,6 +1156,18 @@ fn compile_loaded_in(
             diagnostics.extend(out.diagnostics);
             files.extend(out.files);
             files.append(&mut shipped_files);
+            if mode.keep_gpu {
+                gpu = lowered
+                    .pipelines
+                    .iter()
+                    .map(|p| GpuModule {
+                        name: p.name.clone(),
+                        entries: p.module.entry_points.iter().map(|e| e.name.clone()).collect(),
+                        module: p.module.clone(),
+                        manifest: None,
+                    })
+                    .collect();
+            }
             if let Some(t) = &data.lift {
                 files.push(("lift.json".into(), lift::report(&checked, &sources, t).into_bytes()));
             }
@@ -1080,6 +1198,15 @@ fn compile_loaded_in(
     if has_errors(&diagnostics) {
         files.clear();
     }
+    // Each pipeline's manifest entry, in the manifest's order (the pipelines' own).
+    if let Some((_, bytes)) = files.iter().find(|(p, _)| p == "manifest.json")
+        && let Some(manifest) =
+            std::str::from_utf8(bytes).ok().and_then(|t| wrela_abi::Manifest::parse(t).ok())
+    {
+        for (g, p) in gpu.iter_mut().zip(manifest.pipelines) {
+            g.manifest = Some(p);
+        }
+    }
     let std_warnings = finish_diagnostics(&sources, &mut diagnostics);
     Ok(Output {
         sources,
@@ -1090,6 +1217,8 @@ fn compile_loaded_in(
         program_files,
         consts: stats,
         data: data_report,
+        layout,
+        gpu,
     })
 }
 

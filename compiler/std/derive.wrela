@@ -2,6 +2,7 @@
 // body (language.md §14), and the ranges and boxes they work over. Any function that qualifies
 // has them; nothing here is specific to fields.
 
+use std::collections::Vec
 use std::io::print
 use std::stage::{Tape, Taped}
 
@@ -309,6 +310,144 @@ pub fn tape_with<T: GpuData>(f: fn(vec3) -> (f32, T)) -> Tape {}
 @intrinsic
 pub fn tape_sized<const N: u32, const K: u32>(f: fn(vec3) -> f32) -> Taped<N, K> {}
 
+// ---- reverse mode ------------------------------------------------------------------------------
+
+/// The most numbers a reverse gradient's trace holds: 2²⁶, 16 bytes each (1 GiB).
+pub const TRACE_MOST: u32 = 67108864
+
+/// What one evaluation did, for a reverse sweep (`reverse`): for each number it computed from
+/// its input, which earlier numbers it came from and its derivative by each (Griewank and
+/// Walther's tape of local partials). Node 0 is the number nothing flows from: a constant's.
+pub struct Trace {
+    a: Vec<u32>,
+    b: Vec<u32>,
+    da: Vec<f32>,
+    db: Vec<f32>,
+    most: u32,
+}
+
+impl Trace {
+    /// A trace of node 0 alone.
+    pub fn new() -> Trace {
+        Trace::holding(TRACE_MOST)
+    }
+
+    /// A trace that holds at most `most` nodes (at most `TRACE_MOST`): a push past it panics.
+    pub fn holding(most: u32) -> Trace {
+        var t = Trace {
+            a: Vec::new(),
+            b: Vec::new(),
+            da: Vec::new(),
+            db: Vec::new(),
+            most: min(most, TRACE_MOST),
+        }
+        t.clear()
+        t
+    }
+
+    /// Back to node 0 alone, keeping its room.
+    pub fn clear(mut self) {
+        self.a.clear()
+        self.b.clear()
+        self.da.clear()
+        self.db.clear()
+        self.a.push(0)
+        self.b.push(0)
+        self.da.push(0.0)
+        self.db.push(0.0)
+    }
+
+    /// How many nodes it holds, node 0 among them.
+    pub fn nodes(self) -> u32 {
+        self.a.len()
+    }
+
+    /// A new input: a node nothing flows into.
+    pub fn leaf(mut self) -> u32 {
+        self.node(0, 0.0, 0, 0.0)
+    }
+
+    fn node(mut self, a: u32, da: f32, b: u32, db: f32) -> u32 {
+        let n = self.a.len()
+        if n >= self.most {
+            panic(
+                "a reverse gradient's trace passed 2^26 numbers: sum its terms with `std::lift::reverse_sum`",
+            )
+        }
+        self.a.push(a)
+        self.b.push(b)
+        self.da.push(da)
+        self.db.push(db)
+        n
+    }
+
+    /// Each node's adjoint, node `from`'s being 1: the derivative of `from`'s number by each.
+    pub fn sweep(self, from: u32) -> Vec<f32> {
+        var adj: Vec<f32> = Vec::filled(self.a.len(), value: 0.0)
+        adj[from] = 1.0
+        var i = self.a.len()
+        while i > 1 {
+            i -= 1
+            let g = adj[i]
+            if g != 0.0 {
+                adj[self.a[i]] += g * self.da[i]
+                adj[self.b[i]] += g * self.db[i]
+            }
+        }
+        adj
+    }
+}
+
+/// A recorded number of one term: the slot of a number derived from `a` by `da` (0 if `a` is
+/// node 0, which nothing flows from). What a recording derivation calls.
+fn trace_one(t: mut Trace, a: u32, da: f32) -> u32 {
+    if a == 0 { 0 } else { t.node(a, da, 0, 0.0) }
+}
+
+/// A new input's node: what a record of lifted literals seeds each with.
+fn trace_leaf(t: mut Trace) -> u32 {
+    t.leaf()
+}
+
+/// A recorded number of two terms (0 if both are node 0).
+fn trace_two(t: mut Trace, a: u32, da: f32, b: u32, db: f32) -> u32 {
+    if a == 0 && b == 0 {
+        0
+    } else if b == 0 {
+        t.node(a, da, 0, 0.0)
+    } else if a == 0 {
+        t.node(b, db, 0, 0.0)
+    } else {
+        t.node(a, da, b, db)
+    }
+}
+
+/// `f(at)`, every operation on the input's path recorded onto `trace` with its local partials,
+/// `slots` the input's numbers' nodes (as their bits): the value, and its node (as its bits).
+/// The derivation is forward mode's with one direction whose tangent is a node. (`reverse`
+/// allocates, its trace's room, so a derivation can't be given one by name, §8.3.)
+@intrinsic
+fn recorded<X>(f: fn(X) -> f32, at: X, slots: X, trace: mut Trace) -> (f32, f32) {}
+
+/// `f`'s value at `at`, and its derivative by each of `at`'s numbers, from one recorded
+/// evaluation and one sweep back through it (reverse mode): about the cost of a few
+/// evaluations, however many numbers. CPU only. The input is an array, so what the derivation
+/// follows stays out of heap memory (§14.2).
+pub fn reverse<const N: u32>(f: fn([f32; N]) -> f32, at: [f32; N]) -> (f32, [f32; N]) {
+    var trace = Trace::new()
+    var slots = [0.0; N]
+    for i in 0..N {
+        slots[i] = bitcast_f32(trace.leaf())
+    }
+    let (value, slot) = recorded(f, at, slots, mut trace)
+    let adjoint = trace.sweep(bitcast_u32(slot))
+    var g = [0.0; N]
+    for i in 0..N {
+        g[i] = adjoint[bitcast_u32(slots[i])]
+    }
+    (value, g)
+}
+
 // ---- tests (the suite runs std's: `std_tests_pass`) --------------------------------------------
 
 @test
@@ -536,4 +675,51 @@ fn a_box_one_step_wide_splits_into_children_that_keep_its_ends() {
     let q = Box2 { lo: vec2(0.0, 1.0), hi: vec2(2.0, next) }
     let quarters = q.split()
     assert(quarters[3].hi == q.hi && quarters[2].hi.y == next && quarters[0].lo == q.lo)
+}
+
+@test
+fn a_trace_sweeps_back_to_its_leaves() {
+    // x y + sin(x) at (2, 3), recorded by hand: its gradient is (y + cos(x), x).
+    let (x, y) = (2.0, 3.0)
+    var t = Trace::new()
+    let (sx, sy) = (t.leaf(), t.leaf())
+    let xy = trace_two(mut t, sx, y, sy, x)
+    let s = trace_one(mut t, sx, cos(x))
+    let r = trace_two(mut t, xy, 1.0, s, 1.0)
+    let adj = t.sweep(r)
+    assert(abs(adj[sx] - (y + cos(x))) < 1.0e-6)
+    assert(abs(adj[sy] - x) < 1.0e-6)
+    assert(t.nodes() == 6)
+    t.clear()
+    assert(t.nodes() == 1)
+}
+
+@test
+fn a_reverse_gradient_is_the_gradient() {
+    let (v, g) = reverse(|x: [f32; 2]| x[0] * x[1] + sin(x[0]), [2.0, 3.0])
+    assert(v == 2.0 * 3.0 + sin(2.0))
+    assert(abs(g[0] - (3.0 + cos(2.0))) < 1.0e-6)
+    assert(abs(g[1] - 2.0) < 1.0e-6)
+}
+
+@test
+fn a_reverse_gradient_follows_vectors() {
+    let f = |x: [f32; 6]| {
+        let u = vec3(x[0], x[1], x[2])
+        let w = vec3(x[3], x[4], x[5])
+        length(cross(u, w)) + dot(normalize(u), w * 2.0) + sin(u * w).y
+    }
+    let at = [0.3, -1.2, 0.8, 1.1, 0.4, -0.7]
+    let (v, g) = reverse(f, at)
+    assert(v == f(at))
+    // Each component's derivative, by forward mode along its axis.
+    for i in 0..6 {
+        let along = |t: f32| {
+            var y = at
+            y[i] = y[i] + t
+            f(y)
+        }
+        let d = gradient(along, 0.0)
+        assert(abs(g[i] - d) <= 1.0e-5 * (1.0 + abs(d)))
+    }
 }

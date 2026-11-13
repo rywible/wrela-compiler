@@ -1,0 +1,36 @@
+use std::hash::{StateHash, state_hash}
+use std::input::Event
+use std::tick::{Ticked, start}
+
+struct Sim: Clone + StateHash {
+    total: u32,
+}
+
+/// Each key's slot, from key 30.
+const SLOTS: [u32; 8] = [3, 1, 4, 1, 5, 9, 2, 6]
+
+/// Key `key`'s slot; 0 outside the table.
+pub fn slot(key: u32) -> u32 {
+    if key >= 30 && key < 38 { SLOTS[key - 30] } else { 0 }
+}
+
+@deterministic
+fn step(sim: mut Sim, t: Ticked) {
+    for e in t.records {
+        if let Event::KeyDown { key, .. } = e {
+            sim.total = sim.total.wrapping_add(slot(u32(key)))
+        }
+    }
+}
+
+@deterministic
+fn hash(sim: Sim) -> u64 {
+    state_hash(sim)
+}
+
+pub fn init() -> u32 {
+    start(Sim { total: 0 }, hz: 60, step: step, hash: hash)
+    0
+}
+
+pub fn frame(state: mut u32, time: f32, width: u32, height: u32) {}

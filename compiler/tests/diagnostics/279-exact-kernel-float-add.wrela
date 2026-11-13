@@ -1,0 +1,23 @@
+// mistake: a deterministic kernel that adds floats, which each GPU rounds its own way
+// expect: E0713
+// fix: no
+use std::gpu::{GlobalId, GpuBuffer, Slots, buffer, dispatch}
+
+@deterministic
+@compute(64)
+fn warm(heat: [f32], out: mut Slots<f32>, id: GlobalId) {
+    out[id] = heat[id.x] + 1.0
+}
+
+pub struct S {
+    heat: GpuBuffer<f32>,
+    next: GpuBuffer<f32>,
+}
+
+pub fn init() -> S {
+    S { heat: buffer(64), next: buffer(64) }
+}
+
+pub fn frame(s: mut S, time: f32, width: u32, height: u32) {
+    dispatch(warm.bind(s.heat, mut s.next), groups: 1)
+}

@@ -55,6 +55,10 @@ pub struct BuildData {
     /// A build whose WASM uses no SIMD (`wrela_wasm::Options::simd`): its results are the same,
     /// bit for bit, which a test checks.
     pub no_simd: bool,
+    /// A build whose CPU module isn't optimized (`ir::opt::inline_cpu` skipped): only tests
+    /// ask for one (`wrela_driver::build_for_tests_with`), to check the optimizer keeps every
+    /// bit (the typed programs' oracle O5).
+    pub no_opt: bool,
     /// A relaxed-SIMD build (`wrela build --relaxed-simd`, §11.2): presentation code is marked
     /// relaxable (`mark_relaxable`). In any other build no function is.
     pub relaxed_simd: bool,

@@ -1,17 +1,26 @@
 //! Loops run four iterations at a time, in SIMD (language.md §11, AC12).
 //!
-//! A loop qualifies when it counts a `u32` up by one to a bound computed before it (a `for` over
+//! A loop qualifies when it counts a `u32` up by one (an `Add`, or the `WrappingAdd` a range proof
+//! makes it, `ir::ranges`) to a bound computed before it (a `for` over
 //! a range, `0..xs.len()`), and its body, after the exit test, is straight-line code that
 //!
 //! - reads and writes `f32` elements at the counter's index, and only there, of arrays and
-//!   runs that the loop doesn't replace (so iteration `i` touches element `i` alone);
+//!   runs that the loop doesn't replace (so iteration `i` touches element `i` alone), or of a
+//!   `Vec`: through the pointer `data + i * 4` its indexing makes (`vec_elem`), from a `data`
+//!   the loop can't change;
+//! - checks the counter only against values the loop can't change (`if i >= n { panic }`, a
+//!   `Vec`'s bounds check, where a range proof hasn't removed it);
+//! - branches only on comparisons of `f32`s, each side of the same kind of code: the four-wide
+//!   loop runs both, and a store under a branch keeps the old value in the lanes whose
+//!   condition is false (`select`, after Pharr and Mark's ispc). A pointer's elements reached
+//!   only under a branch must be behind a check there, as a `Vec`'s indexing puts them;
 //! - computes with `f32` arithmetic, comparisons and `select`, the componentwise built-ins
 //!   (`min`, `sqrt`, `mix`, ...), the counter as an `f32`, and values from before the loop;
 //! - keeps nothing from one iteration to the next: a local it writes, it writes before it reads
 //!   it, and nothing outside the loop reads it.
 //!
-//! Then iterations `i..i + 4` run as one, with each `f32` in a lane, while the bound and every
-//! array or run indexed have four more elements. The loop itself runs the rest, one at a time,
+//! Then iterations `i..i + 4` run as one, with each `f32` in a lane, while the bound, every
+//! array or run indexed, and every value a check holds `i` below have four more elements. The loop itself runs the rest, one at a time,
 //! from where the four-wide loop stopped: so the last iterations, and one that would index out
 //! of range (which traps), run as they would have. Each lane computes with the instruction the
 //! scalar code uses, so the bits are the same. Nothing in a four-wide iteration traps, and it
@@ -23,11 +32,43 @@ use std::collections::{HashMap, HashSet};
 use wasm_encoder::{Instruction as I, ValType};
 use wrela_ir as ir;
 
-/// An array or run the body indexes: a place, or a value from before the loop.
+/// An array or run the body indexes: a place, or a value from before the loop; or elements
+/// reached through a pointer, `base + i * 4`, from one of the loop's words (a `Vec`'s, §6.10).
 #[derive(Clone, PartialEq)]
 enum Root {
     Place(ir::Place),
     Value(ir::ValueId),
+    Base(usize),
+}
+
+/// How many elements a root has, which the four-wide loop stays within.
+#[derive(Clone, Copy, PartialEq)]
+enum Len {
+    /// A run's own count.
+    Run,
+    /// An array's length.
+    Array(u32),
+    /// Whatever the loop's checks say: a `Vec`'s elements, each read behind a check that `i` is
+    /// below a word (one of `bounds`), or whose check a range proof removed (`ir::ranges`).
+    Free,
+}
+
+/// A `u32` the loop doesn't change: a place's (loaded once, before the four-wide loop), a
+/// value from before the loop, or the sum or product of two (a `Columns`' column starts at
+/// `data + cap * start`, §6.10).
+#[derive(Clone, PartialEq)]
+enum Word {
+    Place(ir::Place),
+    Value(ir::ValueId),
+    Sum(Opnd, Opnd),
+    Product(Opnd, Opnd),
+}
+
+/// An operand of a word's sum or product: another word, or a constant.
+#[derive(Clone, Copy, PartialEq)]
+enum Opnd {
+    Word(usize),
+    Num(u32),
 }
 
 impl Root {
@@ -47,10 +88,17 @@ pub(super) struct Plan<'a> {
     index: ir::ValueId,
     /// The body after the exit test.
     body: Vec<&'a ir::Stmt>,
-    /// The arrays and runs indexed, and whether each is a run (else an array of that length).
-    roots: Vec<(Root, Option<u32>)>,
+    /// The arrays, runs and pointers indexed, and how many elements each has.
+    roots: Vec<(Root, Len)>,
     /// The locals the body writes before it reads them.
     temps: HashSet<ir::LocalId>,
+    /// The loop's words, and those its checks hold `i` below.
+    words: Vec<Word>,
+    bounds: Vec<usize>,
+    /// Each element pointer's word (its base), and the body's values that emit nothing in the
+    /// four-wide loop (words, offsets, addresses, pointers, checks' conditions).
+    ptrs: HashMap<ir::ValueId, usize>,
+    quiet: HashSet<ir::ValueId>,
 }
 
 /// What a value of the body is, four iterations at a time.
@@ -93,7 +141,7 @@ pub(super) fn plan<'a>(fe: &Fe, body: &'a [ir::Stmt], continuing: &[ir::Stmt]) -
     let [
         ir::Stmt::Let(a, ir::Expr::Load(ap)),
         ir::Stmt::Let(one, ir::Expr::Const(ir::Const::U32(1))),
-        ir::Stmt::Let(sum, ir::Expr::Binary(ir::BinOp::Add, x, y)),
+        ir::Stmt::Let(sum, ir::Expr::Binary(ir::BinOp::Add | ir::BinOp::WrappingAdd, x, y)),
         ir::Stmt::Store(sp, z),
     ] = cont.as_slice()
     else {
@@ -102,13 +150,15 @@ pub(super) fn plan<'a>(fe: &Fe, body: &'a [ir::Stmt], continuing: &[ir::Stmt]) -
     if ap != cp || sp != cp || x != a || y != one || z != sum {
         return None;
     }
-    let defined: HashSet<ir::ValueId> = rest
-        .iter()
-        .filter_map(|s| match s {
-            ir::Stmt::Let(v, _) => Some(*v),
-            _ => None,
-        })
-        .collect();
+    // The values the body defines, in its branches too.
+    let mut defined = HashSet::new();
+    for s in rest {
+        ir::visit::walk(std::slice::from_ref(*s), &mut |s| {
+            if let ir::Stmt::Let(v, _) = s {
+                defined.insert(*v);
+            }
+        });
+    }
     if defined.contains(bound) || fe.values[bound.index()] == u32::MAX {
         return None;
     }
@@ -121,8 +171,34 @@ pub(super) fn plan<'a>(fe: &Fe, body: &'a [ir::Stmt], continuing: &[ir::Stmt]) -
         temps: HashSet::new(),
         stored: HashSet::new(),
         kinds: HashMap::new(),
+        words: Vec::new(),
+        bounds: Vec::new(),
+        consts: HashMap::new(),
+        masked: false,
+        side_checked: false,
+        masked_free: Vec::new(),
+        free_unmasked: HashSet::new(),
     };
+    ir::visit::walk(&fe.f.body, &mut |s| {
+        if let ir::Stmt::Let(v, ir::Expr::Const(ir::Const::U32(n))) = s {
+            p.consts.insert(*v, *n);
+        }
+    });
     p.check(rest)?;
+    let mut ptrs = HashMap::new();
+    let mut quiet = HashSet::new();
+    for (v, k) in &p.kinds {
+        match k {
+            Kind::Ptr(w) => {
+                ptrs.insert(*v, *w);
+                quiet.insert(*v);
+            }
+            Kind::Word(_) | Kind::Num(_) | Kind::Offset | Kind::Addr(_) | Kind::Check(_) => {
+                quiet.insert(*v);
+            }
+            _ => {}
+        }
+    }
     Some(Plan {
         counter,
         bound: *bound,
@@ -130,6 +206,10 @@ pub(super) fn plan<'a>(fe: &Fe, body: &'a [ir::Stmt], continuing: &[ir::Stmt]) -
         body: rest.to_vec(),
         roots: p.roots,
         temps: p.temps,
+        words: p.words,
+        bounds: p.bounds,
+        ptrs,
+        quiet,
     })
 }
 
@@ -139,6 +219,17 @@ enum Kind {
     Index,
     F32,
     Mask,
+    /// One of the loop's words.
+    Word(usize),
+    /// A `u32` constant.
+    Num(u32),
+    /// `i * 4`.
+    Offset,
+    /// `base + i * 4`, and as a pointer to an `f32`.
+    Addr(usize),
+    Ptr(usize),
+    /// `i >= word`.
+    Check(usize),
 }
 
 struct Planner<'f, 'm> {
@@ -147,8 +238,18 @@ struct Planner<'f, 'm> {
     ctr: ir::LocalId,
     /// The values the body defines.
     defined: HashSet<ir::ValueId>,
-    roots: Vec<(Root, Option<u32>)>,
+    roots: Vec<(Root, Len)>,
     temps: HashSet<ir::LocalId>,
+    words: Vec<Word>,
+    bounds: Vec<usize>,
+    /// The function's `u32` constants.
+    consts: HashMap<ir::ValueId, u32>,
+    /// Inside a branch, and whether a check came before, in it or around it; each pointer's
+    /// word reached so, with that; and those reached outside any branch.
+    masked: bool,
+    side_checked: bool,
+    masked_free: Vec<(usize, bool)>,
+    free_unmasked: HashSet<usize>,
     /// The temporaries stored so far, in body order.
     stored: HashSet<ir::LocalId>,
     kinds: HashMap<ir::ValueId, Kind>,
@@ -179,12 +280,82 @@ impl Planner<'_, '_> {
         (self.operand(x)? == Kind::F32).then_some(())
     }
 
+    /// The loop word `w` is, noted.
+    fn word(&mut self, w: Word) -> usize {
+        match self.words.iter().position(|x| *x == w) {
+            Some(k) => k,
+            None => {
+                self.words.push(w);
+                self.words.len() - 1
+            }
+        }
+    }
+
+    /// A `u32` operand's kind: a body value's, the counter, or a value from before the loop
+    /// (a word).
+    fn u32_operand(&mut self, x: ir::ValueId) -> Option<Kind> {
+        if x == self.index {
+            return Some(Kind::Index);
+        }
+        if self.defined.contains(&x) {
+            return self.kinds.get(&x).copied();
+        }
+        if let Some(&n) = self.consts.get(&x) {
+            return Some(Kind::Num(n));
+        }
+        if self.scalar(self.fe.vty(x))? != ir::Scalar::U32 || self.fe.values[x.index()] == u32::MAX
+        {
+            return None;
+        }
+        Some(Kind::Word(self.word(Word::Value(x))))
+    }
+
+    /// Whether a `u32` place is one the loop can't change and the four-wide loop can load
+    /// before it starts: fields of a constant, of a by-reference parameter or of a local in the
+    /// frame (memory that is there whether or not the loop runs; not through a pointer), or a
+    /// scalar local. The body stores only `f32`s, to elements and temporaries, so no `u32`
+    /// changes.
+    fn steady(&self, p: &ir::Place) -> bool {
+        if !p.path.iter().all(|x| matches!(x, ir::Proj::Field(_))) {
+            return false;
+        }
+        match &p.root {
+            ir::PlaceRoot::Data(_) => true,
+            ir::PlaceRoot::Param(k) => self.fe.f.params[*k as usize].by_ref,
+            ir::PlaceRoot::Local(l) => {
+                *l != self.ctr
+                    && match self.fe.ir_locals[l.index()] {
+                        LocalRepr::Slot(_) => true,
+                        LocalRepr::Scalar(w) => p.path.is_empty() && w != u32::MAX,
+                    }
+            }
+            ir::PlaceRoot::Ptr(_) | ir::PlaceRoot::Resource(_) => false,
+        }
+    }
+
+    /// Whether `then` is only a panic (what a bounds check runs): its message's address and
+    /// length, then `Panic`.
+    fn only_panics(then: &[ir::Stmt]) -> bool {
+        let s = skip_at(then);
+        let Some((last, before)) = s.split_last() else { return false };
+        matches!(last, ir::Stmt::Eval(ir::Expr::Mem(ir::MemOp::Panic, _)))
+            && before.iter().all(|s| {
+                matches!(
+                    s,
+                    ir::Stmt::Let(
+                        _,
+                        ir::Expr::Addr(_) | ir::Expr::Const(_) | ir::Expr::Mem(ir::MemOp::Addr, _)
+                    )
+                )
+            })
+    }
+
     /// The root an element access at the counter's index goes through, noted; `None` if it
     /// isn't one.
     fn element(&mut self, root: Root, root_ty: ir::TypeId) -> Option<()> {
         let (elem, len) = match self.fe.m.types.get(root_ty) {
-            ir::TypeDef::Run(e) => (*e, None),
-            ir::TypeDef::Array(e, n) => (*e, Some(*n)),
+            ir::TypeDef::Run(e) => (*e, Len::Run),
+            ir::TypeDef::Array(e, n) => (*e, Len::Array(*n)),
             _ => return None,
         };
         if self.scalar(elem)? != ir::Scalar::F32 {
@@ -199,6 +370,26 @@ impl Planner<'_, '_> {
     /// The type of an element place's root, if the place is `root[i]` with `root` a local the
     /// loop doesn't write whole, or a by-reference parameter.
     fn element_place(&mut self, p: &ir::Place) -> Option<()> {
+        // `*(base + i * 4)`, an `f32`.
+        if let ir::PlaceRoot::Ptr(v) = &p.root
+            && p.path.is_empty()
+        {
+            let Some(Kind::Ptr(w)) = self.kinds.get(v) else { return None };
+            if self.scalar(self.fe.m.place_ty(self.fe.f, p)?)? != ir::Scalar::F32 {
+                return None;
+            }
+            let w = *w;
+            if self.masked {
+                self.masked_free.push((w, self.side_checked));
+            } else {
+                self.free_unmasked.insert(w);
+            }
+            let root = Root::Base(w);
+            if !self.roots.iter().any(|(r, _)| *r == root) {
+                self.roots.push((root, Len::Free));
+            }
+            return Some(());
+        }
         let [ir::Proj::Index(i)] = p.path.as_slice() else { return None };
         if *i != self.index {
             return None;
@@ -220,13 +411,15 @@ impl Planner<'_, '_> {
         let mut inside = vec![0u32; self.fe.f.locals.len()];
         let mut whole = HashSet::new();
         for s in body {
-            super::mentions(s, &mut |l| inside[l.index()] += 1);
-            if let ir::Stmt::Store(p, _) = s
-                && p.path.is_empty()
-                && let Some(l) = p.root_local()
-            {
-                whole.insert(l);
-            }
+            ir::visit::walk(std::slice::from_ref(*s), &mut |s| {
+                super::mentions(s, &mut |l| inside[l.index()] += 1);
+                if let ir::Stmt::Store(p, _) = s
+                    && p.path.is_empty()
+                    && let Some(l) = p.root_local()
+                {
+                    whole.insert(l);
+                }
+            });
         }
         let total = &self.fe.local_mentions;
         for &l in &whole {
@@ -237,27 +430,19 @@ impl Planner<'_, '_> {
             }
             self.temps.insert(l);
         }
-        for s in body {
-            match s {
-                ir::Stmt::Let(v, e) => {
-                    let k = self.expr(*v, e)?;
-                    self.kinds.insert(*v, k);
-                }
-                ir::Stmt::Store(p, x) => {
-                    match p.root_local() {
-                        Some(l) if p.path.is_empty() && self.temps.contains(&l) => {
-                            self.stored.insert(l);
-                        }
-                        _ => self.element_place(p)?,
-                    }
-                    self.f32_operand(*x)?;
-                }
-                _ => return None,
-            }
+        self.stmts(body)?;
+        // A pointer's elements reached only under a branch were reached behind a check there,
+        // as a `Vec`'s indexing makes them, or the loop reaches them anyway, unbranched.
+        if self.masked_free.iter().any(|(w, checked)| !checked && !self.free_unmasked.contains(w)) {
+            return None;
         }
         // No element is also reached another way: a root that's indexed is only indexed.
         let roots: Vec<Root> = self.roots.iter().map(|(r, _)| r.clone()).collect();
+        let mut all = Vec::new();
         for s in body {
+            ir::visit::walk(std::slice::from_ref(*s), &mut |s| all.push(s));
+        }
+        for s in all {
             let mut other = false;
             s.for_each_place(&mut |p| {
                 for r in &roots {
@@ -276,9 +461,119 @@ impl Planner<'_, '_> {
         Some(())
     }
 
+    /// The body's statements, or a branch's (`self.mask`).
+    fn stmts(&mut self, body: &[&ir::Stmt]) -> Option<()> {
+        for s in body {
+            match s {
+                ir::Stmt::Let(v, e) => {
+                    let k = self.expr(*v, e)?;
+                    self.kinds.insert(*v, k);
+                }
+                ir::Stmt::Store(p, x) => {
+                    match p.root_local() {
+                        Some(l) if p.path.is_empty() && self.temps.contains(&l) => {
+                            self.stored.insert(l);
+                        }
+                        _ => self.element_place(p)?,
+                    }
+                    self.f32_operand(*x)?;
+                }
+                // A bounds check, `if i >= n { panic }`: the four-wide loop stays below `n`, so
+                // it never fails there, and the loop itself, one at a time, reaches it as it
+                // would have.
+                ir::Stmt::If { cond, then, else_ }
+                    if skip_at(else_).is_empty() && Self::only_panics(then) =>
+                {
+                    let Some(Kind::Check(w)) = self.kinds.get(cond) else { return None };
+                    if !self.bounds.contains(w) {
+                        self.bounds.push(*w);
+                    }
+                    self.side_checked = true;
+                }
+                // A branch on a comparison of `f32`s (plan stage L.3, after Pharr and Mark's
+                // ispc): in the four-wide loop both sides run, for every lane, and each store
+                // keeps the old value where the lane's condition is false. Both sides are float
+                // arithmetic, which doesn't trap in a release build, loads at the counter's
+                // index, which the four-wide test covers, and checks, which it settles.
+                ir::Stmt::If { cond, then, else_ } => {
+                    if self.operand(*cond)? != Kind::Mask {
+                        return None;
+                    }
+                    let before = self.stored.clone();
+                    let (masked, checked) = (self.masked, self.side_checked);
+                    let mut sides = Vec::new();
+                    for side in [then, else_] {
+                        self.masked = true;
+                        self.side_checked = checked;
+                        self.stmts(&skip_at(side))?;
+                        sides.push(std::mem::replace(&mut self.stored, before.clone()));
+                    }
+                    (self.masked, self.side_checked) = (masked, checked);
+                    // A temporary is written after the branch where both sides write it.
+                    self.stored.extend(sides[0].intersection(&sides[1]).copied());
+                }
+                _ => return None,
+            }
+        }
+        Some(())
+    }
+
     fn expr(&mut self, v: ir::ValueId, e: &ir::Expr) -> Option<Kind> {
         use ir::BinOp as B;
-        let ty = self.scalar(self.fe.vty(v))?;
+        let vt = self.fe.vty(v);
+        // An element pointer: `mem Ptr(base + i * 4)`, to an `f32`.
+        if let ir::Expr::Mem(ir::MemOp::Ptr, args) = e {
+            let ir::TypeDef::Ptr(t) = self.fe.m.types.get(vt) else { return None };
+            if self.scalar(*t)? != ir::Scalar::F32 {
+                return None;
+            }
+            let [a] = args.as_slice() else { return None };
+            let Some(Kind::Addr(w)) = self.kinds.get(a) else { return None };
+            return Some(Kind::Ptr(*w));
+        }
+        let ty = self.scalar(vt)?;
+        if ty == ir::Scalar::U32 {
+            return match e {
+                ir::Expr::Const(ir::Const::U32(n)) => Some(Kind::Num(*n)),
+                ir::Expr::Load(p) if self.steady(p) => {
+                    Some(Kind::Word(self.word(Word::Place(p.clone()))))
+                }
+                ir::Expr::Binary(op @ (B::Mul | B::Add | B::WrappingAdd), a, b) => {
+                    let (ka, kb) = (self.u32_operand(*a)?, self.u32_operand(*b)?);
+                    let opnd = |k: Kind| match k {
+                        Kind::Word(w) => Some(Opnd::Word(w)),
+                        Kind::Num(n) => Some(Opnd::Num(n)),
+                        _ => None,
+                    };
+                    match (op, ka, kb) {
+                        (B::Mul, Kind::Index, Kind::Num(4))
+                        | (B::Mul, Kind::Num(4), Kind::Index) => Some(Kind::Offset),
+                        (B::Add | B::WrappingAdd, Kind::Word(w), Kind::Offset)
+                        | (B::Add | B::WrappingAdd, Kind::Offset, Kind::Word(w)) => {
+                            Some(Kind::Addr(w))
+                        }
+                        // A word from two, checked as the loop checks it (`Mul` and `Add`
+                        // trap on overflow): where it would, the four-wide loop doesn't run.
+                        (B::Mul | B::Add, x, y)
+                            if !matches!((x, y), (Kind::Num(_), Kind::Num(_))) =>
+                        {
+                            let (x, y) = (opnd(x)?, opnd(y)?);
+                            let w =
+                                if *op == B::Mul { Word::Product(x, y) } else { Word::Sum(x, y) };
+                            Some(Kind::Word(self.word(w)))
+                        }
+                        _ => None,
+                    }
+                }
+                _ => None,
+            };
+        }
+        if let ir::Expr::Binary(B::Ge, a, b) = e
+            && *a == self.index
+            && let Some(Kind::Word(w)) = self.u32_operand(*b)
+        {
+            return Some(Kind::Check(w));
+        }
         match e {
             ir::Expr::Const(ir::Const::F32(_)) => Some(Kind::F32),
             ir::Expr::Load(p) => {
@@ -345,9 +640,63 @@ impl Planner<'_, '_> {
 /// Emits the four-wide loop, which leaves the counter where the loop itself goes on.
 pub(super) fn emit(fe: &mut Fe, plan: &Plan) -> R<()> {
     let w = plan.counter;
+    // Out of here, to the loop itself, where a word's sum or product overflows.
+    fe.ins.push(I::Block(wasm_encoder::BlockType::Empty));
+    // The loop's words, once.
+    let mut words: Vec<u32> = Vec::new();
+    for word in &plan.words {
+        words.push(match word {
+            Word::Value(x) => fe.v(*x),
+            Word::Sum(a, b) | Word::Product(a, b) => {
+                let get = |o: &Opnd| match o {
+                    Opnd::Word(k) => I::LocalGet(words[*k]),
+                    Opnd::Num(n) => I::I32Const(*n as i32),
+                };
+                let (ia, ib) = (get(a), get(b));
+                let l = fe.new_local(ValType::I32);
+                if matches!(word, Word::Sum(..)) {
+                    // Overflow iff the sum is below an operand.
+                    fe.ins.extend([ia.clone(), ib, I::I32Add, I::LocalTee(l), ia, I::I32LtU]);
+                } else {
+                    // In 64 bits: overflow iff the high half isn't 0.
+                    let p = fe.new_local(ValType::I64);
+                    fe.ins.extend([
+                        ia,
+                        I::I64ExtendI32U,
+                        ib,
+                        I::I64ExtendI32U,
+                        I::I64Mul,
+                        I::LocalTee(p),
+                        I::I32WrapI64,
+                        I::LocalSet(l),
+                        I::LocalGet(p),
+                        I::I64Const(32),
+                        I::I64ShrU,
+                        I::I64Const(0),
+                        I::I64Ne,
+                    ]);
+                }
+                fe.ins.push(I::BrIf(0));
+                l
+            }
+            Word::Place(p) => match p.root_local().map(|l| fe.ir_locals[l.index()]) {
+                Some(LocalRepr::Scalar(w)) if p.path.is_empty() => w,
+                _ => {
+                    let l = fe.new_local(ValType::I32);
+                    fe.addr(p)?;
+                    fe.ins.extend([I::I32Load(mem(0, 2)), I::LocalSet(l)]);
+                    l
+                }
+            },
+        });
+    }
     // Each root's first element's address and length, once: the loop doesn't change them.
     let mut bases = Vec::new();
     for (root, len) in &plan.roots {
+        if let Root::Base(k) = root {
+            bases.push((root.clone(), words[*k], u32::MAX));
+            continue;
+        }
         let base = fe.new_local(ValType::I32);
         let n = fe.new_local(ValType::I32);
         match root {
@@ -355,10 +704,11 @@ pub(super) fn emit(fe: &mut Fe, plan: &Plan) -> R<()> {
                 fe.addr(p)?;
             }
             Root::Value(x) => fe.ins.push(I::LocalGet(fe.v(*x))),
+            Root::Base(_) => unreachable!(),
         }
         match len {
             // A run is its elements' address, then their count.
-            None => fe.ins.extend([
+            Len::Run => fe.ins.extend([
                 I::LocalTee(base),
                 I::I32Load(mem(4, 2)),
                 I::LocalSet(n),
@@ -366,19 +716,21 @@ pub(super) fn emit(fe: &mut Fe, plan: &Plan) -> R<()> {
                 I::I32Load(mem(0, 2)),
                 I::LocalSet(base),
             ]),
-            Some(len) => {
+            Len::Array(len) => {
                 fe.ins.extend([I::LocalSet(base), I::I32Const(*len as i32), I::LocalSet(n)])
             }
+            Len::Free => return Err("internal: a free root that isn't a pointer's".into()),
         }
         bases.push((root.clone(), base, n));
     }
     let temps: HashMap<ir::LocalId, u32> =
         plan.temps.iter().map(|&l| (l, fe.new_local(ValType::V128))).collect();
-    fe.ins.push(I::Block(wasm_encoder::BlockType::Empty));
     fe.ins.push(I::Loop(wasm_encoder::BlockType::Empty));
-    // On while i < bound and bound - i >= 4, and so for each root's length.
+    // On while i < bound and bound - i >= 4, and so for each root's length and each word a
+    // check holds `i` below.
     let lens: Vec<I<'static>> = std::iter::once(I::LocalGet(fe.v(plan.bound)))
-        .chain(bases.iter().map(|&(_, _, n)| I::LocalGet(n)))
+        .chain(bases.iter().filter(|&&(_, _, n)| n != u32::MAX).map(|&(_, _, n)| I::LocalGet(n)))
+        .chain(plan.bounds.iter().map(|&k| I::LocalGet(words[k])))
         .collect();
     for len in lens {
         fe.ins.extend([
@@ -396,26 +748,8 @@ pub(super) fn emit(fe: &mut Fe, plan: &Plan) -> R<()> {
     }
     let mut vals: HashMap<ir::ValueId, Lanes> = HashMap::new();
     vals.insert(plan.index, Lanes::Index);
-    for s in &plan.body {
-        match s {
-            ir::Stmt::Let(v, e) => {
-                let l = expr(fe, plan, &bases, &temps, &vals, e)?;
-                vals.insert(*v, l);
-            }
-            ir::Stmt::Store(p, x) => match p.root_local().and_then(|l| temps.get(&l)) {
-                Some(&t) if p.path.is_empty() => {
-                    push(fe, &vals, *x)?;
-                    fe.ins.push(I::LocalSet(t));
-                }
-                _ => {
-                    element_addr(fe, plan, &bases, &Root::of(p))?;
-                    push(fe, &vals, *x)?;
-                    fe.ins.push(I::V128Store(mem(0, 2)));
-                }
-            },
-            _ => return Err("internal: a statement a four-wide loop can't have".into()),
-        }
-    }
+    let cx = Body { plan, bases: &bases, temps: &temps };
+    cx.stmts(fe, &mut vals, &plan.body, None)?;
     fe.ins.extend([
         I::LocalGet(w),
         I::I32Const(4),
@@ -426,6 +760,96 @@ pub(super) fn emit(fe: &mut Fe, plan: &Plan) -> R<()> {
         I::End,
     ]);
     Ok(())
+}
+
+/// What the four-wide loop's statements are emitted with.
+struct Body<'p> {
+    plan: &'p Plan<'p>,
+    bases: &'p [(Root, u32, u32)],
+    temps: &'p HashMap<ir::LocalId, u32>,
+}
+
+impl Body<'_> {
+    /// The statements, under `mask` (a `v128` local) inside a branch: a store there keeps the
+    /// old value where the mask is 0.
+    fn stmts(
+        &self,
+        fe: &mut Fe,
+        vals: &mut HashMap<ir::ValueId, Lanes>,
+        body: &[&ir::Stmt],
+        mask: Option<u32>,
+    ) -> R<()> {
+        let (plan, bases, temps) = (self.plan, self.bases, self.temps);
+        for s in body {
+            match s {
+                ir::Stmt::Let(v, _) if plan.quiet.contains(v) => {}
+                // A bounds check, which the four-wide loop's test settles.
+                ir::Stmt::If { cond, .. } if plan.quiet.contains(cond) => {}
+                // A branch: each side under its lanes' mask.
+                ir::Stmt::If { cond, then, else_ } => {
+                    push(fe, vals, *cond)?;
+                    let c = fe.new_local(ValType::V128);
+                    fe.ins.push(I::LocalSet(c));
+                    let yes = match mask {
+                        None => c,
+                        Some(m) => {
+                            let l = fe.new_local(ValType::V128);
+                            fe.ins.extend([I::LocalGet(m), I::LocalGet(c), I::V128And]);
+                            fe.ins.push(I::LocalSet(l));
+                            l
+                        }
+                    };
+                    let no = fe.new_local(ValType::V128);
+                    match mask {
+                        None => fe.ins.extend([I::LocalGet(c), I::V128Not]),
+                        Some(m) => fe.ins.extend([I::LocalGet(m), I::LocalGet(c), I::V128AndNot]),
+                    }
+                    fe.ins.push(I::LocalSet(no));
+                    self.stmts(fe, vals, &skip_at(then), Some(yes))?;
+                    self.stmts(fe, vals, &skip_at(else_), Some(no))?;
+                }
+                ir::Stmt::Let(v, e) => {
+                    let l = expr(fe, plan, bases, temps, vals, e)?;
+                    vals.insert(*v, l);
+                }
+                ir::Stmt::Store(p, x) => match p.root_local().and_then(|l| temps.get(&l)) {
+                    Some(&t) if p.path.is_empty() => {
+                        push(fe, vals, *x)?;
+                        if let Some(m) = mask {
+                            fe.ins.extend([I::LocalGet(t), I::LocalGet(m), I::V128Bitselect]);
+                        }
+                        fe.ins.push(I::LocalSet(t));
+                    }
+                    _ => {
+                        let root = root_of(plan, p);
+                        element_addr(fe, plan, bases, &root)?;
+                        push(fe, vals, *x)?;
+                        if let Some(m) = mask {
+                            element_addr(fe, plan, bases, &root)?;
+                            fe.ins.extend([
+                                I::V128Load(mem(0, 2)),
+                                I::LocalGet(m),
+                                I::V128Bitselect,
+                            ]);
+                        }
+                        fe.ins.push(I::V128Store(mem(0, 2)));
+                    }
+                },
+                _ => return Err("internal: a statement a four-wide loop can't have".into()),
+            }
+        }
+        Ok(())
+    }
+}
+
+/// The root an element place in the plan's body goes through.
+fn root_of(plan: &Plan, p: &ir::Place) -> Root {
+    match &p.root {
+        ir::PlaceRoot::Ptr(v) if p.path.is_empty() && plan.ptrs.contains_key(v) => {
+            Root::Base(plan.ptrs[v])
+        }
+        _ => Root::of(p),
+    }
 }
 
 /// Pushes the address of element `i` of `root`, for the four from it.
@@ -484,7 +908,7 @@ fn expr(
                 LocalRepr::Slot(_) => return Err("internal: a planned load from memory".into()),
             },
             _ => {
-                element_addr(fe, plan, bases, &Root::of(p))?;
+                element_addr(fe, plan, bases, &root_of(plan, p))?;
                 fe.ins.push(I::V128Load(mem(0, 2)));
             }
         },

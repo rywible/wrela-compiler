@@ -1,0 +1,41 @@
+use std::gpu::{ClipPosition, VertexIndex, begin_screen_pass, draw}
+
+pub struct State {
+    frames: u32,
+}
+
+pub fn init() -> State {
+    State { frames: 0 }
+}
+
+struct Quad: Copy {
+    pos: ClipPosition,
+    uv: vec2,
+}
+
+/// The whole screen: one triangle past its corners. `uv` runs from -1 to 1 across it, y up.
+@vertex
+fn whole(v: VertexIndex) -> Quad {
+    let corners = [vec2(-1.0, -1.0), vec2(3.0, -1.0), vec2(-1.0, 3.0)]
+    let c = corners[v.index]
+    Quad { pos: ClipPosition { position: vec4(c, 0.5, 1.0) }, uv: c }
+}
+
+/// A glow round the middle, sampled 16 times.
+@fragment
+fn paint(q: Quad) -> vec4 {
+    var s = 0.0
+    for k in 0..16 {
+        let d = length(q.uv)
+        s += exp(-3.0 * d * d) * (1.0 + 0.5 * cos(6.0 * d))
+    }
+    let v = s / 16.0
+    vec4(v, v * 0.8, v * 0.6, 1.0)
+}
+
+pub fn frame(s: mut State, time: f32, width: u32, height: u32) {
+    s.frames += 1
+    let screen = begin_screen_pass(clear: vec4(0.0))
+    draw(screen, whole.bind(), paint.bind(), vertices: 3)
+    screen.present()
+}

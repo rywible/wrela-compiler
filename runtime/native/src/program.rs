@@ -231,6 +231,14 @@ pub struct Failure {
     pub tick: Option<u32>,
 }
 
+impl Failure {
+    /// Whether the call ran out of fuel (`CpuBuild::load_metered`): it did too much work, not a
+    /// wrong thing.
+    pub fn out_of_fuel(&self) -> bool {
+        self.trap == Some(wasmtime::Trap::OutOfFuel)
+    }
+}
+
 /// Carries out commands that have already been decoded, sequenced and checked.
 pub(crate) trait Executor: 'static {
     fn execute(&mut self, cmd: &Command<'_>) -> Result<()>;
@@ -1641,6 +1649,12 @@ impl<E: Executor> Program<E> {
         self.finish_call(result)
     }
 
+    /// The fuel left after the last call, in a metered build (each call starts with the
+    /// build's fuel): what it spent is that less this.
+    pub(crate) fn fuel_left(&self) -> Option<u64> {
+        self.fuel.and_then(|_| self.store.get_fuel().ok())
+    }
+
     /// Calls another export with numeric arguments.
     pub(crate) fn call(&mut self, name: &str, args: &[Value]) -> Result<Vec<Value>> {
         let func: Func = self
@@ -1837,6 +1851,14 @@ impl<E: Executor> Program<E> {
             }
         }
         Ok(out)
+    }
+
+    /// A fuzzer's build's coverage map ([`wrela_abi::COVERAGE_GLOBAL`]), as it is now: `None`
+    /// for a build without one.
+    pub(crate) fn coverage(&mut self) -> Option<Vec<u8>> {
+        let global = self.instance.get_global(&mut self.store, wrela_abi::COVERAGE_GLOBAL)?;
+        let at = global.get(&mut self.store).i32()? as u32;
+        shared::read(&self.memory, at as usize, wrela_abi::COVERAGE_BYTES as usize)
     }
 
     /// How many chunks of parallel jobs the helpers have run (`wrela_abi::memory::PAR_HELPED`).

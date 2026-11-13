@@ -199,11 +199,26 @@ pub struct Options {
     /// only an add takes is one `f32x4.relaxed_madd`, and `min` and `max` are relaxed. Every
     /// other function stays standard, which the check after emitting proves of each.
     pub relaxed: bool,
+    /// Coverage for a fuzzer (`wrela fuzz`, and only its builds): the module reserves a map of
+    /// [`COVERAGE_BYTES`] after its data, exports its address as the global [`COVERAGE_GLOBAL`],
+    /// and stores 1 at `map[site % COVERAGE_BYTES]` at the start of every function, each side of
+    /// every `if` and every loop's body, `site` counting up through the module.
+    pub coverage: bool,
 }
+
+/// The coverage map's size in bytes (`Options::coverage`), and the exported global that holds
+/// its address: the ABI's, which a host reads.
+pub use wrela_abi::{COVERAGE_BYTES, COVERAGE_GLOBAL};
 
 impl Default for Options {
     fn default() -> Options {
-        Options { shared_memory: true, simd: true, max_pages: memory::MAX_PAGES, relaxed: false }
+        Options {
+            shared_memory: true,
+            simd: true,
+            max_pages: memory::MAX_PAGES,
+            relaxed: false,
+            coverage: false,
+        }
     }
 }
 
@@ -215,13 +230,16 @@ pub fn emit(m: &ir::Module) -> Result<Emitted, String> {
 
 /// [`emit`], with these options.
 pub fn emit_with(m: &ir::Module, options: Options) -> Result<Emitted, String> {
-    let Options { shared_memory, simd, max_pages, relaxed } = options;
+    let Options { shared_memory, simd, max_pages, relaxed, coverage } = options;
     if !m.entry_points.is_empty() || !m.resources.is_empty() {
         return Err("internal: a GPU module reached the WASM back end".into());
     }
     let mut types = TypeTable::default();
     let mut imports = ImportSection::new();
     let (data_at, data_base, data_bytes, heap_base) = data(m)?;
+    // The coverage map, where the heap would have started; the heap starts after it.
+    let (coverage_at, heap_base) =
+        if coverage { (Some(heap_base), heap_base + COVERAGE_BYTES) } else { (None, heap_base) };
     let submit_ty = types.get(vec![ValType::I32, ValType::I32], vec![]);
     let status_ty = types.get(vec![ValType::I32], vec![ValType::I32]);
     for (name, ty) in [
@@ -343,6 +361,8 @@ pub fn emit_with(m: &ir::Module, options: Options) -> Result<Emitted, String> {
         heap_base,
         simd,
         relaxed: relaxed && simd,
+        coverage: coverage_at,
+        sites: std::cell::Cell::new(0),
     };
     for (i, f) in m.functions.iter().enumerate() {
         let (params, results) = signature(m, f, simd);
@@ -423,6 +443,10 @@ pub fn emit_with(m: &ir::Module, options: Options) -> Result<Emitted, String> {
     ] {
         debug_assert_eq!(i, globals.len());
         globals.global(g(true), &ConstExpr::i32_const(start));
+    }
+    if let Some(at) = coverage_at {
+        exports.export(COVERAGE_GLOBAL, ExportKind::Global, globals.len());
+        globals.global(g(false), &ConstExpr::i32_const(at as i32));
     }
     let mut module = Module::new();
     module.section(&types.section);
@@ -1386,5 +1410,72 @@ mod tests {
             !ops.iter().any(|o| o.starts_with("MemoryCopy") || o.starts_with("MemoryFill")),
             "{ops:?}"
         );
+    }
+    /// Coverage (`Options::coverage`): a function with an `if` marks a site of its own on
+    /// each side, and the map's address is exported; without the option nothing is marked.
+    #[test]
+    fn coverage_marks_each_side_of_an_if() {
+        use wrela_ir::{BinOp, Const, Expr, Stmt};
+        let mut m = wrela_ir::Module::default();
+        let (u, b) = (m.types.u32(), m.types.bool());
+        let mut f =
+            wrela_ir::Function::new("branch", vec![wrela_ir::Param::value("x", u)], Some(u));
+        let mut body = Vec::new();
+        let x = f.let_(&mut body, u, Expr::Param(0));
+        let zero = f.let_(&mut body, u, Expr::Const(Const::U32(0)));
+        let c = f.let_(&mut body, b, Expr::Binary(BinOp::Eq, x, zero));
+        let one = f.let_(&mut body, u, Expr::Const(Const::U32(1)));
+        let two = f.let_(&mut body, u, Expr::Const(Const::U32(2)));
+        body.push(Stmt::If {
+            cond: c,
+            then: vec![Stmt::Return(Some(one))],
+            else_: vec![Stmt::Return(Some(two))],
+        });
+        body.push(Stmt::Return(Some(zero)));
+        f.body = body;
+        let id = m.add_function(f);
+        m.exports.push(("branch".into(), id));
+        wrela_ir::verify(&m).expect("valid IR");
+        // The addresses each body stores a 1 byte to: `i32.const a; i32.const 1; i32.store8`.
+        let marks = |wasm: &[u8]| -> Vec<Vec<i32>> {
+            let mut out = Vec::new();
+            for payload in wasmparser::Parser::new(0).parse_all(wasm) {
+                if let wasmparser::Payload::CodeSectionEntry(body) = payload.expect("parses") {
+                    let ops: Vec<wasmparser::Operator> = body
+                        .get_operators_reader()
+                        .expect("operators")
+                        .into_iter()
+                        .map(|o| o.expect("an operator"))
+                        .collect();
+                    let mut sites = Vec::new();
+                    for w in ops.windows(3) {
+                        if let [
+                            wasmparser::Operator::I32Const { value: a },
+                            wasmparser::Operator::I32Const { value: 1 },
+                            wasmparser::Operator::I32Store8 { .. },
+                        ] = w
+                        {
+                            sites.push(*a);
+                        }
+                    }
+                    out.push(sites);
+                }
+            }
+            out
+        };
+        let plain = emit(&m).expect("emits");
+        assert!(marks(&plain.wasm).iter().all(Vec::is_empty), "no coverage unasked");
+        let out = emit_with(&m, Options { coverage: true, ..Options::default() }).expect("emits");
+        wasmparser::Validator::new().validate_all(&out.wasm).expect("a valid module");
+        // The program's function: its start, then the `if`'s two sides, each its own site.
+        let all = marks(&out.wasm);
+        let sites = all.iter().find(|s| s.len() == 3).expect("a function with three sites");
+        assert_eq!(sites[1] + 1, sites[2], "the two sides are two sites: {sites:?}");
+        assert_ne!(sites[1], sites[2]);
+        let exported = wasmparser::Parser::new(0).parse_all(&out.wasm).any(|p| {
+            matches!(p, Ok(wasmparser::Payload::ExportSection(r))
+                if r.clone().into_iter().any(|e| e.is_ok_and(|e| e.name == COVERAGE_GLOBAL)))
+        });
+        assert!(exported, "the map's address is exported");
     }
 }

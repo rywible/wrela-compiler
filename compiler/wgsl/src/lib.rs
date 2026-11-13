@@ -1316,6 +1316,14 @@ impl<'a, 'm> Fb<'a, 'm> {
                     ir::BinOp::Gt => BinaryOperator::Greater,
                     ir::BinOp::Ge => BinaryOperator::GreaterEqual,
                 };
+                let lanes = match types.get(ta) {
+                    ir::TypeDef::Scalar(ir::Scalar::U32) => Some(None),
+                    ir::TypeDef::Vector(ir::Scalar::U32, n) => Some(Some(*n)),
+                    _ => None,
+                };
+                if let (Some(n), ir::BinOp::Div | ir::BinOp::Rem) = (lanes, op) {
+                    return Ok(self.halved(*op == ir::BinOp::Div, left, right, n, out));
+                }
                 self.expr(Expression::Binary { op: bop, left, right }, out)
             }
             ir::Expr::Builtin(b, args) => self.builtin(*b, args, out)?,
@@ -1325,6 +1333,54 @@ impl<'a, 'm> Fb<'a, 'm> {
                 return Err("internal: a CPU-only expression in GPU code".into());
             }
         })
+    }
+
+    /// `a / d` or `a % d` on `u32`s (`n` lanes, or a scalar), as WGSL defines them (`a / 0` is
+    /// `a`, `a % 0` is 0), written so that no dividend reaching the GPU's divide is 2^31 or more.
+    ///
+    /// Apple's Metal compiler (Apple M4, macOS 26.6.2) divides a constant dividend within about
+    /// a hundred of 2^32 wrongly: `4294967295u / d` gives 3579139454 for `d` = 3. The typed
+    /// programs' oracle O10 found it; a bare Metal kernel, no Wrela in it, shows it too
+    /// (compiler/wgsl/metal/u32_division.swift: when it finds nothing wrong on the Macs we
+    /// support, this can go; its i32 twin, i32_division.swift, finds nothing). Halved,
+    /// `(a >> 1) / d`, the divide is right for every dividend, and one step puts the answer
+    /// back: with `q = ((a >> 1) / d) * 2`, `a - q * d` is below `2d`.
+    fn halved(
+        &mut self,
+        div: bool,
+        a: Handle<Expression>,
+        d: Handle<Expression>,
+        n: Option<u8>,
+        out: &mut Block,
+    ) -> Handle<Expression> {
+        let splat = |me: &mut Self, v: u32, out: &mut Block| {
+            let l = me.lit(Literal::U32(v), out);
+            match n {
+                Some(n) => me.expr(Expression::Splat { size: vsize(n), value: l }, out),
+                None => l,
+            }
+        };
+        let (zero, one) = (splat(self, 0, out), splat(self, 1, out));
+        let bin = |me: &mut Self, op, left, right, out: &mut Block| {
+            me.expr(Expression::Binary { op, left, right }, out)
+        };
+        let is_zero = bin(self, BinaryOperator::Equal, d, zero, out);
+        let d = self.expr(Expression::Select { condition: is_zero, accept: one, reject: d }, out);
+        let half = bin(self, BinaryOperator::ShiftRight, a, one, out);
+        let h = bin(self, BinaryOperator::Divide, half, d, out);
+        let q = bin(self, BinaryOperator::ShiftLeft, h, one, out);
+        let qd = bin(self, BinaryOperator::Multiply, q, d, out);
+        let r = bin(self, BinaryOperator::Subtract, a, qd, out);
+        let over = bin(self, BinaryOperator::GreaterEqual, r, d, out);
+        if div {
+            let up =
+                self.expr(Expression::Select { condition: over, accept: one, reject: zero }, out);
+            bin(self, BinaryOperator::Add, q, up, out)
+        } else {
+            let down =
+                self.expr(Expression::Select { condition: over, accept: d, reject: zero }, out);
+            bin(self, BinaryOperator::Subtract, r, down, out)
+        }
     }
 
     /// An atomic read-modify-write (`ir::Expr::Atomic`): the value that was there, if it's
@@ -1646,6 +1702,34 @@ impl<'a, 'm> Fb<'a, 'm> {
                 hs[h] = self.through_variable(hs[h], ty, out);
             }
         }
+        // `tanh` of an `f32` is 1 (or -1) past 10 in size, to the last bit, but a GPU may
+        // compute it as a ratio of exponentials that overflow, and give NaN: Metal's does past
+        // 44 (the typed programs' oracle O6 found it). Clamped, its argument can't overflow.
+        if b == B::Tanh {
+            let n = match self.cx.m.types.get(self.f.value_ty(args[0])) {
+                ir::TypeDef::Scalar(ir::Scalar::F32) => Some(None),
+                ir::TypeDef::Vector(ir::Scalar::F32, n) => Some(Some(*n)),
+                _ => None,
+            };
+            if let Some(n) = n {
+                let mut bound = |x: f32, out: &mut Block| {
+                    let l = self.lit(Literal::F32(x), out);
+                    match n {
+                        Some(n) => self.expr(Expression::Splat { size: vsize(n), value: l }, out),
+                        None => l,
+                    }
+                };
+                let (lo, hi) = (bound(-10.0, out), bound(10.0, out));
+                let clamp = Expression::Math {
+                    fun: MathFunction::Clamp,
+                    arg: hs[0],
+                    arg1: Some(lo),
+                    arg2: Some(hi),
+                    arg3: None,
+                };
+                hs[0] = self.expr(clamp, out);
+            }
+        }
         let deriv = |axis| Expression::Derivative {
             axis,
             ctrl: naga::DerivativeControl::None,
@@ -1734,7 +1818,63 @@ impl<'a, 'm> Fb<'a, 'm> {
                 }
             }
         };
-        Ok(self.expr(e, out))
+        let r = self.expr(e, out);
+        // `atan2(y, x)` with both 0 is NaN on Metal (the typed programs' oracle O6 found it); on
+        // the CPU (the WASM's, as C's) it's y where x is +0 (+0 or -0, y's sign), and π with y's
+        // sign where x is -0. Written so, by the zeros' sign bits, on every GPU.
+        if b == B::Atan2 {
+            let n = match self.cx.m.types.get(self.f.value_ty(args[0])) {
+                ir::TypeDef::Vector(_, n) => Some(*n),
+                _ => None,
+            };
+            let l = self.lit(Literal::F32(0.0), out);
+            let zero = match n {
+                Some(n) => self.expr(Expression::Splat { size: vsize(n), value: l }, out),
+                None => l,
+            };
+            let eq = |me: &mut Self, h, out: &mut Block| {
+                me.expr(Expression::Binary { op: BinaryOperator::Equal, left: h, right: zero }, out)
+            };
+            let (ey, ex) = (eq(self, hs[0], out), eq(self, hs[1], out));
+            let both =
+                self.expr(Expression::Binary { op: BinaryOperator::And, left: ey, right: ex }, out);
+            let splat = |me: &mut Self, l: Handle<Expression>, out: &mut Block| match n {
+                Some(n) => me.expr(Expression::Splat { size: vsize(n), value: l }, out),
+                None => l,
+            };
+            // Whether a float's sign bit is set: its bits shifted down 31 aren't 0.
+            let negative = |me: &mut Self, h, out: &mut Block| {
+                let bits = me.expr(
+                    Expression::As { expr: h, kind: naga::ScalarKind::Uint, convert: None },
+                    out,
+                );
+                let l31 = me.lit(Literal::U32(31), out);
+                let s31 = splat(me, l31, out);
+                let top = me.expr(
+                    Expression::Binary { op: BinaryOperator::ShiftRight, left: bits, right: s31 },
+                    out,
+                );
+                let l0 = me.lit(Literal::U32(0), out);
+                let u0 = splat(me, l0, out);
+                me.expr(
+                    Expression::Binary { op: BinaryOperator::NotEqual, left: top, right: u0 },
+                    out,
+                )
+            };
+            let (sy, sx) = (negative(self, hs[0], out), negative(self, hs[1], out));
+            let lpi = self.lit(Literal::F32(std::f32::consts::PI), out);
+            let pi = splat(self, lpi, out);
+            let lnpi = self.lit(Literal::F32(-std::f32::consts::PI), out);
+            let npi = splat(self, lnpi, out);
+            let signed_pi =
+                self.expr(Expression::Select { condition: sy, accept: npi, reject: pi }, out);
+            let at_zero = self
+                .expr(Expression::Select { condition: sx, accept: signed_pi, reject: hs[0] }, out);
+            return Ok(
+                self.expr(Expression::Select { condition: both, accept: at_zero, reject: r }, out)
+            );
+        }
+        Ok(r)
     }
 }
 

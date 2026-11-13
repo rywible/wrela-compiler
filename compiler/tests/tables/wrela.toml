@@ -1,0 +1,4 @@
+# Tables of functions of 1 to 3 numbers with a proven error (plan stage H): out of std because
+# neither measured pair paid (H.5), kept for the tests that check the proof.
+[package]
+name = "tables"

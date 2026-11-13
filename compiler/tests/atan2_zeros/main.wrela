@@ -1,0 +1,70 @@
+// atan2 where both arguments are zeros (review of 92de9d8e): the GPU gives the CPU's bits,
+// y where x is +0 and pi with y's sign where x is -0, scalar and vector.
+use std::gpu::{GlobalId, GpuBuffer, Slots, buffer, buffer_of, dispatch, read}
+use std::io::Pending
+
+@compute(4)
+fn k(ys: [f32], xs: [f32], out: mut Slots<f32>, id: GlobalId) {
+    out[id] = atan2(ys[id.x], xs[id.x])
+}
+
+@compute(4)
+fn kv(ys: [f32], xs: [f32], out: mut Slots<f32>, id: GlobalId) {
+    let v = atan2(vec2(ys[id.x], 1.0), vec2(xs[id.x], 1.0))
+    out[id] = v.x
+}
+
+pub struct S {
+    frame: u32,
+    out: GpuBuffer<f32>,
+    outv: GpuBuffer<f32>,
+    pending: Vec<Pending<f32>>,
+    got: Vec<f32>,
+}
+
+fn ys() -> Vec<f32> {
+    Vec::from([0.0, 0.0, -0.0, -0.0])
+}
+
+fn xs() -> Vec<f32> {
+    Vec::from([0.0, -0.0, 0.0, -0.0])
+}
+
+pub fn init() -> S {
+    S { frame: 0, out: buffer(4), outv: buffer(4), pending: Vec::new(), got: Vec::new() }
+}
+
+pub fn frame(s: mut S, time: f32, width: u32, height: u32) {
+    if s.frame == 0 {
+        let (y, x) = (buffer_of(ys()), buffer_of(xs()))
+        dispatch(k.bind(y, x, mut s.out), groups: 1)
+        dispatch(kv.bind(y, x, mut s.outv), groups: 1)
+        s.pending.push(read(s.out.items()))
+        s.pending.push(read(s.outv.items()))
+    }
+    if s.got.len() == 0 && s.pending.len() == 2 {
+        if let (Some(Ok(a)), Some(Ok(b))) = (s.pending[0].poll(), s.pending[1].poll()) {
+            for i in 0..4 {
+                s.got.push(a[i])
+            }
+            for i in 0..4 {
+                s.got.push(b[i])
+            }
+        }
+    }
+    s.frame += 1
+}
+
+@test(frames: 6, gpu: true)
+fn gpu_matches_cpu(s: S) {
+    let (y, x) = (ys(), xs())
+    assert(s.got.len() == 8, "no readback")
+    for i in 0..8 {
+        let want = atan2(y[i % 4], x[i % 4])
+        let g = s.got[i]
+        assert(
+            bitcast_u32(g) == bitcast_u32(want),
+            f"{i}: atan2({y[i % 4]}, {x[i % 4]}): GPU {g}, CPU {want}",
+        )
+    }
+}

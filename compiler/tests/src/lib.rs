@@ -6,6 +6,7 @@
 //! size; historical milestone benchmarks and full-scene tours are not part of verification.
 
 pub mod spike01;
+pub mod typed;
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -613,6 +614,9 @@ pub struct ChromeRun {
     pub salt: u32,
     /// Each frame as soon as the last is done, not at its time.
     pub saturate: bool,
+    /// Runs a command on its pipeline's stand-in until the pipeline is built (§18.12): test
+    /// mode otherwise waits for it.
+    pub standins: bool,
 }
 
 impl ChromeRun {
@@ -647,6 +651,7 @@ impl ChromeRun {
             nohash,
             salt,
             saturate,
+            standins,
         } = self;
         let mut fragment = format!(
             "#test&frames={frames}&width={width}&height={height}&fps={fps}&workers={workers}"
@@ -670,6 +675,7 @@ impl ChromeRun {
             ("nohash", flag(nohash)),
             ("salt", *salt),
             ("saturate", flag(saturate)),
+            ("standins", flag(standins)),
         ] {
             if n > 0 {
                 fragment += &format!("&{name}={n}");

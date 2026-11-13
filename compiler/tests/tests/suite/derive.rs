@@ -135,6 +135,61 @@ fn gradients_agree_with_central_differences() {
     println!("AC3 gradients against central differences:\n{}", report.join("\n"));
 }
 
+/// Reverse mode against forward mode (stage C's gate): each corpus function's gradient by
+/// `std::derive::reverse`, through a closure of the point's three numbers, is within
+/// `1e-5 (1 + |g|)` of `gradient`'s at 1,000 points in [-2, 2]³, `|g|` the gradient's size (as
+/// the corpus's gradient test scales its error). Taken a component at a time instead, `march`
+/// misses by 3.5e-5 where its gradient is 17,000 across and its z component 2.87, the sum of
+/// terms of 10⁴ that cancel: there, against f64, reverse mode's z is off by 2e-5 and forward
+/// mode's by 1.2e-4, so it's the order of the sum, not either derivation.
+#[test]
+fn reverse_gradients_agree_with_forward_ones() {
+    let corpus = CpuBuild::load(built("fields")).expect("load the corpus");
+    let functions: Vec<usize> = (0..NAMES.len()).collect();
+    let worst_of = par_map_with(
+        &functions,
+        || corpus.start().expect("start the corpus"),
+        |host, &fi| {
+            let mut rng = Rng::new(0xbac + fi as u64);
+            let mut worst = 0.0f64;
+            let mut at_worst = ([0.0f32; 3], [0.0f64; 3], [0.0f64; 3]);
+            for _ in 0..1000 {
+                let p = [0, 1, 2].map(|_| (rng.unit() * 4.0 - 2.0) as f32);
+                let args = point_args(fi as u32, p);
+                let vec = |host: &mut CpuHost, name: &str| -> [f64; 3] {
+                    match host.call_export(name, &args).expect(name).as_slice() {
+                        [Value::F32(x), Value::F32(y), Value::F32(z)] => {
+                            [*x, *y, *z].map(f64::from)
+                        }
+                        other => panic!("{name} returned {other:?}"),
+                    }
+                };
+                let (f, r) = (vec(host, "gradient"), vec(host, "reverse_gradient"));
+                let norm = |v: [f64; 3]| (v[0] * v[0] + v[1] * v[1] + v[2] * v[2]).sqrt();
+                let d = norm([f[0] - r[0], f[1] - r[1], f[2] - r[2]]) / (1.0 + norm(f));
+                if d.is_nan() || d > worst {
+                    worst = d;
+                    at_worst = (p, f, r);
+                }
+            }
+            if worst.is_nan() || worst > 1e-5 {
+                println!(
+                    "{}: at {:?}, forward {:?}, reverse {:?}",
+                    NAMES[fi], at_worst.0, at_worst.1, at_worst.2
+                );
+            }
+            worst
+        },
+    );
+    let mut report: Vec<String> =
+        NAMES.iter().zip(&worst_of).map(|(n, w)| format!("  {n:>13}: worst {w:.1e}")).collect();
+    report.sort();
+    println!("reverse against forward gradients, 1,000 points each:\n{}", report.join("\n"));
+    let over: Vec<_> =
+        NAMES.iter().zip(&worst_of).filter(|(_, w)| w.is_nan() || **w > 1e-5).collect();
+    assert!(over.is_empty(), "over 1e-5: {over:?}");
+}
+
 /// Boxes per call of `misses_cpu`: the calls of all the functions are shared out between
 /// threads, each with its own host.
 const CHUNK: u32 = 50_000;
@@ -400,6 +455,11 @@ fn set(slot: mut f32, x: f32) {
 /// that reads the value back, so each was run as it was and the gradient was 0, with no error.
 #[test]
 fn a_value_that_depends_on_the_input_put_in_heap_memory_is_an_error() {
+    heap_errors(&heap_programs(), "derive-heap");
+}
+
+/// The programs of the heap test: each case's name and text, a gradient taken through `slope`.
+fn heap_programs() -> Vec<(String, String)> {
     // Each: what keeps `x` (its line marked `// here`), and what reads it back.
     let cases = [
         ("push", "    var v: Vec<f32> = Vec::new()\n    v.push(x) // here\n    v", "v[0]"),
@@ -456,8 +516,13 @@ fn a_value_that_depends_on_the_input_put_in_heap_memory_is_an_error() {
             "{SLOPE}\nfn kept(x: f32) -> Rows {{\n    var r = Rows {{ cells: Vec::filled(2, value: 0.0) }}\n    r.cell(1) = x // here\n    r\n}}\n\nfn read(x: f32) -> f32 {{\n    let r = kept(x)\n    r.cells[1]\n}}\n\nfn curve(x: f32) -> f32 {{\n    read(x) - 3.0\n}}\n\npub fn frame(time: f32, width: u32, height: u32) {{\n    let s = slope(curve, time)\n}}\n"
         ),
     ));
-    for (name, text) in &programs {
-        let dir = crate::package(&format!("derive-heap-{name}"), text);
+    programs
+}
+
+/// Checks each heap program is E0700 at its marked line, with the heap rule's words.
+fn heap_errors(programs: &[(String, String)], stem: &str) {
+    for (name, text) in programs {
+        let dir = crate::package(&format!("{stem}-{name}"), text);
         let (codes, rendered) = crate::checked(&dir);
         let errors: Vec<&String> = codes.iter().filter(|c| c.starts_with('E')).collect();
         assert_eq!(errors, ["E0700"], "{name}:\n{rendered}");
@@ -475,6 +540,83 @@ fn a_value_that_depends_on_the_input_put_in_heap_memory_is_an_error() {
             "{name}:\n{rendered}"
         );
     }
+}
+
+/// The same cases with `reverse` in place of `gradient` (§14.2): a recorded function is held to
+/// the heap rule as a forward one is, with the same words at the same lines.
+#[test]
+fn a_value_put_in_heap_memory_is_an_error_under_reverse_too() {
+    let programs: Vec<(String, String)> =
+        heap_programs().into_iter().map(|(name, text)| (name, as_reverse(&text))).collect();
+    heap_errors(&programs, "derive-heap-reverse");
+}
+
+/// A heap program with its gradient taken by `reverse`, on the same lines.
+fn as_reverse(text: &str) -> String {
+    let out = text
+        .replace("use std::derive::gradient", "use std::derive::reverse")
+        .replace(
+            "fn slope(f: fn(f32) -> f32, x: f32) -> f32 {\n    gradient(f, x)\n}",
+            "fn slope(f: fn([f32; 1]) -> f32, x: f32) -> f32 {\n    reverse(f, [x]).1[0]\n}",
+        )
+        .replace(
+            "fn curve(x: f32) -> f32 {\n    read(x) - 3.0\n}",
+            "fn curve(xs: [f32; 1]) -> f32 {\n    read(xs[0]) - 3.0\n}",
+        );
+    assert_eq!(out.lines().count(), text.lines().count(), "the lines stay where they were");
+    assert!(out.contains("reverse(f, [x])") && out.contains("read(xs[0])"), "{out}");
+    out
+}
+
+/// Weights made in a `Vec` by a function given nothing of the input, handed back as an array,
+/// leave a reverse gradient right; and `reverse` named inside a forward derivation is refused,
+/// since it allocates its trace (§8.3).
+#[test]
+fn heap_memory_that_holds_nothing_of_the_input_is_left_alone_under_reverse() {
+    let src = "use std::collections::Vec
+use std::derive::{gradient, reverse}
+
+fn slope(f: fn([f32; 2]) -> f32, x: [f32; 2]) -> [f32; 2] {
+    reverse(f, x).1
+}
+
+/// Weights made in a `Vec`, given back as values.
+fn weights() -> [f32; 2] {
+    var v: Vec<f32> = Vec::new()
+    v.push(0.5)
+    v.push(4.0)
+    [v[0], v[1]]
+}
+
+fn curve(x: [f32; 2]) -> f32 {
+    let w = weights()
+    x[0] * w[0] + x[1] * x[1] * w[1]
+}
+
+@test
+fn the_slope_is_the_weights() {
+    let g = slope(curve, [2.5, 3.0])
+    assert(abs(g[0] - 0.5) < 1.0e-6)
+    assert(abs(g[1] - 24.0) < 1.0e-5)
+}
+";
+    let dir = crate::package("derive-heap-reverse-constants", src);
+    assert_eq!(crate::tests_pass(&dir), 1);
+    let nested = "use std::derive::{gradient, reverse}
+
+fn inner(x: f32) -> f32 {
+    reverse(|y: [f32; 1]| y[0] * y[0] * x, [x]).1[0]
+}
+
+pub fn frame(time: f32, width: u32, height: u32) {
+    let _s = gradient(inner, time)
+}
+";
+    let dir = crate::package("derive-reverse-in-gradient", nested);
+    let (codes, rendered) = crate::checked(&dir);
+    let errors: Vec<&String> = codes.iter().filter(|c| c.starts_with('E')).collect();
+    assert_eq!(errors, ["E0700"], "{rendered}");
+    assert!(rendered.contains("`reverse` allocates"), "{rendered}");
 }
 
 /// Heap memory that holds nothing of the input stays as it was (§14.2): a function given
@@ -522,4 +664,150 @@ fn the_slope_is_the_weight() {
 ";
     let dir = crate::package("derive-heap-constants", src);
     assert_eq!(crate::tests_pass(&dir), 1);
+}
+
+/// A two-layer net over 4,096 weights: 64 inputs, 60 hidden `tanh`s, one output (W1 at 0, b1 at
+/// 3840, W2 at 3900, b2 at 3960; the rest unused).
+const NET: &str = "use std::derive::reverse
+
+fn input(i: u32) -> f32 {
+    sin(f32(i) * 0.37)
+}
+
+fn net(w: [f32; 4096]) -> f32 {
+    var out = w[3960]
+    for j in 0..60 {
+        var s = w[3840 + j]
+        for i in 0..64 {
+            s += w[j * 64 + i] * input(i)
+        }
+        out += w[3900 + j] * tanh(s)
+    }
+    out
+}
+
+fn weights() -> [f32; 4096] {
+    var w = [0.0; 4096]
+    for k in 0..4096 {
+        w[k] = 0.2 * sin(f32(k) * 1.618)
+    }
+    w
+}
+
+pub fn plain() -> f32 {
+    net(weights())
+}
+
+pub fn reversed(k: u32) -> f32 {
+    let (_, g) = reverse(net, weights())
+    g[k]
+}
+
+pub fn nudged(k: u32, h: f32) -> f32 {
+    var w = weights()
+    w[k] += h
+    net(w)
+}
+";
+
+/// Reverse mode at scale: a function of 4,096 numbers. Its gradient agrees with central
+/// differences on 16 of them within 1e-3 relative, and the reverse call costs less than ten
+/// plain evaluations, in fuel (work, not time).
+#[test]
+fn reverse_is_a_few_evaluations() {
+    let dir = crate::package("derive-reverse-net", NET);
+    wrela_tests::must_build(&dir, &dir.join("build"));
+    let fuel = 1u64 << 40;
+    let mut host = CpuBuild::load_metered(dir.join("build"), fuel)
+        .expect("load")
+        .start_with(1)
+        .expect("start");
+    let spent = |host: &mut CpuHost, name: &str, args: &[Value]| -> (f32, u64) {
+        let v = one_f32(host, name, args);
+        (v, fuel - host.fuel_left().expect("metered"))
+    };
+    let (_, plain) = spent(&mut host, "plain", &[]);
+    let (_, reversed) = spent(&mut host, "reversed", &[Value::I32(0)]);
+    let ratio = reversed as f64 / plain as f64;
+    let mut worst = 0.0f64;
+    for k in (0..3961i32).step_by(3961 / 16).take(16) {
+        let g = f64::from(one_f32(&mut host, "reversed", &[Value::I32(k)]));
+        let h = 1.0e-2f32;
+        let up = f64::from(one_f32(&mut host, "nudged", &[Value::I32(k), Value::F32(h)]));
+        let down = f64::from(one_f32(&mut host, "nudged", &[Value::I32(k), Value::F32(-h)]));
+        let central = (up - down) / (2.0 * f64::from(h));
+        let err = (g - central).abs() / central.abs().max(1e-2);
+        worst = worse(worst, err);
+        assert!(err <= 1e-3, "weight {k}: reverse {g}, central differences {central}");
+    }
+    println!(
+        "a net of 4,096 weights: a plain evaluation {plain} fuel, the reverse gradient {reversed} \
+         ({ratio:.2} times); worst relative difference from central differences {worst:.1e}"
+    );
+    assert!(ratio < 10.0, "the reverse gradient costs {ratio:.2} evaluations");
+}
+
+/// A trace past its most nodes panics, saying what to do (`Trace::holding` sets a small most).
+#[test]
+fn a_trace_past_its_most_panics() {
+    let src = "use std::derive::Trace
+
+@test
+fn past() {
+    var t = Trace::holding(4)
+    for _ in 0..4 {
+        let _ = t.leaf()
+    }
+}
+";
+    let dir = crate::package("derive-trace-most", src);
+    let out = wrela_driver::test(&dir, None);
+    let failure = out.results.iter().find_map(|r| r.failure.clone()).expect("the test fails");
+    let rendered = wrela_diag::render::render_all(&out.sources, &[failure]);
+    assert!(rendered.contains("a reverse gradient's trace passed 2^26 numbers"), "{rendered}");
+}
+
+/// A floor's split (`split_floor`) runs the rest of the function in a loop of its cases; a
+/// result that isn't active (a constant that a folded branch left) is made in that loop, and the
+/// return after it read it there, out of sight (I0001, found by the typed fuzzer's O9 seed
+/// 8136312319217385561). It's carried out of the loop as an active result is: the build's IR is
+/// well formed, and the interval is the constant's.
+#[test]
+fn a_constant_result_after_a_floors_split_is_returned() {
+    let dir = crate::package(
+        "derive-floor-constant",
+        "use std::derive::{Box3, interval}
+
+fn f(p: vec3) -> f32 {
+    var a = 0.5
+    if 0.0 < select(if_false: floor(p.x), if_true: 0.0, cond: p.y < 0.0) {
+        a = 0.0
+    }
+    var b = 0.0
+    if 0.0 < 0.0 {
+        b = a
+    }
+    b
+}
+
+pub fn range(lx: f32, ly: f32, lz: f32, hx: f32, hy: f32, hz: f32) -> vec2 {
+    let r = interval(f, Box3 { lo: vec3(lx, ly, lz), hi: vec3(hx, hy, hz) })
+    vec2(r.lo, r.hi)
+}
+",
+    );
+    let out = wrela_driver::build(&dir);
+    assert!(
+        !out.has_errors(),
+        "{}",
+        wrela_diag::render::render_all(&out.sources, &out.diagnostics)
+    );
+    let build = dir.join("build");
+    out.write_to(&build).expect("write the build");
+    let mut host = crate::cpu_host(&build);
+    let args = [-1.5f32, -1.0, 0.0, 1.5, 1.0, 1.0].map(Value::F32);
+    match host.call_export("range", &args).expect("range").as_slice() {
+        [Value::F32(lo), Value::F32(hi)] => assert!(*lo <= 0.0 && *hi >= 0.0 && *hi - *lo < 1e-6),
+        other => panic!("range returned {other:?}"),
+    }
 }

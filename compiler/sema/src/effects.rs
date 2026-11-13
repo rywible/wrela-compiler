@@ -571,8 +571,10 @@ fn derived_callables(p: &Program, f: FnId, body: &Body) -> Vec<(BodyId, Span)> {
                     | Lang::TapeOf
                     | Lang::TapeWith
                     | Lang::TapeSized
+                    | Lang::Recorded
                     | Lang::LiftGradient
-                    | Lang::LiftJacobian,
+                    | Lang::LiftJacobian
+                    | Lang::LiftRecorded,
             )
         );
         if derived
@@ -1021,7 +1023,8 @@ fn node(
                     Callee::Fn { func, .. } | Callee::JobResume { func, .. } => {
                         call_to(&mut n, *func, c.span)
                     }
-                    Callee::JobStart { .. } => {}
+                    // A deterministic kernel's CPU form: integer arithmetic, on what it's given.
+                    Callee::JobStart { .. } | Callee::ExactRun { .. } => {}
                     Callee::TraitMethod { method, self_ty, trait_args, method_args } => {
                         // Resolved here only when the type is known; otherwise lowering checks
                         // each instantiation.
