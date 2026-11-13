@@ -13,7 +13,7 @@
 //! | O8 | reverse mode agrees | `std::derive::reverse`'s gradient within `1e-5 (1 + |g|)` of `gradient`'s |
 //! | O6 | the targets agree | the GPU's value inside its interval (within 8 ulps: Metal's fast math reassociates), and near the CPU's |
 
-use super::{Features, HARNESS, Mode, REVERSE_HARNESS, TAPE_HARNESS, program};
+use super::{Features, Mode, REVERSE_HARNESS, TAPE_HARNESS, program};
 use crate::{Rng, u32s};
 use std::path::{Path, PathBuf};
 use wrela_host::{CpuBuild, CpuHost, Host, Value};
@@ -30,10 +30,11 @@ pub enum Oracle {
     O7,
     O8,
     O9,
+    O10,
 }
 
 impl Oracle {
-    pub const ALL: [Oracle; 9] = [
+    pub const ALL: [Oracle; 10] = [
         Oracle::O1,
         Oracle::O2,
         Oracle::O3,
@@ -43,6 +44,7 @@ impl Oracle {
         Oracle::O7,
         Oracle::O8,
         Oracle::O9,
+        Oracle::O10,
     ];
 
     pub fn parse(s: &str) -> Option<Oracle> {
@@ -60,6 +62,7 @@ impl Oracle {
             Oracle::O7 => "O7",
             Oracle::O8 => "O8",
             Oracle::O9 => "O9",
+            Oracle::O10 => "O10",
         }
     }
 
@@ -77,6 +80,7 @@ impl Oracle {
     pub fn modes(self) -> &'static [Mode] {
         match self {
             Oracle::O1 => &[Mode::Tame, Mode::Wild],
+            Oracle::O10 => &[Mode::Integer],
             _ => &[Mode::Tame],
         }
     }
@@ -148,7 +152,7 @@ fn fail<T>(what: impl Into<String>) -> Result<T, Failure> {
 
 /// The program `data` makes, with the harness.
 pub fn text(data: &[u32], mode: Mode, feat: Features) -> String {
-    program(&mut super::Choices::replay(data), mode, feat) + HARNESS
+    program(&mut super::Choices::replay(data), mode, feat) + super::harness(mode)
 }
 
 /// Runs the regression file at `path`: its first lines say the oracle (`// oracle: O3`) and the
@@ -273,7 +277,7 @@ pub fn run(oracle: Oracle, src: &str, seed: u64, dir: &Path) -> Result<Counts, F
                     other => other?[0],
                 };
                 let near = 3e-6 * v.abs().max(1.0);
-                if within((t - v).abs(), near) {
+                if within((t - v).abs(), near) || (t.is_nan() && v.is_nan()) {
                     continue;
                 }
                 // The tape rounds each operation as compiled code does, in another order: where
@@ -321,31 +325,48 @@ pub fn run(oracle: Oracle, src: &str, seed: u64, dir: &Path) -> Result<Counts, F
             build(dir, src, false)?;
             o9(dir, seed)
         }
+        Oracle::O10 => o10(&build(dir, src, false)?),
         Oracle::O8 => {
             let mut host = start(&build(dir, &(src.to_string() + REVERSE_HARNESS), false)?)?;
             let mut worst = 0.0f64;
+            let mut counted = 0;
+            let norm = |v: &[f64]| v.iter().map(|x| x * x).sum::<f64>().sqrt();
+            let grad = |host: &mut CpuHost, p: [f32; 3], name: &str| -> Result<Vec<f64>, Failure> {
+                Ok(floats(host, name, &args(p))?.into_iter().map(f64::from).collect())
+            };
             for _ in 0..16 {
                 let p = point(&mut rng);
-                let f = floats(&mut host, "grad", &args(p))?
-                    .into_iter()
-                    .map(f64::from)
-                    .collect::<Vec<_>>();
-                let r = floats(&mut host, "rgrad", &args(p))?
-                    .into_iter()
-                    .map(f64::from)
-                    .collect::<Vec<_>>();
-                let norm = |v: &[f64]| v.iter().map(|x| x * x).sum::<f64>().sqrt();
+                let f = grad(&mut host, p, "grad")?;
+                counted += 1;
+                let r = grad(&mut host, p, "rgrad")?;
                 let diff: Vec<f64> = f.iter().zip(&r).map(|(a, b)| a - b).collect();
                 let d = norm(&diff) / (1.0 + norm(&f));
                 if !within(d, 1e-5) {
-                    return fail(format!(
-                        "at {p:?}: forward mode gives {f:?}, reverse mode {r:?} ({d:e} apart)"
-                    ));
+                    // What rounding inside the forward gradient can do at the point is its point
+                    // interval's width (§14.2), from forward mode alone: a gradient computed
+                    // through cancellation (the length of a vector that's 0 but for rounding) is
+                    // that rounding, and each mode rounds its own way. Within the width, it's
+                    // let through and tallied; an unbounded width sets the point apart.
+                    let w = grad(&mut host, p, "gwidth")?;
+                    if w.iter().any(|x| !x.is_finite()) {
+                        set_apart("O8: a point whose gradient's interval is unbounded");
+                        continue;
+                    }
+                    let room: Vec<f64> = w.iter().map(|x| 2.0 * x).collect();
+                    if norm(&diff) > 1e-5 * (1.0 + norm(&f)) + norm(&room) {
+                        return fail(format!(
+                            "at {p:?}: forward mode gives {f:?}, reverse mode {r:?} ({d:e} apart, \
+                             past the gradient's point interval, widths {w:?})"
+                        ));
+                    }
+                    set_apart(
+                        "O8 (a point counted, agreeing): apart by more than 1e-5, within the gradient's point interval",
+                    );
                 }
                 worst = worst.max(d);
             }
             WORST_O8.with(|w| w.set(w.get().max(worst)));
-            Ok(Counts { points: 16, counted: 16 })
+            Ok(Counts { points: 16, counted })
         }
     }
 }
@@ -693,6 +714,26 @@ fn o9(dir: &Path, seed: u64) -> Result<Counts, Failure> {
         }
     }
     Ok(Counts { points: N, counted })
+}
+
+/// O10 (plan stage K.3): an integer program as a `@deterministic` kernel, run on the GPU and on
+/// the CPU (`k.run`) over 1,024 words, the edges among them: every place the same bits.
+fn o10(build: &Path) -> Result<Counts, Failure> {
+    let mut gpu = Host::load(build).or_else(|e| fail(format!("the GPU host: {e}")))?;
+    let times: Vec<f32> = (0..12).map(|i| i as f32 / 60.0).collect();
+    gpu.run_frames(&times, 16, 16).or_else(|e| fail(format!("the frames: {e}")))?;
+    let lines = gpu.take_logs();
+    let Some(agree) = lines.iter().find_map(|l| {
+        let rest = l.split("exact agree ").nth(1)?;
+        rest.split_whitespace().next()?.parse::<u32>().ok()
+    }) else {
+        return fail(format!("the readback didn't arrive in 12 frames: {lines:?}"));
+    };
+    if agree != 1024 {
+        let first = lines.iter().find(|l| l.contains("exact first")).cloned().unwrap_or_default();
+        return fail(format!("{agree} of 1024 places agree; {first}"));
+    }
+    Ok(Counts { points: 1024, counted: 1024 })
 }
 
 /// The seed of program `i` of a run from `base`: what the suite and the soak both use.

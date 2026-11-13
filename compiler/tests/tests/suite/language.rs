@@ -78,6 +78,7 @@ const CONTEXTS: &[Context] = &[
     },
     Context { first: "use std::derive::Box3", ..NONE },
     Context { first: "use std::field::Surface", ..NONE },
+    Context { first: "use std::gpu::{GlobalId, Slots}", ..NONE },
     Context { first: "use std::gpu::{GlobalId, GpuBuffer, Slots, dispatch}", ..NONE },
     Context { first: "use std::gpu::{FragCoord, Rgba16Float, Sampler, Texture3d}", ..NONE },
     Context {

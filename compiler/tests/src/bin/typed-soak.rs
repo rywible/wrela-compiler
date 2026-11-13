@@ -25,7 +25,12 @@ fn main() {
         let root = wrela_tests::repo_root();
         let scratch = wrela_tests::scratch_root(root.join("target/tmp")).join("typed-file");
         match oracles::run_file(std::path::Path::new(path), &scratch) {
-            Ok(c) => println!("passes: {} points, {} counted", c.points, c.counted),
+            Ok(c) => {
+                println!("passes: {} points, {} counted", c.points, c.counted);
+                for (why, n) in oracles::REFUSALS.lock().unwrap().iter() {
+                    println!("  {n:>6}  {why}");
+                }
+            }
             Err(why) => {
                 println!("{why}");
                 std::process::exit(1);
@@ -69,7 +74,7 @@ fn main() {
     let proven = std::sync::atomic::AtomicU64::new(0);
     let started = std::time::Instant::now();
     // The GPU's oracle opens a device for each program: one at a time.
-    let threads = if matches!(oracle, Oracle::O6 | Oracle::O7) { 1 } else { threads };
+    let threads = if matches!(oracle, Oracle::O6 | Oracle::O7 | Oracle::O10) { 1 } else { threads };
     let total = count * modes.len() as u64;
     let shrink = !args.iter().any(|a| a == "--no-shrink");
     let stop_after = flag("--stop-after").unwrap_or(3) as usize;

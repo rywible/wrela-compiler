@@ -70,6 +70,10 @@ impl Choices {
 pub enum Mode {
     Tame,
     Wild,
+    /// Integer programs as `@deterministic` kernels, for O10 (plan stage K): `u32` and `i32`
+    /// arithmetic that wraps, division and remainder by anything (zero too), shifts by any
+    /// amount, bit operations, comparisons, and table reads at any index.
+    Integer,
 }
 
 /// A switch for each production family, all on by default: one turned off names the bug it
@@ -509,6 +513,9 @@ impl Gen<'_> {
 
 /// A program's text (without [`HARNESS`]) from `choices`.
 pub fn program(choices: &mut Choices, mode: Mode, feat: Features) -> String {
+    if mode == Mode::Integer {
+        return int_program(choices);
+    }
     let mut g = Gen {
         c: choices,
         mode,
@@ -668,12 +675,148 @@ pub fn rgrad(x: f32, y: f32, z: f32) -> vec3 {
     let (_, g) = reverse(|q: [f32; 3]| f(vec3(q[0], q[1], q[2])), [x, y, z])
     vec3(g[0], g[1], g[2])
 }
+
+/// The forward gradient's interval at the point, each component's width: what rounding inside
+/// it can do there (§14.2).
+pub fn gwidth(x: f32, y: f32, z: f32) -> vec3 {
+    let p = vec3(x, y, z)
+    let r = interval(|q: vec3| gradient(f, q), Box3 { lo: p, hi: p })
+    r.hi - r.lo
+}
 ";
 
 /// A whole program: [`program`] and the [`HARNESS`].
 pub fn source(choices: &mut Choices, mode: Mode, feat: Features) -> String {
-    program(choices, mode, feat) + HARNESS
+    program(choices, mode, feat) + harness(mode)
 }
+
+/// The harness a mode's programs are run in.
+pub fn harness(mode: Mode) -> &'static str {
+    if mode == Mode::Integer { INT_HARNESS } else { HARNESS }
+}
+
+/// The integer values a leaf may be: the edges of `u32` and `i32`, a width and either side of it.
+const INT_LITERALS: [&str; 10] =
+    ["0", "1", "2", "7", "31", "32", "33", "2147483647", "2147483648", "4294967295"];
+
+/// An integer program (`Mode::Integer`): `g(w, i, s)` of the input word, the place and the
+/// salt, every operation one WGSL defines for every value, and the table `T` read at any index.
+pub fn int_program(c: &mut Choices) -> String {
+    let mut table = Vec::new();
+    for _ in 0..8 {
+        table.push(INT_LITERALS[c.draw(INT_LITERALS.len() as u32) as usize].to_string());
+    }
+    let body = int_expr(c, 4);
+    format!(
+        "const T: [u32; 8] = [{}]\n\nfn g(w: u32, i: u32, s: u32) -> u32 {{\n    {body}\n}}\n",
+        table.join(", ")
+    )
+}
+
+fn int_expr(c: &mut Choices, depth: u32) -> String {
+    if depth == 0 || c.draw(4) == 0 {
+        return match c.draw(6) {
+            0 => "w".into(),
+            1 => "i".into(),
+            2 => "s".into(),
+            3 => format!("T[{}]", int_expr(c, 0)),
+            // As a `u32`: a literal given to `i32(...)` would be typed as an `i32`.
+            _ => format!("u32({})", INT_LITERALS[c.draw(INT_LITERALS.len() as u32) as usize]),
+        };
+    }
+    let (a, b) = (int_expr(c, depth - 1), int_expr(c, depth - 1));
+    let ops = ["+", "-", "*", "/", "%", "&", "|", "^", "<<", ">>"];
+    match c.draw(14) {
+        k @ 0..10 => format!("({a} {} {b})", ops[k as usize]),
+        10 => {
+            let (x, y) = (int_expr(c, depth - 1), int_expr(c, depth - 1));
+            format!("(if {a} < {b} {{ {x} }} else {{ {y} }})")
+        }
+        11 => format!("(if {a} == {b} {{ 1 }} else {{ 0 }})"),
+        12 => {
+            // Signed arithmetic, through conversions: `MIN / -1` among it.
+            let op = ["+", "-", "*", "/", "%", ">>"][c.draw(6) as usize];
+            if op == ">>" {
+                format!("u32(i32({a}) >> {b})")
+            } else {
+                format!("u32(i32({a}) {op} i32({b}))")
+            }
+        }
+        _ => format!("T[{a}]"),
+    }
+}
+
+/// The integer programs' harness: `g` as a `@deterministic` kernel over 1,024 words (with the
+/// edges among them), run on the GPU and on the CPU (`k.run`), and how many places agree
+/// printed: `exact agree <n> of 1024`, then the first place that doesn't.
+pub const INT_HARNESS: &str = "
+// ---- the harness (compiler/tests/src/typed.rs) -------------------------------------------------
+use std::gpu::{GlobalId, GpuBuffer, Slots, buffer, buffer_of, dispatch, read}
+use std::io::{Pending, print}
+
+const N: u32 = 1024
+
+struct Salt: Copy + GpuData {
+    salt: u32,
+}
+
+@deterministic
+@compute(64)
+fn k(words: [u32], salt: Salt, out: mut Slots<u32>, id: GlobalId) {
+    out[id] = g(words[id.x], id.x, salt.salt)
+}
+
+pub struct State {
+    frame: u32,
+    words: Vec<u32>,
+    out: GpuBuffer<u32>,
+    pending: Vec<Pending<u32>>,
+    done: bool,
+}
+
+pub fn init() -> State {
+    var words = Vec::new()
+    var h: u32 = 99
+    let edges = [0, 1, 31, 32, 2147483647, 2147483648, 4294967295]
+    for i in 0..N {
+        h = h.wrapping_mul(1664525).wrapping_add(1013904223)
+        words.push(if i < 7 { edges[i] } else { h ^ (h >> 11) })
+    }
+    State { frame: 0, words, out: buffer(N), pending: Vec::new(), done: false }
+}
+
+pub fn frame(s: mut State, time: f32, width: u32, height: u32) {
+    if s.frame == 0 {
+        let words = buffer_of(s.words)
+        dispatch(k.bind(words, Salt { salt: 12345 }, mut s.out), groups: N / 64)
+        s.pending.push(read(s.out.items()))
+    }
+    if !s.done && s.pending.len() == 1 {
+        if let Some(Ok(gpu)) = s.pending[0].poll() {
+            var cpu = Vec::new()
+            for _ in 0..N {
+                cpu.push(0)
+            }
+            k.run(s.words, Salt { salt: 12345 }, mut cpu)
+            var agree = 0
+            var first = N
+            for i in 0..N {
+                if gpu[i] == cpu[i] {
+                    agree += 1
+                } else if first == N {
+                    first = i
+                }
+            }
+            print(f\"exact agree {agree} of {N}\")
+            if first < N {
+                print(f\"exact first {first}: word {s.words[first]}, GPU {gpu[first]}, CPU {cpu[first]}\")
+            }
+            s.done = true
+        }
+    }
+    s.frame += 1
+}
+";
 
 /// The program `seed` makes, and its choices.
 pub fn generate(seed: u64, mode: Mode, feat: Features) -> (String, Vec<u32>) {

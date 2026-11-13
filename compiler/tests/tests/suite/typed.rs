@@ -29,7 +29,7 @@ fn over(oracle: Oracle, n: u64) -> Counts {
         oracles::check_seed(oracle, mode, oracle.features(), seed, &scratch, &out)
     };
     // The GPU's oracle runs one program at a time: each opens its own device.
-    let results = if matches!(oracle, Oracle::O6 | Oracle::O7) {
+    let results = if matches!(oracle, Oracle::O6 | Oracle::O7 | Oracle::O10) {
         runs.iter().map(each).collect()
     } else {
         wrela_tests::par_map(&runs, each)
@@ -145,4 +145,12 @@ fn o8_reverse_gradients_agree_with_forward_ones() {
 #[test]
 fn o9_the_error_walk_bounds_moved_values() {
     over(Oracle::O9, count(32));
+}
+
+/// O10 (stage K.3): an integer program as a `@deterministic` kernel gives the same bits on the
+/// GPU as its CPU form (`k.run`), at every one of 1,024 places.
+#[test]
+#[ignore = "needs a GPU"]
+fn o10_exact_kernels_agree_with_their_cpu_form() {
+    over(Oracle::O10, count(16));
 }

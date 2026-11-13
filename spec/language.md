@@ -1219,6 +1219,7 @@ GPU code follows WGSL's semantics, and its results are for presentation only: GP
 | Float → int | Truncates; out of range or NaN traps | WGSL-defined values |
 | Float `%` | `a - b * trunc(a / b)`, exact (C's `fmod`): `a`'s sign, smaller than `b` in magnitude; NaN if `a` is infinite or `b` is 0 | WGSL's `a - b * trunc(a / b)`, rounded at each step |
 | Int → int | Keeps the low bits (`u32(-1)` is 4294967295) | Keeps the low bits |
+| Out-of-bounds index in a `@deterministic` kernel | Its CPU form (`k.run`) reads the last element | Clamped to the last element (§18.14) |
 | Out-of-bounds index | Traps | WebGPU's robust access (a value from inside the buffer, or zero). A debug build checks each index. An index out of range sets a flag that the host reads after each frame, and the host stops with an error that names the pipeline. Not checked: vertex shaders (WebGPU forbids them to write storage), and a pipeline that already binds 8 storage buffers |
 | NaN | Canonical (`0x7fc00000`, `0x7ff8000000000000`) wherever its bits are observed, in all CPU code: bit casts (so `Serialize` too), uploads to the GPU (`write` and uniforms), and hashing. Nothing else shows a NaN's bits, its sign included. A debug build (`wrela build --debug`) traps where a float operation creates a NaN from operands that hold none. | WGSL |
 
@@ -1250,6 +1251,7 @@ Deterministic code gives the same results on every engine and every client; `@de
   - relaxed SIMD;
   - anything that depends on memory addresses;
   - recursion deeper than 256 calls (§8.4), because stack limits differ between engines.
+- **A kernel's work can reach it:** a `@deterministic` kernel's `k.run(input, params, mut out)` is ordinary CPU code, lowered from the kernel's own body, so the simulation and a server (which has no GPU) compute what the kernel computes, to the bit (§18.14).
 - **Checked through every call, instantiation included.** A call whose target only instantiation decides (a trait method of a generic parameter) is checked where the function is instantiated. Each body that its instance reaches is checked for `io`, `nondet` and `host`, with the call chain.
 - **A panic is a deterministic trap:** every client traps on the same tick.
 - **Parallelism is data-parallel only,** through std's combinators (`par_each_mut`, `par_map_reduce`).
@@ -2682,6 +2684,44 @@ A `@deterministic` kernel gives the same bits on every GPU and on the CPU. GPUs 
 
 - **Its shape:** `fn k(input: [A], params: P, out: mut Slots<B>, id: GlobalId)`: one buffer it reads, at most one `GpuData` value, the places it writes, each invocation its own, and its place.
 - **What it can't do,** in it or in any function it reaches: float arithmetic, a float comparison or builtin, a conversion between floats and integers (a float may be loaded, stored, selected and bit-cast: its bits are data); an atomic, workgroup memory, a subgroup operation, a barrier, a texture or a derivative. Each is E0713, naming what and where, when the kernel is built.
+- **An index past the end is clamped** to the last element, in the WGSL and on the CPU alike: every index into its buffer, an array or an array value whose range the compiler can't prove. (WebGPU's robust access would give any value from inside the buffer, or zero.)
+- **Its CPU form is `k.run(input, params, mut out)`,** with `out` a `Vec<B>`: the kernel's body run once for each of `out`'s places, its place `(i, 0, 0)`. It's made from the kernel's GPU module, so it runs the same code: integer `+ - *` wrap; a division or remainder by zero, or `MIN / -1`, gives WGSL's result (the dividend, and 0); a shift's amount is masked to the width. It's callable from `@deterministic` code, on any role.
+
+```wrela
+use std::gpu::{GlobalId, Slots}
+
+struct Grid: Copy + GpuData {
+    side: u32,
+}
+
+/// One step of Life on a torus: the same bits on every GPU and on the CPU.
+@deterministic
+@compute(64)
+fn life(cells: [u32], grid: Grid, out: mut Slots<u32>, id: GlobalId) {
+    let n = grid.side
+    let (x, y) = (id.x % n, id.x / n)
+    var alive = 0
+    for dy in 0..3 {
+        for dx in 0..3 {
+            if dx != 1 || dy != 1 {
+                alive += cells[(y + n + dy - 1) % n * n + (x + n + dx - 1) % n]
+            }
+        }
+    }
+    out[id] = if alive == 3 || (alive == 2 && cells[id.x] == 1) { 1 } else { 0 }
+}
+
+/// The step on the CPU, in a tick or on a server.
+@deterministic
+fn step(cells: [u32], side: u32) -> Vec<u32> {
+    var next = Vec::new()
+    for _ in 0..side * side {
+        next.push(0)
+    }
+    life.run(cells, Grid { side }, mut next)
+    next
+}
+```
 
 ## 19. Rooms
 
