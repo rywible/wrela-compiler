@@ -3,6 +3,56 @@
 Each release's changes a program or a tool can see. The pull request of each release holds the
 detail; `docs/release.md` says how a release is cut.
 
+## 0.34.0
+
+- **`wrela pixel <package> --frame <n> --at <x>,<y>`** says why a pixel has its colour (language.md
+  §23.9): every draw of the frame that changed it, the draw that decided it, and its fragment
+  shader run again for that pixel in an interpreter of the GPU code the build wrote, with each
+  line's values and the first value that wasn't finite. `--kernel <label> --id <i>` does the
+  same for one invocation of a kernel.
+- **`wrela inspect <package> <module>::<fn>`** reads what a surface is made of (§23.10): its
+  pieces, certified by intervals (`floating`, `neck`, `speck`), the parts that decide it nowhere
+  (`dead-part`), parts thinner than a size (`thin`), the literals that move it nowhere
+  (`dead-literal`, with `--lift`), and pictures from three sides with no GPU (`--views`).
+- **`wrela sliders <package> <module>::<fn> --free ...`** finds the independent ways a surface's
+  freed literals move it, each named by what it moves and the literals that make it, lists dead
+  and redundant literals, and moves along one (`--move`, `--write`, `--sheet`) (§23.10).
+- **`wrela fuzz <package>`** looks for the input that traps a program's ticks (or, with
+  `--room`, its server's rooms), guided by the code each input runs; each finding is made as
+  small as it can be and saved as a tick log and a script, and `--replay` runs saved ones
+  (§16.2).
+- **Reverse-mode derivatives** (§14.1): `std::derive::reverse(f, at)` gives a function of an
+  array's value and its derivative by each number from one recorded evaluation (`Trace`), and
+  `std::lift::reverse` and `reverse_sum` do the same for lifted literals, however many. `wrela
+  solve` takes its gradient by reverse mode from 65 free literals, where it is faster.
+- **Outlines are measures** (§20, §23.6): `std::field::coverage`, `outline_miss` and
+  `image_miss` say how far a silhouette from the side, the front or the top (`View`) is from a
+  blueprint's outline or an image, and a spec can hold a subject to it.
+- **`wrela solve` lifts only the files `--free` names** (§23.6): a literal of another file, a
+  blueprint's outline or a spec's target, is a reference the solve neither moves nor derives
+  through.
+- **`wrela solve` holds each literal's step to its own size** and searches along what is left
+  by Armijo's rule; a solve the program traps under says the literals it was trying; a spec
+  whose every check already holds is left as it is (`"held_before": true`); and rounding gives
+  a literal no decimals that buy nothing and never leaves the function larger than the solve
+  found it (§23.6).
+- **`@deterministic` kernels** (§18.14): a `@compute` kernel marked `@deterministic` gives the
+  same bits on every GPU and on the CPU. It computes with integers and moves floats only as
+  bits (anything else is E0713), its indexes past the end are clamped, and `k.run(input,
+  params, mut out)` is its CPU form, made from the same code.
+- **`std::collections::Columns<T>`** keeps each field of `T` in its own array (§6.10): `c[i].x`
+  reads and writes one field, `c[i]` read whole gathers a copy, and a loop over one field reads
+  only that field. Lending `c[i]` to a `mut` parameter, binding it `mut` or assigning it whole is
+  E0339.
+- **More loops run four at a time** (§11.2): loops over `Vec`s, with their bounds checks part of
+  the four-wide test, and loops whose bodies branch on comparisons of floats. A check of a
+  loop's counter against its own bound, or the length of the `Vec` it walks, is gone.
+- **`wrela build --report layout`** lists, for each loop over a container or array of structs,
+  the bytes of the struct it reads and writes, the most skipped first (§6.10).
+- **GPU fixes the compiler's own tests found** (§11.3): `tanh` no longer gives NaN for large
+  arguments, `atan2(0, 0)` is 0 on every GPU as on the CPU, and an unsigned division whose
+  dividend is a constant near 2^32 is right on Apple's GPUs (Metal divided it wrongly).
+
 ## 0.33.0
 
 - **`wrela solve --spec --write` writes only a spec that holds** (language.md §23.6). Where a
