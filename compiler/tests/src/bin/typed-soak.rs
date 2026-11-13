@@ -112,6 +112,7 @@ fn main() {
                     f.push(why);
                     if only.is_none() && f.len() >= stop_after {
                         stopped.store(true, std::sync::atomic::Ordering::Relaxed);
+                        oracles::ENOUGH.store(true, std::sync::atomic::Ordering::Relaxed);
                         eprintln!("stopping: {} failures", f.len());
                     }
                 }
@@ -137,7 +138,7 @@ fn main() {
     let mut refusals = oracles::REFUSALS.lock().unwrap().clone();
     if !refusals.is_empty() {
         refusals.sort_by_key(|r| std::cmp::Reverse(r.1));
-        println!("refused, by reason:");
+        println!("set apart, by reason:");
         for (why, n) in refusals.iter().take(10) {
             println!("  {n:>6}  {why}");
         }

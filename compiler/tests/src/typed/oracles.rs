@@ -82,12 +82,21 @@ impl Oracle {
     }
 }
 
+/// Set by the soak once it has as many failures as it stops after: a failure found after that
+/// isn't shrunk (`check_seed_shrinking`), since the soak has done its job.
+pub static ENOUGH: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
 /// O9's refusals over a run, by reason (the walk's message, its numbers taken out): what the
 /// walk can't prove, which the soak reports.
 pub static REFUSALS: std::sync::Mutex<Vec<(String, u64)>> = std::sync::Mutex::new(Vec::new());
 
 fn refused(why: &str) {
-    let key = class(why);
+    set_apart(&class(why));
+}
+
+/// Counts a program (or a point) set apart for `why`, as written.
+fn set_apart(why: &str) {
+    let key = why.to_string();
     let mut r = REFUSALS.lock().expect("the refusals' lock");
     match r.iter_mut().find(|(k, _)| *k == key) {
         Some((_, n)) => *n += 1,
@@ -104,6 +113,9 @@ std::thread_local! {
 /// a limit of tapes, not a bug.
 pub const TAPE_ALLOWED: &[&str] =
     &["a tape can't hold a power whose exponent depends on the point"];
+
+/// The panic of a tape past its room (`std::stage`): a limit of tapes O4 lets pass.
+pub const TAPE_FULL: &str = "past its room for 4096 and 2048";
 
 /// What a run of an oracle over one program found: how many points it checked, and how many of
 /// them counted (O3: where the function is smooth enough to compare).
@@ -238,6 +250,7 @@ pub fn run(oracle: Oracle, src: &str, seed: u64, dir: &Path) -> Result<Counts, F
             let build = match build(dir, &(src.to_string() + TAPE_HARNESS), false) {
                 Err(f) if f.what.contains("E0709") => {
                     if TAPE_ALLOWED.iter().any(|a| f.what.contains(a)) {
+                        set_apart("O4: a tape can't hold a power whose exponent depends on the point");
                         return Ok(Counts::default());
                     }
                     return Err(f);
@@ -248,10 +261,33 @@ pub fn run(oracle: Oracle, src: &str, seed: u64, dir: &Path) -> Result<Counts, F
             for _ in 0..16 {
                 let p = point(&mut rng);
                 let v = value(&mut host, p)?;
-                let t = floats(&mut host, "taped", &args(p))?[0];
-                if !within((t - v).abs(), 3e-6 * v.abs().max(1.0)) {
-                    return fail(format!("at {p:?}: the tape gives {t:e}, f gives {v:e}"));
+                let t = match floats(&mut host, "taped", &args(p)) {
+                    // A tape has room for 4,096 operations and 2,048 constants (§14.4): a field
+                    // that needs more is a limit of tapes, which the panic says, not a bug.
+                    Err(f) if f.what.contains(TAPE_FULL) => {
+                        set_apart("O4: a tape past its room (4,096 operations, 2,048 constants)");
+                        return Ok(Counts::default());
+                    }
+                    other => other?[0],
+                };
+                let near = 3e-6 * v.abs().max(1.0);
+                if within((t - v).abs(), near) {
+                    continue;
                 }
+                // The tape rounds each operation as compiled code does, in another order: where
+                // that order matters (a `floor` of a value on an integer, a steep `pow`), what
+                // rounding inside `f` can do at the point is the point interval's width (§14.2,
+                // as O6 allows the GPU). Past it, the tape is wrong.
+                let r = floats(&mut host, "range", &ranged(p, p))?;
+                let room = 2.0 * f64::from(r[1] - r[0]);
+                if !within(f64::from((t - v).abs()), f64::from(near) + room) {
+                    return fail(format!(
+                        "at {p:?}: the tape gives {t:e}, f gives {v:e}, apart by more than the \
+                         point interval's width ({:e})",
+                        r[1] - r[0]
+                    ));
+                }
+                set_apart("O4 (a point counted, agreeing): apart by more than 3e-6, within the point interval's width");
             }
             Ok(Counts { points: 16, counted: 16 })
         }
@@ -728,7 +764,7 @@ pub fn check_seed_shrinking(
     };
     let kind = class(&first.what);
     let head = first.what.lines().next().unwrap_or("").to_string();
-    if !shrink {
+    if !shrink || ENOUGH.load(std::sync::atomic::Ordering::Relaxed) {
         let _ = std::fs::remove_dir_all(&dir);
         return Err(format!("{} fails on {mode:?} seed {seed} [{kind}]: {head}", oracle.name()));
     }
