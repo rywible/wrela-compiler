@@ -29,10 +29,11 @@ pub enum Oracle {
     O6,
     O7,
     O8,
+    O9,
 }
 
 impl Oracle {
-    pub const ALL: [Oracle; 8] = [
+    pub const ALL: [Oracle; 9] = [
         Oracle::O1,
         Oracle::O2,
         Oracle::O3,
@@ -41,6 +42,7 @@ impl Oracle {
         Oracle::O6,
         Oracle::O7,
         Oracle::O8,
+        Oracle::O9,
     ];
 
     pub fn parse(s: &str) -> Option<Oracle> {
@@ -57,6 +59,7 @@ impl Oracle {
             Oracle::O6 => "O6",
             Oracle::O7 => "O7",
             Oracle::O8 => "O8",
+            Oracle::O9 => "O9",
         }
     }
 
@@ -261,6 +264,10 @@ pub fn run(oracle: Oracle, src: &str, seed: u64, dir: &Path) -> Result<Counts, F
         }
         Oracle::O6 => o6(&build(dir, src, false)?, seed),
         Oracle::O7 => o7(dir, &build(dir, src, false)?, seed),
+        Oracle::O9 => {
+            build(dir, src, false)?;
+            o9(dir, seed)
+        }
         Oracle::O8 => {
             let mut host = start(&build(dir, &(src.to_string() + REVERSE_HARNESS), false)?)?;
             let mut worst = 0.0f64;
@@ -430,7 +437,9 @@ fn o6(build: &Path, seed: u64) -> Result<Counts, Failure> {
 fn o7(dir: &Path, build: &Path, seed: u64) -> Result<Counts, Failure> {
     use wrela_ir::interp::{Interp, V, concrete};
     const N: u32 = 64;
-    let modules = wrela_driver::gpu_modules(dir, wrela_driver::BuildKind::default())
+    let modules = // A test's build, as the other oracles' are: a shipped build's E0712 isn't this oracle's
+    // concern.
+    wrela_driver::gpu_modules(dir, wrela_driver::BuildKind { testing: true, ..Default::default() })
         .map_err(|out| Failure {
             what: wrela_diag::render::render_all(&out.sources, &out.diagnostics),
         })?
@@ -488,6 +497,149 @@ fn o7(dir: &Path, build: &Path, seed: u64) -> Result<Counts, Failure> {
     Ok(Counts { points: N, counted: N })
 }
 
+/// O9: the error walk (`wrela_ir::interp::error`) is sound. The kernel that writes `f(p)`
+/// (`values_k`, `f` inlined into it) is taken from the build's GPU module; up to three of its
+/// float values, at random, are sites, each with a random bound `δ`; the walk's bound `E` on
+/// `f`'s change over a small box of points; then, at 256 points of the box, the kernel
+/// interpreted with each site's value moved by a random amount within its `δ` writes an `f`
+/// that differs from the unmoved run's by at most `E`, and the two runs' f32 rounding (16 ulps
+/// of the larger of 1 and the value: the walk's rules are over the reals). A program the walk
+/// refuses (no proof) counts its points as not counted.
+fn o9(dir: &Path, seed: u64) -> Result<Counts, Failure> {
+    use std::collections::HashMap;
+    use wrela_ir::interp::error::{A, R, walk_kernel};
+    use wrela_ir::interp::{Interp, Observer, V, concrete};
+    use wrela_ir::{Const, FuncId, TypeId, ValueId};
+    const N: u32 = 256;
+    let modules = // A test's build, as the other oracles' are: a shipped build's E0712 isn't this oracle's
+    // concern.
+    wrela_driver::gpu_modules(dir, wrela_driver::BuildKind { testing: true, ..Default::default() })
+        .map_err(|out| Failure {
+            what: wrela_diag::render::render_all(&out.sources, &out.diagnostics),
+        })?
+        .gpu;
+    let Some(kernel) = modules.iter().find(|g| g.entries.iter().any(|e| e == "values_k")) else {
+        return fail("no pipeline runs `values_k`");
+    };
+    let m = &kernel.module;
+    let Some(input) =
+        m.resources.iter().position(|r| r.kind == wrela_ir::ResourceKind::StorageRead)
+    else {
+        return fail("`values_k` reads no buffer");
+    };
+    let binding = m.resources[input].binding;
+    let entry = m.entry_points[0].function;
+    let mut rng = wrela_grammar::rng::Rng::new(seed ^ 0x09);
+    let c = point(&mut rng).map(f64::from);
+    let half = 0.05 + 0.2 * rng.unit();
+    let mut boxes =
+        c.iter().map(|&x| A::F(R { lo: x - half, hi: x + half, err: 0.0 })).collect::<Vec<_>>();
+    boxes.push(A::F(R::exact(0.0)));
+    let given = |input: usize| {
+        let mut r = HashMap::new();
+        r.insert(wrela_ir::ResourceId(input as u32), A::P(boxes.clone()));
+        r
+    };
+    let none = HashMap::new();
+    let debug = std::env::var_os("O9_DEBUG").is_some();
+    let (_, seen) = match walk_kernel(m, entry, given(input), &none) {
+        Ok(w) => w,
+        Err(e) => {
+            if debug {
+                eprintln!("refused: {e}");
+            }
+            return Ok(Counts { points: N, counted: 0 });
+        }
+    };
+    let mut floats: Vec<(FuncId, ValueId)> =
+        seen.values.iter().filter(|(_, (a, _))| matches!(a, A::F(_))).map(|(k, _)| *k).collect();
+    floats.sort_by_key(|(f, v)| (f.0, v.0));
+    let mut sites = HashMap::new();
+    for _ in 0..3 {
+        if floats.is_empty() {
+            break;
+        }
+        let k = floats.swap_remove(rng.below(floats.len()));
+        let size = match &seen.values[&k].0 {
+            A::F(r) => r.size(),
+            _ => 0.0,
+        };
+        sites.insert(k, (1e-3 + 1e-2 * rng.unit()) * (1.0 + size.min(1e3)));
+    }
+    let bound = match walk_kernel(m, entry, given(input), &sites) {
+        Ok((Some(A::P(w)), _)) if w.len() == 4 => match &w[3] {
+            A::F(r) => r.err,
+            _ => return fail("the kernel wrote a value that isn't a float"),
+        },
+        Ok(other) => return fail(format!("the walk wrote {:?}", other.0)),
+        Err(e) => {
+            if debug {
+                eprintln!("refused with sites: {e}");
+            }
+            return Ok(Counts { points: N, counted: 0 });
+        }
+    };
+    /// Moves each site's value by a random amount within its bound.
+    struct Move<'s> {
+        sites: &'s HashMap<(FuncId, ValueId), f64>,
+        rng: wrela_grammar::rng::Rng,
+    }
+    impl Observer for Move<'_> {
+        fn value(&mut self, f: FuncId, v: ValueId, _ty: TypeId, val: &mut V) {
+            if let Some(&d) = self.sites.get(&(f, v)) {
+                let u = (2.0 * self.rng.unit() - 1.0) * d;
+                nudge(val, u);
+            }
+        }
+    }
+    fn nudge(v: &mut V, u: f64) {
+        match v {
+            V::S(Const::F32(x)) => *x = (f64::from(*x) + u) as f32,
+            V::P(ps) => ps.iter_mut().for_each(|p| nudge(p, u)),
+            _ => {}
+        }
+    }
+    /// The kernel interpreted at point `p` (invocation 0): the `f` it writes.
+    fn run<O: Observer>(m: &wrela_ir::Module, binding: u32, p: &[f32], obs: &mut O) -> Option<f32> {
+        let mut given = concrete::Given::default();
+        let bytes: Vec<u8> = [p[0], p[1], p[2], 0.0].iter().flat_map(|x| x.to_le_bytes()).collect();
+        given.bytes.insert(binding, bytes);
+        given.builtins = vec![
+            (wrela_ir::BuiltinInput::GlobalInvocationId, concrete::uvec3(0, 0, 0)),
+            (wrela_ir::BuiltinInput::NumWorkgroups, concrete::uvec3(1, 1, 1)),
+        ];
+        let out = Interp::new(m, &mut given, obs).run_entry(0).ok()?;
+        let w = out.writes.iter().find(|w| w.index == 0)?;
+        match &w.value {
+            V::P(c) => concrete::floats_of(&c[3]).first().copied(),
+            _ => None,
+        }
+    }
+    let mut mover = Move { sites: &sites, rng: wrela_grammar::rng::Rng::new(seed ^ 0x99) };
+    let mut counted = 0;
+    for _ in 0..N {
+        let p: Vec<f32> = c.iter().map(|&x| (x + half * (2.0 * rng.unit() - 1.0)) as f32).collect();
+        let (Some(a), Some(b)) = (run(m, binding, &p, &mut ()), run(m, binding, &p, &mut mover))
+        else {
+            continue;
+        };
+        if !(a.is_finite() && b.is_finite()) {
+            continue;
+        }
+        counted += 1;
+        let slack = 16.0 * f64::from(f32::EPSILON) * f64::from(a.abs().max(b.abs()).max(1.0));
+        let moved = (f64::from(b) - f64::from(a)).abs();
+        if !within(moved, bound + slack) {
+            return fail(format!(
+                "at {p:?}: moving {} sites ({sites:?}) moved f by {moved:e}, past the walk's \
+                 bound {bound:e}",
+                sites.len()
+            ));
+        }
+    }
+    Ok(Counts { points: N, counted })
+}
+
 /// The seed of program `i` of a run from `base`: what the suite and the soak both use.
 pub fn program_seed(base: u64, i: u64) -> u64 {
     wrela_grammar::rng::mix(base, i)
@@ -496,6 +648,32 @@ pub fn program_seed(base: u64, i: u64) -> u64 {
 /// Runs `oracle` on program `seed` (`mode`), and on a failure shrinks it and writes the shrunk
 /// program to `out/<oracle>-<seed>.wrela`: the counts, or a message that names the seed, the
 /// file and what failed.
+/// What kind of failure `why` is: a diagnostic's code (`E0712`), or the oracle's own message
+/// with its numbers, points and value lists taken out. Shrinking keeps a change only while the
+/// failure stays of the same kind: a shrunk program that fails some other way is a repro of
+/// another failure, worse than none.
+pub fn class(why: &str) -> String {
+    if let Some(i) = why.find("error[")
+        && let Some(j) = why[i..].find(']')
+    {
+        return why[i..i + j + 1].to_string();
+    }
+    let mut out = String::new();
+    let mut depth = 0;
+    for c in why.chars() {
+        match c {
+            '[' | '(' | '{' => depth += 1,
+            ']' | ')' | '}' => depth -= 1,
+            _ if depth > 0 => {}
+            c if c.is_ascii_digit() || c == '.' || c == '-' || c == '+' => {}
+            c => out.push(c),
+        }
+    }
+    let line = out.lines().next().unwrap_or("").to_string();
+    // "e" left of a number in scientific notation: gone with the digits around it.
+    line.split_whitespace().filter(|w| *w != "e").collect::<Vec<_>>().join(" ")
+}
+
 pub fn check_seed(
     oracle: Oracle,
     mode: Mode,
@@ -503,6 +681,20 @@ pub fn check_seed(
     seed: u64,
     scratch: &Path,
     out: &Path,
+) -> Result<Counts, String> {
+    check_seed_shrinking(oracle, mode, feat, seed, scratch, out, true)
+}
+
+/// [`check_seed`], shrinking a failure only if `shrink`; unshrunk, the failure is reported as
+/// it is and no file is written.
+pub fn check_seed_shrinking(
+    oracle: Oracle,
+    mode: Mode,
+    feat: Features,
+    seed: u64,
+    scratch: &Path,
+    out: &Path,
+    shrink: bool,
 ) -> Result<Counts, String> {
     let (_, data) = super::generate(seed, mode, feat);
     let dir = scratch.join(format!("{}-{mode:?}-{seed:x}", oracle.name()));
@@ -513,7 +705,16 @@ pub fn check_seed(
         }
         Err(f) => f,
     };
-    let fails = |d: &[u32]| run(oracle, &text(d, mode, feat), seed, &dir).is_err();
+    let kind = class(&first.what);
+    let head = first.what.lines().next().unwrap_or("").to_string();
+    if !shrink {
+        let _ = std::fs::remove_dir_all(&dir);
+        return Err(format!("{} fails on {mode:?} seed {seed} [{kind}]: {head}", oracle.name()));
+    }
+    eprintln!("{} fails on {mode:?} seed {seed} [{kind}] before shrinking: {head}", oracle.name());
+    let fails = |d: &[u32]| {
+        run(oracle, &text(d, mode, feat), seed, &dir).err().is_some_and(|f| class(&f.what) == kind)
+    };
     let small = super::shrink(&data, 2000, fails);
     let why = run(oracle, &text(&small, mode, feat), seed, &dir).err().unwrap_or(first);
     let _ = std::fs::remove_dir_all(&dir);

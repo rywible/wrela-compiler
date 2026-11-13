@@ -7,7 +7,10 @@
 //! Each failure is shrunk and written to `target/typed/<oracle>-<seed>.wrela`; the run prints
 //! each and a summary, and exits 1 if there was one. `--wild` runs O1 over wild programs only
 //! (O1 otherwise sees both modes). `typed-soak --file <path>` runs one program file (its
-//! header names its oracle and seed).
+//! header names its oracle and seed). `--only <seed>,<seed>...` runs those programs' seeds
+//! (as the files' headers give them) instead of a count. `--no-shrink` reports each failure as it
+//! is; else each is shrunk, keeping its kind (`oracles::class`). `--stop-after N` (3 unless said)
+//! stops the run after N failures: a soak with failures has done its job. Progress every 25.
 
 use std::sync::Mutex;
 use wrela_tests::typed::Mode;
@@ -30,9 +33,16 @@ fn main() {
         }
         return;
     }
-    let usage = "usage: typed-soak <O1..O6> <count> [--seed N] [--threads N] [--wild]";
+    let usage = "usage: typed-soak <O1..O9> (<count> | --only <seed>,...) [--seed N] [--threads N] [--wild] [--no-shrink] [--stop-after N]";
+    let only: Option<Vec<u64>> = args
+        .iter()
+        .position(|a| a == "--only")
+        .and_then(|i| args.get(i + 1))
+        .map(|v| v.split(',').filter_map(|s| s.trim().parse().ok()).collect());
+    let count_arg =
+        only.as_ref().map(|o| o.len() as u64).or(args.get(1).and_then(|a| a.parse().ok()));
     let (Some(oracle), Some(count)): (Option<Oracle>, Option<u64>) =
-        (args.first().and_then(|a| Oracle::parse(a)), args.get(1).and_then(|a| a.parse().ok()))
+        (args.first().and_then(|a| Oracle::parse(a)), count_arg)
     else {
         eprintln!("{usage}");
         std::process::exit(2);
@@ -55,10 +65,15 @@ fn main() {
     let done = std::sync::atomic::AtomicU64::new(0);
     let (points, counted) =
         (std::sync::atomic::AtomicU64::new(0), std::sync::atomic::AtomicU64::new(0));
+    // Programs any of whose points counted: the rest (O9: refused by the walk) are apart.
+    let proven = std::sync::atomic::AtomicU64::new(0);
     let started = std::time::Instant::now();
     // The GPU's oracle opens a device for each program: one at a time.
     let threads = if matches!(oracle, Oracle::O6 | Oracle::O7) { 1 } else { threads };
     let total = count * modes.len() as u64;
+    let shrink = !args.iter().any(|a| a == "--no-shrink");
+    let stop_after = flag("--stop-after").unwrap_or(3) as usize;
+    let stopped = std::sync::atomic::AtomicBool::new(false);
     wrela_grammar::rng::par_seeded(
         total,
         base,
@@ -66,32 +81,57 @@ fn main() {
         64 << 20,
         || (),
         |_, i, _| {
+            if stopped.load(std::sync::atomic::Ordering::Relaxed) {
+                return;
+            }
             let mode = modes[(i / count) as usize];
-            let seed = oracles::program_seed(base, i % count);
-            match oracles::check_seed(oracle, mode, oracle.features(), seed, &scratch, &out) {
+            let seed = match &only {
+                Some(seeds) => seeds[(i % count) as usize],
+                None => oracles::program_seed(base, i % count),
+            };
+            let checked = oracles::check_seed_shrinking(
+                oracle,
+                mode,
+                oracle.features(),
+                seed,
+                &scratch,
+                &out,
+                shrink,
+            );
+            match checked {
                 Ok(c) => {
                     points.fetch_add(u64::from(c.points), std::sync::atomic::Ordering::Relaxed);
                     counted.fetch_add(u64::from(c.counted), std::sync::atomic::Ordering::Relaxed);
+                    if c.counted > 0 {
+                        proven.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    }
                 }
                 Err(why) => {
                     eprintln!("{why}");
-                    failures.lock().unwrap().push(why);
+                    let mut f = failures.lock().unwrap();
+                    f.push(why);
+                    if only.is_none() && f.len() >= stop_after {
+                        stopped.store(true, std::sync::atomic::Ordering::Relaxed);
+                        eprintln!("stopping: {} failures", f.len());
+                    }
                 }
             }
             let n = done.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
-            if n.is_multiple_of(250) {
+            if n.is_multiple_of(25) {
                 eprintln!("{n} of {total} ({:.0} s)", started.elapsed().as_secs_f64());
             }
         },
     );
     let failures = failures.into_inner().unwrap();
     println!(
-        "{}: {total} programs from seed {base:#x} ({:?}), {} failures, {} points, {} counted, {:.0} s",
+        "{}: {} of {total} programs run from seed {base:#x} ({:?}), {} failures, {} points, {} counted (in {} programs), {:.0} s",
         oracle.name(),
+        done.load(std::sync::atomic::Ordering::Relaxed),
         modes,
         failures.len(),
         points.into_inner(),
         counted.into_inner(),
+        proven.into_inner(),
         started.elapsed().as_secs_f64()
     );
     if !failures.is_empty() {

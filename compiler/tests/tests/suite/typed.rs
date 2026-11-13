@@ -139,3 +139,10 @@ fn o7_the_interpreter_agrees_with_the_gpu() {
 fn o8_reverse_gradients_agree_with_forward_ones() {
     over(Oracle::O8, count(32));
 }
+
+/// O9: the error walk (`wrela_ir::interp::error`) is sound: moving up to three values of `f`
+/// within their bounds moves it by no more than the walk's bound, at 256 points of a box.
+#[test]
+fn o9_the_error_walk_bounds_moved_values() {
+    over(Oracle::O9, count(32));
+}

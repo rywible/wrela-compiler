@@ -39,8 +39,8 @@
 
 use crate::const_fold::K;
 use crate::{
-    Arg, BinOp, Builtin, Const, Expr, FuncId, Module, Place, PlaceRoot, Proj, Scalar, Stmt,
-    TypeDef, TypeId, UnOp, ValueId,
+    Arg, BinOp, Builtin, Const, Expr, FuncId, Module, Place, PlaceRoot, Proj, ResourceId, Scalar,
+    Stmt, TypeDef, TypeId, UnOp, ValueId,
 };
 use std::collections::HashMap;
 use wrela_diag::Span;
@@ -128,6 +128,12 @@ pub struct Walk<'a> {
     /// Each site's own bound `δ`, by function and value.
     pub sites: &'a HashMap<(FuncId, ValueId), f64>,
     pub seen: Seen,
+    /// Each read buffer's every element, as a box: a kernel's inputs.
+    pub resources: HashMap<ResourceId, A>,
+    /// What the run wrote to buffers, joined: a kernel's result.
+    pub written: Option<A>,
+    /// Each private variable's value (`var<private>`: the kernel fills it in).
+    private: HashMap<ResourceId, A>,
     frames: Vec<Frame>,
     at: Option<Span>,
 }
@@ -151,7 +157,16 @@ const MOST_PASSES: u32 = 1 << 16;
 
 impl<'a> Walk<'a> {
     pub fn new(m: &'a Module, sites: &'a HashMap<(FuncId, ValueId), f64>) -> Walk<'a> {
-        Walk { m, sites, seen: Seen::default(), frames: Vec::new(), at: None }
+        Walk {
+            m,
+            sites,
+            seen: Seen::default(),
+            resources: HashMap::new(),
+            written: None,
+            private: HashMap::new(),
+            frames: Vec::new(),
+            at: None,
+        }
     }
 
     /// Walks function `f` over `args` (each a box, as ranges with errors): its result's range
@@ -211,7 +226,15 @@ impl<'a> Walk<'a> {
         match s {
             Stmt::At(span) => self.at = Some(*span),
             Stmt::Let(v, e) => {
-                let mut x = self.expr(e)?;
+                let mut x = match e {
+                    // A builtin input (an invocation's id): exact, its zero value, since a
+                    // kernel's result here doesn't depend on which invocation it is.
+                    Expr::EntryInput(_) => {
+                        let f = self.frames.last().expect("a frame").func;
+                        Some(self.zero(self.m.functions[f.index()].value_ty(*v))?)
+                    }
+                    e => self.expr(e)?,
+                };
                 let f = self.frames.last().expect("a frame").func;
                 if let Some(a) = &mut x {
                     if let Some(&d) = self.sites.get(&(f, *v)) {
@@ -270,12 +293,21 @@ impl<'a> Walk<'a> {
             let f = self.frames.last().expect("a frame");
             (f.vals.clone(), f.locals.clone())
         };
+        let private = self.private.clone();
         let a = self.block(then)?;
         let (vals_a, locals_a) = {
             let f = self.frame();
             (std::mem::replace(&mut f.vals, vals), std::mem::replace(&mut f.locals, locals))
         };
+        let private_a = std::mem::replace(&mut self.private, private);
         let b = self.block(else_)?;
+        for (k, v) in private_a {
+            let joined = match self.private.get(&k) {
+                Some(w) => join(w, &v),
+                None => v,
+            };
+            self.private.insert(k, joined);
+        }
         let (Flow::Normal, Flow::Normal) = (&a, &b) else {
             return self.refuse("a branch the ranges don't settle that leaves its block");
         };
@@ -294,6 +326,28 @@ impl<'a> Walk<'a> {
 
     fn store(&mut self, p: &Place, x: A) -> Result<()> {
         let path = self.path(&p.path)?;
+        if let PlaceRoot::Resource(r) = p.root
+            && self.m.resources[r.index()].kind == crate::ResourceKind::Private
+        {
+            let ty = self.m.resources[r.index()].ty;
+            if !self.private.contains_key(&r) {
+                let z = self.zero(ty)?;
+                self.private.insert(r, z);
+            }
+            let target = self.private.get_mut(&r).expect("made");
+            if !put(target, &path, x) {
+                return self.refuse("a store through a projection");
+            }
+            return Ok(());
+        }
+        if let PlaceRoot::Resource(_) = p.root {
+            // A buffer's element, or a part of one: the kernel's result.
+            self.written = Some(match &self.written {
+                Some(w) => join(w, &x),
+                None => x,
+            });
+            return Ok(());
+        }
         let target = match &p.root {
             PlaceRoot::Local(l) => &mut self.frame().locals[l.index()],
             _ => return self.refuse("a store outside the function's locals"),
@@ -321,6 +375,28 @@ impl<'a> Walk<'a> {
     }
 
     fn load(&mut self, p: &Place) -> Result<A> {
+        // An exact index over a range reads each element it reaches, joined.
+        if let Some(k) = p.path.iter().position(
+            |q| matches!(q, Proj::Index(v) if matches!(self.val(*v), Ok(A::I(lo, hi)) if lo != hi)),
+        ) {
+            let Proj::Index(v) = p.path[k] else { unreachable!() };
+            let Ok(A::I(lo, hi)) = self.val(v) else { unreachable!() };
+            if lo < 0 || hi - lo > 4096 {
+                return self.refuse("an index over a range too wide to read");
+            }
+            let mut joined: Option<A> = None;
+            for i in lo..=hi {
+                let mut q = p.clone();
+                q.path[k] = Proj::Field(i as u32);
+                match self.load(&q) {
+                    Ok(x) => joined = Some(joined.map_or(x.clone(), |j| join(&j, &x))),
+                    // Past the array's end: an index the program clamps reaches no further.
+                    Err(_) if joined.is_some() => break,
+                    Err(e) => return Err(e),
+                }
+            }
+            return Ok(joined.expect("an element"));
+        }
         let path = self.path(&p.path)?;
         let mut v = match &p.root {
             PlaceRoot::Local(l) => self.frames.last().expect("a frame").locals[l.index()].clone(),
@@ -328,6 +404,28 @@ impl<'a> Walk<'a> {
             {
                 Some(a) => a.clone(),
                 None => return self.refuse("a parameter that isn't given"),
+            },
+            PlaceRoot::Resource(r)
+                if self.m.resources[r.index()].kind == crate::ResourceKind::Private =>
+            {
+                match self.private.get(r) {
+                    Some(a) => a.clone(),
+                    None => self.zero(self.m.resources[r.index()].ty)?,
+                }
+            }
+            PlaceRoot::Resource(r) => match self.resources.get(r) {
+                // Any element of a buffer: the first projection is its index.
+                Some(a) => {
+                    let mut v = a.clone();
+                    for k in path.into_iter().skip(1) {
+                        v = match v {
+                            A::P(mut ps) if k < ps.len() => ps.swap_remove(k),
+                            _ => return self.refuse("a projection out of a buffer's element"),
+                        };
+                    }
+                    return Ok(v);
+                }
+                None => return self.refuse("a read of a buffer the walk isn't given"),
             },
             _ => return self.refuse("a read of memory other than a local or a parameter"),
         };
@@ -827,7 +925,7 @@ fn builtin(b: Builtin, xs: &[A]) -> std::result::Result<A, String> {
         B::Pow => map_n(xs, &mut |r| {
             let (a, c) = (r[0], r[1]);
             if c.lo != c.hi || c.err != 0.0 {
-                return Err("a power whose exponent isn't a constant".into());
+                return general_pow(a, c);
             }
             let c = c.lo;
             let (wlo, whi) = (a.lo - a.err, a.hi + a.err);
@@ -854,6 +952,28 @@ fn builtin(b: Builtin, xs: &[A]) -> std::result::Result<A, String> {
             };
             Ok(out(lo, hi, c.abs() * sup * a.err))
         }),
+        B::Atan2 => map_n(xs, &mut |r| {
+            // atan2(y, x) moves by at most |Δ(y, x)| / r, r the least distance from the origin
+            // the moved point can have: its gradient is (x, -y) / r².
+            let (y, x) = (r[0], r[1]);
+            let near = (y.least().powi(2) + x.least().powi(2)).sqrt() - (y.err + x.err);
+            if !above(near, 0.0) {
+                return Err("an atan2 whose point, moved by its error, reaches the origin".into());
+            }
+            let range = if x.lo > 0.0 {
+                let ends = [y.lo.atan2(x.lo), y.lo.atan2(x.hi), y.hi.atan2(x.lo), y.hi.atan2(x.hi)];
+                (
+                    ends.iter().copied().fold(f64::INFINITY, f64::min),
+                    ends.iter().copied().fold(f64::NEG_INFINITY, f64::max),
+                )
+            } else {
+                (-std::f64::consts::PI, std::f64::consts::PI)
+            };
+            if !above(x.lo, x.err) && y.lo - y.err <= 0.0 && y.hi + y.err >= 0.0 {
+                return Err("an atan2 whose moved point could cross its cut".into());
+            }
+            Ok(out(range.0, range.1, (y.err + x.err) / near))
+        }),
         B::Abs => map_n(xs, &mut |r| {
             let x = r[0];
             let (lo, hi) = if x.lo >= 0.0 {
@@ -873,7 +993,8 @@ fn builtin(b: Builtin, xs: &[A]) -> std::result::Result<A, String> {
         }),
         B::Clamp => map_n(xs, &mut |r| {
             let (x, l, h) = (r[0], r[1], r[2]);
-            Ok(out(x.lo.max(l.lo).min(h.hi), x.hi.max(l.lo).min(h.hi), x.err.max(l.err).max(h.err)))
+            // min(max(x, l), h): increasing in each, so its ends are its operands' ends.
+            Ok(out(x.lo.max(l.lo).min(h.lo), x.hi.max(l.hi).min(h.hi), x.err.max(l.err).max(h.err)))
         }),
         B::Saturate => {
             map_n(xs, &mut |r| Ok(out(r[0].lo.clamp(0.0, 1.0), r[0].hi.clamp(0.0, 1.0), r[0].err)))
@@ -982,6 +1103,32 @@ fn builtin(b: Builtin, xs: &[A]) -> std::result::Result<A, String> {
     }
 }
 
+/// `a^c` where the exponent varies too: as `exp(c ln a)`, with `a` above 0. Its move is at most
+/// `sup |c a^(c-1)| err_a + sup |a^c ln a| err_c` over the ranges widened by their errors (the
+/// mean value theorem in each argument in turn).
+fn general_pow(a: R, c: R) -> std::result::Result<R, String> {
+    let (alo, ahi) = (a.lo - a.err, a.hi + a.err);
+    if !above(alo, 0.0) {
+        return Err("a power of a range that reaches 0 or below".into());
+    }
+    let (clo, chi) = (c.lo - c.err, c.hi + c.err);
+    // a^c is monotone in each argument, so its extremes are at the corners.
+    let corners = |l1: f64, h1: f64, l2: f64, h2: f64| {
+        let v = [l1.powf(l2), l1.powf(h2), h1.powf(l2), h1.powf(h2)];
+        (
+            v.iter().copied().fold(f64::INFINITY, f64::min),
+            v.iter().copied().fold(f64::NEG_INFINITY, f64::max),
+        )
+    };
+    let (lo, hi) = corners(a.lo, a.hi, c.lo, c.hi);
+    let (_, wide) = corners(alo, ahi, clo, chi);
+    // |c a^(c-1)| at most max|c| · max a^(c-1), the latter at a corner too.
+    let (_, d1) = corners(alo, ahi, clo - 1.0, chi - 1.0);
+    let cmax = clo.abs().max(chi.abs());
+    let lnmax = alo.ln().abs().max(ahi.ln().abs());
+    Ok(out(lo, hi, cmax * d1 * a.err + wide * lnmax * c.err))
+}
+
 /// A vector's length: its range from the components' squares, its error the sum of theirs.
 fn length(v: &[R]) -> std::result::Result<R, String> {
     let (mut lo2, mut hi2, mut err) = (0.0, 0.0, 0.0);
@@ -992,6 +1139,20 @@ fn length(v: &[R]) -> std::result::Result<R, String> {
         err += x.err;
     }
     Ok(out(f64::sqrt(lo2), f64::sqrt(hi2), err))
+}
+
+/// Walks kernel function `f` in `m` with each read buffer's elements the boxes `resources`
+/// gives, with `sites`' bounds: what it wrote, joined, and what it saw.
+pub fn walk_kernel(
+    m: &Module,
+    f: FuncId,
+    resources: HashMap<ResourceId, A>,
+    sites: &HashMap<(FuncId, ValueId), f64>,
+) -> std::result::Result<(Option<A>, Seen), Refused> {
+    let mut w = Walk::new(m, sites);
+    w.resources = resources;
+    w.run(f, Vec::new())?;
+    Ok((w.written, w.seen))
 }
 
 /// Walks `f` in `m` over `args`, with `sites`' bounds: its result and what it saw.
@@ -1111,6 +1272,18 @@ mod tests {
         );
         check("abs", |x| x[0].abs(), |r| one(Builtin::Abs, r), &[(-1.0, 2.0, 0.03)]);
         check(
+            "pow, both moving",
+            |x| x[0].powf(x[1]),
+            |r| one(Builtin::Pow, r),
+            &[(0.3, 2.0, 0.05), (-2.0, 2.0, 0.04)],
+        );
+        check(
+            "atan2",
+            |x| x[0].atan2(x[1]),
+            |r| one(Builtin::Atan2, r),
+            &[(-1.0, 2.0, 0.03), (0.5, 3.0, 0.02)],
+        );
+        check(
             "min",
             |x| x[0].min(x[1]),
             |r| one(Builtin::Min, r),
@@ -1121,6 +1294,18 @@ mod tests {
             |x| x[0].clamp(0.0, 1.0),
             |r| one(Builtin::Clamp, &[r[0], R::exact(0.0), R::exact(1.0)]),
             &[(-1.0, 2.0, 0.03)],
+        );
+        check(
+            "clamp, its bounds moving",
+            |x| x[0].max(x[1]).min(x[2]),
+            |r| one(Builtin::Clamp, r),
+            &[(-1.0, 0.1, 0.03), (-0.5, 0.3, 0.02), (0.6, 1.5, 0.01)],
+        );
+        check(
+            "clamp, above its moving bounds",
+            |x| x[0].max(x[1]).min(x[2]),
+            |r| one(Builtin::Clamp, r),
+            &[(1.6, 2.0, 0.03), (-0.5, 0.3, 0.02), (0.6, 1.5, 0.01)],
         );
         let lane = |rs: &[R]| A::P(rs.iter().map(|r| A::F(*r)).collect());
         check(
