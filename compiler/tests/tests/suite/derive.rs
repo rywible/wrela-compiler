@@ -766,3 +766,48 @@ fn past() {
     let rendered = wrela_diag::render::render_all(&out.sources, &[failure]);
     assert!(rendered.contains("a reverse gradient's trace passed 2^26 numbers"), "{rendered}");
 }
+
+/// A floor's split (`split_floor`) runs the rest of the function in a loop of its cases; a
+/// result that isn't active (a constant that a folded branch left) is made in that loop, and the
+/// return after it read it there, out of sight (I0001, found by the typed fuzzer's O9 seed
+/// 8136312319217385561). It's carried out of the loop as an active result is: the build's IR is
+/// well formed, and the interval is the constant's.
+#[test]
+fn a_constant_result_after_a_floors_split_is_returned() {
+    let dir = crate::package(
+        "derive-floor-constant",
+        "use std::derive::{Box3, interval}
+
+fn f(p: vec3) -> f32 {
+    var a = 0.5
+    if 0.0 < select(if_false: floor(p.x), if_true: 0.0, cond: p.y < 0.0) {
+        a = 0.0
+    }
+    var b = 0.0
+    if 0.0 < 0.0 {
+        b = a
+    }
+    b
+}
+
+pub fn range(lx: f32, ly: f32, lz: f32, hx: f32, hy: f32, hz: f32) -> vec2 {
+    let r = interval(f, Box3 { lo: vec3(lx, ly, lz), hi: vec3(hx, hy, hz) })
+    vec2(r.lo, r.hi)
+}
+",
+    );
+    let out = wrela_driver::build(&dir);
+    assert!(
+        !out.has_errors(),
+        "{}",
+        wrela_diag::render::render_all(&out.sources, &out.diagnostics)
+    );
+    let build = dir.join("build");
+    out.write_to(&build).expect("write the build");
+    let mut host = crate::cpu_host(&build);
+    let args = [-1.5f32, -1.0, 0.0, 1.5, 1.0, 1.0].map(Value::F32);
+    match host.call_export("range", &args).expect("range").as_slice() {
+        [Value::F32(lo), Value::F32(hi)] => assert!(*lo <= 0.0 && *hi >= 0.0 && *hi - *lo < 1e-6),
+        other => panic!("range returned {other:?}"),
+    }
+}

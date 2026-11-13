@@ -411,6 +411,12 @@ impl Builder for Ivx<'_> {
 impl<'a> Ivx<'a> {
     // ---- emission helpers --------------------------------------------------------------------
 
+    /// Whether `v`'s type is its own range type (it holds no enum).
+    fn plain(&mut self, v: ValueId) -> bool {
+        let ty = self.ty(v);
+        range_ty(&mut self.m.types, ty) == ty
+    }
+
     fn range(&self, v: ValueId) -> Iv {
         self.iv.get(&v).copied().unwrap_or((v, v))
     }
@@ -1121,8 +1127,11 @@ impl<'a> Ivx<'a> {
         for r in &roots {
             before.push(self.load_root(out, r)?);
         }
+        // The returned value is carried out of the case loop whether it's active or not: one
+        // that isn't (a constant a folded branch left) may be made in `rest`, inside the loop,
+        // where the return after it can't see it.
         let returned = match tail {
-            Some(Stmt::Return(Some(r))) if self.act.value(*r) => Some(*r),
+            Some(Stmt::Return(Some(r))) => Some(*r),
             _ => None,
         };
         let old_floor = self.iv.get(&v).copied();
@@ -1340,6 +1349,13 @@ impl<'a> Ivx<'a> {
                 let rt = self.nf.ret.ok_or_else(|| Error::internal("no range type"))?;
                 let r = self.emit(out, rt, Expr::Construct(rt, vec![lo, hi]));
                 out.push(Stmt::Return(Some(r)));
+                Ok(())
+            }
+            // A result that isn't active, which a floor's split carried out of its case loop
+            // (`split_floor`): the same in every case, so the joined value's low end.
+            Stmt::Return(Some(v)) if self.iv.contains_key(v) && self.plain(*v) => {
+                let (lo, _) = self.range(*v);
+                out.push(Stmt::Return(Some(lo)));
                 Ok(())
             }
             Stmt::Trap if self.speculative > 0 => Ok(()),
