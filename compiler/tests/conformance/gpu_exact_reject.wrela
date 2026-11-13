@@ -1,0 +1,40 @@
+// rejects: gpu.exact
+// A `@deterministic` kernel computes with integers: float arithmetic, an atomic and a second
+// buffer would each make its result depend on the GPU.
+use std::gpu::{Atomics, GlobalId, GpuBuffer, Slots, buffer, dispatch}
+
+@deterministic
+@compute(64)
+fn floaty(xs: [f32], out: mut Slots<f32>, id: GlobalId) {
+    out[id] = xs[id.x] + 1.0 //~ E0713
+}
+
+@deterministic
+@compute(64)
+fn counted(xs: [u32], bins: mut Atomics<u32>, out: mut Slots<u32>, id: GlobalId) { //~ E0713
+    out[id] = bins.add(i: 0, value: xs[id.x])
+}
+
+@deterministic
+@compute(64)
+fn two(xs: [u32], ys: [u32], out: mut Slots<u32>, id: GlobalId) { //~ E0713
+    out[id] = xs[id.x] + ys[id.x]
+}
+
+pub struct S {
+    a: GpuBuffer<u32>,
+    f: GpuBuffer<f32>,
+    o: GpuBuffer<u32>,
+    of: GpuBuffer<f32>,
+    bins: GpuBuffer<u32>,
+}
+
+pub fn init() -> S {
+    S { a: buffer(64), f: buffer(64), o: buffer(64), of: buffer(64), bins: buffer(64) }
+}
+
+pub fn frame(s: mut S, time: f32, width: u32, height: u32) {
+    dispatch(floaty.bind(s.f, mut s.of), groups: 1)
+    dispatch(counted.bind(s.a, mut s.bins, mut s.o), groups: 1)
+    dispatch(two.bind(s.a, s.a, mut s.o), groups: 1)
+}

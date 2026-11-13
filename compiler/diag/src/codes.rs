@@ -265,6 +265,7 @@ codes! {
     E0710 = "E0710", "a GPU function over its `@budget` of work";
     E0711 = "E0711", "a `@standin` that can't stand in for its entry point";
     E0712 = "E0712", "GPU code that computes a value the same for every invocation, each invocation again";
+    E0713 = "E0713", "a `@deterministic` kernel that does something a GPU may do its own way";
 
     // ---- E09xx: not in tier 0 --------------------------------------------------------------
 

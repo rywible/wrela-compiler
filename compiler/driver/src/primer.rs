@@ -342,6 +342,11 @@ pub const RULES: &[(&str, &str)] = &[
         "gpu.features",
         "half floats are GPU code's, and subgroup operations a kernel's, in uniform control flow, on a device with the feature",
     ),
+    // §18.14 kernels the same on every GPU
+    (
+        "gpu.exact",
+        "a `@deterministic` kernel computes with integers and moves floats only as bits, reading one buffer and writing its own place",
+    ),
     ("build.budget", "a shipped build's pipelines have at most 256 KiB of WGSL each"),
 ];
 

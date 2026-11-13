@@ -1,0 +1,47 @@
+// accepts: gpu.exact
+// A `@deterministic` kernel: one step of Life on a torus, in integers, reading one buffer, given
+// one value, writing its own place.
+use std::gpu::{GlobalId, GpuBuffer, Slots, buffer, dispatch}
+
+struct Grid: Copy + GpuData {
+    side: u32,
+}
+
+@deterministic
+@compute(64)
+fn life(cells: [u32], grid: Grid, out: mut Slots<u32>, id: GlobalId) {
+    let n = grid.side
+    let (x, y) = (id.x % n, id.x / n)
+    var alive = 0
+    for dy in 0..3 {
+        for dx in 0..3 {
+            if dx != 1 || dy != 1 {
+                alive += cells[(y + n + dy - 1) % n * n + (x + n + dx - 1) % n]
+            }
+        }
+    }
+    out[id] = if alive == 3 || (alive == 2 && cells[id.x] == 1) { 1 } else { 0 }
+}
+
+/// Floats as bits: loaded, selected and stored, never computed with.
+@deterministic
+@compute(64)
+fn pick(xs: [f32], grid: Grid, out: mut Slots<f32>, id: GlobalId) {
+    out[id] = if id.x < grid.side { xs[id.x] } else { xs[0] }
+}
+
+pub struct S {
+    cells: GpuBuffer<u32>,
+    next: GpuBuffer<u32>,
+    xs: GpuBuffer<f32>,
+    ys: GpuBuffer<f32>,
+}
+
+pub fn init() -> S {
+    S { cells: buffer(64), next: buffer(64), xs: buffer(64), ys: buffer(64) }
+}
+
+pub fn frame(s: mut S, time: f32, width: u32, height: u32) {
+    dispatch(life.bind(s.cells, Grid { side: 8 }, mut s.next), groups: 1)
+    dispatch(pick.bind(s.xs, Grid { side: 8 }, mut s.ys), groups: 1)
+}

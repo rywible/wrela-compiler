@@ -1,0 +1,24 @@
+// mistake: a deterministic kernel that reads a second buffer
+// expect: E0713
+// fix: no
+use std::gpu::{GlobalId, GpuBuffer, Slots, buffer, dispatch}
+
+@deterministic
+@compute(64)
+fn sum(xs: [u32], ys: [u32], out: mut Slots<u32>, id: GlobalId) {
+    out[id] = xs[id.x] + ys[id.x]
+}
+
+pub struct S {
+    xs: GpuBuffer<u32>,
+    ys: GpuBuffer<u32>,
+    out: GpuBuffer<u32>,
+}
+
+pub fn init() -> S {
+    S { xs: buffer(64), ys: buffer(64), out: buffer(64) }
+}
+
+pub fn frame(s: mut S, time: f32, width: u32, height: u32) {
+    dispatch(sum.bind(s.xs, s.ys, mut s.out), groups: 1)
+}

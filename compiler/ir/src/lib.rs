@@ -16,6 +16,7 @@ pub mod bounds;
 mod const_fold;
 pub mod derive;
 mod error;
+pub mod exact;
 pub mod gpu_memory;
 pub mod interp;
 pub mod layout;
