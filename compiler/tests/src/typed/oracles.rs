@@ -8,7 +8,7 @@
 //! | O2 | the interval encloses | over 8 boxes, 16 points each: `lo <= value <= hi` |
 //! | O3 | the gradient agrees | with central differences where the function is smooth |
 //! | O4 | the tape agrees | `interpret(tape(f), p)` within 3e-6 of `f(p)` (§14.4) |
-//! | O5 | the optimizer keeps the bits | a `no_opt` build's values, bit for bit |
+//! | O5 | the optimizer keeps the bits | a `no_opt` build's values, bit for bit (a loop program's with no SIMD too) |
 //! | O7 | the interpreter agrees | the GPU code interpreted (`wrela_ir::interp`) gives the GPU's value, within O6's bound |
 //! | O8 | reverse mode agrees | `std::derive::reverse`'s gradient within `1e-5 (1 + |g|)` of `gradient`'s |
 //! | O6 | the targets agree | the GPU's value inside its interval (within 8 ulps: Metal's fast math reassociates), and near the CPU's |
@@ -175,11 +175,28 @@ pub fn run_file(path: &Path, scratch: &Path) -> Result<Counts, String> {
 /// Builds `text` as a package in `dir` (made afresh), with `no_opt` if asked: the build's
 /// directory, or the errors rendered.
 pub fn build(dir: &Path, text: &str, no_opt: bool) -> Result<PathBuf, Failure> {
+    build_as(dir, text, if no_opt { Plain::NoOpt } else { Plain::Optimized })
+}
+
+/// How a program is built for an oracle.
+#[derive(Clone, Copy)]
+pub enum Plain {
+    Optimized,
+    NoOpt,
+    /// Unoptimized, and with no SIMD, so its loops run one at a time.
+    NoOptNoSimd,
+}
+
+pub fn build_as(dir: &Path, text: &str, how: Plain) -> Result<PathBuf, Failure> {
     let _ = std::fs::remove_dir_all(dir);
     std::fs::create_dir_all(dir).expect("make the program's directory");
     std::fs::write(dir.join("wrela.toml"), "[package]\nname = \"typed\"\n").expect("write");
     std::fs::write(dir.join("main.wrela"), text).expect("write main.wrela");
-    let out = wrela_driver::build_for_tests_with(dir, false, no_opt);
+    let out = match how {
+        Plain::Optimized => wrela_driver::build_for_tests_with(dir, false, false),
+        Plain::NoOpt => wrela_driver::build_for_tests_with(dir, false, true),
+        Plain::NoOptNoSimd => wrela_driver::build_for_tests_plain(dir),
+    };
     let bad: Vec<_> = out
         .diagnostics
         .iter()
@@ -314,7 +331,10 @@ pub fn run(oracle: Oracle, src: &str, seed: u64, dir: &Path) -> Result<Counts, F
         }
         Oracle::O5 => {
             let mut opt = start(&build(dir, src, false)?)?;
-            let mut plain = start(&build(&dir.join("no_opt"), src, true)?)?;
+            // A loop program's plain build has no SIMD either: its loops run one at a time, so
+            // the optimized build's four at a time (§11.2) are compared with them.
+            let how = if src.contains("loop mode)") { Plain::NoOptNoSimd } else { Plain::NoOpt };
+            let mut plain = start(&build_as(&dir.join("no_opt"), src, how)?)?;
             for _ in 0..16 {
                 let p = point(&mut rng);
                 let (a, b) = (value(&mut opt, p), value(&mut plain, p));

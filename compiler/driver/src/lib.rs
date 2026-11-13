@@ -315,6 +315,14 @@ pub fn build_for_tests_with(root: &Path, debug: bool, no_opt: bool) -> Output {
     on_compiler_thread(|| compile(root, mode, wrela_lower::Roots::of, &[]))
 }
 
+/// [`build_for_tests_with`] unoptimized and with no SIMD in the WASM either, so its loops run
+/// one iteration at a time: what the typed programs' oracle O5 compares a loop program's
+/// optimized build with (four at a time against one at a time, §11.2).
+pub fn build_for_tests_plain(root: &Path) -> Output {
+    let mode = Mode { testing: true, no_opt: true, no_simd: true, ..Mode::RELEASE };
+    on_compiler_thread(|| compile(root, mode, wrela_lower::Roots::of, &[]))
+}
+
 /// A build for `wrela fuzz` alone: a debug build (so a float operation that makes a NaN traps)
 /// whose WASM marks the code it runs in a coverage map (`wrela_wasm::Options::coverage`), with
 /// no GPU output. Nothing else builds this way (language.md §16.2).

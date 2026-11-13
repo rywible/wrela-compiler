@@ -716,7 +716,7 @@ pub fn loop_program(c: &mut Choices) -> String {
     let mut body = String::new();
     for _ in 0..2 + c.draw(3) {
         let cst = consts[c.draw(consts.len() as u32) as usize];
-        body += &match c.draw(8) {
+        body += &match c.draw(11) {
             // The bound is the Vec's own length: its checks go.
             0 => {
                 format!("    for i in 0..xs.len() {{\n        acc = acc + xs[i] * {cst}\n    }}\n")
@@ -738,8 +738,22 @@ pub fn loop_program(c: &mut Choices) -> String {
             // The next element: past the end at the last pass.
             6 => "    for i in 0..xs.len() {\n        acc = acc + xs[i + 1]\n    }\n".into(),
             // One Vec's length bounding another's index.
-            _ => "    for i in 0..ns.len() {\n        acc = acc + xs[i] + f32(ns[i] % 3)\n    }\n"
+            7 => "    for i in 0..ns.len() {\n        acc = acc + xs[i] + f32(ns[i] % 3)\n    }\n"
                 .into(),
+            // Four at a time (§11.2), each element behind its check, which isn't proven: the
+            // bound is another Vec's length, equal but not provably.
+            8 => format!(
+                "    for i in 0..ns.len() {{\n        xs[i] = xs[i] * {cst} + 1.0\n    }}\n"
+            ),
+            // Four at a time, past the end: it traps at the first index past it.
+            9 => format!(
+                "    for i in 0..xs.len() + {} {{\n        xs[i] = xs[i] * 0.5 - {cst}\n    }}\n",
+                c.draw(5)
+            ),
+            // Four at a time with a branch.
+            _ => format!(
+                "    for i in 0..n {{\n        if xs[i] < {cst} {{\n            xs[i] = -xs[i]\n        }} else {{\n            xs[i] = xs[i] * 0.25\n        }}\n    }}\n"
+            ),
         };
     }
     format!(
@@ -753,7 +767,10 @@ pub fn loop_program(c: &mut Choices) -> String {
     }}
     var acc = 0.0
     var isum: u32 = 0
-{body}    acc + f32(isum % 1000)
+{body}    for x in xs {{
+        acc = acc + x
+    }}
+    acc + f32(isum % 1000)
 }}
 "
     )
