@@ -31,8 +31,8 @@ detail; `docs/release.md` says how a release is cut.
 - **`wrela solve` lifts only the files `--free` names** (§23.6): a literal of another file, a
   blueprint's outline or a spec's target, is a reference the solve neither moves nor derives
   through.
-- **`wrela solve` holds each literal's step to its own size** and searches along what is left
-  by Armijo's rule; a solve the program traps under says the literals it was trying; a spec
+- **`wrela solve` holds a step to its literals' sizes** (shortened whole, so it keeps its
+  direction) and searches along it by Armijo's rule; a solve the program traps under says the literals it was trying; a spec
   whose every check already holds is left as it is (`"held_before": true`); and rounding gives
   a literal no decimals that buy nothing and never leaves the function larger than the solve
   found it (§23.6).

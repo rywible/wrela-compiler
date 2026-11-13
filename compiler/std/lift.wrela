@@ -338,8 +338,9 @@ impl Checks for Report {
 ///   learns over many, so it takes far fewer.
 ///
 /// Neither tries a step that moves a literal farther than its own size (`within_reach`): its
-/// size now, or where the solve began if that was larger, or 1 if it began at 0. Each literal
-/// is held by itself, so one with too long a step doesn't shorten the others'.
+/// size now, or where the solve began if that was larger, or 1 if it began at 0. A step that
+/// would is shortened whole, by the one factor that brings its farthest-reaching literal to its
+/// size, so it keeps its direction (the quasi-Newton step's, or Levenberg–Marquardt's).
 ///
 /// Then the literals are rounded to their sources' decimals: all at once where that costs no
 /// more than 5% of the solved value; else one at a time, the one that changed most first and
@@ -812,9 +813,9 @@ fn bfgs(
             slope = -gg
             h = identity(n)
         }
-        // Armijo's rule along the step, halved from 1, each literal's part of it held to its
-        // own size (`within_reach`). A try the same as the last (every literal still held) is
-        // passed over, and isn't one of the 40.
+        // Armijo's rule along the step, halved from 1, the step shortened whole where a literal
+        // would go past its own size (`within_reach`). A try the same as the last (the step
+        // still shortened to the same literal's size) is passed over, and isn't one of the 40.
         var t: f64 = 1.0
         var x1: Vec<f64> = Vec::new()
         var f1: f64 = 0.0
@@ -877,17 +878,21 @@ fn size(x: f64, began: f32) -> f64 {
     max(abs(x), if from == 0.0 { 1.0 } else { from })
 }
 
-/// `t` of the step `p` from `x`, each literal's part of it held to the literal's own `size`.
+/// `t` of the step `p` from `x`, shortened whole, by one factor, until no literal's part of it
+/// is longer than the literal's own `size`.
 /// The function's derivatives say nothing of it farther off than that, and a step can be far
 /// longer than any literal: BFGS's first is as long as the gradient (its estimate starts as
 /// the identity), which for a loss of 1,149 that rises 164 for a thousandth of a second of a
 /// key's time was a time of -164,460 s, where one evaluation ran for hours. A literal can
 /// still double each step, so one that has far to go gets there in a few.
 ///
-/// Each literal is held by itself, so one whose part of the step is far too long (the loss
-/// barely changes with it, and the estimate gives it a long way to go) doesn't hold the rest
-/// to a fraction of theirs: scaling the whole step to fit it stopped a solve of ten literals
-/// against two outlines at a loss of 52.
+/// The whole step is shortened by one factor, not each literal clamped by itself: a clamp of
+/// each changes the step's direction, and the quasi-Newton direction is what the solve learned
+/// (on the humanoid's hook with six literals free, clamping each ended at a loss of 36.4 with
+/// 38 of 41 checks held; one factor ends at 0.36 with all 41). A literal that began at 0 is
+/// sized from where the solve began (`began`), so a re-solve doesn't hold everything to the
+/// hair it has moved, which, not the one factor, stopped a solve of ten literals against two
+/// outlines at a loss of 52 before.
 ///
 /// A step held to a box and searched by Armijo's rule along what is left of it: D. P.
 /// Bertsekas, "On the Goldstein-Levitin-Polyak gradient projection method", IEEE Transactions
@@ -895,11 +900,15 @@ fn size(x: f64, began: f32) -> f64 {
 /// Schnabel, "Numerical Methods for Unconstrained Optimization and Nonlinear Equations"
 /// (1983), §6.3 and algorithm A6.3.1 (`maxstep`), there one length for the whole step.
 fn within_reach(x: [f64], began: [f32], p: [f64], t: f64) -> Vec<f64> {
-    Vec::from_fn(x.len(), |i| {
+    var k = 1.0
+    for i in 0..x.len() {
+        let step = abs(t * p[i])
         let most = size(x[i], began[i])
-        let step = t * p[i]
-        if step > most { most } else if step < -most { -most } else { step }
-    })
+        if step > most {
+            k = min(k, most / step)
+        }
+    }
+    Vec::from_fn(x.len(), |i| k * t * p[i])
 }
 
 /// Whether `step` is all of `t` of `p`: no literal's part was held.
@@ -1254,9 +1263,10 @@ fn a_step_moves_no_literal_farther_than_its_size() {
     assert(long[0] == -0.5 && !whole(long, [-164460.0], 1.0))
     assert(same(long, within_reach([0.5], [0.5], [-164460.0], 0.5)))
     assert(abs(within_reach([0.5], [0.5], [-164460.0], 0.000001)[0] + 0.16446) < 1.0e-12)
-    // One literal held doesn't hold the other.
+    // One literal's size holds the whole step to it, so the step keeps its direction: the other
+    // goes the same fraction of its part.
     let one = within_reach([2.0, 100.0], [2.0, 100.0], [-8.0, 50.0], 1.0)
-    assert(one[0] == -2.0 && one[1] == 50.0)
+    assert(one[0] == -2.0 && one[1] == 12.5)
     // One that has come near 0 can still move as far as it began from it, and so cross it.
     assert(within_reach([0.125], [0.5], [-2.0], 1.0)[0] == -0.5)
     // One that began at 0 has no size to go by: 1.
