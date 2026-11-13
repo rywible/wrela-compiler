@@ -136,7 +136,7 @@ fn main() {
     );
     let mut refusals = oracles::REFUSALS.lock().unwrap().clone();
     if !refusals.is_empty() {
-        refusals.sort_by(|a, b| b.1.cmp(&a.1));
+        refusals.sort_by_key(|r| std::cmp::Reverse(r.1));
         println!("refused, by reason:");
         for (why, n) in refusals.iter().take(10) {
             println!("  {n:>6}  {why}");
