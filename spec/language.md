@@ -931,7 +931,9 @@ The compiler chooses how a container stores its elements: one after another, fie
 - projections never escape (§6.6);
 - a value's bytes exist only where they are viewed: an upload to the GPU, a bitcast or a network message. There the bytes are canonical, as above.
 
-Saves don't depend on layout either, because `Serialize` is derived field by field. Today every container stores its elements one after another. The language keeps the choice open: no feature exposes layout.
+Saves don't depend on layout either, because `Serialize` is derived field by field. Today every container stores its elements one after another, but one: `std::collections::Columns<T>` keeps each field of `T` in its own array, so a loop over one field reads only that field (and runs four at a time, §11.2). Its element isn't one place: `c[i].x` reads and writes a field, and `c[i]` read whole gathers a copy; lending `c[i]` to a `mut` parameter, binding it `mut`, or assigning it whole is E0339. The language keeps the choice open: no feature exposes layout.
+
+`wrela build <package> --report layout` lists, for each loop over a container or array of structs, the struct's size, the bytes of it the loop reads and writes, and whether it takes an element whole, the most bytes skipped first: where `Columns` would pay.
 
 ### 6.11 Snapshots
 
@@ -1192,9 +1194,10 @@ Vector math uses WASM's 128-bit SIMD wherever the result is the same.
 - A `vec2`, `vec3` or `vec4` is one SIMD value. Its arithmetic, comparisons and componentwise built-ins are SIMD instructions.
 - A loop also runs four iterations at a time when all of these are true:
   - It counts a `u32` up by one to a bound computed before the loop (a `for` over `a..b`).
-  - Its body is straight-line `f32` code.
-  - The body reads and writes elements only at the counter's index, of arrays and runs that it doesn't replace.
+  - Its body is `f32` code, whose branches compare `f32`s. Both sides of a branch run for every lane, and a store under it keeps the old value in the lanes whose condition is false.
+  - The body reads and writes `f32` elements only at the counter's index, of arrays, runs, `Vec`s and `Columns`' fields that it doesn't replace or resize.
   - The body keeps nothing from one iteration to the next.
+- A check that the counter is below a length, as indexing a `Vec` makes, is part of the four-wide loop's test, and one the compiler proves (the loop's own bound, or the length of the `Vec` it walks, which it doesn't change) is gone.
 - The last iterations, and an iteration that would index out of range, run one at a time. So a trap happens at the same iteration, with the same elements written.
 - Standard SIMD rounds each lane exactly as the scalar operation does, and has no fused multiply-add, so the bits are identical. Relaxed SIMD is forbidden, except in a relaxed-SIMD build's presentation code (below).
 - An operation whose SIMD form behaves differently stays scalar. For example, float-to-int conversion saturates in SIMD but traps in scalar code (§11.3).
