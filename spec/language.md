@@ -22,7 +22,7 @@ Where this text and the tests disagree, the tests are right.
 | §3 | Items | Functions, structs, enums, traits and impls, constants, modules and packages |
 | §4 | Types | Scalars, vectors and matrices, arrays, runs, tuples, aliases, text and encodings |
 | §5 | Units | SI constants written as number suffixes: `15cm` |
-| §6 | Memory | Values, moves, projections, exclusivity, closures, arenas, plain data and snapshots |
+| §6 | Memory | Values, moves, projections, exclusivity, closures, arenas, plain data, layout and snapshots |
 | §7 | Generics and traits | Monomorphization, inference and trait sets |
 | §8 | Effects and contexts | The seven effects, and what each context forbids |
 | §9 | Attributes | The closed set of `@` attributes |
@@ -34,12 +34,12 @@ Where this text and the tests disagree, the tests are right.
 | §15 | Programs and hosts | Exports, a program's state, client and server builds, and hand-over |
 | §16 | Concurrency | Threads, ticks, hand-offs, tasks, jobs, the audio thread and caches |
 | §17 | Host services | Requests, input, messages, printing and the clock |
-| §18 | GPU code | Entry points, buffers, kernel outputs, bindings, commands, textures, passes and pipelines |
+| §18 | GPU code | Entry points, buffers, kernel outputs, bindings, commands, textures, passes and pipelines, and kernels the same on every GPU |
 | §19 | Rooms | A server's ordered log of what its peers propose, kept and served over the network |
 | §20 | The stdlib boundary | What the compiler knows about std, the map of std's modules, and fields as std code |
 | §21 | What Wrela leaves out | Each missing feature, and what a program uses instead |
 | §22 | A complete program | One program with a field, a kernel and a shader |
-| §23 | Lifted builds, provenance and the tools | Changing a program's numbers while it runs, and the tools for agents |
+| §23 | Lifted builds, provenance and the tools | Changing a program's numbers while it runs, the tools for agents, and reading what was made |
 | | The rules by ID | Every rule of the conformance suite, with its section |
 
 ## How Wrela differs from Rust and TypeScript
@@ -2939,7 +2939,7 @@ The compiler knows the language, a closed list of std items and its targets; the
   - `std::io`: `next_request`, `request_status`, `storage_read_command`, `storage_write_command`, `fetch_command`, `print_command`, `post_command`, `Shipped`
   - `std::input`: `Script`
   - `std::tool::browser`: `Script`
-  - `std::mem`: `take_answer`, `take_input`, `take_payload`, `keep_bytes`, `kept_bytes`, `read_clock`, `Drop`, `size_of`, `align_of`, `needs_drop`, `is_copy`, `read`, `zeroed`, `write`, `drop_at`, `at`, `at_mut`, `at_mut_pair`, `heap_base`, `memory_pages`, `memory_grow`, `load_u32`, `store_u32`, `load_u8`, `store_u8`, `copy`, `fill`, `compare_swap`, `atomic_add`, `atomic_load`, `atomic_store`, `wait`, `notify`, `run_task`, `task`, `thread_block`, `wait_for`, `abort`, `debug_build`, `test_build`, `tool_request`, `tool_wait`, `tool_any`, `tool_take`, `tool_idle`, `tool_active`, `tool_join`, `tool_done`
+  - `std::mem`: `take_answer`, `take_input`, `take_payload`, `keep_bytes`, `kept_bytes`, `read_clock`, `Drop`, `size_of`, `align_of`, `column_bytes`, `column_read`, `column_write`, `needs_drop`, `is_copy`, `read`, `zeroed`, `write`, `drop_at`, `at`, `at_mut`, `at_mut_pair`, `heap_base`, `memory_pages`, `memory_grow`, `load_u32`, `store_u32`, `load_u8`, `store_u8`, `copy`, `fill`, `compare_swap`, `atomic_add`, `atomic_load`, `atomic_store`, `wait`, `notify`, `run_task`, `task`, `thread_block`, `wait_for`, `abort`, `debug_build`, `test_build`, `tool_request`, `tool_wait`, `tool_any`, `tool_take`, `tool_idle`, `tool_active`, `tool_join`, `tool_done`
   - `std::derive`: `Interval`, `Domain`, `gradient`, `value_and_gradient`, `value_gradient_with`, `interval`, `precision`, `precision_note`, `filtered`, `tape`, `tape_with`, `tape_sized`, `recorded`, `Trace`, `trace_one`, `trace_two`, `trace_leaf`
   - `std::field`: `smin`, `value_noise`, `value_noise_box`, `lattice_coord`
   - `std::hash`: `pcg`
@@ -2950,7 +2950,7 @@ The compiler knows the language, a closed list of std items and its targets; the
   - `std::time`: `phase_command`
   - `std::tick`: `start_ticker`
   - `std::reload`: `prepare_command`, `unprepare_command`, `hand_over_command`
-  - `std::collections`: `Vec`, `Bounded`, `Box`, `swap`, `replace`
+  - `std::collections`: `Vec`, `Bounded`, `Columns`, `Box`, `swap`, `replace`
   - `std::string`: `Text`, `Bytes`, `String`, `str_addr`, `str_len`, `str_part`
   - `std::cmp`: `Eq`, `Ord`, `Ordering`
   - `std::fmt`: `Format`, `Spec`, `assert_failed1`, `assert_failed2`
@@ -2973,7 +2973,7 @@ The compiler knows the language, a closed list of std items and its targets; the
 | `std::prelude` | In scope in every module: `Option`, `Result`, `Copy`, `Clone`, `GpuData`, `Plain`, and, from their modules, `Eq`, `Ord`, `Ordering`, `Vec`, `Bounded`, `Box`, `swap`, `replace`, `String`, `Text`, `Bytes`, `Arena`, `Handle`, `SortedMap` and `Quat` |
 | `std::cmp` | `Eq`, `Ord` and `Ordering`: `==` and `<` for the types that declare them (§3.4) |
 | `std::transform` | Matrices for skeletons, cameras and shadow maps, on the CPU and the GPU, in WebGPU's conventions (right-handed, +y up, column vectors, depth 0 to 1): `identity`, `translate`, `scale`, `rotate_x`, `rotate_y`, `rotate_z`, `rotate(axis, angle)`, `from_mat3`, `look_at(eye, at, up)`, `perspective`, `ortho`; `inverse` and `determinant` of any `mat4` |
-| `std::collections` | `Vec` and `Box`. `Bounded<T, N>`: at most `N` values held in place (an array and a count of the values in use). It is `Copy`, and it is `Plain` and `GpuData` where `T` is, so it can be in a snapshot or on the GPU, where a `Vec` cannot. It has `push`, `pop`, `remove`, `clear`, `len`, `is_full` and `Bounded::from(xs)`; `b[i]` projects an element in use (an index past `len()` panics on the CPU), `for x in b` walks the elements in use, and it hashes, saves and compares only those. `swap` and `replace` move values out of places. `Vec::filled(n, value)`, and `Vec::from_fn(n, make)` for a `T` that is not `Clone`. `sort_by` is a stable O(n log n) sort of a run of `Copy` values; `Vec::sort_by` sorts any `Vec`, and `Vec::sort_by_in` keeps its working space in a `Vec<u8>`, so a tick that sorts allocates nothing once that space has grown (§16.2) |
+| `std::collections` | `Vec` and `Box`. `Columns<T>`: each field of a `Copy` `T` in its own array, with `push`, `len` and `clear`; `c[i].x` is a place, and `c[i]` read whole gathers a copy (§6.10). `Bounded<T, N>`: at most `N` values held in place (an array and a count of the values in use). It is `Copy`, and it is `Plain` and `GpuData` where `T` is, so it can be in a snapshot or on the GPU, where a `Vec` cannot. It has `push`, `pop`, `remove`, `clear`, `len`, `is_full` and `Bounded::from(xs)`; `b[i]` projects an element in use (an index past `len()` panics on the CPU), `for x in b` walks the elements in use, and it hashes, saves and compares only those. `swap` and `replace` move values out of places. `Vec::filled(n, value)`, and `Vec::from_fn(n, make)` for a `T` that is not `Clone`. `sort_by` is a stable O(n log n) sort of a run of `Copy` values; `Vec::sort_by` sorts any `Vec`, and `Vec::sort_by_in` keeps its working space in a `Vec<u8>`, so a tick that sorts allocates nothing once that space has grown (§16.2) |
 | `std::string` | `String`; `Text`, text known at build time; `Bytes`, bytes known at build time, with `at(i)` and little-endian reads at any byte (`u16_le`, `u32_le`, `i32_le`, `f32_le`, `u64_le`, `f64_le`); numbers read from text (`parse_u32`, `parse_i32`, `parse_f32`), and `parse_f64` and `parse_f64_at(bytes, from, to)`, which read a decimal as the nearest f64, as Rust's `parse` does |
 | `std::fmt` | `Format`, which `f"…"` calls, and `Spec`, a hole's format spec; `json_text` and `json_number`, which write text and floats as JSON (a NaN or an infinity is `null`) |
 | `std::json` | JSON read: `parse` gives a `Doc`, its values found by index from `TOP` (`kind`, `get`, `at`, `count`, `num`, `text`, `is_true`, `write`); a number keeps its text, and `number_of` reads it as the nearest f64 |

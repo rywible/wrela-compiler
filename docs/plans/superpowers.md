@@ -205,10 +205,12 @@ Keep this table true as you go; stage N checks it against the code.
 
 | Kind | Names |
 |---|---|
-| Commands | `wrela pixel`, `wrela inspect`, `wrela sliders`, `wrela fuzz`, `wrela twin`; `wrela build --report layout` |
-| std | `std::derive::{reverse, Trace}`; `std::lift::{reverse, reverse_sum}`; `std::field::{View, coverage, outline_miss, image_miss, pieces, Pieces, preview, baked, BakedField}`; `std::table::{Table1, Table2, Table3, Tabled1, Tabled2, Tabled3, table1, table2, table3, Baked}`; `std::stage::interpret_at`; `std::gpu::exact::{Exact, offer}` and a deterministic kernel's `run`; `std::collections::Columns` |
+| Commands | `wrela pixel`, `wrela inspect`, `wrela sliders`, `wrela fuzz`, `wrela twin` (experimental: stage I's gate failed); `wrela build --report layout` |
+| std | `std::derive::{reverse, Trace}`; `std::lift::{reverse, reverse_sum}`; `std::field::{View, coverage, outline_miss, image_miss, pieces, Pieces, preview, ~~baked, BakedField~~}`; ~~`std::table::{Table1, Table2, Table3, Tabled1, Tabled2, Tabled3, table1, table2, table3, Baked}`~~; `std::stage::interpret_at`; ~~`std::gpu::exact::{Exact, offer}`~~ and a deterministic kernel's `run`; `std::collections::Columns` (and `std::mem::{column_bytes, column_read, column_write}`, std's own) |
 | Codes | E0713 (a `@deterministic` kernel that uses what isn't the same on every GPU), E0339 (a `Columns` element taken as one place) |
-| Driver | `wrela_driver::gpu_modules` (each pipeline's emitted IR), a `no_opt` test build |
+| Driver | `wrela_driver::gpu_modules` (each pipeline's emitted IR), a `no_opt` test build, and one with no SIMD too (`build_for_tests_plain`, O5's for loop programs) |
+
+Struck, as built and measured (each measurement is in the pull request's **Measured**): `std::table` failed stage H's gates (H.1's table counts, H.5: a table read 2.6 times slower than the sky it replaced) and lives on as the test package `compiler/tests/tables`; `baked` (H.4) wasn't built, after H.1's gate; `Exact` and `offer` (K.4, K.5) weren't built, after K.6's ceiling of 3.0 times against a gate of 3 times and 90% of answers in time.
 | IR | `compiler/ir/src/interp/` (the interpreter and the error walk), `compiler/ir/src/ranges.rs` |
 | Tests | `compiler/tests/src/typed.rs`, `compiler/tests/tests/suite/typed.rs`, `compiler/tests/typed/regress/` |
 
