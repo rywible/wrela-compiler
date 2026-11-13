@@ -79,7 +79,8 @@ impl Oracle {
     /// The programs it's run on: O1 sees both modes; the rest need finite values.
     pub fn modes(self) -> &'static [Mode] {
         match self {
-            Oracle::O1 => &[Mode::Tame, Mode::Wild],
+            Oracle::O1 => &[Mode::Tame, Mode::Wild, Mode::Loops],
+            Oracle::O5 => &[Mode::Tame, Mode::Loops],
             Oracle::O10 => &[Mode::Integer],
             _ => &[Mode::Tame],
         }
@@ -218,6 +219,11 @@ fn value(host: &mut CpuHost, p: [f32; 3]) -> Result<f32, Failure> {
     }
 }
 
+/// Where in the source a trap was: its message's last `at`.
+fn trap_place(what: &str) -> Option<&str> {
+    what.rsplit(" at ").next().map(str::trim)
+}
+
 /// `range`'s arguments for the box from `lo` to `hi`.
 fn ranged(lo: [f32; 3], hi: [f32; 3]) -> Vec<Value> {
     lo.into_iter().chain(hi).map(Value::F32).collect()
@@ -243,8 +249,15 @@ pub fn run(oracle: Oracle, src: &str, seed: u64, dir: &Path) -> Result<Counts, F
     match oracle {
         Oracle::O1 => {
             let mut host = start(&build(dir, src, false)?)?;
+            let loops = src.contains("loop mode)");
             for _ in 0..16 {
-                value(&mut host, point(&mut rng))?;
+                match value(&mut host, point(&mut rng)) {
+                    // A loop program's own trap (an index past the end, an overflow) is a run.
+                    Err(f) if loops && f.what.contains("the program trapped") => {}
+                    other => {
+                        other?;
+                    }
+                }
             }
             Ok(Counts { points: 16, counted: 16 })
         }
@@ -307,7 +320,9 @@ pub fn run(oracle: Oracle, src: &str, seed: u64, dir: &Path) -> Result<Counts, F
                 let (a, b) = (value(&mut opt, p), value(&mut plain, p));
                 match (a, b) {
                     (Ok(a), Ok(b)) if a.to_bits() == b.to_bits() => {}
-                    (Err(_), Err(_)) => {}
+                    // Both trap: at the same place in the source (stage L.1's range proofs may
+                    // remove a check only where it can't fail).
+                    (Err(x), Err(y)) if trap_place(&x.what) == trap_place(&y.what) => {}
                     (a, b) => {
                         return fail(format!(
                             "at {p:?}: optimized {:?}, not optimized {:?}",

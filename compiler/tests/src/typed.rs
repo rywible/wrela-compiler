@@ -70,6 +70,11 @@ impl Choices {
 pub enum Mode {
     Tame,
     Wild,
+    /// Loops over `Vec`s and integer sums, for the optimizer's oracles (O1 and O5, plan stage
+    /// L.1): bounds a range proof may use and ones it mustn't, a `Vec` pushed to in its loop, an
+    /// index past the end, a sum that overflows. A function that reads a `Vec` can't be derived
+    /// (§14.2), so no other oracle sees them.
+    Loops,
     /// Integer programs as `@deterministic` kernels, for O10 (plan stage K): `u32` and `i32`
     /// arithmetic that wraps, division and remainder by anything (zero too), shifts by any
     /// amount, bit operations, comparisons, and table reads at any index.
@@ -516,6 +521,9 @@ pub fn program(choices: &mut Choices, mode: Mode, feat: Features) -> String {
     if mode == Mode::Integer {
         return int_program(choices);
     }
+    if mode == Mode::Loops {
+        return loop_program(choices);
+    }
     let mut g = Gen {
         c: choices,
         mode,
@@ -692,8 +700,74 @@ pub fn source(choices: &mut Choices, mode: Mode, feat: Features) -> String {
 
 /// The harness a mode's programs are run in.
 pub fn harness(mode: Mode) -> &'static str {
-    if mode == Mode::Integer { INT_HARNESS } else { HARNESS }
+    match mode {
+        Mode::Integer => INT_HARNESS,
+        Mode::Loops => LOOP_HARNESS,
+        _ => HARNESS,
+    }
 }
+
+/// A loop program (`Mode::Loops`): `f(p)` builds a `Vec<f32>` and a `Vec<u32>` of a length the
+/// point sets (0 to 40), then runs two to four loops over them.
+pub fn loop_program(c: &mut Choices) -> String {
+    let consts = ["0.5", "1.0", "-0.25", "2.0", "0.0"];
+    let ks = ["1", "7", "65537", "1000003", "4000000000"];
+    let k = ks[c.draw(ks.len() as u32) as usize];
+    let mut body = String::new();
+    for _ in 0..2 + c.draw(3) {
+        let cst = consts[c.draw(consts.len() as u32) as usize];
+        body += &match c.draw(8) {
+            // The bound is the Vec's own length: its checks go.
+            0 => {
+                format!("    for i in 0..xs.len() {{\n        acc = acc + xs[i] * {cst}\n    }}\n")
+            }
+            1 => format!(
+                "    for i in 0..xs.len() {{\n        if xs[i] > {cst} {{\n            xs[i] = xs[i] * 0.5\n        }}\n    }}\n"
+            ),
+            // A bound that's equal but not provably: its checks stay.
+            2 => "    for i in 0..n {\n        acc = acc + xs[i]\n    }\n".into(),
+            // An integer sum that may overflow, and trap.
+            3 => "    for i in 0..ns.len() {\n        isum = isum + ns[i]\n    }\n".into(),
+            // Past the end: it traps once the Vec has an element.
+            4 => format!(
+                "    for i in 0..xs.len() + {} {{\n        acc = acc + xs[i]\n    }}\n",
+                c.draw(3)
+            ),
+            // A push in the loop changes the length: the checks must stay.
+            5 => "    for i in 0..xs.len() {\n        xs.push(xs[i] + 1.0)\n    }\n".into(),
+            // The next element: past the end at the last pass.
+            6 => "    for i in 0..xs.len() {\n        acc = acc + xs[i + 1]\n    }\n".into(),
+            // One Vec's length bounding another's index.
+            _ => "    for i in 0..ns.len() {\n        acc = acc + xs[i] + f32(ns[i] % 3)\n    }\n"
+                .into(),
+        };
+    }
+    format!(
+        "fn f(p: vec3) -> f32 {{
+    let n = u32(clamp(abs(p.x) * 20.0, 0.0, 40.0))
+    var xs: Vec<f32> = Vec::new()
+    var ns: Vec<u32> = Vec::new()
+    for i in 0..n {{
+        xs.push(f32(i) * p.y + p.z)
+        ns.push(i * {k})
+    }}
+    var acc = 0.0
+    var isum: u32 = 0
+{body}    acc + f32(isum % 1000)
+}}
+"
+    )
+}
+
+/// The loop programs' harness: `f` on the CPU alone (loop mode).
+pub const LOOP_HARNESS: &str = "
+// ---- the harness (compiler/tests/src/typed.rs, loop mode) --------------------------------------
+pub fn value(x: f32, y: f32, z: f32) -> f32 {
+    f(vec3(x, y, z))
+}
+
+pub fn frame(time: f32, width: u32, height: u32) {}
+";
 
 /// The integer values a leaf may be: the edges of `u32` and `i32`, a width and either side of it.
 const INT_LITERALS: [&str; 10] =

@@ -1,7 +1,7 @@
 //! The typed programs' soak: one oracle over many programs, not in the gate.
 //!
 //! ```text
-//! cargo run --release -p wrela-tests --bin typed-soak -- <oracle> <count> [--seed N] [--threads N] [--wild]
+//! cargo run --release -p wrela-tests --bin typed-soak -- <oracle> <count> [--seed N] [--threads N] [--wild | --mode tame|wild|loops|integer]
 //! ```
 //!
 //! Each failure is shrunk and written to `target/typed/<oracle>-<seed>.wrela`; the run prints
@@ -61,8 +61,21 @@ fn main() {
     let base = flag("--seed").unwrap_or(0x50a6);
     let threads =
         flag("--threads").map_or_else(wrela_grammar::rng::default_threads, |t| t as usize);
-    let modes: Vec<Mode> =
-        if args.iter().any(|a| a == "--wild") { vec![Mode::Wild] } else { oracle.modes().to_vec() };
+    let named =
+        args.iter().position(|a| a == "--mode").and_then(|i| args.get(i + 1)).and_then(|m| match m
+            .as_str()
+        {
+            "tame" => Some(Mode::Tame),
+            "wild" => Some(Mode::Wild),
+            "loops" => Some(Mode::Loops),
+            "integer" => Some(Mode::Integer),
+            _ => None,
+        });
+    let modes: Vec<Mode> = match named {
+        Some(m) => vec![m],
+        None if args.iter().any(|a| a == "--wild") => vec![Mode::Wild],
+        None => oracle.modes().to_vec(),
+    };
     let root = wrela_tests::repo_root();
     let scratch = wrela_tests::scratch_root(root.join("target/tmp")).join("typed-soak");
     let out = root.join("target/typed");
