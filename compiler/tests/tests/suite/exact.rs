@@ -58,3 +58,29 @@ fn in_chrome_the_gpu_and_run_agree_bit_for_bit() {
         assert_eq!(agree, n, "{k}: {agree} of {n} places agree");
     }
 }
+
+/// Stage K.6's ceiling, a measurement (it prints and asserts nothing of the times): a 1,024 x
+/// 1,024 Life step by `run`, against what a tick with a held answer must still do, its inputs
+/// hashed by std's `Hasher` (the key) and the answer copied into `out`. A held answer can make a
+/// tick at most this much faster; the gate asks for 3 times.
+#[test]
+#[ignore = "a measurement"]
+fn k6_the_most_a_held_answer_could_save() {
+    let dir = crate::built("exact_ceiling");
+    let mut host = wrela_host::CpuBuild::load(&dir).unwrap().start_with(1).unwrap();
+    let mut ms = Vec::new();
+    for name in ["run_once", "take_once"] {
+        let _ = host.call_export(name, &[]).unwrap();
+        let t = std::time::Instant::now();
+        for _ in 0..20 {
+            host.call_export(name, &[]).unwrap();
+        }
+        ms.push(t.elapsed().as_secs_f64() * 1e3 / 20.0);
+    }
+    eprintln!(
+        "run {:.2} ms, hash and copy {:.2} ms: at most {:.2} times",
+        ms[0],
+        ms[1],
+        ms[0] / ms[1]
+    );
+}

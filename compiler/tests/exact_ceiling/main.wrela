@@ -1,0 +1,68 @@
+// K.6's ceiling (plan stage K): a 1,024 x 1,024 Life step by `run`, against what a tick with a held
+// answer must still do: hash its inputs (std's Hasher, as K.4's key) and copy the answer in.
+use std::gpu::{GlobalId, Slots}
+use std::hash::Hasher
+
+const SIDE: u32 = 1024
+
+struct Grid: Copy + GpuData {
+    side: u32,
+}
+
+@deterministic
+@compute(64)
+fn life(cells: [u32], grid: Grid, out: mut Slots<u32>, id: GlobalId) {
+    let n = grid.side
+    let (x, y) = (id.x % n, id.x / n)
+    var alive = 0
+    for dy in 0..3 {
+        for dx in 0..3 {
+            if dx != 1 || dy != 1 {
+                alive += cells[(y + n + dy - 1) % n * n + (x + n + dx - 1) % n]
+            }
+        }
+    }
+    out[id] = if alive == 3 || (alive == 2 && cells[id.x] == 1) { 1 } else { 0 }
+}
+
+pub struct S {
+    cells: Vec<u32>,
+    out: Vec<u32>,
+    held: Vec<u32>,
+}
+
+pub fn init() -> S {
+    var cells = Vec::new()
+    var out = Vec::new()
+    var held = Vec::new()
+    var h: u32 = 7
+    for _ in 0..SIDE * SIDE {
+        h = h.wrapping_mul(1664525).wrapping_add(1013904223)
+        cells.push((h >> 28) & 1)
+        out.push(0)
+        held.push(h & 1)
+    }
+    S { cells, out, held }
+}
+
+/// The step on the CPU.
+pub fn run_once(s: mut S) -> u32 {
+    life.run(s.cells, Grid { side: SIDE }, mut s.out)
+    s.out[12345]
+}
+
+/// The fast path: the key (the kernel's inputs hashed) and the held answer copied in.
+pub fn take_once(s: mut S) -> u32 {
+    var h = Hasher::new()
+    h.write_u32(SIDE)
+    for c in s.cells {
+        h.write_u32(c)
+    }
+    let key = h.finish()
+    for i in 0..SIDE * SIDE {
+        s.out[i] = s.held[i]
+    }
+    u32(key) ^ s.out[777]
+}
+
+pub fn frame(s: mut S, time: f32, width: u32, height: u32) {}

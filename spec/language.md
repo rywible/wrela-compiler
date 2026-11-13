@@ -2723,6 +2723,8 @@ fn step(cells: [u32], side: u32) -> Vec<u32> {
 }
 ```
 
+The GPU's answer isn't used in place of `run`'s: a tick would still hash its inputs to find a held answer, and copy it in. On an Apple M4, a 1,024 × 1,024 Life step by `run` took 7.6 to 7.8 ms, and the hash and the copy alone 2.5 to 2.6 ms, so a held answer could make the tick at most 3 times faster, before the lookup and the check that an answer is right. The CPU form is the kernel's one form in the simulation.
+
 ## 19. Rooms
 
 A room is a server's ordered log of what its peers propose: `std::net` gives the log, and the server host keeps it durably and serves it over the network.
