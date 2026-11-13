@@ -716,7 +716,7 @@ pub fn loop_program(c: &mut Choices) -> String {
     let mut body = String::new();
     for _ in 0..2 + c.draw(3) {
         let cst = consts[c.draw(consts.len() as u32) as usize];
-        body += &match c.draw(11) {
+        body += &match c.draw(12) {
             // The bound is the Vec's own length: its checks go.
             0 => {
                 format!("    for i in 0..xs.len() {{\n        acc = acc + xs[i] * {cst}\n    }}\n")
@@ -749,6 +749,11 @@ pub fn loop_program(c: &mut Choices) -> String {
             9 => format!(
                 "    for i in 0..xs.len() + {} {{\n        xs[i] = xs[i] * 0.5 - {cst}\n    }}\n",
                 c.draw(5)
+            ),
+            // The Vec shrunk between its length being taken and the loop: its checks must stay.
+            10 => format!(
+                "    let m = xs.len()\n    xs.truncate(m / {})\n    for i in 0..m {{\n        acc = acc + xs[i]\n    }}\n",
+                2 + c.draw(2)
             ),
             // Four at a time with a branch.
             _ => format!(

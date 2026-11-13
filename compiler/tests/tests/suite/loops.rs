@@ -40,3 +40,20 @@ fn the_layout_report_finds_the_particle_loop() {
     // The most skipped first.
     assert!(out.layout.windows(2).all(|p| p[0].1.skipped() >= p[1].1.skipped()));
 }
+
+/// A bound taken before the `Vec` (or `Columns`) shrinks keeps every check (L.1's range proofs,
+/// the review of 92de9d8e): in a release build each of these panics, as in 0.33.0, and the
+/// ordinary loop sums.
+#[test]
+fn a_bound_taken_before_a_vec_shrinks_keeps_its_checks() {
+    let (dir, _) = page("compiler/tests/stale", "stale");
+    let mut host = crate::cpu_host(&dir);
+    for k in
+        ["read_after_clear", "write_after_truncate", "columns_after_clear", "read_after_lending"]
+    {
+        let r = host.call_export(k, &[Value::I32(8)]);
+        assert!(matches!(r, Err(wrela_host::Error::Trap(_))), "{k}(8) should panic: {r:?}");
+    }
+    let r = host.call_export("sum", &[Value::I32(8)]).expect("sum");
+    assert_eq!(r, vec![Value::F32(36.0)]);
+}

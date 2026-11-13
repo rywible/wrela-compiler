@@ -5,8 +5,11 @@
 //! and whose `continuing` adds one to the counter, with no other store to the counter. Inside
 //! its body, `i < bound`. So:
 //! - a check `if i >= n { panic }` (what lowering's `check_below` makes) is removed when `n` is
-//!   `bound` itself, or both are loads of one place that nothing in the loop can write: no store
-//!   to it, no call lent a place, no memory operation that writes, and, where the place is
+//!   `bound` itself, or both are loads of one place that nothing can write between them: not in
+//!   the loop, and not between a load made before the loop and the loop's entry (the load's
+//!   `let` must be in the loop's own block, where every statement between can be seen; a `Vec`
+//!   cleared between taking its length and the loop keeps its checks). Nothing writes it: no
+//!   store to it, no call lent a place, no memory operation that writes, and, where the place is
 //!   reached through a pointer (or its root's address is taken), no store through a pointer;
 //! - the counter's `+ 1` becomes `WrappingAdd`: it is below `bound`, so it can't overflow.
 //!
@@ -78,7 +81,7 @@ struct Writes {
     anything: bool,
 }
 
-fn collect_writes(b: &Block, w: &mut Writes) {
+fn collect_writes(b: &[Stmt], w: &mut Writes) {
     for s in b {
         match s {
             Stmt::Store(p, _) => {
@@ -128,11 +131,13 @@ struct Shape {
     counter: crate::LocalId,
     i: ValueId,
     bound: ValueId,
+    /// The values the loop defines.
+    in_loop: HashSet<ValueId>,
 }
 
 impl Cx<'_> {
     fn block(&self, b: Block, removed: &mut u32) -> Block {
-        let mut out = Vec::new();
+        let mut out: Block = Vec::new();
         for s in b {
             match s {
                 Stmt::If { cond, then, else_ } => {
@@ -142,7 +147,7 @@ impl Cx<'_> {
                 }
                 Stmt::Loop { body, continuing } => {
                     let (body, continuing) = match self.shape(&body, &continuing) {
-                        Some(shape) => self.prove_loop(&shape, body, continuing, removed),
+                        Some(shape) => self.prove_loop(&shape, &out, body, continuing, removed),
                         None => (body, continuing),
                     };
                     let body = self.block(body, removed);
@@ -200,12 +205,17 @@ impl Cx<'_> {
         if w.places.iter().any(|p| p.root == PlaceRoot::Local(counter)) {
             return None;
         }
-        Some(Shape { counter, i: *i, bound: *bound })
+        let mut lets = HashMap::new();
+        collect_defs(body, &mut lets);
+        collect_defs(continuing, &mut lets);
+        Some(Shape { counter, i: *i, bound: *bound, in_loop: lets.into_keys().collect() })
     }
 
     /// Whether `n` is the loop's bound: itself, or a load of the place the bound is a load of,
-    /// which nothing in the loop can write.
-    fn same_bound(&self, s: &Shape, n: ValueId, w: &Writes) -> bool {
+    /// which nothing can write between the two loads: not in the loop, and not between a load
+    /// made before the loop and its entry. `before` is the loop's own block up to the loop: a
+    /// load before the loop must be a `let` there, so every statement after it can be seen.
+    fn same_bound(&self, s: &Shape, n: ValueId, w: &Writes, before: &[Stmt]) -> bool {
         if n == s.bound {
             return true;
         }
@@ -214,19 +224,40 @@ impl Cx<'_> {
         else {
             return false;
         };
-        if pn != pb || w.anything {
+        if pn != pb || !self.unwritten(pn, w) {
             return false;
         }
-        if w.places.iter().any(|q| overlaps(q, pn)) {
+        // Each load made before the loop: nothing writes the place from it to the loop.
+        for v in [s.bound, n] {
+            if !s.in_loop.contains(&v) {
+                let Some(at) =
+                    before.iter().position(|st| matches!(st, Stmt::Let(x, _) if *x == v))
+                else {
+                    return false;
+                };
+                let mut between = Writes::default();
+                collect_writes(&before[at + 1..], &mut between);
+                if !self.unwritten(pn, &between) {
+                    return false;
+                }
+            }
+        }
+        true
+    }
+
+    /// Whether writes `w` leave place `p` as it was.
+    fn unwritten(&self, p: &Place, w: &Writes) -> bool {
+        if w.anything || w.places.iter().any(|q| overlaps(q, p)) {
             return false;
         }
-        let through = matches!(pn.root, PlaceRoot::Ptr(_)) || self.addressed.contains(&pn.root);
+        let through = matches!(p.root, PlaceRoot::Ptr(_)) || self.addressed.contains(&p.root);
         !(through && w.through_pointers)
     }
 
     fn prove_loop(
         &self,
         s: &Shape,
+        before: &[Stmt],
         body: Block,
         continuing: Block,
         removed: &mut u32,
@@ -245,7 +276,7 @@ impl Cx<'_> {
                 }
                 Stmt::If { cond, then, else_ }
                     if else_.iter().all(|x| matches!(x, Stmt::At(_)))
-                        && ges.get(cond).is_some_and(|n| self.same_bound(s, *n, &w))
+                        && ges.get(cond).is_some_and(|n| self.same_bound(s, *n, &w, before))
                         && then
                             .iter()
                             .any(|x| matches!(x, Stmt::Eval(Expr::Mem(MemOp::Panic, _)))) =>

@@ -1,0 +1,87 @@
+// A loop's bound taken before its Vec shrinks (plan stage L.1's range proofs): every index must
+// still be checked, so each of these panics in an optimized build as it does in any other
+// (compiler/tests/tests/suite/loops.rs). `sum` is the ordinary loop, whose check may go.
+use std::collections::Columns
+
+struct P: Copy {
+    x: f32,
+    v: f32,
+}
+
+/// Reads `xs[i]` for the length `xs` had before it was cleared: `xs[0]` panics.
+pub fn read_after_clear(k: u32) -> f32 {
+    var xs: Vec<f32> = Vec::new()
+    for i in 0..k {
+        xs.push(f32(i) + 1.0)
+    }
+    let n = xs.len()
+    xs.clear()
+    var t = 0.0
+    for i in 0..n {
+        t += xs[i]
+    }
+    t
+}
+
+/// Writes `xs[i]` for the length `xs` had before it was truncated to 2: `xs[2]` panics.
+pub fn write_after_truncate(k: u32) -> f32 {
+    var xs: Vec<f32> = Vec::new()
+    for i in 0..k {
+        xs.push(f32(i) + 1.0)
+    }
+    let n = xs.len()
+    xs.truncate(2)
+    for i in 0..n {
+        xs[i] = 9.0
+    }
+    f32(xs.len())
+}
+
+/// A `Columns` cleared between its length and the loop: `c[0].x` panics.
+pub fn columns_after_clear(k: u32) -> f32 {
+    var c: Columns<P> = Columns::new()
+    for i in 0..k {
+        c.push(P { x: f32(i), v: 1.0 })
+    }
+    let n = c.len()
+    c.clear()
+    var t = 0.0
+    for i in 0..n {
+        t += c[i].x
+    }
+    t
+}
+
+fn shrink(xs: mut Vec<f32>) {
+    xs.truncate(1)
+}
+
+/// The `Vec` lent to a call that shrinks it, between its length and the loop: `xs[1]` panics.
+pub fn read_after_lending(k: u32) -> f32 {
+    var xs: Vec<f32> = Vec::new()
+    for i in 0..k {
+        xs.push(f32(i) + 1.0)
+    }
+    let n = xs.len()
+    shrink(mut xs)
+    var t = 0.0
+    for i in 0..n {
+        t += xs[i]
+    }
+    t
+}
+
+/// The ordinary loop over the `Vec`'s own length.
+pub fn sum(k: u32) -> f32 {
+    var xs: Vec<f32> = Vec::new()
+    for i in 0..k {
+        xs.push(f32(i) + 1.0)
+    }
+    var t = 0.0
+    for i in 0..xs.len() {
+        t += xs[i]
+    }
+    t
+}
+
+pub fn frame(time: f32, width: u32, height: u32) {}
