@@ -1,9 +1,10 @@
 // CPU loops (plan stage L's bench): the loops programs write, each over 2^20 elements. A loop
 // over runs (`[f32]`, which runs four at a time today: the control); the same over `Vec`s; a
-// `Vec` loop with a branch; a loop over a `Vec<Particle>` that reads two of its eight fields;
-// an integer sum of a `Vec<u32>`. Each is an export (`k_*`, `reps` times, a checksum of what it
+// `Vec` loop with a branch; a loop over a `Vec<Particle>` that reads two of its eight fields,
+// and the same over `Columns<Particle>` (L.5); an integer sum of a `Vec<u32>`. Each is an export (`k_*`, `reps` times, a checksum of what it
 // wrote: compiler/tests/tests/suite/loops.rs compares a build with SIMD against one without)
 // and a phase of the frame (`std::time::phase`, for `wrela profile --compare`).
+use std::collections::Columns
 use std::time::phase
 
 const N: u32 = 1048576
@@ -24,6 +25,7 @@ pub struct State {
     b: Vec<f32>,
     out: Vec<f32>,
     ps: Vec<Particle>,
+    cs: Columns<Particle>,
     idx: Vec<u32>,
 }
 
@@ -32,6 +34,7 @@ pub fn init() -> State {
     var b = Vec::new()
     var out = Vec::new()
     var ps = Vec::new()
+    var cs = Columns::new()
     var idx = Vec::new()
     var h: u32 = 5
     for i in 0..N {
@@ -40,21 +43,21 @@ pub fn init() -> State {
         a.push(x)
         b.push(x * 0.5 + 0.25)
         out.push(0.0)
-        ps.push(
-            Particle {
-                px: x,
-                py: -x,
-                pz: 0.5,
-                vx: 0.25 * x,
-                vy: 1.0,
-                vz: 0.0,
-                mass: 2.0,
-                age: f32(i % 7),
-            },
-        )
+        let p = Particle {
+            px: x,
+            py: -x,
+            pz: 0.5,
+            vx: 0.25 * x,
+            vy: 1.0,
+            vz: 0.0,
+            mass: 2.0,
+            age: f32(i % 7),
+        }
+        ps.push(p)
+        cs.push(p)
         idx.push(h >> 4)
     }
-    State { a, b, out, ps, idx }
+    State { a, b, out, ps, cs, idx }
 }
 
 /// Over runs: the control, which runs four at a time today.
@@ -84,6 +87,13 @@ fn branchy(out: mut Vec<f32>, a: Vec<f32>) {
 
 /// Two of a particle's eight fields.
 fn particles(out: mut Vec<f32>, ps: Vec<Particle>) {
+    for i in 0..ps.len() {
+        out[i] = ps[i].px * 0.5 + ps[i].vx
+    }
+}
+
+/// The same two fields, each in its own array.
+fn particle_columns(out: mut Vec<f32>, ps: Columns<Particle>) {
     for i in 0..ps.len() {
         out[i] = ps[i].px * 0.5 + ps[i].vx
     }
@@ -135,6 +145,13 @@ pub fn k_particles(s: mut State, reps: u32) -> u32 {
     checksum(s.out)
 }
 
+pub fn k_columns(s: mut State, reps: u32) -> u32 {
+    for _ in 0..reps {
+        particle_columns(mut s.out, s.cs)
+    }
+    checksum(s.out)
+}
+
 pub fn k_index_sum(s: mut State, reps: u32) -> u32 {
     var t: u32 = 0
     for _ in 0..reps {
@@ -152,6 +169,8 @@ pub fn frame(s: mut State, time: f32, width: u32, height: u32) {
     branchy(mut s.out, s.a)
     phase("particles")
     particles(mut s.out, s.ps)
+    phase("columns")
+    particle_columns(mut s.out, s.cs)
     phase("index sum")
     let _ = index_sum(s.idx)
     phase("rest")

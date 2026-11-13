@@ -1461,7 +1461,20 @@ impl<'c, 'a> Fl<'c, 'a> {
             }
         };
         let mut variant: Option<u32> = None;
+        // An element of a `Columns` just indexed (§6.10): the `Columns`' place and type, the
+        // element's type and the index, until the next projection says whether it's a field.
+        let mut columns: Option<(ir::Place, TyId, TyId, ir::ValueId)> = None;
         for proj in &p.proj[skip..] {
+            if let Some((c, cty, elem, iv)) = columns.take() {
+                if let mir::Proj::Field(i) = proj {
+                    let (fi, ft) = self.cx.field(self.mb, elem, None, *i, self.code.span)?;
+                    let at = self.columns_elem(c, cty, elem, iv, Some(fi))?;
+                    (root, path, ty) = (at.root, at.path, ft);
+                    continue;
+                }
+                let at = self.columns_elem(c, cty, elem, iv, None)?;
+                (root, path) = (at.root, at.path);
+            }
             if let Some(cs) = &swizzle {
                 // Through an alias of components: they pick from its vector.
                 match proj {
@@ -1545,6 +1558,14 @@ impl<'c, 'a> Fl<'c, 'a> {
                             let iv = self.index_u32(iv);
                             self.vec_elem(whole, ty, elem, iv)?
                         }
+                        // A field of an element in its column, or the element gathered: the
+                        // next projection says which.
+                        Some(Lang::Columns) => {
+                            let iv = self.index_u32(iv);
+                            columns = Some((whole, ty, elem, iv));
+                            ty = elem;
+                            continue;
+                        }
                         _ => whole.with(ir::Proj::Index(iv)),
                     };
                     root = at.root;
@@ -1552,6 +1573,10 @@ impl<'c, 'a> Fl<'c, 'a> {
                     ty = elem;
                 }
             }
+        }
+        if let Some((c, cty, elem, iv)) = columns {
+            let at = self.columns_elem(c, cty, elem, iv, None)?;
+            (root, path) = (at.root, at.path);
         }
         Some((ir::Place { root, path }, ty, swizzle))
     }

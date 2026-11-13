@@ -1,0 +1,22 @@
+// rejects: mem.columns
+// An element of a `Columns` isn't one place: it can't be lent `mut`, bound `mut`, or assigned
+// whole.
+use std::collections::Columns
+
+struct P: Copy {
+    x: f32,
+    v: f32,
+}
+
+fn step(p: mut P) {
+    p.x += p.v
+}
+
+pub fn frame(time: f32, width: u32, height: u32) {
+    var ps: Columns<P> = Columns::new()
+    ps.push(P { x: 0.0, v: 1.0 })
+    step(mut ps[0]) //~ E0339
+    mut e = ps[0] //~ E0339
+    e.x = 1.0
+    ps[0] = P { x: 2.0, v: 0.0 } //~ E0339
+}

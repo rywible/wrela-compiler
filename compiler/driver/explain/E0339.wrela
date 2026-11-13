@@ -1,0 +1,38 @@
+// An element of a `Columns` taken whole as a place: lent to a `mut` parameter, bound with
+// `mut`, or assigned whole. A `Columns<T>` keeps each field of `T` in its own array (§6.10), so
+// an element is a field in each of them, not one place. Write a field, `c[i].x = ...`, or read
+// the element, `let e = c[i]`, which gathers a copy.
+// ---- wrong
+use std::collections::Columns
+
+struct P: Copy {
+    x: f32,
+    v: f32,
+}
+
+fn step(p: mut P) {
+    p.x += p.v
+}
+
+pub fn frame(time: f32, width: u32, height: u32) {
+    var ps: Columns<P> = Columns::new()
+    ps.push(P { x: 0.0, v: 1.0 })
+    for i in 0..ps.len() {
+        step(mut ps[i])
+    }
+}
+// ---- fixed
+use std::collections::Columns
+
+struct P: Copy {
+    x: f32,
+    v: f32,
+}
+
+pub fn frame(time: f32, width: u32, height: u32) {
+    var ps: Columns<P> = Columns::new()
+    ps.push(P { x: 0.0, v: 1.0 })
+    for i in 0..ps.len() {
+        ps[i].x += ps[i].v
+    }
+}

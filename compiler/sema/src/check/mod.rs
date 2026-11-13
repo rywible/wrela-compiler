@@ -1059,8 +1059,28 @@ impl<'p> Checker<'p> {
         }
         // A `GlobalId` is the invocation's own (`Slots` are indexed by it): it can't change.
         let mut e = place;
+        // Whether `e` is a field of the expression above it.
+        let mut fielded = false;
         while let ExprKind::Field(b, _) | ExprKind::Swizzle(b, _) | ExprKind::Index(b, _) = &e.kind
         {
+            // A `Columns`' element is each field in its own array: written, it's a field.
+            if let ExprKind::Index(..) = &e.kind
+                && !fielded
+                && self.is_columns(b.ty)
+            {
+                let shown = self.display(b.ty);
+                self.err(
+                    Diagnostic::new(
+                        codes::E0339,
+                        e.span,
+                        format!("an element of a `{shown}` isn't one place: its fields are in arrays of their own"),
+                    )
+                    .with_note("`c[i].x` reads and writes one field, and `c[i]` read whole gathers a copy (§6.10)")
+                    .with_help("write a field, `c[i].x = ...`, or read the element, `let e = c[i]`"),
+                );
+                break;
+            }
+            fielded = matches!(e.kind, ExprKind::Field(..));
             // `v.xx` reads well, but written its two components are one place: one write would
             // be lost, or two added.
             if let ExprKind::Swizzle(_, cs) = &e.kind
@@ -1086,6 +1106,12 @@ impl<'p> Checker<'p> {
             }
             e = b;
         }
+    }
+
+    /// Whether `t` is a `std::collections::Columns`.
+    pub(crate) fn is_columns(&self, t: TyId) -> bool {
+        let t = self.infer.resolve(&self.p.types, t);
+        matches!(self.kind(t), &TyKind::Adt(a, _) if self.p.is_lang_adt(a, Lang::Columns))
     }
 
     /// Whether `t` is `std::gpu::GlobalId` or `LocalId`: the invocation's own, which `Slots`

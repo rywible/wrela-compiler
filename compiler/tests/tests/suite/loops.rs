@@ -5,7 +5,8 @@
 use wrela_host::{CpuHost, Value};
 use wrela_tests::{one_u32, page, scalar_page};
 
-const KERNELS: [&str; 5] = ["k_runs", "k_vecs", "k_branchy", "k_particles", "k_index_sum"];
+const KERNELS: [&str; 6] =
+    ["k_runs", "k_vecs", "k_branchy", "k_particles", "k_columns", "k_index_sum"];
 
 #[test]
 fn the_kernels_agree() {

@@ -182,6 +182,10 @@ pub const RULES: &[(&str, &str)] = &[
         "mem.plain",
         "`Plain` data has no pointers, and every field of a type that declares it is `Plain`",
     ),
+    (
+        "mem.columns",
+        "a `Columns` keeps each field in its own array: `c[i].x` is a place, and `c[i]` is read whole, never lent",
+    ),
     // §6.12 the unsafe core
     ("mem.unsafe", "`unsafe` only in std's core, and only in packages that declare it"),
     // §7 generics and traits

@@ -3554,6 +3554,7 @@ Each rule of the conformance suite (`compiler/tests/conformance`), with what it 
 | `eff.deterministic-fn` | A function passed as a `@deterministic fn` is deterministic | §6.7 |
 | `mem.arenas` | An arena's values are named by handles: `arena[h]` projects, and a stale handle panics | §6.8 |
 | `mem.plain` | `Plain` data has no pointers, and every field of a type that declares it is `Plain` | §6.10 |
+| `mem.columns` | A `Columns` keeps each field in its own array: `c[i].x` is a place, and `c[i]` is read whole, never lent | §6.10 |
 | `mem.unsafe` | `unsafe` only in std's core, and only in packages that declare it | §6.12 |
 | `gen.bounds` | Generic code is checked against its bounds, and monomorphized | §7 |
 | `gen.impl-trait` | A trait in parameter position makes a function generic | §7 |

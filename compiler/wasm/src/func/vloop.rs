@@ -53,12 +53,22 @@ enum Len {
     Free,
 }
 
-/// A `u32` the loop doesn't change: a place's (loaded once, before the four-wide loop), or a
-/// value from before the loop.
+/// A `u32` the loop doesn't change: a place's (loaded once, before the four-wide loop), a
+/// value from before the loop, or the sum or product of two (a `Columns`' column starts at
+/// `data + cap * start`, §6.10).
 #[derive(Clone, PartialEq)]
 enum Word {
     Place(ir::Place),
     Value(ir::ValueId),
+    Sum(Opnd, Opnd),
+    Product(Opnd, Opnd),
+}
+
+/// An operand of a word's sum or product: another word, or a constant.
+#[derive(Clone, Copy, PartialEq)]
+enum Opnd {
+    Word(usize),
+    Num(u32),
 }
 
 impl Root {
@@ -528,18 +538,29 @@ impl Planner<'_, '_> {
                 ir::Expr::Load(p) if self.steady(p) => {
                     Some(Kind::Word(self.word(Word::Place(p.clone()))))
                 }
-                ir::Expr::Binary(B::Mul, a, b) => {
-                    match (self.u32_operand(*a)?, self.u32_operand(*b)?) {
-                        (Kind::Index, Kind::Num(4)) | (Kind::Num(4), Kind::Index) => {
-                            Some(Kind::Offset)
-                        }
+                ir::Expr::Binary(op @ (B::Mul | B::Add | B::WrappingAdd), a, b) => {
+                    let (ka, kb) = (self.u32_operand(*a)?, self.u32_operand(*b)?);
+                    let opnd = |k: Kind| match k {
+                        Kind::Word(w) => Some(Opnd::Word(w)),
+                        Kind::Num(n) => Some(Opnd::Num(n)),
                         _ => None,
-                    }
-                }
-                ir::Expr::Binary(B::Add | B::WrappingAdd, a, b) => {
-                    match (self.u32_operand(*a)?, self.u32_operand(*b)?) {
-                        (Kind::Word(w), Kind::Offset) | (Kind::Offset, Kind::Word(w)) => {
+                    };
+                    match (op, ka, kb) {
+                        (B::Mul, Kind::Index, Kind::Num(4))
+                        | (B::Mul, Kind::Num(4), Kind::Index) => Some(Kind::Offset),
+                        (B::Add | B::WrappingAdd, Kind::Word(w), Kind::Offset)
+                        | (B::Add | B::WrappingAdd, Kind::Offset, Kind::Word(w)) => {
                             Some(Kind::Addr(w))
+                        }
+                        // A word from two, checked as the loop checks it (`Mul` and `Add`
+                        // trap on overflow): where it would, the four-wide loop doesn't run.
+                        (B::Mul | B::Add, x, y)
+                            if !matches!((x, y), (Kind::Num(_), Kind::Num(_))) =>
+                        {
+                            let (x, y) = (opnd(x)?, opnd(y)?);
+                            let w =
+                                if *op == B::Mul { Word::Product(x, y) } else { Word::Sum(x, y) };
+                            Some(Kind::Word(self.word(w)))
                         }
                         _ => None,
                     }
@@ -619,11 +640,45 @@ impl Planner<'_, '_> {
 /// Emits the four-wide loop, which leaves the counter where the loop itself goes on.
 pub(super) fn emit(fe: &mut Fe, plan: &Plan) -> R<()> {
     let w = plan.counter;
+    // Out of here, to the loop itself, where a word's sum or product overflows.
+    fe.ins.push(I::Block(wasm_encoder::BlockType::Empty));
     // The loop's words, once.
-    let mut words = Vec::new();
+    let mut words: Vec<u32> = Vec::new();
     for word in &plan.words {
         words.push(match word {
             Word::Value(x) => fe.v(*x),
+            Word::Sum(a, b) | Word::Product(a, b) => {
+                let get = |o: &Opnd| match o {
+                    Opnd::Word(k) => I::LocalGet(words[*k]),
+                    Opnd::Num(n) => I::I32Const(*n as i32),
+                };
+                let (ia, ib) = (get(a), get(b));
+                let l = fe.new_local(ValType::I32);
+                if matches!(word, Word::Sum(..)) {
+                    // Overflow iff the sum is below an operand.
+                    fe.ins.extend([ia.clone(), ib, I::I32Add, I::LocalTee(l), ia, I::I32LtU]);
+                } else {
+                    // In 64 bits: overflow iff the high half isn't 0.
+                    let p = fe.new_local(ValType::I64);
+                    fe.ins.extend([
+                        ia,
+                        I::I64ExtendI32U,
+                        ib,
+                        I::I64ExtendI32U,
+                        I::I64Mul,
+                        I::LocalTee(p),
+                        I::I32WrapI64,
+                        I::LocalSet(l),
+                        I::LocalGet(p),
+                        I::I64Const(32),
+                        I::I64ShrU,
+                        I::I64Const(0),
+                        I::I64Ne,
+                    ]);
+                }
+                fe.ins.push(I::BrIf(0));
+                l
+            }
             Word::Place(p) => match p.root_local().map(|l| fe.ir_locals[l.index()]) {
                 Some(LocalRepr::Scalar(w)) if p.path.is_empty() => w,
                 _ => {
@@ -670,7 +725,6 @@ pub(super) fn emit(fe: &mut Fe, plan: &Plan) -> R<()> {
     }
     let temps: HashMap<ir::LocalId, u32> =
         plan.temps.iter().map(|&l| (l, fe.new_local(ValType::V128))).collect();
-    fe.ins.push(I::Block(wasm_encoder::BlockType::Empty));
     fe.ins.push(I::Loop(wasm_encoder::BlockType::Empty));
     // On while i < bound and bound - i >= 4, and so for each root's length and each word a
     // check holds `i` below.
