@@ -1,6 +1,8 @@
 //! `wrela twin <package-dir> <module>::<fn> --box <lo>..<hi>[,<lo>..<hi>]... --within <eps>
 //! [--name <twin>] [--write | --check] [--json]`: a cheaper twin of a function GPU code calls,
-//! proven within `eps` of it over the box (language.md §14.3), as source.
+//! proven within `eps` of it over the box (language.md §14.3), as source. Experimental: on the
+//! frozen programs' GPU code the walk refused the costly functions and its twins saved at most 7%
+//! of their work (plan stage I.5).
 //!
 //! The function (of one `f32` or float vector, returning an `f32`) is called from a kernel in a
 //! program written around the package (`<package>/build/twin/`), whose GPU module the error walk

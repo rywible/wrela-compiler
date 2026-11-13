@@ -30,6 +30,9 @@
 //! wrela sliders <package-dir> <module>::<fn> --free <file>:<lines or names>... [--move i=a] [--write]
 //!                                         the independent ways a surface's literals move it,
 //!                                         each named, and moving along one
+//! wrela twin <package-dir> <module>::<fn> --box ... --within eps [--write | --check]
+//!                                         experimental: a cheaper twin of a GPU function,
+//!                                         proven within eps over the box, as source
 //! wrela fuzz <package-dir> [--ticks n] [--time s | --runs n] [--seed n] [--room]
 //!                                         the inputs that trap the program's ticks (or its
 //!                                         rooms), found by mutating inputs that run new
@@ -151,7 +154,7 @@ pub(crate) fn usage() -> ExitCode {
         "wrela pipelines <package-dir> [--set NAME=VALUE]... [--json]",
         "wrela inspect <package-dir> <module>::<fn> [--depth <n>] [--region <lo>..<hi>,<lo>..<hi>,<lo>..<hi>] [--thin <metres>] [--lift] [--views <dir>] [--json]",
         "wrela sliders <package-dir> <module>::<fn> --free <file>[:<lines or names>]... [--top <k>] [--depth <n>] [--region <lo>..<hi>,<lo>..<hi>,<lo>..<hi>] [--move <i>=<amount>]... [--write] [--sheet <file.png>] [--json]",
-        "wrela twin <package-dir> <module>::<fn> --box <lo>..<hi>[,<lo>..<hi>]... --within <eps> [--name <twin>] [--write | --check] [--json]",
+        "wrela twin <package-dir> <module>::<fn> --box <lo>..<hi>[,<lo>..<hi>]... --within <eps> [--name <twin>] [--write | --check] [--json]   (experimental)",
         "wrela pixel <package-dir> --frame <n> (--at <x>,<y> [--draw <k>] [--fragment <j>] | --kernel <label> --id <i>) [--input <script.json>] [--size <w>x<h>] [--line <file>:<line>] [--full] [--json]",
         "wrela fuzz <package-dir> [--ticks <n>] [--time <seconds> | --runs <n>] [--seed <n>] [--fuel <n>] [--seeds <dir>] [--out <dir>] [--replay <file-or-dir>] [--room] [--json]",
         "wrela profile <package-dir> [--frames n] [--warmup n] [--workers n] [--size WxH] [--input <script.json>] [--scenario name] [--serial] [--worst n] [--chrome [--features none|<list>] [--checked]] [--optimize size|speed] [--relaxed-simd] [--json] [--baseline <report.json> | --compare <build-dir> [--pairs n]]",
