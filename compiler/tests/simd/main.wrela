@@ -267,6 +267,36 @@ fn vec_in_place(xs: mut Vec<f32>, b: Vec<f32>) {
     }
 }
 
+/// Branches (four at a time as masks): a nested one, and a temporary both sides write.
+fn branches(out: mut [f32], a: [f32], b: [f32], n: u32) {
+    for i in 0..n {
+        var t = 0.0
+        if a[i] > b[i] {
+            t = a[i] - b[i]
+            if t > 0.5 {
+                out[i] = t * 2.0
+            } else {
+                out[i] = sqrt(t)
+            }
+        } else {
+            t = b[i]
+            out[i] = -t
+        }
+        out[i] = out[i] + t
+    }
+}
+
+/// A branch over `Vec`s, with `b` read only on one side.
+fn vec_branchy(out: mut Vec<f32>, a: Vec<f32>, b: Vec<f32>, n: u32) {
+    for i in 0..n {
+        if a[i] > 0.0 {
+            out[i] = a[i] * b[i]
+        } else {
+            out[i] = -1.0
+        }
+    }
+}
+
 /// `n` (at most 64) of case `seed`'s components in `Vec`s, through the `Vec` loops, hashed.
 fn vec_loops(seed: u32, n: u32) -> u32 {
     var a = Vec::new()
@@ -278,8 +308,12 @@ fn vec_loops(seed: u32, n: u32) -> u32 {
         out.push(0.0)
     }
     vec_kernel(mut out, a, b, comp(seed, 200), n)
-    vec_in_place(mut a, b)
     var h = 2166136261
+    for i in 0..n {
+        h = mix_in(h, out[i])
+    }
+    vec_branchy(mut out, a, b, n)
+    vec_in_place(mut a, b)
     for i in 0..n {
         h = mix_in(mix_in(h, out[i]), a[i])
     }
@@ -303,6 +337,10 @@ pub fn loops(seed: u32, n: u32) -> u32 {
     }
     in_place(mut a, b, n)
     shapes(mut out, a, b, n)
+    for i in 0..64 {
+        h = mix_in(h, out[i])
+    }
+    branches(mut out, a, b, n)
     for i in 0..64 {
         h = mix_in(mix_in(h, out[i]), a[i])
     }
@@ -367,6 +405,40 @@ pub fn vec_short_into(state: mut Shorts, n: u32) {
         }
     }
     vec_kernel(mut state.vout, a, b, 2.0, n)
+}
+
+/// `vec_branchy` with a `Vec` of 40 for `b`, read where `i % 3` is 0: it traps at 42.
+fn branchy_into(out: mut Vec<f32>, n: u32) {
+    var a = Vec::new()
+    var b = Vec::new()
+    for i in 0..64 {
+        a.push(if i % 3 == 0 { 1.5 } else { -1.5 })
+        if i < 40 {
+            b.push(0.25)
+        }
+    }
+    vec_branchy(mut out, a, b, n)
+}
+
+pub fn branchy_short(n: u32) -> u32 {
+    var out = Vec::new()
+    for _ in 0..64 {
+        out.push(0.0)
+    }
+    branchy_into(mut out, n)
+    var h = 2166136261
+    for i in 0..64 {
+        h = mix_in(h, out[i])
+    }
+    h
+}
+
+pub fn branchy_short_into(state: mut Shorts, n: u32) {
+    branchy_into(mut state.vout, n)
+}
+
+pub fn branchy_short_written(state: Shorts) -> u32 {
+    vec_short_written(state)
 }
 
 pub fn vec_short_written(state: Shorts) -> u32 {

@@ -10,6 +10,10 @@
 //!   the loop can't change;
 //! - checks the counter only against values the loop can't change (`if i >= n { panic }`, a
 //!   `Vec`'s bounds check, where a range proof hasn't removed it);
+//! - branches only on comparisons of `f32`s, each side of the same kind of code: the four-wide
+//!   loop runs both, and a store under a branch keeps the old value in the lanes whose
+//!   condition is false (`select`, after Pharr and Mark's ispc). A pointer's elements reached
+//!   only under a branch must be behind a check there, as a `Vec`'s indexing puts them;
 //! - computes with `f32` arithmetic, comparisons and `select`, the componentwise built-ins
 //!   (`min`, `sqrt`, `mix`, ...), the counter as an `f32`, and values from before the loop;
 //! - keeps nothing from one iteration to the next: a local it writes, it writes before it reads
@@ -136,13 +140,15 @@ pub(super) fn plan<'a>(fe: &Fe, body: &'a [ir::Stmt], continuing: &[ir::Stmt]) -
     if ap != cp || sp != cp || x != a || y != one || z != sum {
         return None;
     }
-    let defined: HashSet<ir::ValueId> = rest
-        .iter()
-        .filter_map(|s| match s {
-            ir::Stmt::Let(v, _) => Some(*v),
-            _ => None,
-        })
-        .collect();
+    // The values the body defines, in its branches too.
+    let mut defined = HashSet::new();
+    for s in rest {
+        ir::visit::walk(std::slice::from_ref(*s), &mut |s| {
+            if let ir::Stmt::Let(v, _) = s {
+                defined.insert(*v);
+            }
+        });
+    }
     if defined.contains(bound) || fe.values[bound.index()] == u32::MAX {
         return None;
     }
@@ -158,6 +164,10 @@ pub(super) fn plan<'a>(fe: &Fe, body: &'a [ir::Stmt], continuing: &[ir::Stmt]) -
         words: Vec::new(),
         bounds: Vec::new(),
         consts: HashMap::new(),
+        masked: false,
+        side_checked: false,
+        masked_free: Vec::new(),
+        free_unmasked: HashSet::new(),
     };
     ir::visit::walk(&fe.f.body, &mut |s| {
         if let ir::Stmt::Let(v, ir::Expr::Const(ir::Const::U32(n))) = s {
@@ -224,6 +234,12 @@ struct Planner<'f, 'm> {
     bounds: Vec<usize>,
     /// The function's `u32` constants.
     consts: HashMap<ir::ValueId, u32>,
+    /// Inside a branch, and whether a check came before, in it or around it; each pointer's
+    /// word reached so, with that; and those reached outside any branch.
+    masked: bool,
+    side_checked: bool,
+    masked_free: Vec<(usize, bool)>,
+    free_unmasked: HashSet<usize>,
     /// The temporaries stored so far, in body order.
     stored: HashSet<ir::LocalId>,
     kinds: HashMap<ir::ValueId, Kind>,
@@ -285,9 +301,10 @@ impl Planner<'_, '_> {
     }
 
     /// Whether a `u32` place is one the loop can't change and the four-wide loop can load
-    /// before it starts: fields of a constant, of a by-reference parameter, of a local in the
-    /// frame, or through a pointer from before the loop, or a scalar local the body doesn't
-    /// store. The body stores only `f32`s, to elements and temporaries, so no `u32` changes.
+    /// before it starts: fields of a constant, of a by-reference parameter or of a local in the
+    /// frame (memory that is there whether or not the loop runs; not through a pointer), or a
+    /// scalar local. The body stores only `f32`s, to elements and temporaries, so no `u32`
+    /// changes.
     fn steady(&self, p: &ir::Place) -> bool {
         if !p.path.iter().all(|x| matches!(x, ir::Proj::Field(_))) {
             return false;
@@ -302,10 +319,7 @@ impl Planner<'_, '_> {
                         LocalRepr::Scalar(w) => p.path.is_empty() && w != u32::MAX,
                     }
             }
-            ir::PlaceRoot::Ptr(v) => {
-                !self.defined.contains(v) && self.fe.values[v.index()] != u32::MAX
-            }
-            ir::PlaceRoot::Resource(_) => false,
+            ir::PlaceRoot::Ptr(_) | ir::PlaceRoot::Resource(_) => false,
         }
     }
 
@@ -354,7 +368,13 @@ impl Planner<'_, '_> {
             if self.scalar(self.fe.m.place_ty(self.fe.f, p)?)? != ir::Scalar::F32 {
                 return None;
             }
-            let root = Root::Base(*w);
+            let w = *w;
+            if self.masked {
+                self.masked_free.push((w, self.side_checked));
+            } else {
+                self.free_unmasked.insert(w);
+            }
+            let root = Root::Base(w);
             if !self.roots.iter().any(|(r, _)| *r == root) {
                 self.roots.push((root, Len::Free));
             }
@@ -381,13 +401,15 @@ impl Planner<'_, '_> {
         let mut inside = vec![0u32; self.fe.f.locals.len()];
         let mut whole = HashSet::new();
         for s in body {
-            super::mentions(s, &mut |l| inside[l.index()] += 1);
-            if let ir::Stmt::Store(p, _) = s
-                && p.path.is_empty()
-                && let Some(l) = p.root_local()
-            {
-                whole.insert(l);
-            }
+            ir::visit::walk(std::slice::from_ref(*s), &mut |s| {
+                super::mentions(s, &mut |l| inside[l.index()] += 1);
+                if let ir::Stmt::Store(p, _) = s
+                    && p.path.is_empty()
+                    && let Some(l) = p.root_local()
+                {
+                    whole.insert(l);
+                }
+            });
         }
         let total = &self.fe.local_mentions;
         for &l in &whole {
@@ -398,6 +420,39 @@ impl Planner<'_, '_> {
             }
             self.temps.insert(l);
         }
+        self.stmts(body)?;
+        // A pointer's elements reached only under a branch were reached behind a check there,
+        // as a `Vec`'s indexing makes them, or the loop reaches them anyway, unbranched.
+        if self.masked_free.iter().any(|(w, checked)| !checked && !self.free_unmasked.contains(w)) {
+            return None;
+        }
+        // No element is also reached another way: a root that's indexed is only indexed.
+        let roots: Vec<Root> = self.roots.iter().map(|(r, _)| r.clone()).collect();
+        let mut all = Vec::new();
+        for s in body {
+            ir::visit::walk(std::slice::from_ref(*s), &mut |s| all.push(s));
+        }
+        for s in all {
+            let mut other = false;
+            s.for_each_place(&mut |p| {
+                for r in &roots {
+                    if let Root::Place(rp) = r
+                        && p.root == rp.root
+                        && p.path.as_slice() != [ir::Proj::Index(self.index)]
+                    {
+                        other = true;
+                    }
+                }
+            });
+            if other {
+                return None;
+            }
+        }
+        Some(())
+    }
+
+    /// The body's statements, or a branch's (`self.mask`).
+    fn stmts(&mut self, body: &[&ir::Stmt]) -> Option<()> {
         for s in body {
             match s {
                 ir::Stmt::Let(v, e) => {
@@ -423,26 +478,31 @@ impl Planner<'_, '_> {
                     if !self.bounds.contains(w) {
                         self.bounds.push(*w);
                     }
+                    self.side_checked = true;
+                }
+                // A branch on a comparison of `f32`s (plan stage L.3, after Pharr and Mark's
+                // ispc): in the four-wide loop both sides run, for every lane, and each store
+                // keeps the old value where the lane's condition is false. Both sides are float
+                // arithmetic, which doesn't trap in a release build, loads at the counter's
+                // index, which the four-wide test covers, and checks, which it settles.
+                ir::Stmt::If { cond, then, else_ } => {
+                    if self.operand(*cond)? != Kind::Mask {
+                        return None;
+                    }
+                    let before = self.stored.clone();
+                    let (masked, checked) = (self.masked, self.side_checked);
+                    let mut sides = Vec::new();
+                    for side in [then, else_] {
+                        self.masked = true;
+                        self.side_checked = checked;
+                        self.stmts(&skip_at(side))?;
+                        sides.push(std::mem::replace(&mut self.stored, before.clone()));
+                    }
+                    (self.masked, self.side_checked) = (masked, checked);
+                    // A temporary is written after the branch where both sides write it.
+                    self.stored.extend(sides[0].intersection(&sides[1]).copied());
                 }
                 _ => return None,
-            }
-        }
-        // No element is also reached another way: a root that's indexed is only indexed.
-        let roots: Vec<Root> = self.roots.iter().map(|(r, _)| r.clone()).collect();
-        for s in body {
-            let mut other = false;
-            s.for_each_place(&mut |p| {
-                for r in &roots {
-                    if let Root::Place(rp) = r
-                        && p.root == rp.root
-                        && p.path.as_slice() != [ir::Proj::Index(self.index)]
-                    {
-                        other = true;
-                    }
-                }
-            });
-            if other {
-                return None;
             }
         }
         Some(())
@@ -634,29 +694,8 @@ pub(super) fn emit(fe: &mut Fe, plan: &Plan) -> R<()> {
     }
     let mut vals: HashMap<ir::ValueId, Lanes> = HashMap::new();
     vals.insert(plan.index, Lanes::Index);
-    for s in &plan.body {
-        match s {
-            ir::Stmt::Let(v, _) if plan.quiet.contains(v) => {}
-            // A bounds check, which the four-wide loop's test settles.
-            ir::Stmt::If { .. } => {}
-            ir::Stmt::Let(v, e) => {
-                let l = expr(fe, plan, &bases, &temps, &vals, e)?;
-                vals.insert(*v, l);
-            }
-            ir::Stmt::Store(p, x) => match p.root_local().and_then(|l| temps.get(&l)) {
-                Some(&t) if p.path.is_empty() => {
-                    push(fe, &vals, *x)?;
-                    fe.ins.push(I::LocalSet(t));
-                }
-                _ => {
-                    element_addr(fe, plan, &bases, &root_of(plan, p))?;
-                    push(fe, &vals, *x)?;
-                    fe.ins.push(I::V128Store(mem(0, 2)));
-                }
-            },
-            _ => return Err("internal: a statement a four-wide loop can't have".into()),
-        }
-    }
+    let cx = Body { plan, bases: &bases, temps: &temps };
+    cx.stmts(fe, &mut vals, &plan.body, None)?;
     fe.ins.extend([
         I::LocalGet(w),
         I::I32Const(4),
@@ -667,6 +706,86 @@ pub(super) fn emit(fe: &mut Fe, plan: &Plan) -> R<()> {
         I::End,
     ]);
     Ok(())
+}
+
+/// What the four-wide loop's statements are emitted with.
+struct Body<'p> {
+    plan: &'p Plan<'p>,
+    bases: &'p [(Root, u32, u32)],
+    temps: &'p HashMap<ir::LocalId, u32>,
+}
+
+impl Body<'_> {
+    /// The statements, under `mask` (a `v128` local) inside a branch: a store there keeps the
+    /// old value where the mask is 0.
+    fn stmts(
+        &self,
+        fe: &mut Fe,
+        vals: &mut HashMap<ir::ValueId, Lanes>,
+        body: &[&ir::Stmt],
+        mask: Option<u32>,
+    ) -> R<()> {
+        let (plan, bases, temps) = (self.plan, self.bases, self.temps);
+        for s in body {
+            match s {
+                ir::Stmt::Let(v, _) if plan.quiet.contains(v) => {}
+                // A bounds check, which the four-wide loop's test settles.
+                ir::Stmt::If { cond, .. } if plan.quiet.contains(cond) => {}
+                // A branch: each side under its lanes' mask.
+                ir::Stmt::If { cond, then, else_ } => {
+                    push(fe, vals, *cond)?;
+                    let c = fe.new_local(ValType::V128);
+                    fe.ins.push(I::LocalSet(c));
+                    let yes = match mask {
+                        None => c,
+                        Some(m) => {
+                            let l = fe.new_local(ValType::V128);
+                            fe.ins.extend([I::LocalGet(m), I::LocalGet(c), I::V128And]);
+                            fe.ins.push(I::LocalSet(l));
+                            l
+                        }
+                    };
+                    let no = fe.new_local(ValType::V128);
+                    match mask {
+                        None => fe.ins.extend([I::LocalGet(c), I::V128Not]),
+                        Some(m) => fe.ins.extend([I::LocalGet(m), I::LocalGet(c), I::V128AndNot]),
+                    }
+                    fe.ins.push(I::LocalSet(no));
+                    self.stmts(fe, vals, &skip_at(then), Some(yes))?;
+                    self.stmts(fe, vals, &skip_at(else_), Some(no))?;
+                }
+                ir::Stmt::Let(v, e) => {
+                    let l = expr(fe, plan, bases, temps, vals, e)?;
+                    vals.insert(*v, l);
+                }
+                ir::Stmt::Store(p, x) => match p.root_local().and_then(|l| temps.get(&l)) {
+                    Some(&t) if p.path.is_empty() => {
+                        push(fe, vals, *x)?;
+                        if let Some(m) = mask {
+                            fe.ins.extend([I::LocalGet(t), I::LocalGet(m), I::V128Bitselect]);
+                        }
+                        fe.ins.push(I::LocalSet(t));
+                    }
+                    _ => {
+                        let root = root_of(plan, p);
+                        element_addr(fe, plan, bases, &root)?;
+                        push(fe, vals, *x)?;
+                        if let Some(m) = mask {
+                            element_addr(fe, plan, bases, &root)?;
+                            fe.ins.extend([
+                                I::V128Load(mem(0, 2)),
+                                I::LocalGet(m),
+                                I::V128Bitselect,
+                            ]);
+                        }
+                        fe.ins.push(I::V128Store(mem(0, 2)));
+                    }
+                },
+                _ => return Err("internal: a statement a four-wide loop can't have".into()),
+            }
+        }
+        Ok(())
+    }
 }
 
 /// The root an element place in the plan's body goes through.
