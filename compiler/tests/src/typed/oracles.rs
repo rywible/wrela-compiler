@@ -250,7 +250,9 @@ pub fn run(oracle: Oracle, src: &str, seed: u64, dir: &Path) -> Result<Counts, F
             let build = match build(dir, &(src.to_string() + TAPE_HARNESS), false) {
                 Err(f) if f.what.contains("E0709") => {
                     if TAPE_ALLOWED.iter().any(|a| f.what.contains(a)) {
-                        set_apart("O4: a tape can't hold a power whose exponent depends on the point");
+                        set_apart(
+                            "O4: a tape can't hold a power whose exponent depends on the point",
+                        );
                         return Ok(Counts::default());
                     }
                     return Err(f);
@@ -287,7 +289,9 @@ pub fn run(oracle: Oracle, src: &str, seed: u64, dir: &Path) -> Result<Counts, F
                         r[1] - r[0]
                     ));
                 }
-                set_apart("O4 (a point counted, agreeing): apart by more than 3e-6, within the point interval's width");
+                set_apart(
+                    "O4 (a point counted, agreeing): apart by more than 3e-6, within the point interval's width",
+                );
             }
             Ok(Counts { points: 16, counted: 16 })
         }

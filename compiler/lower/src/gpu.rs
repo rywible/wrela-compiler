@@ -3017,6 +3017,9 @@ fn non_filtering(m: &ir::Module, bindings: &mut [ResourceBinding]) {
 fn check_exact(cx: &mut Cx, kernel: FnId, m: &ir::Module) {
     let def = cx.checked.program.func(kernel);
     let Some(at) = def.attrs.deterministic else { return };
+    if !cx.exact_checked.insert(kernel) {
+        return;
+    }
     let (name, span) = (def.name.clone(), def.name_span);
     let note = "a deterministic kernel computes with integers, and moves floats only as bits: its \
                 result is then the same on every GPU and on the CPU (§18.14)";
@@ -3071,6 +3074,42 @@ fn check_exact(cx: &mut Cx, kernel: FnId, m: &ir::Module) {
     }
 }
 
+/// A `@deterministic` kernel's module (§18.14), checked (E0713), its indexes clamped and its
+/// calls inlined into its entry point: what its CPU form (`k.run`, `crate::exact`) is made from,
+/// the same code the GPU runs. With its workgroup size.
+pub(crate) fn exact_module(
+    cx: &mut Cx,
+    kernel: FnId,
+    substs: &[TyId],
+) -> Option<(ir::Module, [u32; 3])> {
+    let key =
+        PipelineKey::Compute { kernel, substs: substs.to_vec(), over: false, consts: Vec::new() };
+    let iface = Rc::new(interface(cx, &key));
+    let Some(Entry::Compute(wg)) = cx.entry_of(kernel) else { return None };
+    let name = cx.checked.program.func(kernel).name.clone();
+    let EntryModule { mut mb, keys, .. } =
+        entry_module(cx, iface.clone(), Entry::Compute(wg), Some(Vec::new()));
+    let entry = entry_function(&mut mb, &keys[0], &name, None, None);
+    cx.drain(&mut mb);
+    let inputs = entry_inputs(&iface.entries[0], true, iface.over);
+    mb.m.entry_points.push(ir::EntryPoint {
+        name: ir::ident(&name),
+        stage: ir::Stage::Compute { workgroup_size: wg },
+        function: entry,
+        inputs,
+    });
+    check_exact(cx, kernel, &mb.m);
+    if wrela_diag::has_errors(&cx.diags) {
+        return None;
+    }
+    ir::exact::clamp_indexes(&mut mb.m);
+    if let Err(e) = ir::opt::flatten_gpu(&mut mb.m) {
+        cx.err(Diagnostic::internal(format!("flattening `{name}` for its CPU form: {e}")));
+        return None;
+    }
+    Some((mb.m, wg))
+}
+
 fn lower_compute(cx: &mut Cx, iface: Rc<Interface>, consts: Vec<ir::Const>) -> Option<PipelineOut> {
     let kernel = iface.entries[0].func;
     let Some(Entry::Compute(wg)) = cx.entry_of(kernel) else { return None };
@@ -3090,7 +3129,10 @@ fn lower_compute(cx: &mut Cx, iface: Rc<Interface>, consts: Vec<ir::Const>) -> O
         function: entry,
         inputs,
     });
-    check_exact(cx, kernel, &mb.m);
+    if cx.checked.program.func(kernel).attrs.deterministic.is_some() {
+        check_exact(cx, kernel, &mb.m);
+        ir::exact::clamp_indexes(&mut mb.m);
+    }
     let (work, unbounded, weight, same, few) = verify(cx, &mut mb, name)?;
     non_filtering(&mb.m, &mut bindings);
     let instances = mb.fn_instances();

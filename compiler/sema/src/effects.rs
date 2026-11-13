@@ -1023,7 +1023,8 @@ fn node(
                     Callee::Fn { func, .. } | Callee::JobResume { func, .. } => {
                         call_to(&mut n, *func, c.span)
                     }
-                    Callee::JobStart { .. } => {}
+                    // A deterministic kernel's CPU form: integer arithmetic, on what it's given.
+                    Callee::JobStart { .. } | Callee::ExactRun { .. } => {}
                     Callee::TraitMethod { method, self_ty, trait_args, method_args } => {
                         // Resolved here only when the type is known; otherwise lowering checks
                         // each instantiation.

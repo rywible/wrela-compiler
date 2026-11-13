@@ -2337,6 +2337,15 @@ impl<'p> Checker<'p> {
         {
             return self.bind_value(f, path, args, span);
         }
+        // `k.run(...)`: a `@deterministic` kernel's CPU form (§18.14).
+        if name.name == "run"
+            && let Some(f) = self.fn_named(receiver)
+            && self.p.func(f).attrs.deterministic.is_some()
+            && matches!(self.p.func(f).attrs.entry, Some((crate::defs::Entry::Compute(..), _)))
+            && let ast::ExprKind::Path(path) = &receiver.kind
+        {
+            return self.exact_run(f, path, args, span);
+        }
         // `job.start(...)`: a `Job<job>` (§16.3).
         if name.name == "start"
             && let Some(f) = self.fn_named(receiver)

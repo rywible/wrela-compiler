@@ -2385,6 +2385,10 @@ impl<'c, 'a> Fl<'c, 'a> {
                 let substs: Vec<TyId> = args.iter().map(|&a| self.concrete(a)).collect();
                 crate::job::start(self, *func, &substs, &c.args)
             }
+            mir::Callee::ExactRun { func, args } => {
+                let substs: Vec<TyId> = args.iter().map(|&a| self.concrete(a)).collect();
+                crate::exact::run(self, *func, &substs, &c.args, span)
+            }
             mir::Callee::JobResume { func, args } => {
                 let substs: Vec<TyId> = args.iter().map(|&a| self.concrete(a)).collect();
                 crate::job::resume(self, *func, substs, &c.args, span)

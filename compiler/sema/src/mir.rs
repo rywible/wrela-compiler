@@ -656,6 +656,8 @@ pub fn fn_uses(p: &Program, s: &Statement, r: &Rvalue, mut each: impl FnMut(FnUs
             Callee::JobStart { func, .. } | Callee::JobResume { func, .. } => {
                 each(FnUse::Call(*func), c.span)
             }
+            // A deterministic kernel run on the CPU (§18.14): the kernel, as a dispatch uses it.
+            Callee::ExactRun { func, .. } => each(FnUse::Dispatch(*func), c.span),
             Callee::TraitMethod { method, self_ty, .. } => {
                 each(FnUse::Trait(*method, *self_ty), c.span)
             }

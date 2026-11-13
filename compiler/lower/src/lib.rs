@@ -16,6 +16,7 @@ mod body;
 mod consts;
 mod derive;
 mod eval;
+mod exact;
 mod glue;
 mod gpu;
 pub use gpu::blends_of;
@@ -295,6 +296,8 @@ pub(crate) struct Cx<'a> {
     /// A lifted build's literals (§23): only the program's own modules read them, never the
     /// modules that compute constants or run tests.
     pub lift: Option<&'a LiftTable>,
+    /// The `@deterministic` kernels checked for E0713 (§18.14), each once.
+    pub exact_checked: std::collections::HashSet<FnId>,
 }
 
 /// One target module being built: the CPU module by default.
@@ -332,6 +335,8 @@ pub(crate) struct ModuleBuilder {
     pub lift: Option<lift::CpuTable>,
     /// Each job's value, as laid out (§16.3), by the job and its generics.
     pub jobs: HashMap<(FnId, Vec<TyId>), job::JobLayout>,
+    /// Each `@deterministic` kernel's CPU form (§18.14), by the kernel and its generics.
+    pub exact: HashMap<(FnId, Vec<TyId>), ir::FuncId>,
     /// The files `embed` read into this module's data, by path, in the order first read.
     pub embeds: Vec<std::sync::Arc<str>>,
 }
@@ -648,6 +653,7 @@ impl<'a> Cx<'a> {
             pipeline_sites: Vec::new(),
             pipeline_targets: Vec::new(),
             lift: None,
+            exact_checked: Default::default(),
         }
     }
 

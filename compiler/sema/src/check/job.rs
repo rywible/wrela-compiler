@@ -165,3 +165,76 @@ pub fn check_jobs(p: &crate::Program) -> Vec<Diagnostic> {
     }
     out
 }
+
+impl<'p> Checker<'p> {
+    /// `k.run(input, params, mut out)` (§18.14): a `@deterministic` kernel `fn k(input: [A],
+    /// params: P, out: mut Slots<B>, id: GlobalId)` run on the CPU over `out`'s places, `out` a
+    /// `Vec<B>`. Its shape is checked where it's lowered (E0713).
+    pub(crate) fn exact_run(
+        &mut self,
+        f: FnId,
+        path: &ast::Path,
+        args: &[ast::Arg],
+        span: Span,
+    ) -> Expr {
+        let gen_args = self.fresh_fn_args(f, path, path.span);
+        self.fn_obligations(f, &gen_args, span);
+        let (params, _, _) = self.fn_params(f, &gen_args);
+        let out_elem = params.get(2).and_then(|c| match self.p.types.kind(c.ty) {
+            TyKind::Adt(a, targs) if self.p.adt(*a).lang == Some(Lang::Slots) => {
+                targs.first().copied()
+            }
+            _ => None,
+        });
+        let (Some(out_elem), Some(vec)) = (out_elem, self.p.lang_adt(Lang::Vec)) else {
+            self.err(
+                Diagnostic::new(
+                    codes::E0713,
+                    span,
+                    format!("`{}.run` needs the kernel to be `fn k(input: [A], params: P, out: mut Slots<B>, id: GlobalId)`", self.p.func(f).name),
+                )
+                .with_help("give the kernel that shape (§18.14)"),
+            );
+            return Expr { ty: self.p.types.unit, span, kind: ExprKind::Error };
+        };
+        let out_ty = self.p.types.intern(TyKind::Adt(vec, vec![out_elem]));
+        let module = self.p.func(f).module;
+        let run_params = vec![
+            CallParam {
+                name: "input",
+                mode: Mode::Borrow,
+                ty: params[0].ty,
+                default: None,
+                module,
+                fn_bound: None,
+            },
+            CallParam {
+                name: "params",
+                mode: Mode::Borrow,
+                ty: params[1].ty,
+                default: None,
+                module,
+                fn_bound: None,
+            },
+            CallParam {
+                name: "out",
+                mode: Mode::Mut,
+                ty: out_ty,
+                default: None,
+                module,
+                fn_bound: None,
+            },
+        ];
+        let name = format!("{}.run", self.p.func(f).name);
+        let (args, modes, order) = self.match_args(&name, &run_params, None, args, span, f);
+        let call = Call {
+            callee: Callee::ExactRun { func: f, args: gen_args },
+            args,
+            modes,
+            receiver: false,
+            order,
+            ret_mode: RetMode::Owned,
+        };
+        Expr { ty: self.p.types.unit, span, kind: ExprKind::Call(call) }
+    }
+}

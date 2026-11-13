@@ -1,0 +1,213 @@
+// Kernels the same on every GPU (language.md §18.14, plan stage K): three `@deterministic`
+// kernels, each run on the GPU over 10,000 random inputs and on the CPU (`k.run`), and their
+// outputs compared bit for bit. Frame 0 makes the inputs and dispatches; each later frame takes
+// what the GPU has read back, and once all three are in, prints how many places agree:
+// `exact <kernel> <agree> of <n>`. compiler/tests/tests/suite/exact.rs reads the lines, on the
+// native host and in Chrome.
+use std::gpu::{GlobalId, GpuBuffer, Slots, buffer, buffer_of, dispatch, read}
+use std::io::{Pending, print}
+
+/// Each kernel's inputs: a grid of 100 x 100 cells, and 10,000 words.
+const N: u32 = 10000
+const SIDE: u32 = 100
+
+struct Grid: Copy + GpuData {
+    side: u32,
+}
+
+/// One step of Life on a torus.
+@deterministic
+@compute(64)
+fn life(cells: [u32], grid: Grid, out: mut Slots<u32>, id: GlobalId) {
+    let n = grid.side
+    let (x, y) = (id.x % n, id.x / n)
+    var alive = 0
+    for dy in 0..3 {
+        for dx in 0..3 {
+            if dx != 1 || dy != 1 {
+                alive += cells[(y + n + dy - 1) % n * n + (x + n + dx - 1) % n]
+            }
+        }
+    }
+    out[id] = if alive == 3 || (alive == 2 && cells[id.x] == 1) { 1 } else { 0 }
+}
+
+struct Salt: Copy + GpuData {
+    salt: u32,
+}
+
+/// Hash mixing: multiplies that wrap, shifts by amounts past the width, xors, a division and a
+/// remainder by a value that's sometimes zero, and a signed division that's sometimes
+/// `MIN / -1`.
+@deterministic
+@compute(64)
+fn mix(words: [u32], s: Salt, out: mut Slots<u32>, id: GlobalId) {
+    var h = words[id.x] ^ s.salt
+    h = h * 2654435761
+    h = h ^ (h >> (h & 63))
+    h = h ^ (h << (words[id.x] % 40))
+    let d = h % 7
+    h = h + h / d + h % d
+    let a = i32(h | 2147483648)
+    let b = if (h & 3) == 0 { -1 } else { i32(d) - 3 }
+    out[id] = h ^ u32(a / b) ^ u32(a % b)
+}
+
+/// Reads past its input: the index clamped to the last element (§18.14).
+@deterministic
+@compute(64)
+fn past(words: [u32], s: Salt, out: mut Slots<u32>, id: GlobalId) {
+    out[id] = words[id.x * 3 + s.salt] + words[id.x]
+}
+
+pub struct State {
+    frame: u32,
+    cells: Vec<u32>,
+    words: Vec<u32>,
+    gpu: Vec<GpuBuffer<u32>>,
+    pending: Vec<Pending<u32>>,
+    seen: Vec<Vec<u32>>,
+}
+
+pub fn init() -> State {
+    var cells = Vec::new()
+    var words = Vec::new()
+    var h: u32 = 2026
+    for i in 0..N {
+        h = h.wrapping_mul(1664525).wrapping_add(1013904223)
+        cells.push((h >> 28) & 1)
+        // Words of every size, and some at the edges: 0, the largest, the sign bit.
+        let w = h.wrapping_mul(2246822519) ^ (h >> 13)
+        words.push(if i % 97 == 0 { 0 } else if i % 89 == 0 { 4294967295 } else if i % 83 == 0 {
+            2147483648
+        } else { w })
+    }
+    State { frame: 0, cells, words, gpu: Vec::new(), pending: Vec::new(), seen: Vec::new() }
+}
+
+/// Each kernel's output on the CPU.
+fn on_cpu(s: State) -> Vec<Vec<u32>> {
+    var outs: Vec<Vec<u32>> = Vec::new()
+    for _ in 0..3 {
+        var o = Vec::new()
+        for _ in 0..N {
+            o.push(0)
+        }
+        outs.push(take o)
+    }
+    life.run(s.cells, Grid { side: SIDE }, mut outs[0])
+    mix.run(s.words, Salt { salt: 77 }, mut outs[1])
+    past.run(s.words, Salt { salt: 5000 }, mut outs[2])
+    outs
+}
+
+/// The places where the CPU's and the GPU's outputs agree, for each kernel.
+pub fn agree(s: State) -> vec3u {
+    let cpu = on_cpu(s)
+    var counts = [0, 0, 0]
+    for k in 0..3 {
+        if k < s.seen.len() {
+            for i in 0..N {
+                if cpu[k][i] == s.seen[k][i] {
+                    counts[k] += 1
+                }
+            }
+        }
+    }
+    vec3u(counts[0], counts[1], counts[2])
+}
+
+pub fn frame(s: mut State, time: f32, width: u32, height: u32) {
+    if s.frame == 0 {
+        let cells = buffer_of(s.cells)
+        let words = buffer_of(s.words)
+        var a: GpuBuffer<u32> = buffer(N)
+        var b: GpuBuffer<u32> = buffer(N)
+        var c: GpuBuffer<u32> = buffer(N)
+        let groups = (N + 63) / 64
+        dispatch(life.bind(cells, Grid { side: SIDE }, mut a), groups: groups)
+        dispatch(mix.bind(words, Salt { salt: 77 }, mut b), groups: groups)
+        dispatch(past.bind(words, Salt { salt: 5000 }, mut c), groups: groups)
+        s.pending.push(read(a.items()))
+        s.pending.push(read(b.items()))
+        s.pending.push(read(c.items()))
+        s.gpu.push(take a)
+        s.gpu.push(take b)
+        s.gpu.push(take c)
+    }
+    for i in 0..s.pending.len() {
+        if s.seen.len() == i {
+            if let Some(Ok(v)) = s.pending[i].poll() {
+                s.seen.push(take v)
+                if s.seen.len() == 3 {
+                    let c = agree(s)
+                    print(f"exact life {c.x} of {N}")
+                    print(f"exact mix {c.y} of {N}")
+                    print(f"exact past {c.z} of {N}")
+                }
+            }
+        }
+    }
+    s.frame += 1
+}
+
+/// Life by hand, for `run` to agree with.
+fn life_by_hand(cells: [u32], n: u32) -> Vec<u32> {
+    var out = Vec::new()
+    for i in 0..n * n {
+        let (x, y) = (i % n, i / n)
+        var alive = 0
+        for dy in 0..3 {
+            for dx in 0..3 {
+                if dx != 1 || dy != 1 {
+                    alive += cells[(y + n + dy - 1) % n * n + (x + n + dx - 1) % n]
+                }
+            }
+        }
+        out.push(if alive == 3 || (alive == 2 && cells[i] == 1) { 1 } else { 0 })
+    }
+    out
+}
+
+@test
+fn life_runs_on_the_cpu_as_by_hand() {
+    let n = 64
+    var cells = Vec::new()
+    var h: u32 = 12345
+    for _ in 0..n * n {
+        h = h.wrapping_mul(1664525).wrapping_add(1013904223)
+        cells.push((h >> 28) & 1)
+    }
+    for _step in 0..8 {
+        var next = Vec::new()
+        for _ in 0..n * n {
+            next.push(7)
+        }
+        life.run(cells, Grid { side: n }, mut next)
+        let want = life_by_hand(cells, n)
+        for i in 0..n * n {
+            assert(next[i] == want[i])
+        }
+        cells = take next
+    }
+}
+
+@test
+fn a_read_past_the_input_is_its_last_element() {
+    let words = [10, 20, 30, 40]
+    let out = [0, 0, 0, 0]
+    var v = Vec::new()
+    for w in words {
+        v.push(w)
+    }
+    var o = Vec::new()
+    for x in out {
+        o.push(x)
+    }
+    // Place i reads words[3 i + 2]: 30 at 0, then past the end, the last (40).
+    past.run(v, Salt { salt: 2 }, mut o)
+    assert(o[0] == 30 + 10)
+    assert(o[1] == 40 + 20)
+    assert(o[2] == 40 + 30)
+    assert(o[3] == 40 + 40)
+}
