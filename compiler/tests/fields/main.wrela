@@ -10,9 +10,10 @@ use corpus::{
 use grazer::{Grazer, P3, PARAM_FLOATS, bounds, grazer, grazer_from, p3, params}
 use std::derive::{Box3, interval, reverse}
 use std::field::{Surface, check_lipschitz, hash_u32}
+use std::stage::{Tape, interpret, interpret_at}
 use std::gpu::{
     ClipPosition, FragCoord, GlobalId, GpuBuffer, Slots, VertexIndex, begin_screen_pass, buffer,
-    dispatch, draw,
+    buffer_of, dispatch, draw,
 }
 
 // ---- the program's state: the buffers the tests read back --------------------------------------
@@ -683,6 +684,51 @@ pub fn tape_values_gpu(state: mut Results, k: u32, seed: u32, n: u32) {
     state.dist = twin(k, tape: true, v: TwinGpu { n, seed })
     let compiled: GpuBuffer<f32> = twin(k, tape: false, v: TwinGpu { n, seed })
     state.dist2 = take compiled
+}
+
+/// A tape's values at `n` sampled points, the tape read where it lies: `tapes[which]`.
+@compute(64)
+fn tape_at_values(tapes: [Tape], which: u32, n: u32, seed: u32, out: mut Slots<f32>, id: GlobalId) {
+    if id.x < n {
+        out[id] = interpret_at(tapes, which, sample_point(seed, id.x))
+    }
+}
+
+/// A tape's values at `n` sampled points, the tape given by value.
+@compute(64)
+fn tape_by_value(tape: Tape, n: u32, seed: u32, out: mut Slots<f32>, id: GlobalId) {
+    if id.x < n {
+        out[id] = interpret(tape, sample_point(seed, id.x))
+    }
+}
+
+/// A field's tape.
+struct ToTape: Copy {
+    unused: u32,
+}
+
+impl Visit for ToTape {
+    type Out = Tape
+
+    fn visit<F: Surface>(self, f: F) -> Tape {
+        f.to_tape()
+    }
+}
+
+/// On the GPU (stage J.2): corpus field `k`'s tape at `n` sampled points, read in place from a
+/// buffer of all the corpus's tapes (`interpret_at`) into the state's `dist`, and given by value
+/// (`interpret`) into `dist2`.
+pub fn tape_at_gpu(state: mut Results, k: u32, seed: u32, n: u32) {
+    var tapes: Vec<Tape> = Vec::new()
+    for i in 0..CORPUS {
+        tapes.push(with_function(i, ToTape { unused: 0 }))
+    }
+    let all = buffer_of(tapes)
+    state.dist = buffer(n)
+    state.dist2 = buffer(n)
+    let groups = (n + 63) / 64
+    dispatch(tape_at_values.bind(all, k, n, seed, mut state.dist), groups: groups)
+    dispatch(tape_by_value.bind(tapes[k].clone(), n, seed, mut state.dist2), groups: groups)
 }
 
 /// Pruning the blob's tape to box `b`: how long the pruned tape is, and at how many of `n`
