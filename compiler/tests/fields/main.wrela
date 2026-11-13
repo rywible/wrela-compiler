@@ -929,3 +929,108 @@ pub fn check_vector_intervals(state: mut Results, seed: u32, count: u32) {
     )
     state.out = take out
 }
+
+// ---- plan step H.1: what a table of a field could be proven to -----------------------------
+
+/// Over cells `2 / n` across of the box [-1, 1]³, `count` cells near the surface (a sampled point
+/// within 5 cm of it, its cell): how many a table's interpolation is proven within 1 mm of the
+/// field in (the smaller of `h²/8` times the second derivatives' diagonal's bound, and `L d / 2`
+/// from the gradient's, plus the corners' point intervals' widths and their rounding), how many
+/// were sampled, and how many the second-derivative bound decided. `deep`: derive the second
+/// derivatives (three deep); else the gradient's Lipschitz bound alone.
+struct Proof: Copy {
+    n: u32,
+    seed: u32,
+    count: u32,
+    deep: bool,
+}
+
+impl Visit for Proof {
+    type Out = vec3
+
+    fn visit<F: Surface>(self, f: F) -> vec3 {
+        let h = 2.0 / f32(self.n)
+        var near = 0.0
+        var proven = 0.0
+        var smooth_won = 0.0
+        var tried = 0
+        while near < f32(self.count) && tried < self.count * 400 {
+            let p = sample_point(self.seed, tried) * 0.5
+            tried += 1
+            if abs(f.distance(p)) >= 0.05 {
+                continue
+            }
+            near += 1.0
+            let lo = floor((p + vec3(1.0)) / h) * h - vec3(1.0)
+            let cell = Box3 { lo: lo, hi: lo + vec3(h) }
+            let g = interval(|q: vec3| f.gradient(q), cell)
+            let l = length(max(abs(g.lo), abs(g.hi)))
+            let lip = l * h * sqrt(3.0) / 2.0
+            var bound = lip
+            if self.deep {
+                let d2 = interval(
+                    |q: vec3| vec3(
+                        std::derive::gradient(|r: vec3| f.gradient(r).x, q).x,
+                        std::derive::gradient(|r: vec3| f.gradient(r).y, q).y,
+                        std::derive::gradient(|r: vec3| f.gradient(r).z, q).z,
+                    ),
+                    cell,
+                )
+                let m = max(abs(d2.lo), abs(d2.hi))
+                let smooth = h * h / 8.0 * (m.x + m.y + m.z)
+                if smooth < lip {
+                    bound = smooth
+                    smooth_won += 1.0
+                }
+            }
+            var widest = 0.0
+            var largest = 0.0
+            for k in 0..8 {
+                let c = vec3(
+                    if (k & 1) == 0 { cell.lo.x } else { cell.hi.x },
+                    if (k & 2) == 0 { cell.lo.y } else { cell.hi.y },
+                    if (k & 4) == 0 { cell.lo.z } else { cell.hi.z },
+                )
+                let v = f.interval(Box3 { lo: c, hi: c })
+                widest = max(widest, v.hi - v.lo)
+                largest = max(largest, max(abs(v.lo), abs(v.hi)))
+            }
+            bound += widest + 8.0 * largest / 8388608.0
+            if bound < 0.001 {
+                proven += 1.0
+            }
+        }
+        vec3(proven, near, smooth_won)
+    }
+}
+
+/// H.1's measure of corpus field `fi` (`Proof`): -1 for the three runtime-built tapes, whose
+/// second derivatives don't derive (E0701 in the tape interpreter's value noise).
+pub fn proof(fi: u32, n: u32, seed: u32, count: u32, deep: u32) -> vec3 {
+    let v = Proof { n, seed, count, deep: deep != 0 }
+    match fi {
+        0 => v.visit(sphere_()),
+        1 => v.visit(ellipsoid_()),
+        2 => v.visit(cone_()),
+        3 => v.visit(hoof_()),
+        4 => v.visit(blob_()),
+        5 => v.visit(Noise { freq: 2.5 }),
+        6 => v.visit(fbm_()),
+        7 => v.visit(creature()),
+        8 => v.visit(grazer_()),
+        9 => v.visit(Waves { s: 3.0 }),
+        10 => v.visit(Logs { s: 2.3 }),
+        11 => v.visit(Trig { s: 0.35 }),
+        12 => v.visit(Rational { s: 0.2 }),
+        13 => v.visit(Pieces { s: 2.0 }),
+        14 => v.visit(Vectors { c: vec3(0.3, 0.3, 0.3) }),
+        15 => v.visit(Branchy { n: 3 }),
+        16 => v.visit(Cells { s: 3.0 }),
+        20 => v.visit(closures_(5.0)),
+        21 => v.visit(table_()),
+        22 => v.visit(Hyperbolic { s: 1.7 }),
+        23 => v.visit(Powers { n: 2.4 }),
+        24 => v.visit(March { dir: vec3(0.0, 0.0, 1.0) }),
+        _ => vec3(-1.0),
+    }
+}
