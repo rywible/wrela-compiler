@@ -1340,7 +1340,9 @@ impl<'a, 'm> Fb<'a, 'm> {
     ///
     /// Apple's Metal compiler (Apple M4, macOS 26.6.2) divides a constant dividend within about
     /// a hundred of 2^32 wrongly: `4294967295u / d` gives 3579139454 for `d` = 3. The typed
-    /// programs' oracle O10 found it; a bare Metal kernel, no Wrela in it, shows it too. Halved,
+    /// programs' oracle O10 found it; a bare Metal kernel, no Wrela in it, shows it too
+    /// (compiler/wgsl/metal/u32_division.swift: when it finds nothing wrong on the Macs we
+    /// support, this can go). Halved,
     /// `(a >> 1) / d`, the divide is right for every dividend, and one step puts the answer
     /// back: with `q = ((a >> 1) / d) * 2`, `a - q * d` is below `2d`.
     fn halved(
