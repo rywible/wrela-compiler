@@ -1222,6 +1222,7 @@ GPU code follows WGSL's semantics, and its results are for presentation only: GP
 | Float → int | Truncates; out of range or NaN traps | WGSL-defined values |
 | Float `%` | `a - b * trunc(a / b)`, exact (C's `fmod`): `a`'s sign, smaller than `b` in magnitude; NaN if `a` is infinite or `b` is 0 | WGSL's `a - b * trunc(a / b)`, rounded at each step |
 | Int → int | Keeps the low bits (`u32(-1)` is 4294967295) | Keeps the low bits |
+| `atan2(y, x)` with both zeros | C's: `y` where `x` is +0, π with `y`'s sign where `x` is -0 | The same bits: WGSL leaves it undefined (Metal gives NaN), so the compiler writes it out by the zeros' signs |
 | Out-of-bounds index in a `@deterministic` kernel | Its CPU form (`k.run`) reads the last element | Clamped to the last element (§18.14) |
 | Out-of-bounds index | Traps | WebGPU's robust access (a value from inside the buffer, or zero). A debug build checks each index. An index out of range sets a flag that the host reads after each frame, and the host stops with an error that names the pipeline. Not checked: vertex shaders (WebGPU forbids them to write storage), and a pipeline that already binds 8 storage buffers |
 | NaN | Canonical (`0x7fc00000`, `0x7ff8000000000000`) wherever its bits are observed, in all CPU code: bit casts (so `Serialize` too), uploads to the GPU (`write` and uniforms), and hashing. Nothing else shows a NaN's bits, its sign included. A debug build (`wrela build --debug`) traps where a float operation creates a NaN from operands that hold none. | WGSL |
