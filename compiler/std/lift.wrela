@@ -894,11 +894,10 @@ fn size(x: f64, began: f32) -> f64 {
 /// hair it has moved, which, not the one factor, stopped a solve of ten literals against two
 /// outlines at a loss of 52 before.
 ///
-/// A step held to a box and searched by Armijo's rule along what is left of it: D. P.
-/// Bertsekas, "On the Goldstein-Levitin-Polyak gradient projection method", IEEE Transactions
-/// on Automatic Control 21 (1976). The box as the most a step may go: J. E. Dennis and R. B.
-/// Schnabel, "Numerical Methods for Unconstrained Optimization and Nonlinear Equations"
-/// (1983), §6.3 and algorithm A6.3.1 (`maxstep`), there one length for the whole step.
+/// The most a step may go, its whole length shortened to it before the line search tries it:
+/// J. E. Dennis and R. B. Schnabel, "Numerical Methods for Unconstrained Optimization and
+/// Nonlinear Equations" (1983), §6.3 and algorithm A6.3.1, their line search with its maximum
+/// step length (`maxstep`), here measured literal by literal, each against its own size.
 fn within_reach(x: [f64], began: [f32], p: [f64], t: f64) -> Vec<f64> {
     var k = 1.0
     for i in 0..x.len() {
