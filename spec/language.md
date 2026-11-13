@@ -1578,7 +1578,7 @@ A field built while the program runs is a tape: `std::stage::Tape` holds up to 4
 
 - A program builds a tape while it runs, from an edit log or a sculpting tool: `let d = tape.sphere(center, r)`, `tape.smooth_min(a, b, k)`, and arithmetic over registers.
 - The operations: the point's coordinates and constants; `+ - * /`, `min`, `max`, `smooth_min`, `-`, `abs`, `sqrt`, `sin`, `cos`, `exp`, `log`, `pow` (to a constant power), `floor`, `fract`, `saturate` (`clamp01`), `a - b * floor(a / b)` (`modulo`); `step` (1 where `a < b`), `select` (`b` where `a > 0`, else a third register) and `mix` (`a + (b - a) * t`), the ternary ones reading a third register; a table read at a computed index (`load`, clamped to the table's entries) and between two entries (`lerp_load`); `std::field`'s own value noise (`noise`), fractal noise (`fbm`) and lattice hash (`hash`), so a tape and a compiled field agree bit for bit; `dot3`, `length3` and `normalize3` over three registers in a row; and `noise_box`, `std::field::value_noise_box` (value noise averaged over a box, a filtered field's), over two such rows, the point and the box's half widths. A box noise's interval is [-1, 1] (`tape.interval`), and an interval derived through the tape (a `Taped`'s `Surface::interval`) is every number's where a box noise reaches the value (its loops run as often as its box is wide). Each is one line of `interpret`'s step, and each matches the std function it stands for within an ulp at 10⁶ points on both targets (bit for bit, on the M4 and in Chrome).
-- `stage::interpret(tape, p)` evaluates a tape. A `Taped` is a `Surface`, so it goes wherever a compiled field goes, on the CPU and the GPU: a `ShortTape` as a uniform-sized block, a `Tape` (72 KiB, over the 64 KiB a uniform holds) as read-only storage. On the M4 a 1,024-operation tape costs 0.32 ns an operation a point on the GPU.
+- `stage::interpret(tape, p)` evaluates a tape. A `Taped` is a `Surface`, so it goes wherever a compiled field goes, on the CPU and the GPU: a `ShortTape` as a uniform-sized block, a `Tape` (72 KiB, over the 64 KiB a uniform holds) as read-only storage. On the M4 a 1,024-operation tape costs 0.32 ns an operation a point on the GPU. `stage::interpret_at(tapes, i, p)` interprets the tape at `tapes[i]` where it lies, in a buffer of tapes: the GPU code reads each operation from the buffer and holds no copy.
 - Nothing about a tape is special to the compiler: its gradient and interval are derived from `interpret`'s own code.
 - Integers on a tape are two registers in a row, a 32-bit integer's high and low 16 bits, each exact as a float, so a tape hashes the point's lattice cells exactly, as compiled code does: wrapping `+ - *`, `& | ^`, shifts, `/` and `%` (0 where they'd trap), `<` and `==` (1 or 0), `min` and `max` of `u32`s and `i32`s, conversions between them and floats, a multiply-add (`IMAD`) and `std::hash::pcg`, PCG's output step, which `hash_u32` ends with (`integer`, `integer3`, `integer_constant`). An operation that gives an integer is two operations, one for each half. `atan2` is one too.
 - **A tape of a compiled field.** `std::derive::tape(f)` derives, from the body of `f`, a function of the point, the function that builds `f`'s tape, and runs it on the CPU: the point is active, and each operation on what depends on it puts its tape operation on the tape, while everything else (a part's placement, a radius, a seed, a loop's count) runs as ordinary code and reaches the tape as constants. `Surface::to_tape()` is `tape(|p| self.distance(p))`, and a `Taped`'s is itself. `tape_with(f)`, of an `f` that returns `(f32, T)`, puts the value and `T`'s floats (scalars and vectors of `f32`) in the tape's last registers, which `interpret_with::<N, K, M>(tape, p)` reads as `(f32, [f32; M])`: a field's channels travel with its distance. `tape_sized` builds into a `Taped<N, K>` of another room.
@@ -2641,6 +2641,30 @@ fn far_flat(_pixel: FragCoord, shot: Shot, _field: Texture3d<Rgba16Float>, _smp:
 - **The compiler builds each pipeline's stand-in beside it:** the same bindings and uniform block, so a command recorded for the one runs the other (a render pipeline's stand-in keeps its vertex shader and draws into its targets). The manifest names it (`"standin": j`, pipeline `j`), and `wrela pipelines` shows it (`stand-in far_flat`, and the stand-in's own line; in `--json`, `"standin": j` and `"stands_in": true`). CPU code can't tell them apart: it records the same commands either way.
 - **The browser builds stand-ins first**, then the rest as §18.9 says. A command whose pipeline isn't built runs on its stand-in once that is, and waits only while neither is (a command that needs one starts its stand-in's build, not its own). Once its own pipeline is built, the next command runs on it. So the first frames may draw what the stand-ins draw: what a stand-in draws should be something a player may see for a moment, such as a flat colour or the scene's last bake. Test mode waits for each command's own pipeline, so the frames are the native host's, unless `standins=1`; its `starts.json` lists each frame a pipeline's commands ran on its stand-in (`stood_in`). The native host builds every pipeline before the first frame and runs none on its stand-in.
 - What a stand-in draws or computes is presentation, never state: a readback is `nondet` already (§17.1), and a GPU result reaches the simulation only through a tick's input.
+
+**A stand-in for a field can draw the field: through its tape.** The real shader takes one more parameter it doesn't use, a buffer of the field's tape, and its stand-in reads the tape there (`stage::interpret_at`, §14.4) where the real one calls the field. The parameters match, so the rule above holds as it is, and a command carries the buffer's handle, not a tape's 72 KiB:
+
+```wrela
+use std::field::Surface
+use std::gpu::FragCoord
+use std::stage::{Tape, interpret_at}
+
+@fragment
+@standin(shade_taped)
+fn shade<F: Surface>(pixel: FragCoord, field: F, _tapes: [Tape]) -> vec4 {
+    let d = field.distance(vec3(pixel.position.xy / 256.0, 0.0))
+    vec4(vec3(d), 1.0)
+}
+
+/// The same picture through the field's tape, until `shade` is built.
+@fragment
+fn shade_taped<F: Surface>(pixel: FragCoord, _field: F, tapes: [Tape]) -> vec4 {
+    let d = interpret_at(tapes, 0, vec3(pixel.position.xy / 256.0, 0.0))
+    vec4(vec3(d), 1.0)
+}
+```
+
+It draws the field, not a flat colour (compiler/tests/standin_tape: frame 0 on the stand-in was the real frame's to the 8-bit step). But it doesn't come first: in Chrome on an Apple M4, cold, eight creatures each its own pipeline, the first frame was submitted 355 to 380 ms after the page opened with tape stand-ins, 136 to 155 ms with flat-colour ones, and 193 to 320 ms with none. The tape interpreter's shader takes longer to build than the creatures' own pipelines did, so a flat colour remains the stand-in for a first frame there.
 
 ### 18.13 How often code runs
 
