@@ -48,7 +48,7 @@ fn the_gpu_and_run_agree_bit_for_bit() {
 #[test]
 #[ignore = "needs Chrome and a GPU"]
 fn in_chrome_the_gpu_and_run_agree_bit_for_bit() {
-    let (_, rel) = wrela_tests::page("compiler/tests/exact", "exact");
+    let (_, rel) = wrela_tests::page("compiler/tests/exact", "exact-page");
     let run = wrela_tests::run_in_chrome(&rel, 30, 16, 16, 60.0);
     let lines: Vec<String> = run.printed.iter().map(|(_, l)| l.clone()).collect();
     let got = agreements(&lines);
