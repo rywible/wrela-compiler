@@ -1,0 +1,75 @@
+// oracle: O10
+// mode: Integer
+// seed: 11844670878804677072
+const T: [u32; 8] = [0, 0, 0, 0, 0, 0, 0, 0]
+
+fn g(w: u32, i: u32, s: u32) -> u32 {
+    (((T[w] + w) + (u32(4294967295) / i)) + w)
+}
+
+// ---- the harness (compiler/tests/src/typed.rs) -------------------------------------------------
+use std::gpu::{GlobalId, GpuBuffer, Slots, buffer, buffer_of, dispatch, read}
+use std::io::{Pending, print}
+
+const N: u32 = 1024
+
+struct Salt: Copy + GpuData {
+    salt: u32,
+}
+
+@deterministic
+@compute(64)
+fn k(words: [u32], salt: Salt, out: mut Slots<u32>, id: GlobalId) {
+    out[id] = g(words[id.x], id.x, salt.salt)
+}
+
+pub struct State {
+    frame: u32,
+    words: Vec<u32>,
+    out: GpuBuffer<u32>,
+    pending: Vec<Pending<u32>>,
+    done: bool,
+}
+
+pub fn init() -> State {
+    var words = Vec::new()
+    var h: u32 = 99
+    let edges = [0, 1, 31, 32, 2147483647, 2147483648, 4294967295]
+    for i in 0..N {
+        h = h.wrapping_mul(1664525).wrapping_add(1013904223)
+        words.push(if i < 7 { edges[i] } else { h ^ (h >> 11) })
+    }
+    State { frame: 0, words, out: buffer(N), pending: Vec::new(), done: false }
+}
+
+pub fn frame(s: mut State, time: f32, width: u32, height: u32) {
+    if s.frame == 0 {
+        let words = buffer_of(s.words)
+        dispatch(k.bind(words, Salt { salt: 12345 }, mut s.out), groups: N / 64)
+        s.pending.push(read(s.out.items()))
+    }
+    if !s.done && s.pending.len() == 1 {
+        if let Some(Ok(gpu)) = s.pending[0].poll() {
+            var cpu = Vec::new()
+            for _ in 0..N {
+                cpu.push(0)
+            }
+            k.run(s.words, Salt { salt: 12345 }, mut cpu)
+            var agree = 0
+            var first = N
+            for i in 0..N {
+                if gpu[i] == cpu[i] {
+                    agree += 1
+                } else if first == N {
+                    first = i
+                }
+            }
+            print(f"exact agree {agree} of {N}")
+            if first < N {
+                print(f"exact first {first}: word {s.words[first]}, GPU {gpu[first]}, CPU {cpu[first]}")
+            }
+            s.done = true
+        }
+    }
+    s.frame += 1
+}

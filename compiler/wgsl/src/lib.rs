@@ -1316,6 +1316,14 @@ impl<'a, 'm> Fb<'a, 'm> {
                     ir::BinOp::Gt => BinaryOperator::Greater,
                     ir::BinOp::Ge => BinaryOperator::GreaterEqual,
                 };
+                let lanes = match types.get(ta) {
+                    ir::TypeDef::Scalar(ir::Scalar::U32) => Some(None),
+                    ir::TypeDef::Vector(ir::Scalar::U32, n) => Some(Some(*n)),
+                    _ => None,
+                };
+                if let (Some(n), ir::BinOp::Div | ir::BinOp::Rem) = (lanes, op) {
+                    return Ok(self.halved(*op == ir::BinOp::Div, left, right, n, out));
+                }
                 self.expr(Expression::Binary { op: bop, left, right }, out)
             }
             ir::Expr::Builtin(b, args) => self.builtin(*b, args, out)?,
@@ -1325,6 +1333,52 @@ impl<'a, 'm> Fb<'a, 'm> {
                 return Err("internal: a CPU-only expression in GPU code".into());
             }
         })
+    }
+
+    /// `a / d` or `a % d` on `u32`s (`n` lanes, or a scalar), as WGSL defines them (`a / 0` is
+    /// `a`, `a % 0` is 0), written so that no dividend reaching the GPU's divide is 2^31 or more.
+    ///
+    /// Apple's Metal compiler (Apple M4, macOS 26.6.2) divides a constant dividend within about
+    /// a hundred of 2^32 wrongly: `4294967295u / d` gives 3579139454 for `d` = 3. The typed
+    /// programs' oracle O10 found it; a bare Metal kernel, no Wrela in it, shows it too. Halved,
+    /// `(a >> 1) / d`, the divide is right for every dividend, and one step puts the answer
+    /// back: with `q = ((a >> 1) / d) * 2`, `a - q * d` is below `2d`.
+    fn halved(
+        &mut self,
+        div: bool,
+        a: Handle<Expression>,
+        d: Handle<Expression>,
+        n: Option<u8>,
+        out: &mut Block,
+    ) -> Handle<Expression> {
+        let splat = |me: &mut Self, v: u32, out: &mut Block| {
+            let l = me.lit(Literal::U32(v), out);
+            match n {
+                Some(n) => me.expr(Expression::Splat { size: vsize(n), value: l }, out),
+                None => l,
+            }
+        };
+        let (zero, one) = (splat(self, 0, out), splat(self, 1, out));
+        let bin = |me: &mut Self, op, left, right, out: &mut Block| {
+            me.expr(Expression::Binary { op, left, right }, out)
+        };
+        let is_zero = bin(self, BinaryOperator::Equal, d, zero, out);
+        let d = self.expr(Expression::Select { condition: is_zero, accept: one, reject: d }, out);
+        let half = bin(self, BinaryOperator::ShiftRight, a, one, out);
+        let h = bin(self, BinaryOperator::Divide, half, d, out);
+        let q = bin(self, BinaryOperator::ShiftLeft, h, one, out);
+        let qd = bin(self, BinaryOperator::Multiply, q, d, out);
+        let r = bin(self, BinaryOperator::Subtract, a, qd, out);
+        let over = bin(self, BinaryOperator::GreaterEqual, r, d, out);
+        if div {
+            let up =
+                self.expr(Expression::Select { condition: over, accept: one, reject: zero }, out);
+            bin(self, BinaryOperator::Add, q, up, out)
+        } else {
+            let down =
+                self.expr(Expression::Select { condition: over, accept: d, reject: zero }, out);
+            bin(self, BinaryOperator::Subtract, r, down, out)
+        }
     }
 
     /// An atomic read-modify-write (`ir::Expr::Atomic`): the value that was there, if it's
