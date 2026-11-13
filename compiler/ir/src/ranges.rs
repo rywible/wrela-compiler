@@ -10,7 +10,8 @@
 //!   `let` must be in the loop's own block, where every statement between can be seen; a `Vec`
 //!   cleared between taking its length and the loop keeps its checks). Nothing writes it: no
 //!   store to it, no call lent a place, no memory operation that writes, and, where the place is
-//!   reached through a pointer (or its root's address is taken), no store through a pointer;
+//!   reached through a pointer (or its root's address is taken), no store through a pointer and
+//!   no call at all (a callee given the address as a value could write through it);
 //! - the counter's `+ 1` becomes `WrappingAdd`: it is below `bound`, so it can't overflow.
 //!
 //! Nothing else. Run in `inline_cpu` after inlining; each removal is counted.
@@ -78,6 +79,9 @@ fn collect_addressed(b: &Block, out: &mut HashSet<PlaceRoot>) {
 struct Writes {
     places: Vec<Place>,
     through_pointers: bool,
+    /// A call, whatever its arguments: an address handed over as a value can be written
+    /// through.
+    calls: bool,
     anything: bool,
 }
 
@@ -92,6 +96,7 @@ fn collect_writes(b: &[Stmt], w: &mut Writes) {
             }
             Stmt::Let(_, e) | Stmt::Eval(e) => match e {
                 Expr::Call(_, args) => {
+                    w.calls = true;
                     if args.iter().any(|a| matches!(a, crate::Arg::Place(_))) {
                         w.anything = true;
                     }
@@ -251,7 +256,7 @@ impl Cx<'_> {
             return false;
         }
         let through = matches!(p.root, PlaceRoot::Ptr(_)) || self.addressed.contains(&p.root);
-        !(through && w.through_pointers)
+        !(through && (w.through_pointers || w.calls))
     }
 
     fn prove_loop(
