@@ -47,7 +47,8 @@ pub struct Set: Clone {
 }
 
 /// How to build: through Binaryen's `wasm-opt` (`wrela build --optimize`), lifting the literals
-/// of these packages (`--lift`), with dependencies read from other packages, with SIMD or
+/// of these packages, or of one file of a package named `<package>/<file>` by its path in the
+/// package (`--lift`, §23.1: a file the package doesn't have fails the build), with dependencies read from other packages, with SIMD or
 /// without, as a debug build or not, as a test build with the program's `@testing` exports or
 /// not (`--testing`, §9), how long it may take in seconds (0: 300 s), and with constants set
 /// (`--set`).

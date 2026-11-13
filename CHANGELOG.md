@@ -28,6 +28,10 @@ detail; `docs/release.md` says how a release is cut.
 - **Outlines are measures** (§20, §23.6): `std::field::coverage`, `outline_miss` and
   `image_miss` say how far a silhouette from the side, the front or the top (`View`) is from a
   blueprint's outline or an image, and a spec can hold a subject to it.
+- **A lift entry names one file of a package, `<package>/<file>`** (§23.1), for `wrela build
+  --lift`, `wrela run --lift` and a tool's `BuildOptions.lift` alike: that file's literals alone
+  are lifted. The form was taken before and said nowhere but the spec; a file the package
+  doesn't have is now an error that names it, where it lifted nothing.
 - **`wrela solve` lifts only the files `--free` names** (§23.6): a literal of another file, a
   blueprint's outline or a spec's target, is a reference the solve neither moves nor derives
   through.

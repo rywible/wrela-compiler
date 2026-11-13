@@ -2,7 +2,7 @@
 //!
 //! ```text
 //! wrela check <package-dir> [--json]      check a package; exit 1 if it has errors
-//! wrela build <package-dir> [-o <dir>] [--debug] [--testing] [--optimize] [--lift <package>]... [--report data|consts|layout]
+//! wrela build <package-dir> [-o <dir>] [--debug] [--testing] [--optimize] [--lift <package>[/<file>]]... [--report data|consts|layout]
 //!                                         check and build; writes <dir> (default
 //!                                         <package>/build); --debug adds checks (§11);
 //!                                         --testing keeps the `@testing` exports (§9);
@@ -143,7 +143,7 @@ mod twin;
 pub(crate) fn usage() -> ExitCode {
     let lines = [
         "wrela check <package-dir> [--json]",
-        "wrela build <package-dir> [-o <out-dir>] [--debug] [--testing] [--optimize [size|speed]] [--relaxed-simd] [--lift <package>]... [--set NAME=VALUE]... [--report data|consts|layout] [--json]",
+        "wrela build <package-dir> [-o <out-dir>] [--debug] [--testing] [--optimize [size|speed]] [--relaxed-simd] [--lift <package>[/<file>]]... [--set NAME=VALUE]... [--report data|consts|layout] [--json]",
         "wrela fmt <file-or-dir>... [--check]",
         "wrela fix <package-dir> [--dry-run] [--json]",
         "wrela migrate <package-dir> [--dry-run] [--json]",
@@ -168,7 +168,7 @@ pub(crate) fn usage() -> ExitCode {
         "wrela refactor <package-dir> (rename <item> <new-name> | move <item> <module> | add-param <fn> \"<name>: <type>\" (--value <expr> | --default <expr>) | change-mode <fn> <param> <borrow|mut|take> | extract-const <file>:<line>:<col> <NAME> | inline <fn> | extract-fn <file>:<first>-<last> <name> | apply <plan.json>) [--dry-run] [--json]",
         "wrela trace <package-dir> --watch <export>[,<export>...] [--frames n] [--csv] [--fps f] [--size WxH] [--input <script.json>] [--release] [--no-gpu] [--workers N]",
         "wrela bisect <package-dir> --until \"<export> <op> <number>\" [--frames n] [--json] [--fps f] [--size WxH] [--input <script.json>] [--release] [--no-gpu] [--workers N]",
-        "wrela run <package-dir> [--port N] [--lan] [--lift <package>]... [--debug]",
+        "wrela run <package-dir> [--port N] [--lan] [--lift <package>[/<file>]]... [--debug]",
         "wrela same <package-dir> --against <build-dir> [--set NAME=VALUE]... [--frames n] [--fps f] [--size WxH] [--input <script.json>] [--within x] [--no-gpu] [--json]",
         "wrela suite [fmt | allow | wrela::<package-path>::[<test-name>]] [--workspace <dir>]",
         "wrela tool (<package-dir> | <name>) [--read NAME=DIR]... [--write NAME=DIR]... [--secret NAME]... [--net HOST]... [--allow-run NAME[=PATH]]... [--browser] [--timeout S] [--workers N] [--blob-budget B] [-- args...]",
@@ -284,8 +284,8 @@ pub(crate) struct PackageArgs {
     /// `--testing`, which only `build` takes: a test build, with the program's `@testing`
     /// exports (§9).
     pub testing: bool,
-    /// `--lift <package>`, which only `build` takes: the packages whose literals a lifted
-    /// build lifts.
+    /// `--lift <package>[/<file>]`, which only `build` takes: the packages whose literals a
+    /// lifted build lifts, or one file of a package, by its path in the package.
     pub lift: Vec<String>,
     /// `--optimize [size|speed]`, which only `build` takes: the WASM through `wasm-opt`
     /// (`wrela_driver::optimize`), for size or speed (alone, `Level::DEFAULT`).

@@ -488,9 +488,14 @@ fn lifts_file(lift: &[String], pkg: &str, dir: &Path, path: &Path) -> bool {
         None => e == pkg,
         Some((p, file)) => {
             p == pkg
-                && path
-                    .canonicalize()
-                    .is_ok_and(|c| c.strip_prefix(dir).is_ok_and(|r| r == Path::new(file)))
+                && path.canonicalize().is_ok_and(|c| {
+                    // `./a.wrela` names `a.wrela`: a path's `.` parts name nothing.
+                    let want: std::path::PathBuf = Path::new(file)
+                        .components()
+                        .filter(|k| !matches!(k, std::path::Component::CurDir))
+                        .collect();
+                    c.strip_prefix(dir).is_ok_and(|r| r == want)
+                })
         }
     })
 }
@@ -1044,6 +1049,20 @@ fn compile_loaded_in(
         })
         .map(|(f, _, path)| (*f, lift::relative(path, root)))
         .collect();
+    // A file named alone must be one of its package's: lifting nothing is no build of it.
+    for e in lift.iter().filter(|e| e.contains('/')) {
+        let one = std::slice::from_ref(e);
+        let found = all_files.iter().any(|(_, pkg, path)| {
+            *pkg > 0 && lifts_file(one, &packages[*pkg].name, &dirs[*pkg], path)
+        });
+        if !found {
+            let (p, file) = e.split_once('/').unwrap_or((e, ""));
+            return Err(format!(
+                "lift: the package `{p}` has no file `{file}` (a file is named by its path in its \
+                 package, `{p}/<file>.wrela`)"
+            ));
+        }
+    }
     let checked = wrela_sema::check_packages_set(units, &packages, &scope.set, &mut diagnostics);
     scope.stop()?;
     let mut files = Vec::new();

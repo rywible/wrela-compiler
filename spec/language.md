@@ -3232,7 +3232,7 @@ The command-line tools for agents (§23.9) and a tool's toolchain service (§15.
 
 A lifted build reads a package's `f32` literals from a table instead of building them into the code, so a tool can change them while the program runs.
 
-- **`wrela build <package> --lift <name>`** lifts the `f32` literals of package `<name>`: the program's own package or a dependency. `--lift <name>/<file>` lifts one file of the package, by its path in the package, and the rest runs at a normal build's speed (for example, a floor's `map.wrela` alone).
+- **`wrela build <package> --lift <name>`** lifts the `f32` literals of package `<name>`: the program's own package or a dependency. `--lift <name>/<file>` lifts one file of the package, by its path in the package, and the rest runs at a normal build's speed (for example, a floor's `map.wrela` alone); a file the package doesn't have is an error that names it. The same entries reach `wrela run --lift` and a tool's `std::tool::toolchain::BuildOptions.lift`, so a tool's test can build with one file lifted: the file that holds a spec's solved numbers, when the rest of the package keeps what depends on its literals in heap memory (E0700).
 - **Which literals are lifted:**
   - A constant whose value is a literal is built where it is used, so every use of `EAR_H` reads one table entry. A parameter's default and a field's default are built the same way.
   - A literal that only a computed constant reads is not lifted: the build runs that code once (§13.1).

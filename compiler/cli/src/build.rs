@@ -1,4 +1,4 @@
-//! `wrela build <package-dir> [-o <out-dir>] [--debug] [--testing] [--optimize [size|speed]] [--lift <package>]... [--json]`: checks and builds a package, writing
+//! `wrela build <package-dir> [-o <out-dir>] [--debug] [--testing] [--optimize [size|speed]] [--lift <package>[/<file>]]... [--json]`: checks and builds a package, writing
 //! `game.wasm`, the WGSL, `manifest.json` and the runtime into the output directory (default
 //! `<package>/build`). With `--optimize`, `game.wasm` goes through Binaryen (for size, `-Oz`, or
 //! speed, `-O3`; alone, `wrela_driver::optimize::Level::DEFAULT`) and its trap
