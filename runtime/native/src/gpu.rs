@@ -611,6 +611,11 @@ pub(crate) struct Gpu {
     /// `wrela pixel`'s probe: the frame whose GPU work stops before a draw, and how many draws
     /// it has run ([`Probe`]).
     pub(crate) probe: Option<crate::Probe>,
+    /// For tests: each command runs on its pipeline's stand-in (§18.12), as the browser runs it
+    /// until the pipeline is built ([`Host::use_standins`](crate::Host::use_standins)).
+    pub(crate) use_standins: bool,
+    /// Each pipeline's stand-in, as the manifest names it.
+    standin_of: Vec<Option<u32>>,
     frames_begun: u32,
     probe_draws: u32,
     probe_stopped: bool,
@@ -821,6 +826,8 @@ impl Gpu {
         let timer = timestamps.then(|| Timer::new(&device, timing == Timing::Serial, true));
         let mut gpu = Gpu {
             probe: None,
+            use_standins: false,
+            standin_of: manifest.pipelines.iter().map(|p| p.standin).collect(),
             frames_begun: 0,
             probe_draws: 0,
             probe_stopped: false,
@@ -1798,6 +1805,7 @@ impl Gpu {
         bindings: &[Binding],
         uniforms: &[u8],
     ) -> Result<()> {
+        let pipeline = self.stood(pipeline);
         // Everything that can flush happens before anything is recorded for this dispatch.
         self.reserve_uniforms(Opcode::Dispatch, self.aligned(uniforms.len()))?;
         self.reserve_timestamps()?;
@@ -1856,7 +1864,16 @@ impl Gpu {
         self.pass = Some(OpenPass { pass, draws: Vec::new(), label, uses: None, rect_set: false });
     }
 
+    /// The pipeline a command runs on: its stand-in, where tests asked for stand-ins.
+    fn stood(&self, pipeline: u32) -> u32 {
+        match self.standin_of.get(pipeline as usize) {
+            Some(Some(s)) if self.use_standins => *s,
+            _ => pipeline,
+        }
+    }
+
     fn draw(&mut self, pipeline: u32, how: DrawHow, bindings: &[Binding], uniforms: &[u8]) {
+        let pipeline = self.stood(pipeline);
         let draw =
             PendingDraw { pipeline, how, bindings: bindings.to_vec(), uniforms: uniforms.to_vec() };
         self.pass_item(PassItem::Draw(draw));

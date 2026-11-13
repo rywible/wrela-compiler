@@ -203,3 +203,60 @@ fn a_standin_binds_its_samplers_as_its_entry_point_does() {
         (Some(true), Some(true))
     );
 }
+
+/// Stage J.3: compiler/tests/standin_tape's `shade` marches a creature's compiled field, and its
+/// stand-in `shade_taped` the creature's tape, read in place (`std::stage::interpret_at`). The
+/// manifest names the stand-in, and on the native host, made to run each draw on its stand-in,
+/// the frame is the real pipeline's within 2/255 (a mean over every channel).
+#[test]
+#[ignore = "needs a GPU"]
+fn a_tape_stand_in_draws_the_field() {
+    let dir = crate::built("standin_tape");
+    let manifest: serde_json::Value = serde_json::from_str(
+        &std::fs::read_to_string(dir.join("manifest.json")).expect("manifest"),
+    )
+    .expect("json");
+    let ps = manifest["pipelines"].as_array().expect("pipelines");
+    let real = ps.iter().position(|p| p["name"] == "whole+shade").expect("shade's pipeline");
+    let stand = ps.iter().position(|p| p["name"] == "whole+shade_taped").expect("the stand-in");
+    assert_eq!(ps[real]["standin"], stand, "{manifest}");
+    let frame = |standins: bool| {
+        let mut host = wrela_host::Host::load(&dir).expect("load");
+        host.use_standins(standins);
+        host.run_frames(&[0.0], 128, 128).expect("run").frame
+    };
+    let (real, taped) = (frame(false), frame(true));
+    let diff = wrela_host::image::compare(&real, &taped).expect("same size");
+    eprintln!(
+        "the tape stand-in against the field: mean {:.4}/255, max {}/255",
+        diff.mean, diff.max
+    );
+    assert!(diff.mean <= 2.0, "mean difference {:.4} over 2/255", diff.mean);
+    // Not a blank screen: the creature is drawn.
+    let lit = real.chunks(4).filter(|p| p[0] > 16).count();
+    assert!(lit > 128 * 128 / 20, "only {lit} pixels lit");
+}
+
+/// Stage J.3 in Chrome, with stand-ins: frame 0 ran on the tape stand-in (`starts.json`'s
+/// `stood_in`), and a later frame on the real pipeline.
+#[test]
+#[ignore = "needs Chrome and a GPU"]
+fn in_chrome_the_tape_stands_in_until_the_field_is_built() {
+    let (_, rel) = wrela_tests::page("compiler/tests/standin_tape", "standin_tape");
+    let run = wrela_tests::ChromeRun {
+        standins: true,
+        ..wrela_tests::ChromeRun::new(120, 128, 128, 60.0)
+    };
+    wrela_tests::run_in_chrome_with(&rel, run);
+    let results = wrela_tests::repo_root().join(&rel).join("results");
+    let starts = wrela_tests::result_json(&results, "starts.json");
+    let frames: Vec<u64> = starts["stood_in"]
+        .as_array()
+        .expect("stood_in")
+        .iter()
+        .map(|s| s["frame"].as_u64().expect("a frame"))
+        .collect();
+    eprintln!("frames on a stand-in: {frames:?}");
+    assert!(frames.contains(&0), "frame 0 didn't run on the stand-in: {starts}");
+    assert!(frames.iter().all(|&f| f < 119), "the last frame ran on the stand-in: {starts}");
+}

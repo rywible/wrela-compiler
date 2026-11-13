@@ -1070,6 +1070,12 @@ impl Host {
         self.p().executor().buffer_size(handle)
     }
 
+    /// For tests: each dispatch and draw runs on its pipeline's stand-in (language.md §18.12), as
+    /// a browser runs it until the pipeline is built; `false`, on the pipeline itself.
+    pub fn use_standins(&mut self, on: bool) {
+        self.p().executor().use_standins = on;
+    }
+
     /// Sets `wrela pixel`'s probe ([`Probe`]), or clears it.
     pub fn set_probe(&mut self, probe: Option<Probe>) {
         self.p().executor().probe = probe;
